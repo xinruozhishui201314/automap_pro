@@ -1,0 +1,99 @@
+# ========== 大文件和数据文件 ==========
+# ROS bag 文件
+*.bag
+*.db3
+
+# 模型权重文件
+*.pth
+*.pth.tar
+*.pt
+*.onnx
+*.pkl
+*.h5
+*.hdf5
+
+# 点云数据
+*.ply
+*.pcd
+*.las
+*.laz
+
+# 视频和动画
+*.gif
+*.mp4
+*.avi
+*.mov
+
+# PDF 文档
+*.pdf
+
+# ========== Docker 依赖 ==========
+# Docker 下载的二进制依赖
+docker/deps/downloads/
+docker/deps/*/bin/
+docker/deps/*/lib/
+docker/deps/*/include/
+docker/deps/*/share/
+
+# 第三方库构建产物
+docker/deps/*/build/
+
+# ========== 临时文件 ==========
+*.log
+*.tmp
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# ========== IDE 和编辑器 ==========
+.vscode/
+.idea/
+*.iml
+*.code-workspace
+
+# ========== Python ==========
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+build/
+dist/
+*.egg-info/
+
+# ========== C/C++ ==========
+*.o
+*.a
+*.so
+*.dylib
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+compile_commands.json
+
+# ========== 测试和覆盖率 ==========
+.coverage
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+
+# ========== 系统文件 ==========
+*.bak
+*.backup
+*.orig
+
+# ========== 特定项目数据 ==========
+# 自动地图数据集
+data/automap_input/**/*.bag
+data/automap_output/**/*.pcd
+
+# 第三方仓库的示例数据
+**/examples/**/data/*.bin
+**/examples/**/data/*.ply
+**/test/**/data/*.ply
+**/demo/**/scans/*.bin
