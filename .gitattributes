@@ -1,2 +1,49 @@
-docker/automap-env_humble.tar filter=lfs diff=lfs merge=lfs -text
-docker/*.tar filter=lfs diff=lfs merge=lfs -text
+# ========== Git LFS Configuration ==========
+# 此文件定义哪些文件应该由 Git LFS 追踪
+# 策略：只追踪项目特定的数据和模型，第三方库文件也使用 LFS
+
+# ========== ROS Bag Files (项目数据) ==========
+*.bag filter=lfs diff=lfs merge=lfs -text
+*.db3 filter=lfs diff=lfs merge=lfs -text
+
+# ========== Deep Learning Model Weights ==========
+*.pth filter=lfs diff=lfs merge=lfs -text
+*.pth.tar filter=lfs diff=lfs merge=lfs -text
+*.pt filter=lfs diff=lfs merge=lfs -text
+*.onnx filter=lfs diff=lfs merge=lfs -text
+
+# ========== Point Cloud Data (所有 .ply 文件) ==========
+*.ply filter=lfs diff=lfs merge=lfs -text
+*.pcd filter=lfs diff=lfs merge=lfs -text
+*.las filter=lfs diff=lfs merge=lfs -text
+*.laz filter=lfs diff=lfs merge=lfs -text
+
+# ========== Binary Data Files ==========
+data/**/*.bin filter=lfs diff=lfs merge=lfs -text
+*.bin filter=lfs diff=lfs merge=lfs -text
+
+# ========== Documentation (所有 PDF 和 GIF) ==========
+*.pdf filter=lfs diff=lfs merge=lfs -text
+*.gif filter=lfs diff=lfs merge=lfs -text
+
+# ========== Video Files ==========
+*.mp4 filter=lfs diff=lfs merge=lfs -text
+*.avi filter=lfs diff=lfs merge=lfs -text
+*.mov filter=lfs diff=lfs merge=lfs -text
+
+# ========== Model Files ==========
+*.obj filter=lfs diff=lfs merge=lfs -text
+*.stl filter=lfs diff=lfs merge=lfs -text
+*.fbx filter=lfs diff=lfs merge=lfs -text
+*.bvh filter=lfs diff=lfs merge=lfs -text
+
+# ========== Archive Files (特定用途) ==========
+*.tar.gz filter=lfs diff=lfs merge=lfs -text
+*.zip filter=lfs diff=lfs merge=lfs -text
+
+# ========== ML/Data Files ==========
+*.pkl filter=lfs diff=lfs merge=lfs -text
+*.h5 filter=lfs diff=lfs merge=lfs -text
+*.hdf5 filter=lfs diff=lfs merge=lfs -text
+*.ckpt filter=lfs diff=lfs merge=lfs -text
+*.safetensors filter=lfs diff=lfs merge=lfs -text

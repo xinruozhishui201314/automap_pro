@@ -1,33 +1,8 @@
-# ========== 大文件和数据文件 ==========
-# ROS bag 文件
-*.bag
-*.db3
+# ========== Git LFS 管理说明 ==========
+# 大文件（*.bag, *.pth.tar, *.ply, *.gif, *.pdf等）由 Git LFS 管理
+# 本文件只忽略不需要版本控制的文件
 
-# 模型权重文件
-*.pth
-*.pth.tar
-*.pt
-*.onnx
-*.pkl
-*.h5
-*.hdf5
-
-# 点云数据
-*.ply
-*.pcd
-*.las
-*.laz
-
-# 视频和动画
-*.gif
-*.mp4
-*.avi
-*.mov
-
-# PDF 文档
-*.pdf
-
-# ========== Docker 依赖 ==========
+# ========== Docker 依赖（构建产物，可重新下载）==========
 # Docker 下载的二进制依赖
 docker/deps/downloads/
 docker/deps/*/bin/
@@ -45,6 +20,9 @@ docker/deps/*/build/
 *~
 .DS_Store
 Thumbs.db
+*.bak
+*.backup
+*.orig
 
 # ========== IDE 和编辑器 ==========
 .vscode/
@@ -83,17 +61,14 @@ htmlcov/
 .mypy_cache/
 
 # ========== 系统文件 ==========
-*.bak
-*.backup
-*.orig
+*.cache
+*.pid
 
-# ========== 特定项目数据 ==========
-# 自动地图数据集
-data/automap_input/**/*.bag
-data/automap_output/**/*.pcd
-
-# 第三方仓库的示例数据
-**/examples/**/data/*.bin
-**/examples/**/data/*.ply
-**/test/**/data/*.ply
-**/demo/**/scans/*.bin
+# ========== 子模块工作目录修改 ==========
+# Git 子模块的修改通常不需要提交
+docker/deps/Livox-SDK2/
+docker/deps/Open3D/
+docker/deps/TEASER-plusplus/
+docker/deps/gtsam/
+docker/deps/ikd-Tree/
+thrid_party/ceres-solver/
