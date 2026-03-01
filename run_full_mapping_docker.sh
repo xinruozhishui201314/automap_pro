@@ -24,7 +24,7 @@ BAG_FILE="${BAG_FILE:-data/automap_input/nya_02_slam_imu_to_lidar/nya_02.bag}"
 CONFIG="${CONFIG:-automap_pro/config/system_config_nya02.yaml}"
 OUTPUT_DIR="${OUTPUT_DIR:-/data/automap_output/nya_02}"
 CONTAINER_NAME="automap_mapping"
-IMAGE_NAME="automap_pro:latest"
+IMAGE_NAME="${IMAGE_NAME:-automap-env:humble}"
 
 # 显示帮助信息
 show_help() {
@@ -175,22 +175,20 @@ check_docker() {
 
 # 检查镜像
 check_image() {
-    if [ "$NO_BUILD" = true ]; then
-        return 0
-    fi
-    
     log_step "检查 Docker 镜像"
+    
+    # 跳过镜像检查（使用现有的 automap-env:humble 镜像）
+    log_info "使用现有镜像: $IMAGE_NAME"
     
     if docker images | grep -q "^$IMAGE_NAME "; then
         log_info "✓ 镜像已存在: $IMAGE_NAME"
     else
         log_warn "镜像不存在: $IMAGE_NAME"
-        read -p "是否构建镜像? (y/n): " -n 1 -r
+        log_warn "请确保镜像已下载或构建"
+        read -p "是否继续使用其他镜像? (y/n): " -n 1 -r
         echo
-        if [[ $REPLY =~ ^[Yy]$ ]]; then
-            BUILD_IMAGE=true
-        else
-            log_error "没有镜像，无法运行"
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            log_error "用户取消"
             exit 1
         fi
     fi
