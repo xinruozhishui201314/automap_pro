@@ -1,0 +1,42 @@
+version: '3.8'
+
+services:
+  bag-converter:
+    build:
+      context: .
+      dockerfile: converter.Dockerfile
+    image: automap_ros1_to_ros2_converter:latest
+    container_name: automap_converter
+    volumes:
+      # 挂载数据目录
+      - ./data:/workspace/data
+      - ./docker/scripts:/workspace/scripts:ro
+    environment:
+      - ROS_DOMAIN_ID=0
+    working_dir: /workspace
+    stdin_open: true
+    tty: true
+    command: /bin/bash
+
+  # 可选：直接运行转换
+  bag-converter-run:
+    build:
+      context: .
+      dockerfile: converter.Dockerfile
+    image: automap_ros1_to_ros2_converter:latest
+    container_name: automap_converter_run
+    volumes:
+      - ./data:/workspace/data
+    environment:
+      - ROS_DOMAIN_ID=0
+    working_dir: /workspace
+    # 转换nya_02数据集
+    command: >
+      bash -c "
+        echo '开始转换 ROS1 bag 到 ROS2...' &&
+        source /opt/ros/humble/setup.bash &&
+        python3 /workspace/scripts/convert_ros1_to_ros2.py \\
+          /workspace/data/automap_input/nya_02_slam_imu_to_lidar/nya_02.bag \\
+          /workspace/data/automap_input/nya_02_slam_imu_to_lidar/ros2 \\
+          --verbose
+      "
