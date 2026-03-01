@@ -3,7 +3,7 @@ SHELL := /bin/bash
 WS    := $(HOME)/automap_ws
 PKG   := automap_pro
 
-.PHONY: setup build build-release test run-online run-offline clean docker-build docker-run
+.PHONY: setup build build-release test run-online run-offline clean docker-build docker-run full-mapping play-data
 
 setup:
 	@echo "=== Setting up AutoMap-Pro workspace (ROS2 Humble) ==="
@@ -68,3 +68,12 @@ eval-map:
 visualize: DIR ?= /data/automap_output
 visualize:
 	python3 scripts/visualize_results.py --output_dir $(DIR)
+
+full-mapping:
+	@echo "=== Running Full Mapping Pipeline (One-Click) ==="
+	$(CURDIR)/run_full_mapping.sh
+
+play-data: BAG_FILE ?= $(HOME)/data/automap_input/nya_02_slam_imu_to_lidar/nya_02.bag
+play-data:
+	@echo "=== Playing Data (One-Click) ==="
+	$(CURDIR)/play_data.sh --bag-file $(BAG_FILE)
