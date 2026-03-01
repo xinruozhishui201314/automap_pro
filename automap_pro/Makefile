@@ -60,6 +60,10 @@ docker-mapping:
 	@echo "=== Running AutoMap-Pro in Docker (One-Click) ==="
 	$(CURDIR)/run_full_mapping_docker.sh
 
+docker-play-data:
+	@echo "=== Playing Data in Docker (One-Click) ==="
+	$(CURDIR)/docker/play_data_docker.sh
+
 eval-traj: EST ?= /data/automap_output/trajectory/optimized_trajectory_tum.txt
 eval-traj: REF ?= /data/groundtruth.txt
 eval-traj:

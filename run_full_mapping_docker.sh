@@ -14,6 +14,12 @@ NC='\033[0m'
 
 # 配置参数
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# 处理 BAG_FILE 参数（去掉可能的 @ 符号）
+if [[ "$BAG_FILE" == @* ]]; then
+    BAG_FILE="${BAG_FILE#@}"
+fi
+
 BAG_FILE="${BAG_FILE:-data/automap_input/nya_02_slam_imu_to_lidar/nya_02.bag}"
 CONFIG="${CONFIG:-automap_pro/config/system_config_nya02.yaml}"
 OUTPUT_DIR="${OUTPUT_DIR:-/data/automap_output/nya_02}"
@@ -242,14 +248,28 @@ run_mapping_in_container() {
     # 输出目录（本地）
     OUTPUT_DIR_LOCAL="$OUTPUT_DIR"
     
-    # 转换为容器内路径
-    BAG_FILE_CONTAINER="/workspace/data/$(basename "$BAG_FILE")"
-    CONFIG_CONTAINER="/workspace/$(basename "$CONFIG_ABS")"
-    OUTPUT_DIR_CONTAINER="/workspace/data/automap_output/nya_02"
+    # 检查 bag 文件是否存在
+    if [ ! -f "$BAG_FILE_ABS" ]; then
+        log_error "Bag 文件不存在: $BAG_FILE_ABS"
+        log_info "可用的 bag 文件:"
+        find "$SCRIPT_DIR/data" -name "*.bag" -o -name "*.db3" 2>/dev/null || true
+        exit 1
+    fi
     
-    log_info "Bag 文件: $BAG_FILE_CONTAINER"
-    log_info "配置文件: $CONFIG_CONTAINER"
-    log_info "输出目录: $OUTPUT_DIR_CONTAINER"
+    # 转换为容器内路径
+    # bag 文件直接挂载到 /workspace/data
+    BAG_FILE_CONTAINER="/workspace/data/$(basename "$BAG_FILE")"
+    # 配置文件在 /workspace/automap_pro
+    CONFIG_CONTAINER="/workspace/automap_pro/$(basename "$CONFIG_ABS")"
+    # 输出目录挂载到 /workspace/output
+    OUTPUT_DIR_CONTAINER="/workspace/output"
+    
+    log_info "本地 Bag 文件: $BAG_FILE_ABS"
+    log_info "容器 Bag 文件: $BAG_FILE_CONTAINER"
+    log_info "本地配置文件: $CONFIG_ABS"
+    log_info "容器配置文件: $CONFIG_CONTAINER"
+    log_info "本地输出目录: $OUTPUT_DIR_LOCAL"
+    log_info "容器输出目录: $OUTPUT_DIR_CONTAINER"
     
     # 创建本地输出目录
     mkdir -p "$OUTPUT_DIR_LOCAL"

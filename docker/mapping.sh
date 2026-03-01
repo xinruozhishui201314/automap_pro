@@ -115,8 +115,25 @@ print_config() {
 check_bag_file() {
     log_step "检查 bag 文件"
     
+    # 如果 BAG_FILE 以 @ 开头，去掉 @
+    if [[ "$BAG_FILE" == @* ]]; then
+        BAG_FILE="${BAG_FILE#@}"
+    fi
+    
     if [ ! -f "$BAG_FILE" ]; then
         log_error "Bag 文件不存在: $BAG_FILE"
+        log_info "搜索可用的 bag 文件..."
+        
+        # 搜索 data 目录
+        local found_bags=$(find /workspace/data -name "*.bag" -o -name "*.db3" 2>/dev/null)
+        
+        if [ -n "$found_bags" ]; then
+            echo -e "${GREEN}找到以下 bag 文件:${NC}"
+            echo "$found_bags" | head -10
+        else
+            log_error "未找到任何 bag 文件"
+        fi
+        
         exit 1
     fi
     
