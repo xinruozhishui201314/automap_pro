@@ -56,6 +56,10 @@ docker-build:
 docker-run:
 	docker-compose -f docker/docker-compose.yml up automap
 
+docker-mapping:
+	@echo "=== Running AutoMap-Pro in Docker (One-Click) ==="
+	$(CURDIR)/run_full_mapping_docker.sh
+
 eval-traj: EST ?= /data/automap_output/trajectory/optimized_trajectory_tum.txt
 eval-traj: REF ?= /data/groundtruth.txt
 eval-traj:
