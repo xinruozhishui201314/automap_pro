@@ -1,0 +1,8 @@
+overlap_transformer_descriptor_server:
+  ros__parameters:
+    model_path: ""  # e.g. /path/to/OverlapTransformer-master/pretrained/overlap_transformer.pth
+    fov_up: 3.0
+    fov_down: -25.0
+    proj_H: 64
+    proj_W: 900
+    max_range: 80.0

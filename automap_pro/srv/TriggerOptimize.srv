@@ -1,0 +1,8 @@
+bool full_optimization
+int32 max_iterations
+---
+bool success
+string message
+float64 optimization_time_ms
+int32 num_nodes
+int32 num_edges

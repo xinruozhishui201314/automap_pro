@@ -1,0 +1,13 @@
+std_msgs/Header header
+int32 submap_i
+int32 submap_j
+int32 keyframe_i
+int32 keyframe_j
+geometry_msgs/Transform delta_pose
+float64[36] information
+float64 overlap_score
+float64 inlier_ratio
+float64 fitness_score
+float64 rmse
+bool is_inter_session
+int32 status

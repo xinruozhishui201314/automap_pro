@@ -1,0 +1,9 @@
+---
+string system_state
+int32 num_keyframes
+int32 num_submaps
+int32 num_loop_constraints
+float64 frontend_rate_hz
+float64 memory_usage_mb
+string gps_state
+bool is_mapping

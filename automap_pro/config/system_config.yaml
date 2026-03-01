@@ -1,0 +1,151 @@
+system:
+  name: "AutoMap-Pro"
+  mode: "online"          # online / offline / incremental
+  log_level: "info"       # debug / info / warn / error
+  output_dir: "/data/automap_output"
+  num_threads: 8
+  use_gpu: true
+  gpu_device_id: 0
+
+sensor:
+  lidar:
+    type: "livox_avia"
+    topic: "/livox/lidar"
+    frequency: 10
+    max_range: 150.0
+    min_range: 0.5
+    undistort: true
+  imu:
+    topic: "/livox/imu"
+    frequency: 200
+    gravity: 9.81
+  camera:
+    enabled: false
+    topic: "/camera/image_raw"
+    frequency: 20
+  gps:
+    enabled: true
+    topic: "/gps/fix"
+    frequency: 10
+    enu_origin:
+      auto_init: true
+
+gps_fusion:
+  quality_thresholds:
+    excellent_hdop: 1.0
+    high_hdop: 2.0
+    medium_hdop: 5.0
+  covariance:
+    excellent: [0.05, 0.05, 0.10]
+    high:      [0.10, 0.10, 0.20]
+    medium:    [1.00, 1.00, 2.00]
+    low:       [10.0, 10.0, 20.0]
+  consistency_check:
+    enabled: true
+    chi2_threshold: 11.345
+    max_velocity: 30.0
+  jump_detection:
+    enabled: true
+    max_jump: 5.0
+    consecutive_valid: 5
+
+frontend:
+  # "internal" = 自研 ESIKF 前端; "external_fast_livo" = 使用 fast-livo2-humble 节点
+  mode: "external_fast_livo"
+  external_fast_livo:
+    odom_topic: "/aft_mapped_to_init"
+    cloud_topic: "/cloud_registered"
+  fast_livo2:
+    config_file: "config/fast_livo2_config.yaml"
+    keyframe_policy:
+      min_translation: 1.0     # meters
+      min_rotation: 10.0       # degrees
+      max_interval: 2.0        # seconds
+    cloud_downsample_resolution: 0.2
+
+submap:
+  ms_mapping:
+    config_file: "config/ms_mapping_config.yaml"
+  split_policy:
+    max_keyframes: 100
+    max_spatial_extent: 100.0   # meters
+    max_temporal_extent: 60.0   # seconds
+  cloud_for_matching_resolution: 0.5
+
+loop_closure:
+  overlap_transformer:
+    # "internal" = 自研/LibTorch; "external_service" = 使用 overlap_transformer_ros2 服务
+    mode: "internal"
+    descriptor_service: "/automap/compute_descriptor"
+    model_path: "models/overlap_transformer/pretrained.pth"
+    range_image:
+      height: 64
+      width: 900
+    descriptor_dim: 256
+    top_k: 5
+    overlap_threshold: 0.3
+    min_temporal_gap: 30.0      # seconds
+    min_submap_gap: 3
+    gps_search_radius: 200.0    # meters
+  teaser:
+    voxel_size: 0.5
+    fpfh:
+      normal_radius: 1.0
+      feature_radius: 2.5
+      max_nn_normal: 30
+      max_nn_feature: 100
+    solver:
+      noise_bound: 0.1
+      cbar2: 1.0
+      rotation_gnc_factor: 1.4
+      rotation_max_iterations: 100
+      rotation_cost_threshold: 1.0e-6
+    validation:
+      min_inlier_ratio: 0.30
+      max_rmse: 0.3
+      min_fitness: 0.5
+    icp_refine:
+      enabled: true
+      max_iterations: 30
+      max_correspondence_distance: 1.0
+      convergence_threshold: 1.0e-6
+
+backend:
+  hba:
+    config_file: "config/hba_config.yaml"
+    trigger_policy:
+      on_loop: true
+      periodic_submaps: 10
+      on_finish: true
+    optimization:
+      max_iterations: 100
+      convergence_threshold: 1.0e-4
+      use_robust_kernel: true
+      robust_kernel_delta: 1.0
+  hba_bridge:
+    export_path: "/data/automap_output/hba_export"
+    run_after_export: false
+    run_command: "ros2 run hba hba --ros-args -p data_path:=%s"
+
+map_output:
+  global_map:
+    voxel_size: 0.1
+    statistical_filter:
+      enabled: true
+      mean_k: 50
+      std_dev_mul: 2.0
+  tiling:
+    enabled: true
+    tile_size: 100.0
+  formats:
+    pcd: true
+    ply: true
+    las: false
+
+visualization:
+  publish_rate: 1.0
+  global_map_publish: true
+  global_map_downsample: 0.5
+  show_loop_closures: true
+  show_gps_trajectory: true
+  show_submap_boundaries: true

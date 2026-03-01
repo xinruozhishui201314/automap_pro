@@ -1,0 +1,46 @@
+version: "3.8"
+
+services:
+  automap:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: automap_pro:latest
+    container_name: automap_pro
+    runtime: nvidia            # requires nvidia-container-toolkit
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - DISPLAY=${DISPLAY:-:0}
+      - ROS_MASTER_URI=http://localhost:11311
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      - /data/automap:/data/automap_output    # map output
+      - /data/bags:/data/bags:ro              # input bag files
+    network_mode: host
+    ipc: host
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    command: >
+      bash -c "roscore &
+               sleep 2 &&
+               roslaunch automap_pro automap_online.launch
+                 config:=/automap_ws/src/automap_pro/config/system_config.yaml
+                 output_dir:=/data/automap_output
+                 use_rviz:=false"
+
+  # Optional: RViz on host machine (connect to container's roscore)
+  rviz:
+    image: osrf/ros:noetic-desktop-full
+    container_name: automap_rviz
+    environment:
+      - DISPLAY=${DISPLAY:-:0}
+      - ROS_MASTER_URI=http://localhost:11311
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+    network_mode: host
+    command: rviz
+    profiles:
+      - rviz

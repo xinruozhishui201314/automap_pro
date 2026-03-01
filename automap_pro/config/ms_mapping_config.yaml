@@ -1,0 +1,16 @@
+# MS-Mapping (Multi-Session Mapping) configuration
+submap:
+  max_keyframes: 100
+  max_spatial_extent: 100.0     # meters
+  max_temporal_extent: 60.0     # seconds
+  cloud_for_matching_resolution: 0.5
+  merged_cloud_resolution: 0.2
+
+session:
+  save_on_exit: true
+  load_previous_on_start: false
+  previous_session_dir: ""
+
+storage:
+  compress_archives: false
+  keep_raw_clouds: false         # Only keep downsampled matching cloud

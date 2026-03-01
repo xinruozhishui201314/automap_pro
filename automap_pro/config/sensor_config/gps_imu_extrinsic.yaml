@@ -1,0 +1,11 @@
+# GPS antenna - IMU extrinsic (lever arm)
+T_gps_imu:
+  translation:   # GPS antenna position relative to IMU [x, y, z] meters
+    - 0.0
+    - 0.0
+    - 0.1        # GPS antenna 10 cm above IMU center (example)
+  rotation_quat: # GPS does not have orientation (identity)
+    - 1.0
+    - 0.0
+    - 0.0
+    - 0.0

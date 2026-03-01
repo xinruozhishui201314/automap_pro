@@ -1,0 +1,135 @@
+#0 building with "default" instance using docker driver
+
+#1 [internal] load build definition from dockerfile
+#1 transferring dockerfile: 22.50kB done
+#1 DONE 0.0s
+
+#2 [internal] load metadata for docker.io/nvidia/cuda:11.8.0-cudnn8-devel-ubuntu22.04
+#2 DONE 0.0s
+
+#3 [internal] load .dockerignore
+#3 transferring context: 2B done
+#3 DONE 0.0s
+
+#4 [ 1/36] FROM docker.io/nvidia/cuda:11.8.0-cudnn8-devel-ubuntu22.04@sha256:8f9dd0d09d3ad3900357a1cf7f887888b5b74056636cd6ef03c160c3cd4b1d95
+#4 resolve docker.io/nvidia/cuda:11.8.0-cudnn8-devel-ubuntu22.04@sha256:8f9dd0d09d3ad3900357a1cf7f887888b5b74056636cd6ef03c160c3cd4b1d95 done
+#4 DONE 0.0s
+
+#5 [internal] load build context
+#5 transferring context: 1.07MB 0.1s done
+#5 DONE 0.1s
+
+#6 [ 9/36] RUN echo "" &&     echo "========================================" &&     echo "[阶段 2.1] 配置 ROS2 Humble 源" &&     echo "========================================" &&     curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key       -o /usr/share/keyrings/ros-archive-keyring.gpg &&     echo "✓ ROS2 GPG 密钥添加完成" &&     echo "deb [arch=$(dpkg --print-architecture)       signed-by=/usr/share/keyrings/ros-archive-keyring.gpg]       http://packages.ros.org/ros2/ubuntu       $(. /etc/os-release && echo $UBUNTU_CODENAME) main"       > /etc/apt/sources.list.d/ros2.list &&     echo "✓ ROS2 源配置完成"
+#6 CACHED
+
+#7 [34/36] RUN cat >> /root/.bashrc << 'BASHEOF'
+#7 CACHED
+
+#8 [ 2/36] RUN echo "" &&     echo "========================================" &&     echo "AutoMap-Pro Docker 镜像构建开始" &&     echo "========================================" &&     echo "基础镜像: nvidia/cuda:11.8.0-cudnn8-devel-ubuntu22.04" &&     echo "ROS 版本: Humble" &&     echo "CUDA 版本: 11.8" &&     echo "" &&     echo "主要组件:" &&     echo "  - ROS2 Humble (桌面完整版)" &&     echo "  - PyTorch 2.1.2 (CUDA 11.8)" &&     echo "  - Open3D 0.18.0" &&     echo "  - GTSAM, Sophus, ikd-Tree, TEASER++" &&     echo "  - Livox SDK" &&     echo "========================================" &&     echo ""
+#8 CACHED
+
+#9 [ 6/36] COPY ./deps/cmake /opt/cmake-3.24.0
+#9 CACHED
+
+#10 [24/36] RUN cd /tmp/Livox-SDK2 && mkdir build && cd build &&     cmake .. -DCMAKE_BUILD_TYPE=Release &&     echo "开始编译..." &&     make -j$(nproc) &&     echo "✓ Livox-SDK2 编译完成" &&     make install && ldconfig &&     echo "✓ Livox-SDK2 安装完成" &&     rm -rf /tmp/Livox-SDK2
+#10 CACHED
+
+#11 [33/36] RUN echo "========================================" &&     echo "[阶段 10.1] 配置 PyPI 镜像源" &&     echo "========================================" &&     mkdir -p ~/.pip &&     cat > ~/.pip/pip.conf << 'EOF'
+#11 CACHED
+
+#12 [15/36] RUN cd /tmp/gtsam && mkdir build && cd build &&     cmake ..       -DCMAKE_BUILD_TYPE=Release       -DCMAKE_INSTALL_PREFIX=/usr/local       -DGTSAM_BUILD_TESTS=OFF       -DGTSAM_BUILD_EXAMPLES_ALWAYS=OFF       -DGTSAM_BUILD_UNSTABLE=ON       -DGTSAM_BUILD_PYTHON=OFF       -DGTSAM_USE_SYSTEM_EIGEN=ON       -DGTSAM_WITH_TBB=ON       -DGTSAM_BUILD_WITH_MARCH_NATIVE=OFF &&     echo "" &&     echo "开始编译 (使用 $(nproc) 个线程)..." &&     make -j$(nproc) &&     echo "✓ GTSAM 编译完成" &&     make install &&     ldconfig &&     echo "✓ GTSAM 安装完成" &&     rm -rf /tmp/gtsam
+#12 CACHED
+
+#13 [16/36] RUN echo "" &&     echo "========================================" &&     echo "[阶段 5.1] 编译 Sophus" &&     echo "========================================" &&     echo "预计编译时间: 1-2 分钟" &&     echo ""
+#13 CACHED
+
+#14 [18/36] RUN cd /tmp/Sophus && mkdir build && cd build &&     cmake ..       -DCMAKE_BUILD_TYPE=Release       -DCMAKE_INSTALL_PREFIX=/usr/local       -DBUILD_SOPHUS_TESTS=OFF       -DBUILD_PYTHON_BINDINGS=OFF       -DSOPHUS_INSTALL=ON &&     echo "开始编译..." &&     make -j$(nproc) &&     echo "✓ Sophus 编译完成" &&     make install && ldconfig &&     echo "✓ Sophus 安装完成" &&     rm -rf /tmp/Sophus
+#14 CACHED
+
+#15 [29/36] COPY ./deps/TEASER-plusplus /tmp/TEASER-plusplus
+#15 CACHED
+
+#16 [30/36] COPY ./deps/pmc /tmp/TEASER-plusplus/teaser/pmc-src
+#16 CACHED
+
+#17 [12/36] RUN echo "" &&     echo "========================================" &&     echo "[阶段 3.2] 安装 GeographicLib 数据文件" &&     echo "========================================" &&     geographiclib-get-geoids egm96-5 2>/dev/null || true &&     geographiclib-get-magnetic emm2015 2>/dev/null || true &&     echo "✓ GeographicLib 数据文件安装完成"
+#17 CACHED
+
+#18 [ 4/36] RUN echo "" &&     echo "========================================" &&     echo "[阶段 1.1] 安装系统基础工具" &&     echo "========================================" &&     apt-get update && apt-get install -y --no-install-recommends     build-essential     cmake     ninja-build     ccache     git     wget     curl     unzip     pkg-config     software-properties-common     lsb-release     gnupg2     ca-certificates     apt-transport-https     python3     python3-dev     python3-pip     python3-setuptools     python3-wheel     python3-numpy     vim     sudo     gdb     && rm -rf /var/lib/apt/lists/* &&     echo "✓ 系统基础工具安装完成"
+#18 CACHED
+
+#19 [ 3/36] RUN ln -snf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime && echo Asia/Shanghai > /etc/timezone
+#19 CACHED
+
+#20 [20/36] COPY ./deps/ikd-Tree /tmp/ikd-Tree
+#20 CACHED
+
+#21 [21/36] RUN cd /tmp/ikd-Tree && mkdir build && cd build &&     cmake .. -DCMAKE_BUILD_TYPE=Release &&     echo "开始编译..." &&     make -j$(nproc) &&     echo "✓ ikd-Tree 编译完成" &&     make install && ldconfig &&     echo "✓ ikd-Tree 安装完成" &&     rm -rf /tmp/ikd-Tree
+#21 CACHED
+
+#22 [ 8/36] RUN echo "" &&     echo "验证 CMake 和 ISPC 安装:" &&     cmake --version &&     ispc --version &&     echo "" &&     echo "✓ CMake and ISPC 安装成功"
+#22 CACHED
+
+#23 [32/36] RUN cd /tmp/TEASER-plusplus && mkdir build && cd build &&     cmake ..       -DCMAKE_BUILD_TYPE=Release       -DCMAKE_INSTALL_PREFIX=/usr/local       -DBUILD_TESTS=OFF       -DBUILD_PYTHON_BINDINGS=ON       -DBUILD_DOC=OFF       -DBUILD_WITH_MARCH_NATIVE=OFF       -DENABLE_DIAGNOSTIC_PRINT=OFF &&     echo "开始编译 TEASER++..." &&     make -j$(nproc) &&     echo "✓ TEASER++ 编译完成" &&     make install && ldconfig &&     echo "✓ TEASER++ C++ 库安装完成" &&     echo "" &&     echo "安装 Python binding..." &&     python3 -c "import site; print(site.getsitepackages()[0])" > /tmp/site_packages.txt &&     SITE_PACKAGES=$(cat /tmp/site_packages.txt) &&     mkdir -p ${SITE_PACKAGES}/teaserpp_python &&     cp /tmp/TEASER-plusplus/build/python/teaserpp_python/_teaserpp*.so ${SITE_PACKAGES}/teaserpp_python/ &&     echo "from ._teaserpp import *" > ${SITE_PACKAGES}/teaserpp_python/__init__.py &&     echo "✓ TEASER++ Python binding 安装完成" &&     rm -f /tmp/site_packages.txt &&     rm -rf /tmp/TEASER-plusplus
+#23 CACHED
+
+#24 [10/36] RUN echo "" &&     echo "========================================" &&     echo "[阶段 2.2] 安装 ROS2 Humble" &&     echo "========================================" &&     echo "预计安装时间: 5-10 分钟" &&     echo "" &&     apt-get update && apt-get install -y --no-install-recommends     ros-humble-desktop-full     ros-dev-tools     python3-colcon-common-extensions     python3-rosdep     python3-vcstool     python3-argcomplete     ros-humble-perception     ros-humble-pcl-ros     ros-humble-pcl-conversions     ros-humble-cv-bridge     ros-humble-image-transport     ros-humble-compressed-image-transport     ros-humble-image-transport-plugins     ros-humble-tf2     ros-humble-tf2-ros     ros-humble-tf2-eigen     ros-humble-tf2-geometry-msgs     ros-humble-tf2-sensor-msgs     ros-humble-geographic-msgs     ros-humble-nmea-msgs     ros-humble-diagnostic-msgs     ros-humble-visualization-msgs     ros-humble-rmw-cyclonedds-cpp     ros-humble-rviz2     ros-humble-rviz-common     ros-humble-rviz-default-plugins     ros-humble-foxglove-bridge     ros-humble-rqt     ros-humble-rqt-graph     ros-humble-rqt-topic     ros-humble-rqt-tf-tree     ros-humble-rosbag2     ros-humble-rosbag2-storage-mcap     && rm -rf /var/lib/apt/lists/* &&     echo "✓ ROS2 Humble 安装完成"
+#24 CACHED
+
+#25 [13/36] RUN echo "========================================" &&     echo "[阶段 4.1] 编译 GTSAM 4.2" &&     echo "========================================" &&     echo "预计编译时间: 5-10 分钟" &&     echo ""
+#25 CACHED
+
+#26 [27/36] RUN cd /tmp/pmc && mkdir build && cd build &&     cmake .. -DCMAKE_BUILD_TYPE=Release &&     echo "开始编译 pmc..." &&     make -j$(nproc) &&     echo "✓ pmc 编译完成" &&     make install && ldconfig &&     echo "✓ pmc 安装完成" &&     rm -rf /tmp/pmc
+#26 CACHED
+
+#27 [28/36] RUN echo "" &&     echo "========================================" &&     echo "[阶段 9.2] 编译 TEASER++" &&     echo "========================================" &&     echo "预计编译时间: 3-5 分钟" &&     echo ""
+#27 CACHED
+
+#28 [19/36] RUN echo "" &&     echo "========================================" &&     echo "[阶段 6.1] 编译 ikd-Tree" &&     echo "========================================" &&     echo "预计编译时间: 1-2 分钟" &&     echo ""
+#28 CACHED
+
+#29 [35/36] RUN echo "" &&     echo "========================================" &&     echo "[最终阶段] 环境验证" &&     echo "========================================" &&     echo "运行 ldconfig 更新库缓存..." &&     ldconfig &&     echo "✓ 库缓存更新完成" &&     echo "" &&     echo "验证核心依赖:" &&     echo "  - Python: $(python3 --version)" &&     echo "  - PyTorch: $(python3 -c 'import torch; print(torch.__version__)')" &&     echo "  - CUDA: $(python3 -c 'import torch; print(torch.version.cuda)')" &&     echo "  - Open3D: $(python3 -c 'import open3d; print(open3d.__version__)')" &&     echo "  - GTSAM: $(pkg-config --modversion gtsam 2>/dev/null || echo '已安装')" &&     echo "✓ 核心依赖验证完成" &&     echo "" &&     echo "========================================" &&     echo "✓ Docker 镜像构建完成!" &&     echo "========================================"
+#29 CACHED
+
+#30 [26/36] COPY ./deps/pmc /tmp/pmc
+#30 CACHED
+
+#31 [ 5/36] RUN echo "" &&     echo "========================================" &&     echo "[阶段 0.1] 配置 CMake 和 ISPC" &&     echo "========================================"
+#31 CACHED
+
+#32 [ 7/36] COPY ./deps/ispc /opt/ispc
+#32 CACHED
+
+#33 [17/36] COPY ./deps/Sophus /tmp/Sophus
+#33 CACHED
+
+#34 [14/36] COPY ./deps/gtsam /tmp/gtsam
+#34 CACHED
+
+#35 [25/36] RUN echo "" &&     echo "========================================" &&     echo "[阶段 9.1] 编译 pmc (TEASER++ 依赖)" &&     echo "========================================" &&     echo "预计编译时间: 1-2 分钟" &&     echo ""
+#35 CACHED
+
+#36 [22/36] RUN echo "" &&     echo "========================================" &&     echo "[阶段 7.1] 编译 Livox-SDK2" &&     echo "========================================" &&     echo "预计编译时间: 2-3 分钟" &&     echo ""
+#36 CACHED
+
+#37 [23/36] COPY ./deps/Livox-SDK2 /tmp/Livox-SDK2
+#37 CACHED
+
+#38 [11/36] RUN echo "" &&     echo "========================================" &&     echo "[阶段 3.1] 安装 C++ 核心依赖库" &&     echo "========================================" &&     echo "包括: Eigen3, PCL, OpenCV, Boost, Ceres, 等" &&     echo "预计安装时间: 3-5 分钟" &&     echo "" &&     apt-get update && apt-get install -y --no-install-recommends     libeigen3-dev     libpcl-dev     libopencv-dev     libboost-all-dev     libceres-dev     libgoogle-glog-dev     libgflags-dev     libatlas-base-dev     liblapack-dev     liblapacke-dev     libblas-dev     libsuitesparse-dev     libmetis-dev     libtbb-dev     libyaml-cpp-dev     libjsoncpp-dev     libfmt-dev     libspdlog-dev     libgeographic-dev     geographiclib-tools     libflann-dev     libhdf5-dev     libjpeg-dev     libjpeg-turbo8-dev     libpng-dev     libtiff-dev     zlib1g-dev     libzmq3-dev     libcurl4-openssl-dev     libssl-dev     libglew-dev     libglfw3-dev     libassimp-dev     libembree-dev     && rm -rf /var/lib/apt/lists/* &&     echo "✓ C++ 核心依赖库安装完成"
+#38 CACHED
+
+#39 [31/36] COPY ./deps/tinyply /tmp/TEASER-plusplus/teaser/tinyply-src
+#39 CACHED
+
+#40 [36/36] WORKDIR /root
+#40 CACHED
+
+#41 exporting to image
+#41 exporting layers done
+#41 exporting manifest sha256:6df37964c5fb5ba5f2540beb16f335af752a58369a2a44a48b52b87829374d55 done
+#41 exporting config sha256:6e6dbcde80e44f7c3b8a0ecebb9a6d46cd982b5fea0457e953cbcc0c260584fa done
+#41 exporting attestation manifest sha256:54502faa5b87c976be5fb15601f0613f84efd4f158c7e52ccc125653b634a3b9 done
+#41 exporting manifest list sha256:9b192a834b7dfc302e996f03774aee0470db3b186e66dc5116a1ff7b3c999f3e done
+#41 naming to docker.io/library/automap-env:humble done
+#41 unpacking to docker.io/library/automap-env:humble 0.0s done
+#41 DONE 0.1s

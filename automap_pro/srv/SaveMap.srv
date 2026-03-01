@@ -1,0 +1,9 @@
+string output_dir
+bool save_pcd
+bool save_ply
+bool save_las
+bool save_trajectory
+---
+bool success
+string message
+string output_path

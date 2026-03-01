@@ -1,0 +1,5 @@
+# 可选：指定 HBA 数据目录，空则使用 config 中的 backend.hba_bridge.export_path
+string data_path
+---
+bool success
+string message

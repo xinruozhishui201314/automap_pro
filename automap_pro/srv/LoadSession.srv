@@ -1,0 +1,8 @@
+string session_dir
+int32 session_id
+bool load_point_clouds
+---
+bool success
+string message
+int32 num_submaps_loaded
+int32 num_keyframes_loaded
