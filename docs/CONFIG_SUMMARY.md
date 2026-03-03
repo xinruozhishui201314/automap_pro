@@ -1,7 +1,8 @@
 # AutoMap-Pro 工程配置文件汇总
 
-> 生成时间: 2026-03-01
-> 工程路径: /home/wqs/Documents/github/automap_pro
+> 生成时间: 2026-03-01 | 更新: 2026-03-03（重构后路径说明）
+> 路径均以**仓库根目录**为基准；modular 子模块位于 `automap_pro/src/modular/`（如 HBA-main、fast-livo2-humble、overlap_transformer_ros2）。
+> 推荐入口：**automap_start.sh**，唯一主配置：**automap_pro/config/system_config.yaml**。
 > 配置文件总数: 85个（含第三方依赖、构建产物）
 
 ---
@@ -33,14 +34,14 @@
 | 7 | `automap_pro/config/fast_livo2_config.yaml` | 前端里程计配置 | P0 |
 | 8 | `automap_pro/config/sensor_config/gps_imu_extrinsic.yaml` | GPS-IMU外参 | P1 |
 | 9 | `automap_pro/config/sensor_config/lidar_imu_extrinsic.yaml` | LiDAR-IMU外参 | P1 |
-| 10 | `overlap_transformer_ros2/config/descriptor_params.yaml` | 回环检测描述子参数 | P1 |
-| 11 | `HBA-main/HBA_ROS2/config/hba.yaml` | HBA优化器主配置 | P1 |
-| 12 | `HBA-main/HBA_ROS2/config/cal_MME.yaml` | HBA数据预处理配置 | P2 |
-| 13 | `HBA-main/HBA_ROS2/config/visualize.yaml` | HBA可视化配置 | P2 |
-| 14 | `fast-livo2-humble/config/avia.yaml` | Livox Avia雷达配置 | P0 |
-| 15 | `fast-livo2-humble/config/MARS_LVIG.yaml` | MARS数据集配置（含相机） | P2 |
-| 16 | `automap_ws/src/livox_ros_driver2/config/MID360_config.json` | Livox MID360雷达网络配置 | P1 |
-| 17 | `automap_pro/docker/docker-compose.yml` | Docker容器编排配置 | P1 |
+| 10 | `automap_pro/src/modular/overlap_transformer_ros2/config/descriptor_params.yaml` | 回环检测描述子参数 | P1 |
+| 11 | `automap_pro/src/modular/HBA-main/HBA_ROS2/config/hba.yaml` | HBA优化器主配置 | P1 |
+| 12 | `automap_pro/src/modular/HBA-main/HBA_ROS2/config/cal_MME.yaml` | HBA数据预处理配置 | P2 |
+| 13 | `automap_pro/src/modular/HBA-main/HBA_ROS2/config/visualize.yaml` | HBA可视化配置 | P2 |
+| 14 | `automap_pro/src/modular/fast-livo2-humble/config/avia.yaml` | Livox Avia雷达配置 | P0 |
+| 15 | `automap_pro/src/modular/fast-livo2-humble/config/MARS_LVIG.yaml` | MARS数据集配置（含相机） | P2 |
+| 16 | `automap_ws/src/livox_ros_driver2/config/MID360_config.json` | Livox MID360雷达网络配置（若存在） | P1 |
+| 17 | `automap_pro/docker/docker-compose.yml` 或 `docker/` 下配置 | Docker 相关配置 | P1 |
 
 ### 1.2 数据集配置（nya_02专用，7个）
 

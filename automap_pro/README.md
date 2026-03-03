@@ -1,5 +1,7 @@
 # AutoMap-Pro: High-Precision Automated Point Cloud Mapping System
 
+> **仓库根目录推荐入口**：在工程根目录执行 `bash automap_start.sh` 可一键完成 Docker 内编译与建图运行。本文件描述 automap_pro 包本身的结构与本地构建/运行方式。
+
 ## System Overview
 
 AutoMap-Pro is an end-to-end automated 3D point cloud mapping system designed for urban roads, campuses, tunnels, and mines. It achieves:

@@ -217,6 +217,9 @@ git add --renormalize .
 
 ---
 
-**配置日期**: 2026-03-01
-**版本**: 1.0
+**说明**：工程重构后，仓库根目录为 `automap_pro/`，主入口为 `automap_start.sh`，详见 [README.md](README.md) 与 [QUICK_START.md](QUICK_START.md)。
+
+**配置日期**: 2026-03-01  
+**更新日期**: 2026-03-03（与重构后文档对齐）  
+**版本**: 1.1  
 **状态**: ✅ 已完成

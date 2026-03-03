@@ -1,158 +1,142 @@
 # AutoMap-Pro 编译/部署/运行说明
 
-> 重构约定：唯一配置、统一 Launch、三方库路径、日志路径、Docker 挂载
+> 重构约定：**automap_start.sh** 为推荐入口；唯一配置 `system_config.yaml`；Docker 镜像 `automap-env:humble`；工作空间 `automap_ws`。
 
 ---
 
 ## 0. Executive Summary
 
-- **唯一配置**：工程启动仅使用 `automap_pro/config/system_config.yaml`，overlap_transformer / HBA / fast-livo2 参数均由此文件生成。
-- **Launch**：入口 launch 均位于 `automap_pro/launch/`（offline / online / incremental / visualization）。
-- **三方库**：工程依赖统一放在 `thrid_party/`（优先 repo 根目录，否则 `automap_pro/thrid_party`），Docker 内挂载到工作空间 `src/thrid_party`。
-- **日志**：统一写入 `logs/`（宿主机与容器一致）；launch 内 fast_livo 参数文件等通过环境变量 `AUTOMAP_LOG_DIR` 指定。
-- **Docker**：镜像 `automap-env:humble` 仅提供编译与运行环境，**所有编译与运行产物均在挂载目录**（不写入镜像）。
-- **前端与 fast_livo**：建图使用 **modular 中已验证的 fast_livo**（FAST-LIVO2 官方 LIVMapper）。进程内 **FastLIVO2Wrapper** 为自研 ESIKF 前端，非同一算法，仅作 fallback。
+- **推荐入口**：仓库根目录执行 `bash automap_start.sh`，一键完成编译（容器内）与运行（bag 播放 + 建图 + RViz2）。
+- **唯一配置**：`automap_pro/config/system_config.yaml`，overlap_transformer / HBA / fast-livo2 参数均由此文件或由其生成的参数文件提供。
+- **Launch**：入口为 `automap_pro/launch/automap_composable.launch.py`（Composable 零拷贝）或 offline/online；`automap_start.sh` 默认调用 composable。
+- **路径**：宿主机 `automap_ws/`、`automap_pro/`、`data/`、`logs/`、`output/`；容器内 `/workspace/automap_ws`、`/workspace/data`、`/workspace/logs`、`/workspace/output`；源码由宿主机 `automap_pro/` 等挂载到容器 `automap_ws/src/`。
+- **日志**：统一写入宿主机 `logs/automap_YYYYMMDD_HHMMSS/`，容器内 `AUTOMAP_LOG_DIR=/workspace/logs`。
+- **前端**：默认 Fast-LIVO2（Composable 或独立进程），由 `system_config.yaml` 与 launch 参数控制。
 
 ---
 
-## 1. 工程目录约定
+## 1. 工程目录约定（重构后）
 
 | 路径 | 说明 |
 |------|------|
-| `automap_pro/config/system_config.yaml` | 唯一系统配置文件 |
-| `automap_pro/launch/` | 入口 launch 文件（automap_offline / online / incremental / visualization），**统一启动 modular 节点**：fast_livo、overlap_transformer_ros2、HBA |
-| `thrid_party/` 或 `automap_pro/thrid_party/` | 三方库（nlohmann-json3、ceres-solver、Sophus 等） |
-| `logs/` | 统一日志目录（建图脚本日志、fast_livo_params.yaml、launch 子目录等） |
-| `data/` | 输入 bag 与建图数据 |
-| `automap_ws/` | ROS2 工作空间（build/install/log 均在此，挂载到容器） |
+| `automap_start.sh` | **推荐入口**：一键编译 & 运行 |
+| `automap_ws/` | ROS2 工作空间（build/install/log 在此；Docker 挂载） |
+| `automap_pro/` | 主包源码（挂载到容器内 `automap_ws/src/automap_pro`） |
+| `automap_pro/config/system_config.yaml` | 唯一系统主配置 |
+| `automap_pro/launch/` | automap_composable / offline / online / visualization |
+| `data/` | 输入 bag 与数据集 |
+| `logs/` | 运行日志（每次运行子目录 `automap_YYYYMMDD_HHMMSS`） |
+| `output/` | 建图输出 |
+| `docker/` | 镜像与 Dockerfile（`automap-env:humble`） |
+| `scripts/` | 辅助脚本（如 GitHub 上传、验证） |
 
-### 1.1 FastLIVO2Wrapper 与 前端 fast_livo 的关系
+### 1.1 容器内路径（automap_start.sh）
 
-| 名称 | 位置 | 说明 |
-|------|------|------|
-| **fast_livo**（已验证） | modular fast-livo2-humble，ROS2 包 `fast_livo`，节点 `fastlivo_mapping` | FAST-LIVO2 官方实现（LIVMapper），LiDAR-Inertial-Visual Odometry，**精度已验证**，建图工程默认使用。 |
-| **FastLIVO2Wrapper** | automap_pro 进程内 | 自研 ESIKF LiDAR-IMU 里程计（点面残差 + 体素局部图），**非** fast_livo 官方算法，精度未与 fast_livo 对齐，仅作无 fast_livo 节点时的 fallback。 |
-
-- 配置 `frontend.mode: external_fast_livo` 且 launch `use_external_frontend:=true` 时：由 **fast_livo 节点**订阅 lidar/IMU/image，发布 odom+cloud，automap_system 用 FastLIVO2Adapter 消费，再供给子图/回环/HBA。
-- 数据流：原始数据 → **fast_livo 节点**（唯一数据入口）→ odom/cloud → automap_system → 其他模块。
+| 容器内路径 | 宿主机路径 |
+|------------|------------|
+| `/workspace/automap_ws` | `automap_ws/` |
+| `/workspace/data/bag` | `data/automap_input/nya_02_slam_imu_to_lidar/nya_02_ros2/`（bag 所在目录） |
+| `/workspace/logs` | `logs/automap_YYYYMMDD_HHMMSS/` |
+| `/workspace/output` | `output/` |
+| `/workspace/automap_ws/src/automap_pro` | `automap_pro/` |
+| `/workspace/automap_ws/src/fast_livo` | `automap_pro/src/modular/fast-livo2-humble` |
+| `/workspace/automap_ws/src/hba` | `automap_pro/src/modular/HBA-main/HBA_ROS2`（或 HBA-main） |
 
 ---
 
 ## 2. 环境要求
 
 - **OS**：Linux（推荐 Ubuntu 22.04）
-- **ROS2**：Humble
-- **Docker**（可选）：用于一键建图时，需已拉取或构建镜像 `automap-env:humble`
-- **依赖**：colcon、Python3、yaml、Eigen、PCL、OpenCV、GeographicLib 等（见 `automap_pro/package.xml` 与各子模块）
+- **ROS2**：Humble（容器内已装）
+- **Docker**：推荐使用，镜像 `automap-env:humble`（可从 `docker/automap-env_humble.tar` 加载）
+- **GPU**：可选，无则 CPU 模式
 
 ---
 
-## 3. 依赖安装（宿主机）
+## 3. 构建
+
+### 3.1 使用 automap_start.sh（推荐）
 
 ```bash
-cd /path/to/automap_pro
-# 若使用 automap_ws 且需从 thrid_party 编译
-# 确保 thrid_party 在 repo 根或 automap_pro/thrid_party 存在
-sudo apt update
-rosdep update
-rosdep install --from-paths automap_pro --ignore-src -r -y
+# 在仓库根目录
+bash automap_start.sh --build
 ```
 
----
+在容器内执行：source ROS2、colcon build、产物在挂载的 `automap_ws/build` 与 `automap_ws/install`。
 
-## 4. 构建
-
-### 4.1 宿主机构建
+### 3.2 宿主机本地构建
 
 ```bash
-cd /path/to/automap_pro/automap_ws
+cd automap_ws
 source /opt/ros/humble/setup.bash
-# 若 nlohmann_json 使用本地 thrid_party（thrid_party 需在 src 下或通过 -D 指定）
-colcon build --packages-select automap_pro --cmake-args -DCMAKE_BUILD_TYPE=Release
-# 可选：-DNLOHMANN_JSON_LOCAL=/path/to/thrid_party/nlohmann-json3
+colcon build --packages-select automap_pro fast_livo hba hba_api --cmake-args -DCMAKE_BUILD_TYPE=Release
 source install/setup.bash
 ```
 
-### 4.2 Docker 内构建（推荐）
-
-由 `run_full_mapping_docker.sh` 挂载工程后，在容器内执行：
-
-```bash
-cd /workspace/automap_pro
-export WORKSPACE=/workspace/automap_ws
-ln -sfn /workspace/automap_ws $HOME/automap_ws 2>/dev/null || true
-source /opt/ros/humble/setup.bash
-cd $WORKSPACE && colcon build --packages-select automap_pro --cmake-args -DCMAKE_BUILD_TYPE=Release
-```
-
-产物在挂载的 `automap_ws/build` 与 `automap_ws/install`，不在镜像内。
-
 ---
 
-## 5. 运行
+## 4. 运行
 
-### 5.1 使用唯一配置文件
-
-默认即使用 `automap_pro/config/system_config.yaml`：
+### 4.1 使用 automap_start.sh（推荐）
 
 ```bash
-# 宿主机
-./run_full_mapping_enhanced.sh
+# 一键编译 + 运行
+bash automap_start.sh
 
-# Docker 一键建图（推荐）
-./run_full_mapping_docker.sh
-# 或指定 bag
-./run_full_mapping_docker.sh -b data/automap_input/nya_02_slam_imu_to_lidar/nya_02.bag
+# 仅运行（须先编译）
+bash automap_start.sh --run
+
+# 指定 bag、不启 RViz
+bash automap_start.sh --run --bag /path/to/xxx.db3 --no-rviz
 ```
 
-如需临时使用其他配置（不推荐，仅调试）：
+脚本会：挂载 volume、启动容器、播放 bag、执行 `ros2 launch automap_pro automap_composable.launch.py config:=... use_rviz:=true/false`。
+
+### 4.2 直接调用 launch（宿主机或容器内）
 
 ```bash
-CONFIG=automap_pro/config/system_config_nya02.yaml ./run_full_mapping_docker.sh -b ...
-```
+source install/setup.bash
+export AUTOMAP_LOG_DIR=/path/to/logs   # 可选
 
-### 5.2 直接调用 launch
-
-```bash
-source /path/to/automap_ws/install/setup.bash
-export AUTOMAP_LOG_DIR=/path/to/automap_pro/logs   # 可选，不设则用 automap_pro/logs
-ros2 launch automap_pro automap_offline.launch.py \
+ros2 launch automap_pro automap_composable.launch.py \
   config:=/path/to/automap_pro/config/system_config.yaml \
-  bag_file:=/path/to/your.bag
+  use_rviz:=true
 ```
 
-**Modular 节点开关**（参数均来自 system_config.yaml）：
-
-- `use_external_frontend:=true`（默认）— 启动 fast_livo
-- `use_external_overlap:=true` — 启动 overlap_transformer descriptor_server
-- `use_hba:=true`（默认）— 启动 HBA 后端节点
-- `use_hba_cal_mme:=true` — 启动 HBA cal_MME 节点
-- `use_hba_visualize:=true` — 启动 HBA 可视化节点
+需另终端播放 bag（如 `ros2 bag play ... --clock`）。
 
 ---
 
-## 6. Docker 挂载说明（automap-env:humble）
+## 5. Docker 挂载说明（automap_start.sh）
 
-镜像 **仅提供**：ROS2 Humble、系统依赖、编译工具链。**不包含**工程源码与产物。
+镜像 **仅提供**：ROS2 Humble、CUDA、系统依赖、编译工具链。**不包含**工程源码与编译产物，均通过挂载写入宿主机。
 
-| 宿主机路径 | 容器内路径 | 说明 |
-|------------|------------|------|
-| `$SCRIPT_DIR` | `/workspace/automap_pro` | 工程根（含 config、launch、scripts） |
-| `$SCRIPT_DIR/automap_ws` | `/workspace/automap_ws` | 工作空间（build/install/log） |
-| `$SCRIPT_DIR/data` | `/workspace/data` | 数据与 bag |
-| `$SCRIPT_DIR/logs` | `/workspace/automap_pro/logs` | 统一日志目录 |
-| `$OUTPUT_DIR_LOCAL` | `/workspace/output` | 建图输出 |
-| `thrid_party` 或 `automap_pro/thrid_party` | `/workspace/automap_ws/src/thrid_party` | 三方库 |
+| 宿主机 | 容器内 |
+|--------|--------|
+| `automap_ws/` | `/workspace/automap_ws` |
+| `automap_pro/` | `/workspace/automap_ws/src/automap_pro` |
+| `data/.../nya_02_ros2/`（bag 目录） | `/workspace/data/bag` |
+| `logs/automap_*/` | `/workspace/logs` |
+| `output/` | `/workspace/output` |
 
-容器内工作目录为 `/workspace/automap_pro`，会设置 `WORKSPACE=/workspace/automap_ws`、`CONFIG`、`BAG_FILE`、`OUTPUT_DIR`、`AUTOMAP_LOG_DIR`。
+工作目录：容器内 `-w /workspace/automap_ws`。
+
+---
+
+## 6. 配置与模块开关
+
+- **主配置**：`automap_pro/config/system_config.yaml`
+- **Launch 参数**：`config`、`use_rviz`、`composable`、`fast_livo_config` 等；composable 默认使用 `automap_composable.launch.py` 内默认路径（非空，避免 [Errno 21]）。
+
+Modular 节点由 system_config 与 launch 参数控制（如 use_external_frontend、use_hba 等），详见 launch 文件与 CONFIG_SUMMARY.md。
 
 ---
 
 ## 7. 验证
 
-- **配置**：`automap_pro/scripts/verify_system_config_launch.sh [config.yaml]`
-- **建图流水线**：`./verify_mapping_pipeline.sh`
-- **日志**：主日志在 `logs/full_mapping_*.log`，launch 子目录在 `logs/launch_*.d/`，fast_livo 参数文件在 `logs/fast_livo_params.yaml`
+- **配置**：`automap_pro/scripts/verify_system_config_launch.sh [config.yaml]`（若存在）
+- **建图流水线**：`./verify_mapping_pipeline.sh`（若存在）
+- **日志**：宿主机 `logs/automap_YYYYMMDD_HHMMSS/`，容器内 `/workspace/logs`
 
 ---
 
@@ -160,16 +144,21 @@ ros2 launch automap_pro automap_offline.launch.py \
 
 | 现象 | 处理 |
 |------|------|
-| 找不到 `system_config.yaml` | 确认使用默认配置或 `-c automap_pro/config/system_config.yaml` |
-| fast_livo 报 `parameter ''` | 检查 `logs/fast_livo_params.yaml` 是否含空键；确认 launch 使用 params_from_system_config 生成参数 |
-| 容器内无 thrid_party | 确认 repo 根存在 `thrid_party` 或 `automap_pro/thrid_party`，脚本会择一挂载 |
-| 日志不在宿主机 | 确认已挂载 `logs`，且容器内 `AUTOMAP_LOG_DIR=/workspace/automap_pro/logs` |
+| 找不到 `system_config.yaml` | 确认使用 `automap_start.sh` 或传入 `config:=/path/to/automap_pro/config/system_config.yaml` |
+| Launch 报 [Errno 21] Is a directory | 已修复；确保使用当前 `automap_pro/launch/automap_composable.launch.py` 与 `rviz/automap.rviz` |
+| 容器内无源码 | 确认宿主机存在 `automap_pro/`、`automap_ws/`，脚本会挂载到容器 |
+| 日志不在宿主机 | 确认脚本挂载了 `logs`，且容器内 `AUTOMAP_LOG_DIR=/workspace/logs` |
 
 ---
 
-## 9. 变更清单（本次重构）
+## 9. 变更记录（重构后）
 
-- 默认配置由 `system_config_nya02.yaml` 改为 `system_config.yaml`（`run_full_mapping_docker.sh`、`run_full_mapping_enhanced.sh`、`docker/mapping.sh`）。
-- 日志统一到 `logs/`：`run_full_mapping_enhanced.sh` 导出 `AUTOMAP_LOG_DIR`，`automap_offline.launch.py` 优先使用该环境变量。
-- Docker 增加 `logs` 挂载；三方库支持 repo 根 `thrid_party` 与 `automap_pro/thrid_party` 二选一挂载。
-- `verify_mapping_pipeline.sh` 中 fast_livo 参数文件路径改为 `SCRIPT_DIR/logs/fast_livo_params.yaml`。
+- 推荐入口统一为 **automap_start.sh**（Docker + automap_ws + automap_pro 挂载）。
+- 默认 launch 为 **automap_composable.launch.py**（Composable 零拷贝），配置与 RViz 路径使用非空默认值。
+- 日志目录：宿主机 `logs/automap_YYYYMMDD_HHMMSS/`，容器 `/workspace/logs`。
+- 唯一主配置：`automap_pro/config/system_config.yaml`。
+
+---
+
+文档版本：v2.0（重构后）  
+更新日期：2026-03-03

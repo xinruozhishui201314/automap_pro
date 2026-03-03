@@ -1,137 +1,82 @@
-# AutoMap-Pro 快速验证清单
+# AutoMap-Pro 快速开始
 
-## ✅ 修复完成
-
-原始报错命令现在可以正常工作：
-```bash
-./run_full_mapping_docker.sh -b @data/automap_input/nya_02.bag
-```
+> 重构后以 **automap_start.sh** 为唯一推荐入口，Docker 镜像 `automap-env:humble`，工作空间 `automap_ws`。
 
 ---
 
-## 🚀 快速验证（推荐）
+## 1. 前置条件
 
-```bash
-# 一键验证修复
-./verify_fix.sh
-```
-
-**预期结果**：所有测试通过 ✅
+- **系统**：Ubuntu 20.04 / 22.04
+- **Docker**：已安装并运行，可执行 `docker info`
+- **数据**：默认使用 `data/automap_input/nya_02_slam_imu_to_lidar/nya_02_ros2/nya_02_ros2.db3`，或通过 `--bag <path>` 指定
+- **镜像**：`automap-env:humble`（脚本会尝试从 `docker/automap-env_humble.tar` 加载）
 
 ---
 
-## 📋 完整测试清单
-
-### 1. 语法检查
-```bash
-bash -n run_full_mapping_docker.sh
-```
-**预期**：无输出（语法正确）
-
-### 2. 原始报错场景测试
-```bash
-echo "n" | timeout 15 ./run_full_mapping_docker.sh -b @data/automap_input/nya_02.bag 2>&1 | head -20
-```
-**预期**：
-- 显示 "找到匹配文件: data/automap_input/nya_02_slam_imu_to_lidar/nya_02.bag"
-- 不再报 "Bag 文件不存在"
-
-### 3. 其他路径格式测试
-```bash
-# 短路径不带 @
-echo "n" | timeout 10 ./run_full_mapping_docker.sh -b data/automap_input/nya_02.bag 2>&1 | grep -E "(找到匹配|Bag 文件)"
-
-# 仅文件名
-echo "n" | timeout 10 ./run_full_mapping_docker.sh -b nya_02.bag 2>&1 | grep -E "(找到匹配|Bag 文件)"
-
-# 默认参数
-echo "n" | timeout 10 ./run_full_mapping_docker.sh 2>&1 | grep -E "(找到匹配|Bag 文件)"
-```
-
----
-
-## ✅ 实际运行建图
-
-确认验证通过后，可以运行实际建图：
+## 2. 一键运行
 
 ```bash
-# 前台运行（推荐用于测试）
-./run_full_mapping_docker.sh -b @data/automap_input/nya_02.bag
-
-# 后台运行（推荐用于生产）
-./run_full_mapping_docker.sh -b @data/automap_input/nya_02.bag --detach
-
-# 进入容器 shell（调试用）
-./run_full_mapping_docker.sh -b @data/automap_input/nya_02.bag --shell
+# 在仓库根目录执行：编译 + 运行（含 RViz2）
+bash automap_start.sh
 ```
 
----
-
-## 📚 相关文档
-
-- 完整修复文档：`FIX_DOCUMENTATION.md`
-- 主脚本：`run_full_mapping_docker.sh`
-- 验证脚本：`verify_fix.sh`
+首次会进行容器内编译（约数分钟），随后自动播放 bag 并启动建图与 RViz。
 
 ---
 
-## 🐛 问题排查
+## 3. 常用命令
 
-如果验证失败，检查以下内容：
-
-1. **脚本权限**
-   ```bash
-   chmod +x run_full_mapping_docker.sh verify_fix.sh
-   ```
-
-2. **Docker 状态**
-   ```bash
-   docker ps  # 检查容器运行状态
-   ```
-
-3. **Bag 文件存在性**
-   ```bash
-   ls -lh data/automap_input/nya_02_slam_imu_to_lidar/nya_02.bag
-   ```
-
-4. **查看详细日志**
-   ```bash
-   ./run_full_mapping_docker.sh -b @data/automap_input/nya_02.bag 2>&1 | tee mapping.log
-   ```
+| 命令 | 说明 |
+|------|------|
+| `bash automap_start.sh` | 一键编译并运行 |
+| `bash automap_start.sh --build` | 仅编译 |
+| `bash automap_start.sh --run` | 仅运行（须已编译） |
+| `bash automap_start.sh --clean --build` | 清理后重新编译 |
+| `bash automap_start.sh --no-rviz` | 不启动 RViz2 |
+| `bash automap_start.sh --bag /path/to/xxx.db3` | 指定 ROS2 bag |
+| `bash automap_start.sh --help` | 显示帮助 |
 
 ---
 
-## 🎯 支持的路径格式
+## 4. 路径说明
 
-| 格式 | 示例 | 说明 |
-|------|------|------|
-| @ 前缀短路径 | `@data/automap_input/nya_02.bag` | 原始报错的格式，现已支持 ✅ |
-| 短路径 | `data/automap_input/nya_02.bag` | 不带 @ 的相对路径 |
-| 仅文件名 | `nya_02.bag` | 在 data 目录下搜索 |
-| 完整路径 | `data/automap_input/nya_02_slam_imu_to_lidar/nya_02.bag` | 精确匹配 |
-| 绝对路径 | `/home/.../nya_02.bag` | 绝对路径 |
-| 默认参数 | （不指定 -b） | 使用默认 bag 文件 |
+| 用途 | 路径 |
+|------|------|
+| 默认 bag | `data/automap_input/nya_02_slam_imu_to_lidar/nya_02_ros2/nya_02_ros2.db3` |
+| 系统配置 | `automap_ws/src/automap_pro/config/system_config.yaml`（容器内同路径为 `/workspace/automap_ws/src/automap_pro/config/`） |
+| 日志 | `logs/automap_YYYYMMDD_HHMMSS/` |
+| 建图输出 | `output/` |
 
 ---
 
-## 🔍 验证成功标志
+## 5. 验证
 
-运行 `./verify_fix.sh` 后，应该看到：
+- **编译成功**：终端出现 `BUILD SUCCESS ✓`。
+- **运行正常**：无 `[Errno 21] Is a directory`；RViz2 打开；bag 播放且建图节点无异常退出。
+- **日志**：`logs/automap_*/` 下可见 spdlog 与 launch 日志。
 
-```
-========================================
-AutoMap-Pro 路径修复验证
-========================================
+---
 
-测试 1: 原始报错命令 -b @data/automap_input/nya_02.bag
-----------------------------------------
-✓ PASS 成功找到匹配文件
-[INFO] ✓ 找到匹配文件: data/automap_input/nya_02_slam_imu_to_lidar/nya_02.bag
-✓ PASS 脚本成功运行到确认步骤
+## 6. 故障排查
 
-========================================
-✓ 验证通过！修复成功！
-========================================
-```
+| 现象 | 处理 |
+|------|------|
+| 找不到 bag | 检查 `data/automap_input/.../nya_02_ros2.db3` 是否存在，或使用 `--bag <path>` |
+| 镜像不存在 | 将 `docker/automap-env_humble.tar` 放在仓库根同级，或先构建镜像 |
+| Launch 报错 Is a directory | 确认使用当前 `automap_pro/launch/automap_composable.launch.py`（已修复默认配置路径） |
+| 无 GPU | 脚本会检测，无 GPU 时以 CPU 模式运行 |
 
-如果看到上述输出，说明修复成功！🎉
+更多见 [docs/BUILD_DEPLOY_RUN.md](docs/BUILD_DEPLOY_RUN.md)。
+
+---
+
+## 7. 相关文档
+
+- [README.md](README.md) - 项目总览
+- [docs/BUILD_DEPLOY_RUN.md](docs/BUILD_DEPLOY_RUN.md) - 编译/部署/运行详细说明
+- [docs/README.md](docs/README.md) - 文档索引
+
+---
+
+文档版本：v2.0（重构后）  
+更新日期：2026-03-03

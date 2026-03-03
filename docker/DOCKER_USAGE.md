@@ -1,11 +1,14 @@
 # AutoMap-Pro Docker 环境使用说明
 
+> **重构后推荐**：在仓库根目录使用 **`bash automap_start.sh`** 一键完成镜像检查、编译与建图运行，无需手动挂载与启动。以下为镜像与手动运行参考。
+
 ## 环境概述
 
+- **镜像名称**: `automap-env:humble`（可由 `docker/automap-env_humble.tar` 加载）
 - **基础镜像**: `nvidia/cuda:11.8.0-cudnn8-devel-ubuntu22.04`
 - **ROS2 版本**: Humble
 - **CUDA 版本**: 11.8
-- **用途**: 纯运行/编译环境，源码通过 -v 挂载进容器
+- **用途**: 纯运行/编译环境，源码通过 -v 挂载进容器；**推荐通过 automap_start.sh 使用**
 
 ## 目录结构
 

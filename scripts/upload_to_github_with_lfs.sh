@@ -7,8 +7,9 @@
 #
 # 用法：
 #   bash scripts/upload_to_github_with_lfs.sh [--commit-and-push]
+#   bash scripts/upload_to_github_with_lfs.sh --push-code-only   # 只推送代码/脚本，不推送 LFS 大文件
 #
-# 若不加 --commit-and-push，仅检查环境并打印后续步骤。
+# 若不加参数，仅检查环境并打印后续步骤。
 # ══════════════════════════════════════════════════════════════════════════════
 set -euo pipefail
 
@@ -43,7 +44,15 @@ echo "当前由 Git LFS 追踪的规则："
 git lfs track 2>/dev/null | head -20
 echo "  ..."
 
-# 4. 可选：仅提交 .gitattributes 的变更（不 touch 其他文件）
+# 4. 只推送代码与脚本，暂不推送 LFS 大文件（避免上传数十 GB）
+if [[ "${1:-}" == "--push-code-only" ]]; then
+    echo "[INFO] 仅推送代码与脚本，跳过 LFS 对象上传（LFS 文件在远端显示为指针，可后续 git lfs push 补传）"
+    GIT_LFS_SKIP_PUSH=1 git push -u origin main
+    echo "[OK] 推送完成（未上传 LFS 大文件）"
+    exit 0
+fi
+
+# 5. 可选：仅提交 .gitattributes 的变更（不 touch 其他文件）
 if [[ "${1:-}" == "--commit-and-push" ]]; then
     if git diff --quiet .gitattributes 2>/dev/null && git diff --cached --quiet .gitattributes 2>/dev/null; then
         echo "[INFO] .gitattributes 无变更，跳过提交"
@@ -63,7 +72,7 @@ if [[ "${1:-}" == "--commit-and-push" ]]; then
     exit 0
 fi
 
-# 5. 仅检查模式：打印后续步骤
+# 6. 仅检查模式：打印后续步骤
 echo ""
 echo "──────────────────────────────────────────────"
 echo "后续步骤（不会删除任何本地文件）："
@@ -81,4 +90,7 @@ echo "   git push -u origin main"
 echo ""
 echo "若只想先提交 .gitattributes 的修改，可运行："
 echo "   bash scripts/upload_to_github_with_lfs.sh --commit-and-push"
+echo ""
+echo "若只推送代码与脚本、暂不推送 LFS 大文件（推荐首次推送）："
+echo "   bash scripts/upload_to_github_with_lfs.sh --push-code-only"
 echo ""

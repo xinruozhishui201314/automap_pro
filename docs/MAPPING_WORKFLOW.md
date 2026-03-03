@@ -133,31 +133,33 @@ ros2 bag play data/automap_input/nya_02_slam_imu_to_lidar/nya_02.bag --topics /l
 - CUDA ≥ 11.3（用于GPU特性）
 - GTSAM ≥ 4.1, PCL ≥ 1.10, OpenCV ≥ 4.2, Eigen ≥ 3.3
 
-### 编译
+### 编译（重构后推荐）
 
 ```bash
-# 设置工作空间
-cd automap_pro
-make setup
+# 在仓库根目录：使用 automap_start.sh 在 Docker 内编译
+bash automap_start.sh --build
+```
 
-# 编译（Release模式）
-make build-release
+或宿主机本地：
 
-# 运行测试
-make test
+```bash
+cd automap_ws
+source /opt/ros/humble/setup.bash
+colcon build --packages-select automap_pro fast_livo hba hba_api --cmake-args -DCMAKE_BUILD_TYPE=Release
+source install/setup.bash
 ```
 
 ### 验证编译
 
 ```bash
-# 检查可执行文件
-ls ~/automap_ws/install/automap_pro/lib/automap_pro/
+# 检查可执行文件（automap_ws 在仓库根下）
+ls automap_ws/install/automap_pro/lib/automap_pro/
 
 # 检查配置文件
-ls ~/automap_ws/install/automap_pro/share/automap_pro/config/
+ls automap_ws/install/automap_pro/share/automap_pro/config/
 
 # 检查 launch 文件
-ls ~/automap_ws/install/automap_pro/share/automap_pro/launch/
+ls automap_ws/install/automap_pro/share/automap_pro/launch/
 ```
 
 ---
@@ -168,9 +170,12 @@ AutoMap-Pro 支持三种建图模式：
 
 | 模式 | 描述 | 适用场景 | Launch 文件 |
 |------|------|----------|-------------|
+| **composable**（推荐） | 容器内建图，零拷贝 | 一键 `automap_start.sh` 默认 | `automap_composable.launch.py` |
 | **online** | 在线建图 | 实时传感器数据输入 | `automap_online.launch.py` |
 | **offline** | 离线建图 | ROS bag 回放 | `automap_offline.launch.py` |
 | **incremental** | 增量式建图 | 多会话合并 | `automap_incremental.launch.py` |
+
+默认 bag 路径（automap_start.sh）：`data/automap_input/nya_02_slam_imu_to_lidar/nya_02_ros2/nya_02_ros2.db3`。
 
 ### 模式选择
 

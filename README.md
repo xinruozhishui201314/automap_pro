@@ -15,7 +15,7 @@
 - 🔄 **增量式**：支持多次采集数据的增量式拼接建图
 - 🤖 **自动化**：端到端无人工干预完成建图
 - 🌐 **多场景**：适应 GPS 信号时好时坏、退化场景（长走廊、隧道）
-- 🐳 **Docker 支持**：一键编译和运行，开箱即用
+- 🐳 **Docker 一键**：`automap_start.sh` 一键编译与运行，开箱即用
 
 ---
 
@@ -25,50 +25,51 @@
 
 - Ubuntu 20.04 / 22.04
 - Docker 20.10+
-- NVIDIA GPU + Driver 470+
-- NVIDIA Container Runtime
+- NVIDIA GPU + Driver 470+（可选，无 GPU 时以 CPU 模式运行）
+- NVIDIA Container Runtime（使用 GPU 时）
 
-### 一键启动（在线模式）
+### 一键编译并运行（推荐）
 
 ```bash
-# 克隆项目（如需要）
-git clone <repository-url> mapping
-cd mapping
+# 克隆项目
+git clone <repository-url> automap_pro
+cd automap_pro
 
-# 一键启动（首次运行会自动构建镜像和编译项目）
-# 默认使用 Fast-LIVO2 作为前端
-bash run_automap.sh
+# 一键编译 + 运行（使用 Docker 镜像 automap-env:humble，默认回放 nya_02_ros2）
+bash automap_start.sh
 ```
 
-**注意：** 默认配置使用 Fast-LIVO2 作为前端。如需使用自研前端，请：
-1. 编辑 `automap_pro/config/system_config.yaml`，将 `frontend.mode` 改为 `"internal"`
-2. 或使用 `--no-external-frontend` 参数启动
+首次运行会：检查 Docker 与数据、在容器内编译 `automap_ws`、播放 ROS2 bag、启动建图与 RViz2。
 
-### 离线模式
+### 常用选项
 
 ```bash
-# 离线回放 rosbag
-bash run_automap.sh --offline --bag-file /data/record.mcap
-```
+# 仅编译
+bash automap_start.sh --build
 
-### 其他常用命令
-
-```bash
-# 仅编译项目
-bash run_automap.sh --build-only
-
-# 仅运行（跳过编译）
-bash run_automap.sh --run-only
-
-# 不启动可视化
-bash run_automap.sh --no-rviz
+# 仅运行（须先编译）
+bash automap_start.sh --run
 
 # 清理后重新编译
-bash run_automap.sh --clean
+bash automap_start.sh --clean --build
 
-# 查看系统状态
-bash scripts/status.sh
+# 不启动 RViz2
+bash automap_start.sh --no-rviz
+
+# 指定 rosbag 路径
+bash automap_start.sh --bag /path/to/your.db3
+
+# Debug 模式编译
+bash automap_start.sh --debug --build
 ```
+
+### 数据与输出路径
+
+| 用途     | 宿主机路径 | 说明 |
+|----------|------------|------|
+| 默认 bag | `data/automap_input/nya_02_slam_imu_to_lidar/nya_02_ros2/nya_02_ros2.db3` | 须事先准备 |
+| 日志     | `logs/automap_YYYYMMDD_HHMMSS/` | 每次运行新建目录 |
+| 建图输出 | `output/` | 点云、轨迹等 |
 
 ---
 
@@ -76,8 +77,11 @@ bash scripts/status.sh
 
 | 文档 | 说明 |
 |------|------|
-| [快速启动指南](QUICKSTART.md) | 详细的安装、配置和使用说明 |
-| [架构文档](高精度高性能自动化点云建图系统架构文档.md) | 系统架构、模块设计和数据流 |
+| [QUICK_START.md](QUICK_START.md) | 快速开始与验证步骤 |
+| [docs/BUILD_DEPLOY_RUN.md](docs/BUILD_DEPLOY_RUN.md) | 编译/部署/运行说明（重构约定） |
+| [docs/README.md](docs/README.md) | 文档索引 |
+| [README_LFS.md](README_LFS.md) | Git LFS 与 GitHub 上传说明 |
+| [高精度高性能自动化点云建图系统架构文档.md](高精度高性能自动化点云建图系统架构文档.md) | 系统架构与数据流 |
 
 ---
 
@@ -86,11 +90,9 @@ bash scripts/status.sh
 ```
 传感器数据 (LiDAR/IMU/GPS)
          ↓
-   前端里程计 (Fast-LIVO2 默认)
+   前端里程计 (Fast-LIVO2，Composable 或独立进程)
          ↓
-   GPS 融合模块
-         ↓
-   增量子地图管理 (MS-Mapping)
+   AutoMapSystem（子图 / 回环 / 优化）
          ↓
    回环检测 (OverlapTransformer + TEASER++)
          ↓
@@ -99,44 +101,38 @@ bash scripts/status.sh
    地图输出
 ```
 
-**前端可选：**
-- Fast-LIVO2（默认）：高性能 LiDAR-IMU-Visual 紧耦合里程计
-- 自研 ESIKF：可配置为 `frontend.mode: "internal"`
-
 ### 核心模块
 
-| 模块 | 技术选型 | 说明 |
-|------|---------|------|
-| 前端里程计 | Fast-LIVO2 | LiDAR-IMU-(Visual) 紧耦合状态估计 |
-| GPS 融合 | 自适应因子图 | 弱/强 GPS 信号自适应融合 |
-| 增量子地图 | MS-Mapping | 多会话增量建图、子地图管理 |
-| 回环粗匹配 | OverlapTransformer | 基于深度学习的位置识别 |
-| 回环精匹配 | TEASER++ | 鲁棒点云配准 |
-| 全局优化 | HBA | 分层位姿图优化 + BA |
+| 模块         | 技术选型           | 说明 |
+|--------------|--------------------|------|
+| 前端里程计   | Fast-LIVO2         | LiDAR-IMU-(Visual) 紧耦合，Composable 零拷贝 |
+| 主控         | automap_pro        | 子图管理、回环、iSAM2/HBA 优化 |
+| 回环粗匹配   | OverlapTransformer | 深度学习位置识别 |
+| 回环精匹配   | TEASER++           | 鲁棒点云配准 |
+| 全局优化     | HBA                | 分层位姿图优化 |
 
 ---
 
-## 📁 项目结构
+## 📁 项目结构（重构后）
 
 ```
-mapping/
-├── run_automap.sh              # 🚀 一键编译和运行脚本
-├── automap_pro/                # AutoMap-Pro 源码
-│   ├── src/                    # 源代码
-│   ├── include/                # 头文件
-│   ├── launch/                 # 启动文件
-│   └── config/                 # 配置文件
-├── docker/                     # Docker 镜像
-│   ├── dockerfile             # 镜像定义
-│   └── deps/                  # 预编译依赖
-├── scripts/                    # 辅助脚本
-│   ├── build_in_container.sh  # 容器内编译
-│   ├── clean.sh               # 清理工具
-│   └── status.sh              # 状态检查
-├── fast-livo2-humble/          # Fast-LIVO2
-├── OverlapTransformer-master/  # OverlapTransformer
-├── TEASER-plusplus-master/     # TEASER++
-└── HBA-main/                   # HBA
+automap_pro/                    # 仓库根目录
+├── automap_start.sh            # 🚀 一键编译 & 运行（主入口）
+├── automap_ws/                 # ROS2 工作空间（build/install 在此，Docker 挂载）
+│   └── src/                    # 编译时使用的源码（含 automap_pro、fast_livo、hba 等）
+├── automap_pro/                # AutoMap-Pro 主包源码（挂载到容器内 automap_ws/src/automap_pro）
+│   ├── config/                 # 系统配置（system_config.yaml 为唯一主配置）
+│   ├── launch/                 # Launch 文件（automap_composable / offline / online）
+│   ├── src/                    # 源码与 modular 子模块
+│   │   └── modular/            # fast-livo2-humble、HBA-main、TEASER、overlap_transformer 等
+│   └── rviz/
+├── data/                       # 数据与 rosbag
+│   └── automap_input/
+├── docker/                     # Docker 镜像（automap-env:humble）
+├── docs/                       # 文档
+├── scripts/                    # 辅助脚本（上传 GitHub、验证等）
+├── logs/                       # 运行日志（自动创建）
+└── output/                     # 建图输出
 ```
 
 ---
@@ -144,142 +140,67 @@ mapping/
 ## 🛠️ 系统要求
 
 | 组件 | 最低配置 | 推荐配置 |
-|------|---------|---------|
-| CPU | x86_64，4核心 | x86_64，8核心以上 |
+|------|----------|----------|
+| CPU  | x86_64，4 核 | x86_64，8 核以上 |
 | 内存 | 16GB | 32GB 以上 |
-| GPU | NVIDIA RTX 3060 | NVIDIA RTX 4060 或更高 |
-| 存储 | 50GB 可用空间 | 100GB 可用空间 |
+| GPU  | NVIDIA RTX 3060（可选） | NVIDIA RTX 4060 或更高 |
+| 存储 | 50GB 可用 | 100GB 可用 |
 | 系统 | Ubuntu 20.04 / 22.04 | Ubuntu 22.04 |
 
 ---
 
-## 📊 性能指标
+## 🔧 编译与运行（无 Docker）
 
-| 指标 | 目标值 |
-|------|--------|
-| 前端频率 | ≥10 Hz |
-| 回环检测延迟 | <1 s |
-| 全局优化时间 | <5 s |
-| 全局一致性误差 | <0.3% |
-| 内存占用 | <8 GB |
-
----
-
-## 🔧 常用命令
-
-### 编译相关
+若在宿主机直接编译运行：
 
 ```bash
-# 编译项目
-bash scripts/build_in_container.sh
+cd automap_ws
+source /opt/ros/humble/setup.bash
+colcon build --packages-select automap_pro fast_livo hba hba_api --cmake-args -DCMAKE_BUILD_TYPE=Release
+source install/setup.bash
 
-# 清理后重新编译
-bash scripts/build_in_container.sh --clean
-
-# 仅编译指定包
-bash scripts/build_in_container.sh --package automap_pro
+# 播放 bag 与启动建图（需另终端播放 bag）
+export AUTOMAP_LOG_DIR=$(pwd)/../logs
+ros2 launch automap_pro automap_composable.launch.py config:=/path/to/automap_pro/config/system_config.yaml use_rviz:=true
 ```
 
-### 清理相关
-
-```bash
-# 清理工作空间
-bash scripts/clean.sh --workspace
-
-# 清理 Docker 资源
-bash scripts/clean.sh --docker
-
-# 清理所有
-bash scripts/clean.sh --all
-```
-
-### 状态检查
-
-```bash
-# 查看系统状态
-bash scripts/status.sh
-```
-
-### ROS2 服务
-
-```bash
-# 保存地图
-ros2 service call /automap/save_map automap_pro/srv/SaveMap \
-  "{output_dir: '/data/automap_output', save_pcd: true, save_ply: true, save_las: false, save_trajectory: true}"
-
-# 触发全局优化
-ros2 service call /automap/trigger_optimize automap_pro/srv/TriggerOptimize \
-  "{full_optimization: true, max_iterations: 100}"
-
-# 查看状态
-ros2 service call /automap/get_status automap_pro/srv/GetStatus "{}"
-```
+详见 [docs/BUILD_DEPLOY_RUN.md](docs/BUILD_DEPLOY_RUN.md)。
 
 ---
 
 ## ❓ 常见问题
 
-### Q：首次构建 Docker 镜像需要多长时间？
+### 首次运行需要什么？
 
-**A：** 首次构建通常需要 30-45 分钟，主要耗时在安装 ROS2、编译依赖库和安装 PyTorch。
+- 已安装 Docker，并加载或构建镜像 `automap-env:humble`（脚本会检查，无则从 `docker/automap-env_humble.tar` 加载）。
+- 默认 bag 存在：`data/automap_input/nya_02_slam_imu_to_lidar/nya_02_ros2/nya_02_ros2.db3`，或使用 `--bag <path>` 指定。
 
-### Q：如何加快首次构建速度？
+### 如何查看建图结果？
 
-**A：** 使用预下载的依赖库，避免重复下载。将依赖库放置在 `docker/deps/` 目录下。
+- 建图输出在宿主机 `output/`（容器内 `/workspace/output`）。日志在 `logs/automap_YYYYMMDD_HHMMSS/`。
 
-### Q：离线模式需要准备什么？
+### Launch 报错 [Errno 21] Is a directory?
 
-**A：** 需要准备 rosbag 数据文件，包含 LiDAR、IMU 和 GPS 数据。将数据文件放置在 `${HOME}/data/` 目录下。
+- 已修复：`automap_composable.launch.py` 使用非空默认配置路径。若仍遇问题，请确认使用当前 `automap_pro/launch` 与 `automap_pro/rviz/automap.rviz`。
 
-### Q：如何查看建图结果？
-
-**A：** 建图结果保存在 `${HOME}/data/automap_output/` 目录下，包含点云地图、轨迹和子地图。
-
-更多常见问题请查看 [快速启动指南](QUICKSTART.md)。
-
----
-
-## 🐛 故障排查
-
-### Docker 镜像构建失败
-
-```bash
-# 查看详细构建日志
-cd docker
-docker build --no-cache -t automap-env:humble .
-```
-
-### 项目编译失败
-
-```bash
-# 清理并重新编译
-bash scripts/clean.sh --workspace
-bash scripts/build_in_container.sh --clean
-```
-
-### GPU 不可用
-
-```bash
-# 检查 NVIDIA 驱动
-nvidia-smi
-
-# 检查 Docker GPU 支持
-docker run --rm --gpus all nvidia/cuda:11.8.0-base-ubuntu22.04 nvidia-smi
-```
+更多见 [docs/BUILD_DEPLOY_RUN.md](docs/BUILD_DEPLOY_RUN.md) 与 [QUICK_START.md](QUICK_START.md)。
 
 ---
 
 ## 📖 详细文档
 
-- 📖 [快速启动指南](QUICKSTART.md) - 详细的安装、配置和使用说明
-- 📐 [架构文档](高精度高性能自动化点云建图系统架构文档.md) - 系统架构、模块设计和数据流
-- 📦 [Docker 使用说明](docker/DOCKER_USAGE.md) - Docker 环境配置和使用
+- [QUICK_START.md](QUICK_START.md) - 快速开始与验证
+- [docs/BUILD_DEPLOY_RUN.md](docs/BUILD_DEPLOY_RUN.md) - 编译/部署/运行（重构约定）
+- [docs/README.md](docs/README.md) - 文档索引
+- [README_LFS.md](README_LFS.md) - Git LFS 与推送说明
+- [docker/DOCKER_USAGE.md](docker/DOCKER_USAGE.md) - Docker 使用说明
+- [高精度高性能自动化点云建图系统架构文档.md](高精度高性能自动化点云建图系统架构文档.md) - 系统架构
 
 ---
 
 ## 🤝 贡献
 
-欢迎提交 Issue 和 Pull Request！
+欢迎提交 Issue 与 Pull Request。
 
 ---
 
@@ -289,18 +210,7 @@ docker run --rm --gpus all nvidia/cuda:11.8.0-base-ubuntu22.04 nvidia-smi
 
 ---
 
-## 👥 联系方式
-
-- 项目地址：[GitHub Repository]
-- 文档版本：v1.0
-- 更新日期：2025-02-28
-
----
-
-## ⭐ Star History
-
-如果这个项目对你有帮助，请给它一个星标！
-
----
-
 **Made with ❤️ by AutoMap-Pro Team**
+
+文档版本：v2.0（重构后）  
+更新日期：2026-03-03
