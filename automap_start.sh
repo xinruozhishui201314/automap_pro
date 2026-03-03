@@ -464,8 +464,9 @@ do_run() {
     read -ra vol_args <<< "$(build_volume_args)"
 
     # 生成运行脚本（容器内执行）
+    # 约定：\$VAR / \$(...) 在容器内展开；${VAR} 在宿主机生成此字符串时展开
     local run_cmd="
-set -euo pipefail
+set -uo pipefail
 set +u
 source /opt/ros/humble/setup.bash
 source ${CONTAINER_WS}/install/setup.bash
@@ -474,38 +475,200 @@ set -u
 export AUTOMAP_LOG_LEVEL=info
 export AUTOMAP_LOG_DIR=${log_dir}
 
+# ── 带时间戳的彩色日志 ────────────────────────────────────────────────
+_ts() { date '+%Y-%m-%d %H:%M:%S'; }
+log_info()  { echo -e \"\$(_ts) \033[0;34m[INFO ]\033[0m \$*\"; }
+log_ok()    { echo -e \"\$(_ts) \033[0;32m[OK   ]\033[0m \$*\"; }
+log_warn()  { echo -e \"\$(_ts) \033[1;33m[WARN ]\033[0m \$*\"; }
+log_error() { echo -e \"\$(_ts) \033[0;31m[ERROR]\033[0m \$*\" >&2; }
+log_mon()   { echo -e \"\$(_ts) \033[0;36m[MON  ]\033[0m \$*\"; }
+
 echo ''
 echo '╔══════════════════════════════════════════════╗'
 echo '║        AutoMap-Pro v2.0  STARTING             ║'
 echo '╠══════════════════════════════════════════════╣'
-echo '║  ROS2 bag: ${container_bag}'
-echo '║  Config:   ${config_path}'
-echo '║  Log dir:  ${log_dir}'
+echo \"║  ROS2 bag: ${container_bag}\"
+echo \"║  Config:   ${config_path}\"
+echo \"║  Log dir:  ${log_dir}\"
 echo '╚══════════════════════════════════════════════╝'
 echo ''
 
-# 在后台播放 bag
+# ── 从 system_config.yaml 动态读取传感器话题（避免硬编码 /livox/*）────────
+LID_TOPIC=\$(python3 -c \"import yaml; c=yaml.safe_load(open('${config_path}')); print(c['sensor']['lidar']['topic'])\" 2>/dev/null || echo '/os1_cloud_node1/points')
+IMU_TOPIC=\$(python3 -c \"import yaml; c=yaml.safe_load(open('${config_path}')); print(c['sensor']['imu']['topic'])\"  2>/dev/null || echo '/os1_cloud_node1/imu')
+log_info \"Input topics from config: LiDAR=\${LID_TOPIC}  IMU=\${IMU_TOPIC}\"
+
+# ════════════════════════════════════════════════════════════════
+# Step 1: 先启动建图系统（fast_livo + automap_system），暂不播放 bag
+# ════════════════════════════════════════════════════════════════
+log_info 'Step 1: Starting launch system (fast_livo + automap_system) using unified config: ${config_path}'
+log_info '  fast_livo params will be extracted from fast_livo: section at runtime'
+ros2 launch automap_pro automap_composable.launch.py \
+    config:='${config_path}' \
+    '${rviz_arg}' \
+    &
+LAUNCH_PID=\$!
+log_info \"automap_pro launch started (PID=\${LAUNCH_PID})\"
+
+# ════════════════════════════════════════════════════════════════
+# Step 2: 等待 fast_livo 节点健康（最多 45s）+ 稳定性检查（防启动即崩溃）
+# ════════════════════════════════════════════════════════════════
+log_info 'Step 2: Waiting for /fast_livo node (max 45s). If it crashes you will see [ERROR] process has died below.'
+MAX_WAIT=45
+STABILITY_WAIT=5
+ELAPSED=0
+FAST_LIVO_OK=false
+while [[ \$ELAPSED -lt \$MAX_WAIT ]]; do
+    if ! kill -0 \$LAUNCH_PID 2>/dev/null; then
+        log_error 'Launch process exited unexpectedly — fast_livo likely crashed!'
+        break
+    fi
+    if ros2 node list 2>/dev/null | grep -qE '(^|/)fast_livo\$'; then
+        NODE_LIST=\$(ros2 node list 2>/dev/null | grep -E '(^|/)fast_livo\$' || true)
+        log_ok \"fast_livo node seen in ros2 node list (after \${ELAPSED}s): \$NODE_LIST\"
+        log_info \"Stability check: waiting \${STABILITY_WAIT}s then re-checking node and publisher ...\"
+        sleep \${STABILITY_WAIT}
+        if ! kill -0 \$LAUNCH_PID 2>/dev/null; then
+            log_error 'Launch process died during stability wait — fast_livo crashed.'
+            break
+        fi
+        if ! ros2 node list 2>/dev/null | grep -qE '(^|/)fast_livo\$'; then
+            log_error 'fast_livo node DISAPPEARED after \${STABILITY_WAIT}s (crashed). Search log for \"process has died\" or \"parameter \\\"\\\"\" or InvalidParameterTypeException.'
+            break
+        fi
+        # 检查关键话题是否有发布者（有发布者才说明真的在跑）
+        if ros2 topic info /aft_mapped_to_init 2>/dev/null | grep -q 'Publisher count: [1-9]'; then
+            log_ok \"fast_livo node STABLE and publishing /aft_mapped_to_init (after \${ELAPSED}s + \${STABILITY_WAIT}s)\"
+            FAST_LIVO_OK=true
+            break
+        fi
+        log_ok \"fast_livo node still present after stability wait (topic may appear after first lidar frame)\"
+        FAST_LIVO_OK=true
+        break
+    fi
+    sleep 2
+    ELAPSED=\$((ELAPSED + 2))
+    log_info \"  Waiting for fast_livo... \${ELAPSED}s / \${MAX_WAIT}s\"
+done
+
+if [[ \"\$FAST_LIVO_OK\" != 'true' ]]; then
+    log_error '======================================================'
+    log_error ' fast_livo did NOT become active or STABLE within \${MAX_WAIT}s'
+    log_error ' Possible causes:'
+    log_error '   1. parameter \"\" crash in avia.yaml (check build; search log for InvalidParameterTypeException)'
+    log_error '   2. fast_livo binary not compiled / not found'
+    log_error '   3. Config path mismatch (check --params-file output above)'
+    log_error ' Aborting bag playback. Fix fast_livo first.'
+    log_error '======================================================'
+    kill \$LAUNCH_PID 2>/dev/null || true
+    exit 1
+fi
+
+# ════════════════════════════════════════════════════════════════
+# Step 3: 确认 fast_livo 输出话题已注册（并打开发布者数量便于排障）
+# ════════════════════════════════════════════════════════════════
+log_info 'Step 3: Checking fast_livo output topic registration and publisher count ...'
+EXPECTED_TOPICS='/aft_mapped_to_init /cloud_registered /fast_livo/keyframe_info'
+for topic in \$EXPECTED_TOPICS; do
+    if ros2 topic list 2>/dev/null | grep -q \"\$topic\"; then
+        PUB_COUNT=\$(ros2 topic info \"\$topic\" 2>/dev/null | grep 'Publisher count:' | sed 's/.*: *//' || echo '?')
+        log_ok \"  [REG] \$topic  (publishers: \$PUB_COUNT)\"
+    else
+        log_warn \"  [MISS] \$topic (will appear after first lidar frame)\"
+    fi
+done
+
+# ════════════════════════════════════════════════════════════════
+# Step 4: 启动 bag 播放（rate=0.5 正常频率，--clock 仿真时间，--loop 循环）
+# ════════════════════════════════════════════════════════════════
+log_info \"Step 4: Starting ros2 bag play (rate=0.5, --clock, --loop). Key input topics: \${LID_TOPIC}, \${IMU_TOPIC}\"
 ros2 bag play '${container_bag}' \
     --rate 0.5 \
     --clock \
     --loop \
     &
 BAG_PID=\$!
-echo \"[INFO] ros2 bag play started (PID=\${BAG_PID})\"
+log_ok \"ros2 bag play started (PID=\${BAG_PID})\"
 
-# 启动建图系统
-ros2 launch automap_pro automap_composable.launch.py \
-    config:='${config_path}' \
-    '${rviz_arg}' \
-    &
-LAUNCH_PID=\$!
-echo \"[INFO] automap_pro launch started (PID=\${LAUNCH_PID})\"
+# ════════════════════════════════════════════════════════════════
+# Step 5: 首次数据接收确认（15s 内检测关键话题是否有数据流入）
+# ════════════════════════════════════════════════════════════════
+(
+    sleep 15
+    log_info '--- [DATACHECK] First-data verification (15s after bag play) ---'
+    ALL_OK=true
+    # 输入话题（bag → fast_livo）
+    for topic in \${LID_TOPIC} \${IMU_TOPIC}; do
+        MSG=\$(timeout 4 ros2 topic echo \"\$topic\" --once 2>/dev/null | head -c 80 || true)
+        if [[ -n \"\$MSG\" ]]; then
+            log_ok \"  [INPUT ] \$topic → data received ✓\"
+        else
+            log_warn \"  [INPUT ] \$topic → NO data in 4s (bag not playing or topic mismatch)\"
+            ALL_OK=false
+        fi
+    done
+    # 输出话题（fast_livo → automap_system）
+    for topic in /aft_mapped_to_init /cloud_registered; do
+        MSG=\$(timeout 6 ros2 topic echo \"\$topic\" --once 2>/dev/null | head -c 80 || true)
+        if [[ -n \"\$MSG\" ]]; then
+            log_ok \"  [OUTPUT] \$topic → data received ✓\"
+        else
+            log_warn \"  [OUTPUT] \$topic → NO data in 6s (fast_livo not outputting)\"
+            ALL_OK=false
+        fi
+    done
+    if [[ \"\$ALL_OK\" == 'true' ]]; then
+        log_ok '[DATACHECK] All key topics flowing normally ✓'
+    else
+        log_warn '[DATACHECK] Some OUTPUT topics missing.'
+        log_warn '[DATACHECK] Likely cause: fast_livo crashed at startup — search log for \"process has died\" or \"parameter \\\"\\\"\" or InvalidParameterTypeException above.'
+    fi
+    log_info '--- [DATACHECK] End ---'
+) &
+DATACHECK_PID=\$!
 
-# 等待任意进程退出
+# ════════════════════════════════════════════════════════════════
+# Step 6: 后台数据流监控（每 60s 打印关键话题频率快照）
+# ════════════════════════════════════════════════════════════════
+(
+    sleep 60
+    CHECK_NUM=0
+    while kill -0 \$BAG_PID 2>/dev/null && kill -0 \$LAUNCH_PID 2>/dev/null; do
+        CHECK_NUM=\$((CHECK_NUM + 1))
+        log_mon \"=== Periodic Data-Flow Check #\${CHECK_NUM} ========================\"
+        # 输入话题
+        for topic in \${LID_TOPIC} \${IMU_TOPIC}; do
+            HAVE=\$(timeout 3 ros2 topic echo \"\$topic\" --once 2>/dev/null | head -c 10 && echo 'yes' || echo 'no')
+            if [[ \"\$HAVE\" == *'yes'* ]]; then
+                log_mon \"  INPUT  \$topic  → active\"
+            else
+                log_warn \"  INPUT  \$topic  → SILENT (bag may have stalled)\"
+            fi
+        done
+        # fast_livo 输出话题
+        for topic in /aft_mapped_to_init /cloud_registered /fast_livo/keyframe_info; do
+            HAVE=\$(timeout 5 ros2 topic echo \"\$topic\" --once 2>/dev/null | head -c 10 && echo 'yes' || echo 'no')
+            if [[ \"\$HAVE\" == *'yes'* ]]; then
+                log_mon \"  OUTPUT \$topic  → active\"
+            else
+                log_warn \"  OUTPUT \$topic  → SILENT (fast_livo may have crashed; check for 'process has died' earlier in log)\"
+            fi
+        done
+        log_mon \"================================================================\"
+        sleep 60
+    done
+    log_mon 'Periodic monitor stopped (bag or launch exited).'
+) &
+MONITOR_PID=\$!
+
+# ════════════════════════════════════════════════════════════════
+# Step 7: 等待 bag 或 launch 任一退出
+# ════════════════════════════════════════════════════════════════
+log_info \"Step 7: Data flow: bag → \${LID_TOPIC}, \${IMU_TOPIC} → fast_livo → /aft_mapped_to_init, /cloud_registered → automap_system. Waiting for exit ...\"
 wait -n \${BAG_PID} \${LAUNCH_PID}
 EXIT_CODE=\$?
-echo \"[INFO] Process exited with code \${EXIT_CODE}\"
-kill \${BAG_PID} \${LAUNCH_PID} 2>/dev/null || true
+log_info \"Main process exited (code=\${EXIT_CODE}), shutting down all subprocesses ...\"
+kill \${BAG_PID} \${LAUNCH_PID} \${DATACHECK_PID} \${MONITOR_PID} 2>/dev/null || true
 exit \${EXIT_CODE}
 "
 

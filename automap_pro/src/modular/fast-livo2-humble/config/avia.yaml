@@ -4,7 +4,7 @@
       img_topic: "/left_camera/image"
       lid_topic: "/livox/lidar"
       imu_topic: "/livox/imu"
-      img_en: 1
+      img_en: 0   # 0=LIO-only (no camera YAML needed); 1=LIVO (must also pass camera YAML via --params-file)
       lidar_en: 1
       # 这个开启后，会将imu的时间取雷达时间，比如雷达时间last_timestamp_lidar是0.01，则imu的时间也取0.01
       # 应该只是调试用的

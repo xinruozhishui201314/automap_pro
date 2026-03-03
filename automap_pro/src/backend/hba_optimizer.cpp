@@ -44,11 +44,12 @@ void HBAOptimizer::onSubmapFrozen(const SubMap::Ptr& submap) {
     }
     task.enable_gps = gps_aligned_;
         if (!task.keyframes.empty()) {
+            size_t kf_count = task.keyframes.size();
+            size_t qdepth = pending_queue_.size() + 1;
             pending_queue_.push(std::move(task));
             queue_cv_.notify_one();
             trigger_count_++;
-            ALOG_INFO(MOD, "HBA triggered by frozen submap: kf_count={} queue_depth={}",
-                      task.keyframes.size(), pending_queue_.size());
+            ALOG_INFO(MOD, "HBA triggered by frozen submap: kf_count={} queue_depth={}", kf_count, qdepth);
         }
 }
 
@@ -59,6 +60,8 @@ void HBAOptimizer::triggerAsync(
     auto kfs = collectKeyFramesFromSubmaps(all_submaps);
     if (kfs.empty()) return;
 
+    size_t kf_count = kfs.size();
+    size_t sm_count = all_submaps.size();
     {
         std::lock_guard<std::mutex> lk(queue_mutex_);
         PendingTask task;
@@ -68,6 +71,8 @@ void HBAOptimizer::triggerAsync(
         queue_cv_.notify_one();
         trigger_count_++;
     }
+    ALOG_INFO(MOD, "HBA triggerAsync: submaps={} keyframes={} gps={} trigger_count={}",
+              sm_count, kf_count, gps_aligned_ ? 1 : 0, trigger_count_);
 
     if (wait) {
         // 等待队列清空（阻塞）

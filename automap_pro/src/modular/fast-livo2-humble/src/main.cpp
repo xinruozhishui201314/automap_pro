@@ -1,10 +1,16 @@
 #include "LIVMapper.h"
 #include <cstdio>
+#include <cstring>
 
 int main(int argc, char **argv)
 {
   // 启动即打印，便于确认是否运行了「已修复 parameter ''」的二进制（若未见此行说明未重新编译 fast_livo）
   std::fprintf(stderr, "[fast_livo] main: automatically_declare_parameters_from_overrides=false (parameter '' fix applied)\n");
+  // 诊断：打印所有 --params-file 参数，便于定位「parameter ''」是否由多文件合并导致
+  for (int i = 0; i < argc; ++i) {
+    if (std::strcmp(argv[i], "--params-file") == 0 && i + 1 < argc)
+      std::fprintf(stderr, "[fast_livo] [DIAG] --params-file #%d = %s\n", (i/2)+1, argv[i+1]);
+  }
   std::fflush(stderr);
 
   rclcpp::init(argc, argv);

@@ -43,7 +43,7 @@ void LivoBridge::init(rclcpp::Node::SharedPtr node) {
 
     connected_ = true;
     RCLCPP_INFO(node->get_logger(),
-        "[LivoBridge] Initialized (odom=%s, cloud=%s, kfinfo=%s, gps=%s)",
+        "[LivoBridge][DATA] inited odom=%s cloud=%s kfinfo=%s gps=%s",
         cfg.fastLivoOdomTopic().c_str(),
         cfg.fastLivoCloudTopic().c_str(),
         cfg.fastLivoKFInfoTopic().c_str(),
@@ -62,6 +62,15 @@ void LivoBridge::onOdometry(const nav_msgs::msg::Odometry::SharedPtr msg) {
     Pose3d pose = poseFromOdom(*msg);
     Mat66d cov  = covFromOdom(*msg);
 
+    if (odom_count_ == 1) {
+        RCLCPP_INFO(node_->get_logger(),
+            "[LivoBridge][DATA] first odom ts=%.3f pos=[%.2f,%.2f,%.2f]",
+            ts, pose.translation().x(), pose.translation().y(), pose.translation().z());
+    } else if (odom_count_.load() % 500 == 0) {
+        RCLCPP_INFO(node_->get_logger(),
+            "[LivoBridge][DATA] odom count=%d ts=%.3f pos=[%.2f,%.2f,%.2f]",
+            odom_count_.load(), ts, pose.translation().x(), pose.translation().y(), pose.translation().z());
+    }
     if (odom_count_ % 100 == 0) {
         ALOG_DEBUG(MOD, "Odom#{}: ts={:.3f} t=[{:.2f},{:.2f},{:.2f}]",
                    odom_count_, ts,
@@ -78,8 +87,14 @@ void LivoBridge::onCloud(const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
     pcl::fromROSMsg(*msg, *cloud);
 
     if (cloud->empty()) {
+        RCLCPP_WARN(node_->get_logger(), "[LivoBridge][DATA] empty cloud ts=%.3f count=%d", ts, cloud_count_.load());
         ALOG_WARN(MOD, "Empty cloud at ts={:.3f}", ts);
         return;
+    }
+    if (cloud_count_ == 1) {
+        RCLCPP_INFO(node_->get_logger(), "[LivoBridge][DATA] first cloud ts=%.3f pts=%zu", ts, cloud->size());
+    } else if (cloud_count_.load() % 100 == 0) {
+        RCLCPP_INFO(node_->get_logger(), "[LivoBridge][DATA] cloud count=%d ts=%.3f pts=%zu", cloud_count_.load(), ts, cloud->size());
     }
     if (cloud_count_ % 50 == 0) {
         ALOG_DEBUG(MOD, "Cloud#{}: pts={} ts={:.3f}", cloud_count_, cloud->size(), ts);
@@ -88,6 +103,9 @@ void LivoBridge::onCloud(const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
 }
 
 void LivoBridge::onKFInfo(const automap_pro::msg::KeyFrameInfoMsg::SharedPtr msg) {
+    static std::atomic<uint32_t> kfinfo_count{0};
+    kfinfo_count++;
+
     LivoKeyFrameInfo info;
     info.timestamp        = msg->timestamp;
     info.esikf_cov_norm   = msg->esikf_covariance_norm;
@@ -97,23 +115,34 @@ void LivoBridge::onKFInfo(const automap_pro::msg::KeyFrameInfoMsg::SharedPtr msg
     info.gyro_bias  = Eigen::Vector3d(msg->gyro_bias[0], msg->gyro_bias[1], msg->gyro_bias[2]);
     info.accel_bias = Eigen::Vector3d(msg->accel_bias[0], msg->accel_bias[1], msg->accel_bias[2]);
 
+    if (kfinfo_count == 1 || (kfinfo_count % 200 == 0)) {
+        RCLCPP_INFO(node_->get_logger(),
+            "[LivoBridge][DATA] kfinfo count=%u ts=%.3f cov_norm=%.4f degen=%d",
+            kfinfo_count.load(), info.timestamp, info.esikf_cov_norm, info.is_degenerate ? 1 : 0);
+    }
     for (auto& cb : kfinfo_cbs_) cb(info);
 }
 
 void LivoBridge::onGPS(const sensor_msgs::msg::NavSatFix::SharedPtr msg) {
     if (msg->status.status < 0) return;  // GPS fix 无效
 
+    static std::atomic<uint32_t> gps_count{0};
+    gps_count++;
+
     double ts  = msg->header.stamp.sec + 1e-9 * msg->header.stamp.nanosec;
     double lat = msg->latitude;
     double lon = msg->longitude;
     double alt = msg->altitude;
 
-    // 从协方差矩阵估算 HDOP
-    double sigma_h = std::sqrt(msg->position_covariance[0]);  // east variance
-    double hdop    = std::max(0.5, sigma_h / 0.3);  // 0.3m/HDOP 估算
+    double sigma_h = std::sqrt(msg->position_covariance[0]);
+    double hdop    = std::max(0.5, sigma_h / 0.3);
+    int sats = 0;
 
-    int sats = 0;  // NavSatFix 不包含卫星数，使用默认值
-
+    if (gps_count == 1 || (gps_count % 50 == 0)) {
+        RCLCPP_INFO(node_->get_logger(),
+            "[LivoBridge][DATA] gps count=%u ts=%.3f lat=%.6f lon=%.6f alt=%.1f hdop=%.2f",
+            gps_count.load(), ts, lat, lon, alt, hdop);
+    }
     for (auto& cb : gps_cbs_) cb(ts, lat, lon, alt, hdop, sats);
 }
 

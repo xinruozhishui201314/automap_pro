@@ -1,5 +1,16 @@
 # ══════════════════════════════════════════════════════════════════════════════
-# AutoMap-Pro v2.0 系统配置文件
+# AutoMap-Pro v2.0  统一配置文件  （全工程唯一配置，所有模块均从此读取）
+#
+# 读取方式：
+#   automap_system ── 通过 YAML-cpp 直接解析各节
+#   fast_livo      ── launch 文件读取 fast_livo: 节，自动转换为临时 ROS2
+#                     参数文件 (/tmp/automap_fl_params_<pid>.yaml) 后通过
+#                     --params-file 传入 fastlivo_mapping
+#
+# 修改原则：
+#   · LiDAR/IMU 话题同时在 sensor: 和 fast_livo.common: 两处出现，两处保持同步
+#   · img_en: 0 = LIO-only（无相机，nya_02 bag 默认）；1 = LIVO（需相机内参）
+#   · preprocess.lidar_type：1=Livox Avia(AVIA)  2=Velodyne(VELO16)  3=Ouster(OUST64)  4=RealSense L515
 # ══════════════════════════════════════════════════════════════════════════════
 
 # ── 系统全局 ──────────────────────────────────────────────────────────────────
@@ -9,115 +20,222 @@ system:
   num_threads: 8
   log_level: "INFO"          # DEBUG | INFO | WARN | ERROR
 
-# ── 传感器接口 ────────────────────────────────────────────────────────────────
+# ── 传感器接口（automap_system 读取；话题须与 fast_livo.common 同步）─────────
 sensor:
   lidar:
-    topic: "/os1_cloud_node1/points"   # 或 /livox/lidar，按实际修改
-    type: "OUSTER"                      # OUSTER | LIVOX | VELODYNE | HESAI
-    frame_id: "os_lidar"
+    topic:    "/os1_cloud_node1/points"   # ← 与 fast_livo.common.lid_topic 同步
+    type:     "OUSTER"                    # LIVOX | OUSTER | VELODYNE | HESAI
+    frame_id: "os_sensor"
   imu:
-    topic: "/imu/imu"
-    frame_id: "imu"
-    frequency: 400.0
+    topic:    "/os1_cloud_node1/imu"      # ← 与 fast_livo.common.imu_topic 同步
+    frame_id: "os_imu"
+    frequency: 100.0                      # Ouster OS1 内置 IMU：100 Hz
   gps:
-    enabled: false                      # 建图初期设 false，GPS好后改 true 或运行时通过 service 触发
-    topic: "/gps/fix"
+    enabled:  false
+    topic:    "/gps/fix"
     frame_id: "gps"
 
-# ── FAST-LIVO2 前端 ───────────────────────────────────────────────────────────
+# ── FAST-LIVO2 前端输出话题（automap_system 订阅）─────────────────────────────
 frontend:
-  # Composable Node 模式（零拷贝）
   use_composable_node: true
-  odom_topic:   "/aft_mapped_to_init"
-  cloud_topic:  "/cloud_registered"
+  odom_topic:    "/aft_mapped_to_init"
+  cloud_topic:   "/cloud_registered"
   kf_info_topic: "/fast_livo/keyframe_info"
 
 # ── 关键帧选取 ────────────────────────────────────────────────────────────────
 keyframe:
-  min_translation:   1.0    # 米，最小平移距离触发
-  min_rotation_deg: 10.0    # 度，最小旋转角触发
-  max_interval:      2.0    # 秒，最长间隔强制插入
-  max_esikf_cov_norm: 1000.0  # ESIKF协方差范数阈值（超过→自适应降低KF阈值）
+  min_translation:    1.0    # 米，最小平移距离触发
+  min_rotation_deg:  10.0    # 度，最小旋转角触发
+  max_interval:       2.0    # 秒，最长间隔强制插入
+  max_esikf_cov_norm: 1000.0 # ESIKF 协方差范数阈值
 
-# ── 子图管理（MS-Mapping 增量建图参数）──────────────────────────────────────────
+# ── 子图管理 ──────────────────────────────────────────────────────────────────
 submap:
-  max_keyframes:  100       # 单子图最大关键帧数
-  max_spatial_m:  100.0     # 单子图最大空间范围（米）
-  max_temporal_s:  60.0     # 单子图最大时间跨度（秒）
-  match_resolution:  0.4    # 用于回环匹配的点云降采样分辨率（米）
-  merge_resolution:  0.1    # 子图合并点云降采样分辨率（米）
+  max_keyframes:    100
+  max_spatial_m:    100.0
+  max_temporal_s:    60.0
+  match_resolution:   0.4
+  merge_resolution:   0.1
 
-# ── GPS 延迟对齐 ───────────────────────────────────────────────────────────────
+# ── GPS 延迟对齐 ──────────────────────────────────────────────────────────────
 gps:
-  # 对齐触发条件
-  align_min_points:    50      # 最少 GPS-LiDAR 时间对应对
-  align_min_distance_m: 30.0   # LiDAR 轨迹总长度阈值（米）
-  quality_threshold_hdop: 2.0  # GPS 质量阈值（HDOP ≤ 2.0 = HIGH）
-  align_rmse_threshold_m: 1.5  # SVD 对齐结果 RMSE 接受阈值（米）
-  good_samples_needed: 30      # 连续高质量 GPS 帧数触发对齐
-  
-  # 对齐后 GPS 因子
-  add_constraints_on_align: true   # 对齐成功后批量添加历史 GPS 因子
-  factor_interval_m: 5.0           # 每隔 5m 添加一个 GPS 因子（避免过密）
+  align_min_points:       50
+  align_min_distance_m:   30.0
+  quality_threshold_hdop:  2.0
+  align_rmse_threshold_m:  1.5
+  good_samples_needed:    30
+  add_constraints_on_align: true
+  factor_interval_m:       5.0
 
-# ── 回环检测 ───────────────────────────────────────────────────────────────────
+# ── 回环检测 ──────────────────────────────────────────────────────────────────
 loop_closure:
-  overlap_threshold: 0.30      # OverlapTransformer 余弦相似度阈值
-  top_k:             5         # 候选子图数量
-  min_temporal_gap_s: 30.0     # 同 session 内最小时间间隔（避免与近期帧匹配）
-  min_submap_gap:    3         # 同 session 内最小子图间隔
-  gps_search_radius_m: 200.0  # GPS 半径过滤（双方有 GPS 时才使用）
-  worker_threads:    2         # 描述子计算 Worker 线程数
-
-  # OverlapTransformer
+  overlap_threshold:   0.30
+  top_k:               5
+  min_temporal_gap_s:  30.0
+  min_submap_gap:      3
+  gps_search_radius_m: 200.0
+  worker_threads:      2
   overlap_transformer:
-    model_path: ""             # TorchScript .pt 模型路径
-                               # 生成方式：python OT_libtorch/gen_libtorch_model.py
-                               # 生成后路径示例：/data/models/overlapTransformer.pt
-    proj_H:    64              # Range image 高度（64 for KITTI/OS1-128, 32 for Haomo）
-    proj_W:   900              # Range image 宽度（保持 900）
-    fov_up:    3.0             # 上视场角（度）
-    fov_down: -25.0            # 下视场角（度）
-    max_range: 50.0            # 最大有效距离（米）
-    descriptor_dim: 256        # 描述子维度（固定 256）
-
-  # TEASER++（鲁棒点云配准）
+    model_path:     ""
+    proj_H:         64
+    proj_W:         900
+    fov_up:         3.0
+    fov_down:      -25.0
+    max_range:      50.0
+    descriptor_dim: 256
   teaser:
-    noise_bound:      0.1      # TEASER++ 噪声上界（米）
-    cbar2:            1.0      # 最大旋转误差因子
-    voxel_size:       0.4      # 用于 TEASER 的点云降采样（米）
-    min_inlier_ratio: 0.30     # 最小内点率阈值
-    max_rmse_m:       0.3      # 最大 RMSE 阈值（米）
-    icp_refine:       true     # 是否在 TEASER 后做 ICP 精配准
+    noise_bound:      0.1
+    cbar2:            1.0
+    voxel_size:       0.4
+    min_inlier_ratio: 0.30
+    max_rmse_m:       0.3
+    icp_refine:       true
 
-# ── 后端优化 ───────────────────────────────────────────────────────────────────
+# ── 后端优化 ──────────────────────────────────────────────────────────────────
 backend:
-  # iSAM2 实时增量优化
   isam2:
-    relinearize_threshold: 0.01    # 重线性化阈值（越小越精确，越慢）
-    relinearize_skip:       1      # 每隔几次 update 才检查重线性化
+    relinearize_threshold: 0.01
+    relinearize_skip:       1
     enable_relinearization: true
-
-  # HBA 全局优化（低频触发）
   hba:
-    total_layer_num:  3            # 分层数（3层：KF→Submap→Global）
-    thread_num:       8            # 并行线程数
-    trigger_every_n_submaps: 10   # 每 N 个子图冻结时触发一次 HBA
-    trigger_on_loop:  false        # 是否在回环检测时触发（开销大，建议 false）
-    trigger_on_finish: true        # 建图结束时触发最终 HBA
-    data_path: "/tmp/hba_data"     # 临时数据目录（HBA Bridge 文件 I/O 备用）
+    total_layer_num:         3
+    thread_num:              8
+    trigger_every_n_submaps: 10
+    trigger_on_loop:         false
+    trigger_on_finish:       true
+    data_path:               "/tmp/hba_data"
 
-# ── 地图输出 ───────────────────────────────────────────────────────────────────
+# ── 地图输出 ──────────────────────────────────────────────────────────────────
 map:
-  voxel_size:        0.1      # 最终地图体素大小（米）
-  statistical_filter: true    # 是否使用统计滤波去除噪声
+  voxel_size:        0.1
+  statistical_filter: true
 
-# ── 多会话建图（增量建图） ─────────────────────────────────────────────────────
+# ── 多会话建图 ────────────────────────────────────────────────────────────────
 session:
-  multi_session:  false       # 是否启用多会话模式
-  session_dir:    ""          # 当前 session 保存目录
-  previous_session_dirs: []   # 历史 session 目录列表（回环检测时加载）
-  # 示例（多会话）：
-  # previous_session_dirs:
-  #   - "/data/automap_output/session_1234567890"
-  #   - "/data/automap_output/session_9876543210"
+  multi_session: false
+  session_dir:   ""
+  previous_session_dirs: []
+
+# ══════════════════════════════════════════════════════════════════════════════
+# fast_livo 参数
+#
+# launch 文件在启动时自动将此节转换为 ROS2 --params-file 格式：
+#   /**:
+#     ros__parameters:
+#       common: { lid_topic: ..., img_en: 0, ... }
+#       extrin_calib: { ... }
+#       ...
+# 直接编辑此处即可，无需手工维护 avia.yaml 或任何独立的 fast_livo 配置文件。
+# ══════════════════════════════════════════════════════════════════════════════
+fast_livo:
+
+  # ── 传感器话题（与上方 sensor: 节保持同步）──────────────────────────────
+  common:
+    lid_topic:          "/os1_cloud_node1/points"   # ← 与 sensor.lidar.topic 同步
+    imu_topic:          "/os1_cloud_node1/imu"      # ← 与 sensor.imu.topic 同步
+    img_topic:          "/left/image_raw"            # nya_02 bag 中左目相机话题
+    img_en:             0       # 0=LIO-only; 1=LIVO（需相机内参 YAML）
+    lidar_en:           1
+    ros_driver_bug_fix: false
+
+  # ── LiDAR ↔ IMU 外参 ────────────────────────────────────────────────────
+  # Ouster OS1-16：IMU 与 LiDAR 同壳，平移近似 [0,0,0.036]，旋转单位阵
+  # 如有精确标定结果请替换 extrinsic_T / extrinsic_R
+  extrin_calib:
+    extrinsic_T: [0.0, 0.0, 0.036]
+    extrinsic_R: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+    # LiDAR → Camera 外参（仅 img_en=1 LIVO 模式生效，值待实际标定后替换）
+    Rcl: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+    Pcl: [0.0, 0.0, 0.0]
+
+  # ── 时间偏移 ─────────────────────────────────────────────────────────────
+  time_offset:
+    imu_time_offset:    0.0
+    img_time_offset:    0.1
+    exposure_time_init: 0.0
+
+  # ── LiDAR 预处理 ─────────────────────────────────────────────────────────
+  preprocess:
+    lidar_type:       3         # 1=Livox Avia  2=Velodyne  3=Ouster  4=Hesai
+    scan_line:        16        # Ouster OS1-16 有 16 条扫描线（高度=16）
+    point_filter_num: 1
+    filter_size_surf: 0.1
+    blind:            0.8       # Ouster OS1 最小量程约 0.8 m
+
+  # ── VIO（仅 img_en=1 生效）───────────────────────────────────────────────
+  vio:
+    max_iterations:         5
+    outlier_threshold:      1000
+    img_point_cov:          100
+    patch_size:             8
+    patch_pyrimid_level:    4
+    normal_en:              true
+    raycast_en:             false
+    inverse_composition_en: false
+    exposure_estimate_en:   true
+    inv_expo_cov:           0.1
+
+  # ── IMU ─────────────────────────────────────────────────────────────────
+  imu:
+    imu_en:         true
+    imu_int_frame:  10          # Ouster IMU 100 Hz / LiDAR 10 Hz = 10 帧/扫
+    acc_cov:        0.5
+    gyr_cov:        0.3
+    b_acc_cov:      0.0001
+    b_gyr_cov:      0.0001
+    gravity_est_en: true
+    ba_bg_est_en:   true
+
+  # ── LIO 体素地图 ─────────────────────────────────────────────────────────
+  lio:
+    max_iterations:  5
+    dept_err:        0.02
+    beam_err:        0.05
+    min_eigen_value: 0.0025
+    voxel_size:      0.5
+    max_layer:       2
+    max_points_num:  50
+    sigma_num:       3.0
+    min_iterations:  5
+    layer_init_num:  [5, 5, 5, 5, 5]
+
+  # ── 滑动局部地图 ─────────────────────────────────────────────────────────
+  local_map:
+    map_sliding_en: false
+    half_map_size:  100
+    sliding_thresh: 8.0
+
+  # ── UAV / 重力对齐 ────────────────────────────────────────────────────────
+  uav:
+    imu_rate_odom:    false
+    gravity_align_en: false
+
+  # ── 话题发布 ─────────────────────────────────────────────────────────────
+  publish:
+    dense_map_en:         true
+    pub_effect_point_en:  false
+    pub_plane_en:         false
+    pub_scan_num:         1
+    blind_rgb_points:     0.0
+
+  # ── 评估输出 ─────────────────────────────────────────────────────────────
+  evo:
+    seq_name:       "automap_pro"
+    pose_output_en: false
+
+  # ── PCD 保存 ─────────────────────────────────────────────────────────────
+  pcd_save:
+    pcd_save_en:      false
+    colmap_output_en: false
+    filter_size_pcd:  0.15
+    interval:         -1
+
+  # ── 调试日志 ─────────────────────────────────────────────────────────────
+  debug_log:
+    mat_pre_en: false
+    mat_out_en: false
+    imu_log_en: false
+
+  debug:
+    plot_time: -10.0
+    frame_cnt: 6

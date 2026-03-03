@@ -12,6 +12,8 @@ which is included as part of this source code package.
 
 #include "LIVMapper.h"
 #include <vikit/camera_loader.h>
+#include <rclcpp/exceptions.hpp>
+#include <cstdio>
 
 using namespace Sophus;
 LIVMapper::LIVMapper(rclcpp::Node::SharedPtr &node, std::string node_name, const rclcpp::NodeOptions & options)
@@ -27,7 +29,17 @@ LIVMapper::LIVMapper(rclcpp::Node::SharedPtr &node, std::string node_name, const
   p_pre.reset(new Preprocess());
   p_imu.reset(new ImuProcess());
 
-  readParameters(this->node);
+  try {
+    readParameters(this->node);
+  } catch (const rclcpp::exceptions::InvalidParameterTypeException& e) {
+    std::fprintf(stderr, "[fast_livo] [DIAG] readParameters failed: %s\n", e.what());
+    std::fflush(stderr);
+    throw;
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "[fast_livo] [DIAG] readParameters exception: %s\n", e.what());
+    std::fflush(stderr);
+    throw;
+  }
   VoxelMapConfig voxel_config;
   loadVoxelConfig(this->node, voxel_config);
 
@@ -207,30 +219,48 @@ void LIVMapper::initializeComponents(rclcpp::Node::SharedPtr &node)
   voxelmap_manager->extT_ << VEC_FROM_ARRAY(extrinT);
   voxelmap_manager->extR_ << MAT_FROM_ARRAY(extrinR);
 
-  if (!vk::camera_loader::loadFromRosNs(this->node, "parameter_blackboard", vio_manager->cam)) throw std::runtime_error("Camera model not correctly specified.");
-  // if (!vk::camera_loader::loadFromRosNs(this->node, "parameter_blackboard", vio_manager->cam)) {
-  //   RCLCPP_ERROR(this->node->get_logger(), "Camera model not correctly specified. Please check camera parameters.");
-  //   RCLCPP_ERROR(this->node->get_logger(), "Node will continue running for debugging purposes, but VIO may not work correctly.");
-  //   // throw std::runtime_error("Camera model not correctly specified.");
-  // }
-  vio_manager->grid_size = grid_size;
-  vio_manager->patch_size = patch_size;
-  vio_manager->outlier_threshold = outlier_threshold;
-  vio_manager->setImuToLidarExtrinsic(extT, extR);
-  vio_manager->setLidarToCameraExtrinsic(cameraextrinR, cameraextrinT);
-  vio_manager->state = &_state;
-  vio_manager->state_propagat = &state_propagat;
-  vio_manager->max_iterations = max_iterations;
-  vio_manager->img_point_cov = IMG_POINT_COV;
-  vio_manager->normal_en = normal_en;
-  vio_manager->inverse_composition_en = inverse_composition_en;
-  vio_manager->raycast_en = raycast_en;
-  vio_manager->grid_n_width = grid_n_width;
-  vio_manager->grid_n_height = grid_n_height;
-  vio_manager->patch_pyrimid_level = patch_pyrimid_level;
-  vio_manager->exposure_estimate_en = exposure_estimate_en;
-  vio_manager->colmap_output_en = colmap_output_en;
-  vio_manager->initializeVIO();
+  if (img_en) {
+    // ── LIVO mode: load camera model from parameter_blackboard namespace ─────
+    // Requires a camera YAML (e.g. camera_pinhole.yaml) passed as a second
+    // --params-file alongside avia.yaml.  camera_loader.h looks for parameters
+    // named "parameter_blackboard.<key>" using dot separator; the YAML must
+    // expose them under ros__parameters: parameter_blackboard: <key>.
+    // Known issue: camera_loader.h uses ns+"/" (slash) separator which is
+    // invalid in ROS2 parameter names – rclcpp maps it to an empty-name
+    // parameter causing "parameter '' has invalid type" crash.  Until
+    // camera_loader.h is updated to use dot separator, LIVO mode requires
+    // building camera_loader with the patched version below.
+    if (!vk::camera_loader::loadFromRosNs(this->node, "parameter_blackboard", vio_manager->cam)) {
+      RCLCPP_ERROR(this->node->get_logger(),
+        "[fast_livo] Camera model not correctly specified. "
+        "Ensure camera YAML (e.g. camera_pinhole.yaml) is passed via --params-file "
+        "and that camera_loader.h uses '.' separator (not '/') for parameter names.");
+      throw std::runtime_error("Camera model not correctly specified.");
+    }
+    vio_manager->grid_size = grid_size;
+    vio_manager->patch_size = patch_size;
+    vio_manager->outlier_threshold = outlier_threshold;
+    vio_manager->setImuToLidarExtrinsic(extT, extR);
+    vio_manager->setLidarToCameraExtrinsic(cameraextrinR, cameraextrinT);
+    vio_manager->state = &_state;
+    vio_manager->state_propagat = &state_propagat;
+    vio_manager->max_iterations = max_iterations;
+    vio_manager->img_point_cov = IMG_POINT_COV;
+    vio_manager->normal_en = normal_en;
+    vio_manager->inverse_composition_en = inverse_composition_en;
+    vio_manager->raycast_en = raycast_en;
+    vio_manager->grid_n_width = grid_n_width;
+    vio_manager->grid_n_height = grid_n_height;
+    vio_manager->patch_pyrimid_level = patch_pyrimid_level;
+    vio_manager->exposure_estimate_en = exposure_estimate_en;
+    vio_manager->colmap_output_en = colmap_output_en;
+    vio_manager->initializeVIO();
+    RCLCPP_INFO(this->node->get_logger(),
+      "[fast_livo] LIVO mode: camera model loaded, VIO initialized.");
+  } else {
+    RCLCPP_INFO(this->node->get_logger(),
+      "[fast_livo] img_en=0: LIO-only mode, skipping camera model loading and VIO initialization.");
+  }
 
   p_imu->set_extrinsic(extT, extR);
   p_imu->set_gyr_cov_scale(V3D(gyr_cov, gyr_cov, gyr_cov));

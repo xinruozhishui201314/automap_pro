@@ -29,6 +29,7 @@ void SubMapManager::init(rclcpp::Node::SharedPtr node) {
     node_ = node;
     event_pub_ = node->create_publisher<automap_pro::msg::SubMapEventMsg>(
         "/automap/submap_event", 50);
+    RCLCPP_INFO(node->get_logger(), "[SubMapMgr][DATA] inited event_pub=/automap/submap_event");
 }
 
 void SubMapManager::startNewSession(uint64_t session_id) {
@@ -48,6 +49,9 @@ void SubMapManager::addKeyFrame(const KeyFrame::Ptr& kf) {
     if (!active_submap_) {
         active_submap_ = createNewSubmap(kf);
         submaps_.push_back(active_submap_);
+        RCLCPP_INFO(node_->get_logger(),
+            "[SubMapMgr][DATA] new submap sm_id=%d first_kf_id=%d ts=%.3f",
+            active_submap_->id, kf->id, kf->timestamp);
     }
 
     // 添加关键帧到子图
@@ -83,16 +87,25 @@ void SubMapManager::addKeyFrame(const KeyFrame::Ptr& kf) {
                    active_submap_->pose_w_anchor.translation()).norm();
     active_submap_->spatial_extent_m = std::max(active_submap_->spatial_extent_m, dist);
 
+    RCLCPP_DEBUG(node_->get_logger(),
+        "[SubMapMgr][DATA] kf_id=%d sm_id=%d kf_count=%zu dist=%.2fm",
+        kf->id, active_submap_->id, active_submap_->keyframes.size(), active_submap_->spatial_extent_m);
     ALOG_DEBUG(MOD, "KF#{} added to SM#{}: kf_count={} dist={:.1fm}",
                kf->id, active_submap_->id,
                active_submap_->keyframes.size(), active_submap_->spatial_extent_m);
 
     if (isFull(active_submap_)) {
-        ALOG_INFO(MOD, "SM#{} FULL (kf={} dist={:.1f}m) → freezing",
-                  active_submap_->id, active_submap_->keyframes.size(),
-                  active_submap_->spatial_extent_m);
+        const int sm_id = active_submap_->id;
+        const size_t kf_count = active_submap_->keyframes.size();
+        const double dist = active_submap_->spatial_extent_m;
+        const double t_start = active_submap_->t_start;
+        const double t_end = active_submap_->t_end;
+        ALOG_INFO(MOD, "SM#{} FULL (kf={} dist={:.1f}m) → freezing", sm_id, kf_count, dist);
         freezeActiveSubmap();
         active_submap_ = nullptr;
+        RCLCPP_INFO(node_->get_logger(),
+            "[SubMapMgr][DATA] freeze sm_id=%d kf_count=%zu dist=%.2fm t=[%.3f,%.3f]",
+            sm_id, kf_count, dist, t_start, t_end);
     }
 }
 
@@ -136,6 +149,7 @@ SubMap::Ptr SubMapManager::createNewSubmap(const KeyFrame::Ptr& first_kf) {
     sm->t_end       = first_kf->timestamp;
     sm->merged_cloud = std::make_shared<CloudXYZI>();
     publishEvent(sm, "CREATED");
+    RCLCPP_DEBUG(node_->get_logger(), "[SubMapMgr][DATA] createNewSubmap sm_id=%d session=%lu", sm->id, sm->session_id);
     return sm;
 }
 

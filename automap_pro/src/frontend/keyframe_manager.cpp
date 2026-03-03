@@ -37,10 +37,10 @@ bool KeyFrameManager::shouldCreateKeyFrame(const Pose3d& cur_pose, double timest
     std::lock_guard<std::mutex> lk(mutex_);
 
     if (!has_last_) {
-        // 第一帧，强制创建
         last_pose_ = cur_pose;
         last_ts_   = timestamp;
         has_last_  = true;
+        ALOG_INFO(MOD, "KF decision: first frame ts={:.3f}", timestamp);
         return true;
     }
 
@@ -48,27 +48,28 @@ bool KeyFrameManager::shouldCreateKeyFrame(const Pose3d& cur_pose, double timest
     double eff_min_trans = min_translation_ * scale;
     double eff_min_rot   = min_rotation_deg_ * scale;
 
-    // 平移距离
     double dist = (cur_pose.translation() - last_pose_.translation()).norm();
     if (dist >= eff_min_trans) {
         last_pose_ = cur_pose;
         last_ts_   = timestamp;
+        ALOG_DEBUG(MOD, "KF decision: dist={:.3f}m >= {:.3f} ts={:.3f}", dist, eff_min_trans, timestamp);
         return true;
     }
 
-    // 旋转角度
     Eigen::AngleAxisd aa(cur_pose.rotation() * last_pose_.rotation().transpose());
     double angle_deg = std::abs(aa.angle()) * 180.0 / M_PI;
     if (angle_deg >= eff_min_rot) {
         last_pose_ = cur_pose;
         last_ts_   = timestamp;
+        ALOG_DEBUG(MOD, "KF decision: rot={:.2f}deg >= {:.2f} ts={:.3f}", angle_deg, eff_min_rot, timestamp);
         return true;
     }
 
-    // 时间间隔
-    if (timestamp - last_ts_ >= max_interval_) {
+    double dt = timestamp - last_ts_;
+    if (dt >= max_interval_) {
         last_pose_ = cur_pose;
         last_ts_   = timestamp;
+        ALOG_DEBUG(MOD, "KF decision: dt={:.2f}s >= {:.2f} ts={:.3f}", dt, max_interval_, timestamp);
         return true;
     }
 

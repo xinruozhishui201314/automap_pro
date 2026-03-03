@@ -86,13 +86,21 @@ void LoopDetector::stop() {
 
 void LoopDetector::addSubmap(const SubMap::Ptr& submap) {
     float priority = static_cast<float>(submap->id);
+    size_t qsize;
+    size_t dbsize;
     {
         std::lock_guard<std::mutex> lk(desc_mutex_);
         desc_queue_.push({submap, priority});
+        qsize = desc_queue_.size();
+        dbsize = dbSize();
     }
     desc_cv_.notify_one();
+    RCLCPP_INFO(node_->get_logger(),
+        "[LoopDetector][DATA] addSubmap sm_id=%d kf=%zu desc_pts=%zu queue=%zu db=%zu",
+        submap->id, submap->keyframes.size(),
+        submap->downsampled_cloud ? submap->downsampled_cloud->size() : 0u, qsize, dbsize);
     ALOG_INFO(MOD, "SubMap#{} submitted for loop detection (queue_size={}, db_size={})",
-              submap->id, desc_queue_.size(), dbSize());
+              submap->id, qsize, dbsize);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -313,6 +321,7 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
         // 发布 ROS2 消息
         publishLoopConstraint(lc);
 
+        loop_detected_count_++;
         // 触发回调（→ IncrementalOptimizer）
         for (auto& cb : loop_cbs_) cb(lc);
     }

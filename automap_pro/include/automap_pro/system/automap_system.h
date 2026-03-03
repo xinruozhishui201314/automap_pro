@@ -87,6 +87,17 @@ private:
     // 子图计数（用于 HBA 周期触发）
     int  frozen_submap_count_ = 0;
 
+    // 首次数据到达日志（各打一次，便于确认数据流）
+    std::atomic<bool> first_odom_logged_{false};
+    std::atomic<bool> first_cloud_logged_{false};
+    // 周期性状态汇总（每 10 次 status 打一条，约 10s）
+    int status_publish_count_ = 0;
+    // 低频数据流日志：各模块收发/发布计数（每 15s 打一条）
+    std::atomic<int> pub_odom_path_count_{0};
+    std::atomic<int> pub_opt_path_count_{0};
+    std::atomic<int> pub_map_count_{0};
+    std::atomic<int> pub_status_count_{0};
+
     // ── 发布者 ────────────────────────────────────────────────────────────
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr                odom_path_pub_;
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr                opt_path_pub_;
@@ -105,9 +116,13 @@ private:
     // ── 定时器 ────────────────────────────────────────────────────────────
     rclcpp::TimerBase::SharedPtr status_timer_;
     rclcpp::TimerBase::SharedPtr map_pub_timer_;
+    rclcpp::TimerBase::SharedPtr data_flow_timer_;  // 低频数据流汇总（约 15s）
+    rclcpp::TimerBase::SharedPtr deferred_init_timer_;
 
     // ── 初始化 ────────────────────────────────────────────────────────────
     void setupModules();
+    /** 延后执行：在首次 spin 后调用，内部使用 shared_from_this()，避免 Composable 构造时 bad_weak_ptr */
+    void deferredSetupModules();
     void setupPublishers();
     void setupServices();
     void setupTimers();
@@ -151,6 +166,7 @@ private:
     // ── 定时任务 ──────────────────────────────────────────────────────────
     void publishStatus();
     void publishGlobalMap();
+    void publishDataFlowSummary();  // 低频：各模块收发/发布汇总
 
     // ── 工具 ─────────────────────────────────────────────────────────────
     void saveMapToFiles(const std::string& output_dir);
