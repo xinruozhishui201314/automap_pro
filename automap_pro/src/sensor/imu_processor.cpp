@@ -1,19 +1,22 @@
 #include "automap_pro/sensor/imu_processor.h"
 #include "automap_pro/core/config_manager.h"
 
+#include <chrono>
+
 namespace automap_pro {
 
 ImuProcessor::ImuProcessor() = default;
 
 void ImuProcessor::init(rclcpp::Node::SharedPtr node, TimedBuffer<ImuData>& imu_buffer) {
     imu_buffer_ = &imu_buffer;
+    logger_ = node->get_logger();
     const auto& cfg = ConfigManager::instance();
     time_offset_ = 0.0;
     gravity_     = cfg.imuGravity();
-    std::string topic = cfg.imuTopic();
+    topic_name_ = cfg.imuTopic();
     sub_ = node->create_subscription<sensor_msgs::msg::Imu>(
-        topic, 2000, std::bind(&ImuProcessor::imuCallback, this, std::placeholders::_1));
-    RCLCPP_INFO(node->get_logger(), "[ImuProcessor] Subscribing to %s", topic.c_str());
+        topic_name_, 2000, std::bind(&ImuProcessor::imuCallback, this, std::placeholders::_1));
+    RCLCPP_INFO(logger_, "[ImuProcessor] Subscribing to %s", topic_name_.c_str());
 }
 
 void ImuProcessor::registerCallback(ImuCallback cb) {
@@ -31,6 +34,16 @@ void ImuProcessor::process(const sensor_msgs::msg::Imu::SharedPtr msg) {
 
 void ImuProcessor::imuCallback(const sensor_msgs::msg::Imu::SharedPtr msg) {
     process(msg);
+    double now = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    double msg_ts = rclcpp::Time(msg->header.stamp).seconds() + time_offset_;
+    last_msg_ts_ = msg_ts;
+    msg_count_++;
+    if (now - last_log_time_ >= kDataFlowLogInterval) {
+        RCLCPP_INFO(logger_, "[DataFlow] IMU | topic=%s | count=%lu | last_ts=%.3f",
+                    topic_name_.c_str(), static_cast<unsigned long>(msg_count_), last_msg_ts_);
+        msg_count_ = 0;
+        last_log_time_ = now;
+    }
 }
 
 ImuProcessor::PreintResult ImuProcessor::preintegrate(

@@ -1,0 +1,25 @@
+# HBA (Hierarchical Bundle Adjustment) configuration
+optimization:
+  solver: "gtsam"        # gtsam / ceres / gauss_newton
+  max_iterations: 100
+  convergence_threshold: 1.0e-4
+  use_robust_kernel: true
+  robust_kernel_type: "huber"
+  robust_kernel_delta: 1.0
+  verbose: false
+
+levels:
+  level2:
+    enabled: true        # Submap-level optimization
+    fix_first: true
+  level1:
+    enabled: true        # Keyframe-level optimization
+    fix_anchors: true
+  level0:
+    enabled: false       # Point cloud BA (expensive, offline only)
+
+gps_weights:
+  excellent: 400.0   # 1/sigma^2 = 1/0.05^2
+  high:      100.0
+  medium:    1.0
+  low:       0.01

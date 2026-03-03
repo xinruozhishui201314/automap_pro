@@ -1,0 +1,15 @@
+# This is a generated file and its contents are an internal implementation detail.
+# The download step will be re-executed if anything in this file changes.
+# No other meaning or use of this file is supported.
+
+method=git
+command=/opt/cmake-3.24.0/bin/cmake;-P;/root/automap_ws/build_teaser/_deps/tinyply-subbuild/tinyply-populate-prefix/tmp/tinyply-populate-gitclone.cmake
+source_dir=/root/automap_ws/build_teaser/_deps/tinyply-src
+work_dir=/root/automap_ws/build_teaser/_deps
+repository=https://github.com/ddiakopoulos/tinyply.git
+remote=origin
+init_submodules=TRUE
+recurse_submodules=--recursive
+submodules=
+CMP0097=NEW
+

@@ -18,7 +18,7 @@ Git LFS 已成功配置并推送到远程仓库。
 | 二进制数据 | `*.bin`, `data/**/*.bin` |
 | 文档 | `*.pdf` |
 | 媒体文件 | `*.gif`, `*.mp4`, `*.avi`, `*.mov` |
-| 压缩包 | `*.tar.gz`, `*.zip` |
+| 压缩包 | `*.tar`, `*.tar.gz`, `*.zip` |
 | 其他 | `*.pkl`, `*.h5`, `*.hdf5`, `*.ckpt`, `*.safetensors` |
 
 ### 2. `.gitignore` - 忽略规则
@@ -46,6 +46,30 @@ Git LFS 已成功配置并推送到远程仓库。
 - 最佳实践
 - 故障排查
 - 团队协作
+
+## 📤 上传整个工程到 GitHub（不删除任何本地文件）
+
+**承诺：以下流程仅做 LFS 标记与推送，不会删除本地任何代码或文件。**
+
+```bash
+# 1. 确保 LFS 就绪（仅配置，不删文件）
+bash scripts/upload_to_github_with_lfs.sh
+
+# 2. 添加要提交的内容（大文件会按 .gitattributes 自动走 LFS）
+git add .
+
+# 3. 查看将用 LFS 的文件（可选）
+git lfs status
+
+# 4. 提交并推送
+git commit -m "feat: sync project with Git LFS"
+git push -u origin main
+```
+
+若只需提交 `.gitattributes` 的修改：
+```bash
+bash scripts/upload_to_github_with_lfs.sh --commit-and-push
+```
 
 ## 🚀 快速开始
 

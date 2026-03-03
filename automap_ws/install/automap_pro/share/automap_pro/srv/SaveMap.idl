@@ -1,0 +1,29 @@
+// generated from rosidl_adapter/resource/srv.idl.em
+// with input from automap_pro/srv/SaveMap.srv
+// generated code does not contain a copyright notice
+
+
+module automap_pro {
+  module srv {
+    struct SaveMap_Request {
+      string output_dir;
+
+      boolean save_pcd;
+
+      boolean save_ply;
+
+      boolean save_las;
+
+      boolean save_trajectory_tum;
+
+      boolean save_trajectory_kitti;
+    };
+    struct SaveMap_Response {
+      boolean success;
+
+      string output_path;
+
+      string message;
+    };
+  };
+};

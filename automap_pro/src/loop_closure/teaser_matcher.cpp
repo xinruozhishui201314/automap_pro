@@ -1,219 +1,146 @@
 #include "automap_pro/loop_closure/teaser_matcher.h"
 #include "automap_pro/core/config_manager.h"
-#include "automap_pro/core/utils.h"
+#include "automap_pro/core/logger.h"
+#define MOD "TeaserMatcher"
+#include "automap_pro/loop_closure/fpfh_extractor.h"
 
-#include <rclcpp/rclcpp.hpp>
 #include <pcl/common/transforms.h>
-#include <random>
-
-#ifdef USE_TEASER
-#include <teaser/registration.h>
-#include <teaser/fpfh.h>
-#endif
+#include <pcl/filters/voxel_grid.h>
 
 namespace automap_pro {
 
 TeaserMatcher::TeaserMatcher() {
     const auto& cfg = ConfigManager::instance();
-    voxel_size_       = cfg.teaserVoxelSize();
     noise_bound_      = cfg.teaserNoiseBound();
+    cbar2_            = cfg.teaserCbar2();
+    voxel_size_       = cfg.teaserVoxelSize();
     min_inlier_ratio_ = cfg.teaserMinInlierRatio();
     max_rmse_         = cfg.teaserMaxRMSE();
-    max_points_       = 5000;
 }
 
 CloudXYZIPtr TeaserMatcher::preprocess(const CloudXYZIPtr& cloud) const {
-    auto ds = utils::voxelDownsample(cloud, voxel_size_);
-    // Cap points
-    if (static_cast<int>(ds->size()) > max_points_) {
+    CloudXYZIPtr ds(new CloudXYZI);
+    pcl::VoxelGrid<pcl::PointXYZI> vg;
+    vg.setInputCloud(cloud);
+    vg.setLeafSize(voxel_size_, voxel_size_, voxel_size_);
+    vg.filter(*ds);
+
+    if ((int)ds->size() > max_points_) {
         CloudXYZIPtr capped(new CloudXYZI);
         capped->reserve(max_points_);
         int step = ds->size() / max_points_;
-        for (size_t i = 0; i < ds->size() && (int)capped->size() < max_points_; i += step) {
+        for (size_t i = 0; i < ds->size() && (int)capped->size() < max_points_; i += step)
             capped->push_back(ds->points[i]);
-        }
         return capped;
     }
     return ds;
 }
 
-TeaserMatcher::Result TeaserMatcher::match(const CloudXYZIPtr& src_cloud,
-                                             const CloudXYZIPtr& tgt_cloud,
-                                             const Pose3d& /*initial_guess*/) const {
+TeaserMatcher::Result TeaserMatcher::match(
+    const CloudXYZIPtr& src_cloud,
+    const CloudXYZIPtr& tgt_cloud,
+    const Pose3d& /*initial_guess*/) const
+{
     Result result;
+    auto src = preprocess(src_cloud);
+    auto tgt = preprocess(tgt_cloud);
 
-    CloudXYZIPtr src = preprocess(src_cloud);
-    CloudXYZIPtr tgt = preprocess(tgt_cloud);
+    if (src->size() < 30 || tgt->size() < 30) return result;
 
-    if (src->size() < 50 || tgt->size() < 50) {
-        RCLCPP_WARN(rclcpp::get_logger("automap_pro"), "[TeaserMatcher] Too few points: src=%zu tgt=%zu",
-                 src->size(), tgt->size());
-        return result;
-    }
+    // FPFH 特征提取
+    FpfhExtractor extractor;
+    auto src_feat = extractor.compute(src);
+    auto tgt_feat = extractor.compute(tgt);
 
-    // Compute FPFH features
-    auto src_feat = fpfh_extractor_.compute(src);
-    auto tgt_feat = fpfh_extractor_.compute(tgt);
-
-    // Find correspondences
-    auto correspondences = fpfh_extractor_.findCorrespondences(src_feat, tgt_feat, true);
-
-    result.num_correspondences = static_cast<int>(correspondences.size());
-    if (correspondences.size() < 10) {
-        RCLCPP_WARN(rclcpp::get_logger("automap_pro"), "[TeaserMatcher] Too few correspondences: %zu", correspondences.size());
-        return result;
-    }
+    // 互近邻对应
+    auto corrs = extractor.findCorrespondences(src_feat, tgt_feat, true);
+    result.num_correspondences = (int)corrs.size();
+    if ((int)corrs.size() < 10) return result;
 
 #ifdef USE_TEASER
-    // TEASER++ registration
     teaser::PointCloud src_pts, tgt_pts;
-    for (const auto& [si, ti] : correspondences) {
+    std::vector<std::pair<int, int>> teaser_corrs;
+    for (size_t i = 0; i < corrs.size(); ++i) {
+        const auto& [si, ti] = corrs[i];
         const auto& sp = src->points[si];
         const auto& tp = tgt->points[ti];
         src_pts.push_back({sp.x, sp.y, sp.z});
         tgt_pts.push_back({tp.x, tp.y, tp.z});
+        teaser_corrs.push_back({static_cast<int>(i), static_cast<int>(i)});
     }
 
     teaser::RobustRegistrationSolver::Params params;
     params.noise_bound               = noise_bound_;
-    params.cbar2                     = ConfigManager::instance().teaserCbar2();
-    params.rotation_gnc_factor       = ConfigManager::instance().teaserRotGNCFactor();
-    params.rotation_max_iterations   = ConfigManager::instance().teaserRotMaxIter();
-    params.rotation_cost_threshold   = ConfigManager::instance().teaserRotCostThresh();
+    params.cbar2                     = cbar2_;
+    params.estimate_scaling          = false;   // 同一传感器，不估计尺度（提速）
+    params.rotation_estimation_algorithm =
+        teaser::RobustRegistrationSolver::ROTATION_ESTIMATION_ALGORITHM::GNC_TLS;
+    params.rotation_gnc_factor       = 1.4;
+    params.rotation_max_iterations   = 100;
+    params.rotation_cost_threshold   = 1e-6;
+    params.inlier_selection_mode     =
+        teaser::RobustRegistrationSolver::INLIER_SELECTION_MODE::PMC_HEU;  // 更快
+    params.max_clique_time_limit     = 10.0;  // 限制时间
 
-    // TEASER++ solve(PointCloud, PointCloud, correspondences): indices into the two point clouds
-    std::vector<std::pair<int, int>> corr;
-    corr.reserve(src_pts.size());
-    for (size_t i = 0; i < src_pts.size(); ++i)
-        corr.emplace_back(static_cast<int>(i), static_cast<int>(i));
-    teaser::RobustRegistrationSolver solver(params);
-    solver.solve(src_pts, tgt_pts, corr);
-    auto solution = solver.getSolution();
+    {
+        AUTOMAP_TIMED_SCOPE(MOD, fmt::format("TEASER solve corr={}", corrs.size()), 3000.0);
+        teaser::RobustRegistrationSolver solver(params);
+        solver.solve(src_pts, tgt_pts, teaser_corrs);
 
-    Eigen::Matrix4d T = Eigen::Matrix4d::Identity();
-    T.block<3,3>(0,0) = solution.rotation;
-    T.block<3,1>(0,3) = solution.translation;
-    result.T_tgt_src = utils::matrix4dToIsometry3d(T);
-
-    const auto& inliers = solver.getTranslationInliersMask();
-    result.num_inliers   = std::count(inliers.begin(), inliers.end(), true);
-    result.inlier_ratio  = static_cast<double>(result.num_inliers) / correspondences.size();
-
-#else
-    // Fallback: RANSAC-based SVD
-    result = matchRANSAC(src, tgt, correspondences);
-#endif
-
-    // Compute RMSE
-    result.rmse = computeRMSE(src, tgt, result.T_tgt_src);
-
-    result.success = (result.inlier_ratio >= min_inlier_ratio_) &&
-                     (result.rmse <= max_rmse_);
-
-    return result;
-}
-
-TeaserMatcher::Result TeaserMatcher::matchRANSAC(
-        const CloudXYZIPtr& src, const CloudXYZIPtr& tgt,
-        const std::vector<std::pair<int,int>>& correspondences) const {
-    Result result;
-    int n = static_cast<int>(correspondences.size());
-    if (n < 4) return result;
-
-    std::mt19937 rng(42);
-    std::uniform_int_distribution<int> dist(0, n - 1);
-
-    Pose3d best_T;
-    int    best_inliers = 0;
-
-    auto computeTransform = [&](const std::vector<int>& sample_idx) -> Pose3d {
-        // SVD-based point-to-point rigid transform from 3 random correspondences
-        Eigen::MatrixXd src_pts(3, sample_idx.size());
-        Eigen::MatrixXd tgt_pts(3, sample_idx.size());
-        for (size_t k = 0; k < sample_idx.size(); ++k) {
-            int ci = sample_idx[k];
-            const auto& sp = src->points[correspondences[ci].first];
-            const auto& tp = tgt->points[correspondences[ci].second];
-            src_pts.col(k) = Eigen::Vector3d(sp.x, sp.y, sp.z);
-            tgt_pts.col(k) = Eigen::Vector3d(tp.x, tp.y, tp.z);
-        }
-        Eigen::Vector3d sc = src_pts.rowwise().mean();
-        Eigen::Vector3d tc = tgt_pts.rowwise().mean();
-        Eigen::MatrixXd A = (src_pts.colwise() - sc);
-        Eigen::MatrixXd B = (tgt_pts.colwise() - tc);
-        Eigen::JacobiSVD<Eigen::MatrixXd> svd(B * A.transpose(),
-                                               Eigen::ComputeFullU | Eigen::ComputeFullV);
-        Eigen::Matrix3d R = svd.matrixU() * svd.matrixV().transpose();
-        if (R.determinant() < 0) {
-            Eigen::Matrix3d V = svd.matrixV();
-            V.col(2) *= -1.0;
-            R = svd.matrixU() * V.transpose();
-        }
-        Pose3d T;
-        T.linear()      = R;
-        T.translation() = tc - R * sc;
-        return T;
-    };
-
-    for (int iter = 0; iter < ransac_max_iter_; ++iter) {
-        // Sample 3 correspondences
-        std::vector<int> sample;
-        for (int k = 0; k < 3; ++k) {
-            int idx;
-            do { idx = dist(rng); } while (std::find(sample.begin(), sample.end(), idx) != sample.end());
-            sample.push_back(idx);
+        auto solution = solver.getSolution();
+        if (!solution.valid) {
+            ALOG_WARN(MOD, "TEASER solution invalid (corr={})", corrs.size());
+            return result;
         }
 
-        Pose3d T = computeTransform(sample);
-
-        // Count inliers
+        // 计算内点率
+        const auto& inlier_mask = solver.getInlierMaxClique();
         int inliers = 0;
-        for (int ci = 0; ci < n; ++ci) {
-            const auto& sp = src->points[correspondences[ci].first];
-            const auto& tp = tgt->points[correspondences[ci].second];
-            Eigen::Vector3d sp_w = T * Eigen::Vector3d(sp.x, sp.y, sp.z);
-            Eigen::Vector3d tp_v(tp.x, tp.y, tp.z);
-            if ((sp_w - tp_v).norm() <= ransac_inlier_dist_) inliers++;
-        }
+        for (bool b : inlier_mask) if (b) inliers++;
+        result.inlier_ratio = (float)inliers / (float)corrs.size();
+        ALOG_DEBUG(MOD, "TEASER: inlier_ratio={:.2f} ({}/{}) thresh={}",
+                   result.inlier_ratio, inliers, corrs.size(), min_inlier_ratio_);
 
-        if (inliers > best_inliers) {
-            best_inliers = inliers;
-            best_T = T;
-        }
+        if (result.inlier_ratio < min_inlier_ratio_) return result;
 
-        // Early exit if enough inliers found
-        if (static_cast<double>(best_inliers) / n >= 0.7) break;
+        result.T_tgt_src = Pose3d::Identity();
+        result.T_tgt_src.linear()      = solution.rotation;
+        result.T_tgt_src.translation() = solution.translation;
     }
 
-    result.T_tgt_src     = best_T;
-    result.num_inliers   = best_inliers;
-    result.inlier_ratio  = static_cast<double>(best_inliers) / n;
-    result.success       = false;  // set by caller after RMSE check
-
-    return result;
-}
-
-double TeaserMatcher::computeRMSE(const CloudXYZIPtr& src,
-                                    const CloudXYZIPtr& tgt,
-                                    const Pose3d& T) const {
-    auto src_t = utils::transformCloud(src, T);
-    if (src_t->empty() || tgt->empty()) return 1e9;
-
-    // Build KD-tree on target
-    pcl::search::KdTree<PointXYZI> kdtree;
-    kdtree.setInputCloud(tgt);
-
-    double sum_sq = 0.0;
-    int cnt = 0;
-    for (const auto& pt : src_t->points) {
-        std::vector<int> idx(1);
-        std::vector<float> dist(1);
-        if (kdtree.nearestKSearch(pt, 1, idx, dist) > 0) {
-            sum_sq += dist[0];
+    // 计算 RMSE（内点，在 block 外使用 result 中已存的数据）
+    {
+        double sq_err = 0.0;
+        int cnt = 0;
+        for (size_t idx = 0; idx < corrs.size(); ++idx) {
+            const auto& sp = src->points[corrs[idx].first];
+            const auto& tp = tgt->points[corrs[idx].second];
+            Eigen::Vector3d pred = result.T_tgt_src.linear() *
+                Eigen::Vector3d(sp.x, sp.y, sp.z) + result.T_tgt_src.translation();
+            Eigen::Vector3d actual(tp.x, tp.y, tp.z);
+            sq_err += (pred - actual).squaredNorm();
             cnt++;
         }
+        result.rmse    = cnt > 0 ? static_cast<float>(std::sqrt(sq_err / cnt)) : 1e6f;
+        result.success = (result.rmse < max_rmse_);
     }
-    return cnt > 0 ? std::sqrt(sum_sq / cnt) : 1e9;
+#else
+    // 无 TEASER++ 时回退到 SVD（仅参考用，鲁棒性低）
+    (void)src_pts; (void)tgt_pts;
+    result.success = false;
+#endif
+
+    if (result.success) {
+        ALOG_INFO(MOD, "TEASER match OK: inlier={:.2f} rmse={:.3f}m t=[{:.2f},{:.2f},{:.2f}]",
+                  result.inlier_ratio, result.rmse,
+                  result.T_tgt_src.translation().x(),
+                  result.T_tgt_src.translation().y(),
+                  result.T_tgt_src.translation().z());
+    } else {
+        ALOG_DEBUG(MOD, "TEASER match rejected: inlier={:.2f} rmse={:.3f}m",
+                   result.inlier_ratio, result.rmse);
+    }
+    return result;
 }
 
-}  // namespace automap_pro
+} // namespace automap_pro

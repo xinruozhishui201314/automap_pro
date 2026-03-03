@@ -1,0 +1,39 @@
+// generated from rosidl_adapter/resource/msg.idl.em
+// with input from automap_pro/msg/LoopConstraintMsg.msg
+// generated code does not contain a copyright notice
+
+#include "geometry_msgs/msg/Pose.idl"
+#include "std_msgs/msg/Header.idl"
+
+module automap_pro {
+  module msg {
+    typedef double double__36[36];
+    struct LoopConstraintMsg {
+      std_msgs::msg::Header header;
+
+      int32 submap_i;
+
+      int32 submap_j;
+
+      uint64 session_i;
+
+      uint64 session_j;
+
+      float overlap_score;
+
+      float inlier_ratio;
+
+      float rmse;
+
+      boolean is_inter_session;
+
+      double__36 information_matrix;
+
+      geometry_msgs::msg::Pose delta_pose;
+
+      @verbatim (language="comment", text=
+        "\"ACCEPTED\" | \"REJECTED\"")
+      string status;
+    };
+  };
+};

@@ -1,0 +1,1 @@
+cv_bridge:eigen:fmt:geometry_msgs:image_transport:libopencv-dev:nav_msgs:pcl_conversions:pcl_ros:rclcpp:rclpy:sensor_msgs:sophus:std_msgs:tf2_ros:vikit_common:vikit_ros:visualization_msgs

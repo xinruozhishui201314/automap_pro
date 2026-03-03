@@ -14,7 +14,7 @@ NC='\033[0m'
 
 # 配置参数
 BAG_FILE="${BAG_FILE:-/workspace/data/automap_input/nya_02_slam_imu_to_lidar/nya_02.bag}"
-CONFIG="${CONFIG:-/workspace/automap_pro/config/system_config_nya02.yaml}"
+CONFIG="${CONFIG:-/workspace/automap_pro/config/system_config.yaml}"
 OUTPUT_DIR="${OUTPUT_DIR:-/workspace/data/automap_output/nya_02}"
 
 # 显示帮助

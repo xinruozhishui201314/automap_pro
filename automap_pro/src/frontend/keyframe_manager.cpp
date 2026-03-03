@@ -1,100 +1,112 @@
 #include "automap_pro/frontend/keyframe_manager.h"
 #include "automap_pro/core/config_manager.h"
-#include "automap_pro/core/utils.h"
+#include "automap_pro/core/logger.h"
+#define MOD "KFManager"
+#include <pcl/filters/voxel_grid.h>
+#include <cmath>
 
 namespace automap_pro {
+
+uint64_t KeyFrameManager::next_id_ = 0;
 
 KeyFrameManager::KeyFrameManager() {
     const auto& cfg = ConfigManager::instance();
     min_translation_  = cfg.kfMinTranslation();
-    min_rotation_rad_ = cfg.kfMinRotationDeg() * M_PI / 180.0;
+    min_rotation_deg_ = cfg.kfMinRotationDeg();
     max_interval_     = cfg.kfMaxInterval();
 }
 
-void KeyFrameManager::registerCallback(KeyFrameCallback cb) {
-    callbacks_.push_back(std::move(cb));
+void KeyFrameManager::updateLivoInfo(const LivoKeyFrameInfo& info) {
+    std::lock_guard<std::mutex> lk(mutex_);
+    is_degenerate_ = info.is_degenerate;
+
+    double cov_norm = info.esikf_cov_norm;
+    double max_cov  = ConfigManager::instance().kfMaxEsikfCovNorm();
+
+    if (info.is_degenerate || cov_norm > max_cov) {
+        adaptive_dist_scale_ = 0.3;
+        ALOG_DEBUG(MOD, "ESIKF degenerate/high_cov (cov_norm={:.4f}) → dist_scale=0.3", cov_norm);
+    } else if (cov_norm > max_cov * 0.5) {
+        adaptive_dist_scale_ = 0.6;
+    } else {
+        adaptive_dist_scale_ = 1.0;
+    }
 }
 
-void KeyFrameManager::setMinTranslation(double min_translation) {
+bool KeyFrameManager::shouldCreateKeyFrame(const Pose3d& cur_pose, double timestamp) {
     std::lock_guard<std::mutex> lk(mutex_);
-    min_translation_ = min_translation;
-}
 
-void KeyFrameManager::setMinRotationDeg(double min_rotation_deg) {
-    std::lock_guard<std::mutex> lk(mutex_);
-    min_rotation_rad_ = min_rotation_deg * M_PI / 180.0;
-}
+    if (!has_last_) {
+        // 第一帧，强制创建
+        last_pose_ = cur_pose;
+        last_ts_   = timestamp;
+        has_last_  = true;
+        return true;
+    }
 
-void KeyFrameManager::setMaxInterval(double max_interval) {
-    std::lock_guard<std::mutex> lk(mutex_);
-    max_interval_ = max_interval;
-}
+    double scale = adaptive_dist_scale_;
+    double eff_min_trans = min_translation_ * scale;
+    double eff_min_rot   = min_rotation_deg_ * scale;
 
-bool KeyFrameManager::shouldCreateKeyFrame(const Pose3d& pose, double timestamp) const {
-    std::lock_guard<std::mutex> lk(mutex_);
-    if (last_kf_time_ < 0.0) return true;  // first keyframe
+    // 平移距离
+    double dist = (cur_pose.translation() - last_pose_.translation()).norm();
+    if (dist >= eff_min_trans) {
+        last_pose_ = cur_pose;
+        last_ts_   = timestamp;
+        return true;
+    }
 
-    // Time condition
-    if (timestamp - last_kf_time_ > max_interval_) return true;
+    // 旋转角度
+    Eigen::AngleAxisd aa(cur_pose.rotation() * last_pose_.rotation().transpose());
+    double angle_deg = std::abs(aa.angle()) * 180.0 / M_PI;
+    if (angle_deg >= eff_min_rot) {
+        last_pose_ = cur_pose;
+        last_ts_   = timestamp;
+        return true;
+    }
 
-    // Translation condition
-    double trans = (pose.translation() - last_kf_pose_.translation()).norm();
-    if (trans > min_translation_) return true;
-
-    // Rotation condition
-    Pose3d delta = last_kf_pose_.inverse() * pose;
-    if (utils::rotationAngleDeg(delta) * M_PI / 180.0 > min_rotation_rad_) return true;
+    // 时间间隔
+    if (timestamp - last_ts_ >= max_interval_) {
+        last_pose_ = cur_pose;
+        last_ts_   = timestamp;
+        return true;
+    }
 
     return false;
 }
 
 KeyFrame::Ptr KeyFrameManager::createKeyFrame(
-        const Pose3d& pose, const Pose3d& /*unused*/,
-        const Mat66d& covariance,
-        double timestamp,
-        const CloudXYZIPtr& cloud,
-        const CloudXYZIPtr& cloud_ds,
-        const GPSMeasurement& gps,
-        bool has_valid_gps,
-        uint64_t session_id) {
-
+    const Pose3d& T_w_b,
+    const Mat66d& covariance,
+    double timestamp,
+    const CloudXYZIPtr& cloud_body,
+    const CloudXYZIPtr& cloud_ds,
+    const GPSMeasurement& gps,
+    bool has_gps,
+    uint64_t session_id)
+{
     auto kf = std::make_shared<KeyFrame>();
-    kf->id          = nextId();
-    kf->session_id  = session_id;
-    kf->timestamp   = timestamp;
-    kf->T_w_b       = pose;
-    kf->T_w_b_optimized = pose;
-    kf->covariance  = covariance;
-    kf->cloud_body  = cloud;
-    kf->cloud_ds_body = cloud_ds;
-    kf->gps         = gps;
-    kf->has_valid_gps = has_valid_gps;
+    kf->id             = ++next_id_;
+    kf->session_id     = session_id;
+    kf->timestamp      = timestamp;
+    kf->T_w_b          = T_w_b;
+    kf->T_w_b_optimized = T_w_b;
+    kf->covariance     = covariance;
+    kf->cloud_body     = cloud_body;
+    kf->cloud_ds_body  = cloud_ds;
+    kf->gps            = gps;
+    kf->has_valid_gps  = has_gps;
+    kf_count_++;
 
-    {
-        std::lock_guard<std::mutex> lk(mutex_);
-        last_kf_pose_ = pose;
-        last_kf_time_ = timestamp;
-        last_kf_      = kf;
-    }
-
-    for (auto& cb : callbacks_) cb(kf);
+    for (auto& cb : cbs_) cb(kf);
     return kf;
 }
 
-uint64_t KeyFrameManager::nextId() {
-    return id_counter_++;
-}
-
-const KeyFrame::Ptr& KeyFrameManager::lastKeyFrame() const {
+void KeyFrameManager::resetLastPose(const Pose3d& pose, double ts) {
     std::lock_guard<std::mutex> lk(mutex_);
-    return last_kf_;
+    last_pose_ = pose;
+    last_ts_   = ts;
+    has_last_  = true;
 }
 
-void KeyFrameManager::reset() {
-    std::lock_guard<std::mutex> lk(mutex_);
-    last_kf_time_ = -1e9;
-    id_counter_.store(0);
-    last_kf_.reset();
-}
-
-}  // namespace automap_pro
+} // namespace automap_pro

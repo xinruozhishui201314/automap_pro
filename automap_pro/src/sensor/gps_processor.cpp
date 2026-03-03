@@ -2,6 +2,8 @@
 #include "automap_pro/core/config_manager.h"
 #include "automap_pro/core/utils.h"
 
+#include <chrono>
+
 namespace automap_pro {
 
 GPSProcessor::GPSProcessor() {
@@ -19,10 +21,10 @@ GPSProcessor::GPSProcessor() {
 
 void GPSProcessor::init(rclcpp::Node::SharedPtr node) {
     logger_ = node->get_logger();
-    std::string topic = ConfigManager::instance().gpsTopic();
+    topic_name_ = ConfigManager::instance().gpsTopic();
     sub_ = node->create_subscription<sensor_msgs::msg::NavSatFix>(
-        topic, 100, std::bind(&GPSProcessor::gpsCallback, this, std::placeholders::_1));
-    RCLCPP_INFO(logger_, "[GPSProcessor] Subscribing to %s", topic.c_str());
+        topic_name_, 100, std::bind(&GPSProcessor::gpsCallback, this, std::placeholders::_1));
+    RCLCPP_INFO(logger_, "[GPSProcessor] Subscribing to %s", topic_name_.c_str());
 }
 
 void GPSProcessor::setENUOrigin(double lat, double lon, double alt) {
@@ -40,6 +42,16 @@ void GPSProcessor::registerCallback(MeasurementCallback cb) {
 
 void GPSProcessor::gpsCallback(const sensor_msgs::msg::NavSatFix::SharedPtr msg) {
     process(msg);
+    double now = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    last_msg_ts_ = rclcpp::Time(msg->header.stamp).seconds();
+    msg_count_++;
+    if (now - last_log_time_ >= kDataFlowLogInterval) {
+        RCLCPP_INFO(logger_, "[DataFlow] GPS | topic=%s | count=%lu | last_ts=%.3f | valid=%d",
+                    topic_name_.c_str(), static_cast<unsigned long>(msg_count_), last_msg_ts_,
+                    msg->status.status >= 0 ? 1 : 0);
+        msg_count_ = 0;
+        last_log_time_ = now;
+    }
 }
 
 void GPSProcessor::process(const sensor_msgs::msg::NavSatFix::SharedPtr msg) {

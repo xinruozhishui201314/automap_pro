@@ -1,0 +1,57 @@
+# ========== 超大文件（>10MB）==========
+# ROS bag 文件 (10GB)
+data/automap_input/nya_02_slam_imu_to_lidar/nya_02.bag
+
+# 模型权重文件 (340MB)
+OverlapTransformer-master/model/pretrained_overlap_transformer.pth.tar
+
+# ========== Docker 二进制依赖 (88MB-47MB)==========
+docker/deps/ispc/bin/ispc
+docker/deps/downloads/cmake-3.24.0-linux-x86_64.tar.gz
+docker/deps/downloads/ispc-v1.16.1-linux.tar.gz
+
+# ========== CMake 二进制文件 (29MB-13MB)==========
+docker/deps/cmake/bin/cmake-gui
+docker/deps/cmake/bin/ctest
+docker/deps/cmake/bin/cpack
+docker/deps/cmake/bin/cmake
+docker/deps/cmake/bin/ccmake
+
+# ========== 示例数据文件 (34MB-13MB)==========
+docker/deps/ispc/examples/cpu/deferred/data/pp1920x1200.bin
+docker/deps/ispc/examples/cpu/volume_rendering/density_highres.vol
+docker/deps/ispc/examples/cpu/deferred/data/pp1280x720.bin
+
+# ========== 点云文件 (19MB)==========
+TEASER-plusplus-master/test/teaser/data/uw-rgbdv2-01.ply
+
+# ========== GIF 动画 (17MB)==========
+OverlapTransformer-master/query_database_haomo.gif
+
+# ========== PDF 文档 (19MB)==========
+fast-livo2-humble/Supplementary/LIVO2_supplementary.pdf
+
+# ========== 所有点云数据文件 (*.ply)==========
+TEASER-plusplus-master/examples/example_data/3dmatch_sample/cloud_bin_*.ply
+TEASER-plusplus-master/examples/example_data/bun_zipper_res3.ply
+TEASER-plusplus-master/examples/teaser_python_fpfh_icp/data/cloud_bin_*.ply
+TEASER-plusplus-master/test/benchmark/data/benchmark_1/dst.ply
+TEASER-plusplus-master/test/benchmark/data/benchmark_1/src.ply
+TEASER-plusplus-master/test/benchmark/data/benchmark_2/dst.ply
+TEASER-plusplus-master/test/benchmark/data/benchmark_2/src.ply
+TEASER-plusplus-master/test/benchmark/data/benchmark_3/dst.ply
+TEASER-plusplus-master/test/benchmark/data/benchmark_3/src.ply
+
+# ========== 所有 GIF 文件 (*.gif)==========
+OverlapTransformer-master/query_database_kitti.gif
+TEASER-plusplus-master/examples/teaser_python_3dsmooth/3dsmooth_example.gif
+OverlapTransformer-master/Haomo_Dataset/dataset_short_term.gif
+
+# ========== 所有二进制数据文件 (*.bin)==========
+OverlapTransformer-master/OT_libtorch/ws/000000.bin
+OverlapTransformer-master/demo/scans/000000.bin
+OverlapTransformer-master/demo/scans/000005.bin
+OverlapTransformer-master/demo/scans/000015.bin
+
+# ========== BVH 数据 (*.bvh)==========
+docker/deps/ispc/examples/cpu/rt/sponza.bvh

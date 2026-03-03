@@ -4,6 +4,7 @@
 
 #include <pcl_conversions/pcl_conversions.h>
 #include <rclcpp/rclcpp.hpp>
+#include <chrono>
 
 namespace automap_pro {
 
@@ -49,6 +50,16 @@ void FastLIVO2Adapter::setKeyFramePolicy(double min_translation, double min_rota
 
 void FastLIVO2Adapter::onOdometry(const nav_msgs::msg::Odometry::SharedPtr msg) {
     double t = static_cast<double>(msg->header.stamp.sec) + 1e-9 * static_cast<double>(msg->header.stamp.nanosec);
+    odom_count_++;
+    double now = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (now - last_log_time_ >= kDataFlowLogInterval) {
+        RCLCPP_INFO(node_->get_logger(),
+                    "[DataFlow] FastLIVO2Adapter Odom | count=%lu | cloud_count=%lu | last_ts=%.3f",
+                    static_cast<unsigned long>(odom_count_), static_cast<unsigned long>(cloud_count_), t);
+        odom_count_ = 0;
+        cloud_count_ = 0;
+        last_log_time_ = now;
+    }
     Pose3d pose = odometryToPose(msg);
 
     {
@@ -98,6 +109,7 @@ void FastLIVO2Adapter::onOdometry(const nav_msgs::msg::Odometry::SharedPtr msg) 
 }
 
 void FastLIVO2Adapter::onCloudRegistered(const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
+    cloud_count_++;
     CloudXYZIPtr cloud = cloudMsgToPcl(msg);
     if (!cloud || cloud->empty()) return;
     std::lock_guard<std::mutex> lk(state_mutex_);

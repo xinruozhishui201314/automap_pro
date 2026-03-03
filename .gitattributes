@@ -38,6 +38,7 @@ data/**/*.bin filter=lfs diff=lfs merge=lfs -text
 *.bvh filter=lfs diff=lfs merge=lfs -text
 
 # ========== Archive Files (特定用途) ==========
+*.tar filter=lfs diff=lfs merge=lfs -text
 *.tar.gz filter=lfs diff=lfs merge=lfs -text
 *.zip filter=lfs diff=lfs merge=lfs -text
 

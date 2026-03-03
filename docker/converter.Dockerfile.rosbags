@@ -1,0 +1,16 @@
+# 仅用 rosbags 做 ROS1→ROS2 转换，不依赖 ROS1/ROS2 环境
+# 注：已移除 syntax=docker/dockerfile:1，避免国内镜像站对 dockerfile:1 返回 403 导致构建在 FROM 前失败
+# 宿主机仅有 Noetic 镜像时可用此镜像完成转换
+# 国内网络可构建时传: --build-arg PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+FROM python:3.10.19-slim
+
+ARG PIP_INDEX_URL
+ENV PIP_INDEX_URL=${PIP_INDEX_URL}
+
+# 使用 BuildKit 缓存挂载：pip 下载的包缓存在宿主机，下次构建复用，不增大镜像
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --no-cache-dir rosbags
+
+WORKDIR /workspace
+
+CMD ["rosbags-convert", "--help"]

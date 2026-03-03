@@ -252,19 +252,6 @@ prepare_workspace() {
         print_info "符号链接已存在"
     fi
 
-    # 检查 livox_ros_driver2（兼容 ROS1/ROS2 共用仓库：需用 package_ROS2.xml -> package.xml）
-    LIVOX_SRC="${WORKSPACE_DIR}/src/livox_ros_driver2"
-    if [ ! -d "${LIVOX_SRC}" ]; then
-        print_warning "⚠ livox_ros_driver2 未找到，尝试克隆..."
-        git clone https://github.com/Livox-SDK/livox_ros_driver2.git "${LIVOX_SRC}"
-        print_success "✓ livox_ros_driver2 克隆完成"
-    fi
-    if [ -f "${LIVOX_SRC}/package_ROS2.xml" ] && [ ! -f "${LIVOX_SRC}/package.xml" ]; then
-        cp -f "${LIVOX_SRC}/package_ROS2.xml" "${LIVOX_SRC}/package.xml"
-        [ -d "${LIVOX_SRC}/launch_ROS2" ] && cp -rf "${LIVOX_SRC}/launch_ROS2" "${LIVOX_SRC}/launch"
-        print_info "已为 ROS2 生成 package.xml 与 launch/"
-    fi
-
     # 可选：fast-livo2-humble 或 fast-livo2-humble.disabled（融合模式时编译并启动）
     FAST_LIVO_DIR=""
     [ -d "${SCRIPT_DIR}/fast-livo2-humble" ] && FAST_LIVO_DIR="${SCRIPT_DIR}/fast-livo2-humble"
@@ -356,17 +343,6 @@ build_project() {
             [ -d /root/mapping/overlap_transformer_ros2 ] && ln -sf /root/mapping/overlap_transformer_ros2 src/ 2>/dev/null || true
             [ -d /root/mapping/HBA-main/HBA_ROS2 ]        && ln -sf /root/mapping/HBA-main/HBA_ROS2 src/hba 2>/dev/null || true
 
-            # 第一步：先编译 livox_ros_driver2（fast_livo 的依赖）
-            echo '========================================'
-            echo '编译 livox_ros_driver2'
-            echo '========================================'
-            LIVOX_SRC=/root/automap_ws/src/livox_ros_driver2
-            if [ -f \"\${LIVOX_SRC}/package_ROS2.xml\" ] && [ ! -f \"\${LIVOX_SRC}/package.xml\" ]; then
-              cp -f \"\${LIVOX_SRC}/package_ROS2.xml\" \"\${LIVOX_SRC}/package.xml\"
-              [ -d \"\${LIVOX_SRC}/launch_ROS2\" ] && cp -rf \"\${LIVOX_SRC}/launch_ROS2\" \"\${LIVOX_SRC}/launch\"
-            fi
-            colcon build --packages-select livox_ros_driver2 --cmake-args -DCMAKE_BUILD_TYPE=Release -DROS_EDITION=ROS2 -DHUMBLE_ROS=humble
-
             if [ -d src/overlap_transformer_msgs ]; then
               echo '========================================'
               echo '编译 overlap_transformer_msgs'
@@ -379,15 +355,6 @@ build_project() {
               echo '========================================'
               colcon build --packages-select overlap_transformer_ros2 --cmake-args -DCMAKE_BUILD_TYPE=Release
             fi
-            echo '========================================'
-            echo '编译 livox_ros_driver2'
-            echo '========================================'
-            LIVOX_SRC=/root/automap_ws/src/livox_ros_driver2
-            if [ -f \"\${LIVOX_SRC}/package_ROS2.xml\" ] && [ ! -f \"\${LIVOX_SRC}/package.xml\" ]; then
-              cp -f \"\${LIVOX_SRC}/package_ROS2.xml\" \"\${LIVOX_SRC}/package.xml\"
-              [ -d \"\${LIVOX_SRC}/launch_ROS2\" ] && cp -rf \"\${LIVOX_SRC}/launch_ROS2\" \"\${LIVOX_SRC}/launch\"
-            fi
-            colcon build --packages-select livox_ros_driver2 --cmake-args -DCMAKE_BUILD_TYPE=Release -DROS_EDITION=ROS2 -DHUMBLE_ROS=humble
             if [ -d src/hba ]; then
               echo '========================================'
               echo '编译 hba (HBA-main)'

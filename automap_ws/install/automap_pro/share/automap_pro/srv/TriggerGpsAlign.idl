@@ -1,0 +1,25 @@
+// generated from rosidl_adapter/resource/srv.idl.em
+// with input from automap_pro/srv/TriggerGpsAlign.srv
+// generated code does not contain a copyright notice
+
+
+module automap_pro {
+  module srv {
+    struct TriggerGpsAlign_Request {
+      boolean force;
+    };
+    typedef double double__9[9];
+    typedef double double__3[3];
+    struct TriggerGpsAlign_Response {
+      boolean success;
+
+      double alignment_rmse_m;
+
+      double__9 r_gps_lidar;
+
+      double__3 t_gps_lidar;
+
+      string message;
+    };
+  };
+};

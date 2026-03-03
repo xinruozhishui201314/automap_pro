@@ -1,0 +1,2 @@
+bool full_optimization
+int32 max_iterations

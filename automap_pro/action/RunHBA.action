@@ -1,0 +1,18 @@
+# Goal
+string data_path
+int32 total_layer_num
+int32 thread_num
+bool enable_gps
+---
+# Result
+bool success
+string output_path
+float64 elapsed_seconds
+float64 final_mme
+int32 total_keyframes
+---
+# Feedback
+int32 current_layer
+int32 total_layers
+float32 progress_percent
+float32 layer_elapsed_ms

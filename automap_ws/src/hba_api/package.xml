@@ -1,0 +1,13 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>hba_api</name>
+  <version>1.0.0</version>
+  <description>HBA (Hierarchical Bundle Adjustment) C++ API library – direct call without file I/O</description>
+  <maintainer email="automap@example.com">AutoMap Team</maintainer>
+  <license>Apache-2.0</license>
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <depend>hba</depend>
+  <depend>rclcpp</depend>
+  <depend>visualization_msgs</depend>
+  <export><build_type>ament_cmake</build_type></export>
+</package>

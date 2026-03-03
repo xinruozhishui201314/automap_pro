@@ -1,0 +1,21 @@
+// generated from rosidl_adapter/resource/srv.idl.em
+// with input from automap_pro/srv/TriggerHBA.srv
+// generated code does not contain a copyright notice
+
+
+module automap_pro {
+  module srv {
+    struct TriggerHBA_Request {
+      boolean wait_for_result;
+    };
+    struct TriggerHBA_Response {
+      boolean success;
+
+      string message;
+
+      double elapsed_seconds;
+
+      double final_mme;
+    };
+  };
+};

@@ -9,17 +9,22 @@ SensorManager::SensorManager()
     , gps_  (std::make_unique<GPSProcessor>())
 {}
 
-void SensorManager::init(rclcpp::Node::SharedPtr node) {
-    imu_->init(node, imu_buffer_);
+void SensorManager::init(rclcpp::Node::SharedPtr node, bool subscribe_lidar_imu) {
+    if (subscribe_lidar_imu) {
+        imu_->init(node, imu_buffer_);
+        lidar_->init(node, imu_buffer_);
+    }
 
     gps_->registerCallback([this](const GPSMeasurement& meas) {
         gps_buffer_.push(meas.timestamp, meas);
     });
     gps_->init(node);
 
-    lidar_->init(node, imu_buffer_);
-
-    RCLCPP_INFO(node->get_logger(), "[SensorManager] Initialized all sensor processors.");
+    if (subscribe_lidar_imu) {
+        RCLCPP_INFO(node->get_logger(), "[SensorManager] Initialized lidar/IMU/GPS (internal frontend).");
+    } else {
+        RCLCPP_INFO(node->get_logger(), "[SensorManager] Initialized GPS only (external fast_livo = single data entry for lidar/IMU/image).");
+    }
 }
 
 LidarProcessor&          SensorManager::lidar()     { return *lidar_; }

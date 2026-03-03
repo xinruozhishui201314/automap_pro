@@ -1,0 +1,6 @@
+string output_dir
+bool save_pcd
+bool save_ply
+bool save_las
+bool save_trajectory_tum
+bool save_trajectory_kitti

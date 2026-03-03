@@ -1,0 +1,6 @@
+
+bool success
+float64 alignment_rmse_m
+float64[9] r_gps_lidar
+float64[3] t_gps_lidar
+string message

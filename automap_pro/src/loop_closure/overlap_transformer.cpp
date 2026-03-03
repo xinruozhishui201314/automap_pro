@@ -108,7 +108,6 @@ Eigen::VectorXf OverlapTransformer::computeFallbackDescriptor(const CloudXYZIPtr
     }
 
     // Combine into descriptor (truncate/pad to descriptor_dim_)
-    int total = static_cast<int>(hist.size() + hist_vert.size());
     int copy_h1 = std::min(static_cast<int>(hist.size()),      descriptor_dim_ / 2);
     int copy_h2 = std::min(static_cast<int>(hist_vert.size()), descriptor_dim_ - copy_h1);
 

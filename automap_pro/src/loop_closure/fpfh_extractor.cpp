@@ -1,98 +1,82 @@
 #include "automap_pro/loop_closure/fpfh_extractor.h"
-#include "automap_pro/core/config_manager.h"
-
 #include <pcl/search/kdtree.h>
+#include <limits>
 
 namespace automap_pro {
 
-FPFHExtractor::FPFHExtractor() {
-    const auto& cfg = ConfigManager::instance();
-    normal_radius_  = cfg.fpfhNormalRadius();
-    feature_radius_ = cfg.fpfhFeatureRadius();
-    max_nn_normal_  = cfg.fpfhMaxNNNormal();
-    max_nn_feature_ = cfg.fpfhMaxNNFeature();
-}
+FPFHCloudPtr FpfhExtractor::compute(
+    const CloudXYZIPtr& cloud,
+    float normal_radius,
+    float fpfh_radius) const
+{
+    auto feat = std::make_shared<FPFHCloud>();
+    if (!cloud || cloud->empty()) return feat;
 
-NormalCloud::Ptr FPFHExtractor::computeNormals(const CloudXYZIPtr& cloud) const {
-    auto normals = std::make_shared<NormalCloud>();
-    pcl::NormalEstimation<PointXYZI, pcl::Normal> ne;
+    // 法向量估计（OpenMP 并行）
+    auto normals = std::make_shared<pcl::PointCloud<pcl::Normal>>();
+    pcl::NormalEstimationOMP<pcl::PointXYZI, pcl::Normal> ne;
     ne.setInputCloud(cloud);
-    auto tree = std::make_shared<pcl::search::KdTree<PointXYZI>>();
-    ne.setSearchMethod(tree);
-    ne.setRadiusSearch(normal_radius_);
-    ne.setKSearch(max_nn_normal_);
+    auto tree_n = std::make_shared<pcl::search::KdTree<pcl::PointXYZI>>();
+    ne.setSearchMethod(tree_n);
+    ne.setRadiusSearch(normal_radius);
+    ne.setNumberOfThreads(4);
     ne.compute(*normals);
-    return normals;
-}
 
-FPFHCloudPtr FPFHExtractor::compute(const CloudXYZIPtr& cloud) const {
-    auto normals = computeNormals(cloud);
-
-    pcl::FPFHEstimation<PointXYZI, pcl::Normal, pcl::FPFHSignature33> fpfh;
+    // FPFH 计算（OpenMP 并行）
+    pcl::FPFHEstimationOMP<pcl::PointXYZI, pcl::Normal, pcl::FPFHSignature33> fpfh;
     fpfh.setInputCloud(cloud);
     fpfh.setInputNormals(normals);
-    auto tree = std::make_shared<pcl::search::KdTree<PointXYZI>>();
-    fpfh.setSearchMethod(tree);
-    fpfh.setRadiusSearch(feature_radius_);
-    fpfh.setKSearch(max_nn_feature_);
-
-    auto features = std::make_shared<FPFHCloud>();
-    fpfh.compute(*features);
-    return features;
+    auto tree_f = std::make_shared<pcl::search::KdTree<pcl::PointXYZI>>();
+    fpfh.setSearchMethod(tree_f);
+    fpfh.setRadiusSearch(fpfh_radius);
+    fpfh.setNumberOfThreads(4);
+    fpfh.compute(*feat);
+    return feat;
 }
 
-std::vector<std::pair<int,int>> FPFHExtractor::findCorrespondences(
-        const FPFHCloudPtr& src_feat,
-        const FPFHCloudPtr& tgt_feat,
-        bool mutual_check) const {
-    if (!src_feat || !tgt_feat) return {};
-
-    int ns = static_cast<int>(src_feat->size());
-    int nt = static_cast<int>(tgt_feat->size());
-
-    auto l2 = [](const pcl::FPFHSignature33& a,
-                  const pcl::FPFHSignature33& b) {
-        float d = 0.0f;
-        for (int i = 0; i < 33; ++i) d += (a.histogram[i] - b.histogram[i]) *
-                                           (a.histogram[i] - b.histogram[i]);
-        return d;
-    };
-
-    // Forward: for each src, find best match in tgt
-    std::vector<int> fwd(ns, -1);
-    for (int i = 0; i < ns; ++i) {
-        float best = std::numeric_limits<float>::max();
-        for (int j = 0; j < nt; ++j) {
-            float d = l2(src_feat->points[i], tgt_feat->points[j]);
-            if (d < best) { best = d; fwd[i] = j; }
-        }
-    }
-
-    if (!mutual_check) {
-        std::vector<std::pair<int,int>> out;
-        for (int i = 0; i < ns; ++i) {
-            if (fwd[i] >= 0) out.push_back({i, fwd[i]});
-        }
-        return out;
-    }
-
-    // Backward: for each tgt, find best match in src
-    std::vector<int> bwd(nt, -1);
-    for (int j = 0; j < nt; ++j) {
-        float best = std::numeric_limits<float>::max();
-        for (int i = 0; i < ns; ++i) {
-            float d = l2(tgt_feat->points[j], src_feat->points[i]);
-            if (d < best) { best = d; bwd[j] = i; }
-        }
-    }
-
-    // Mutual matches
-    std::vector<std::pair<int,int>> out;
-    for (int i = 0; i < ns; ++i) {
-        int j = fwd[i];
-        if (j >= 0 && bwd[j] == i) out.push_back({i, j});
-    }
-    return out;
+static float fpfhDist(const pcl::FPFHSignature33& a, const pcl::FPFHSignature33& b) {
+    float d = 0;
+    for (int i = 0; i < 33; ++i) { float diff = a.histogram[i] - b.histogram[i]; d += diff*diff; }
+    return d;
 }
 
-}  // namespace automap_pro
+std::vector<std::pair<int,int>> FpfhExtractor::findCorrespondences(
+    const FPFHCloudPtr& src, const FPFHCloudPtr& tgt, bool mutual) const
+{
+    std::vector<std::pair<int,int>> corrs;
+    if (!src || !tgt || src->empty() || tgt->empty()) return corrs;
+
+    // src → tgt 最近邻
+    std::vector<int> src2tgt(src->size(), -1);
+    for (size_t i = 0; i < src->size(); ++i) {
+        float best = std::numeric_limits<float>::max();
+        for (size_t j = 0; j < tgt->size(); ++j) {
+            float d = fpfhDist(src->points[i], tgt->points[j]);
+            if (d < best) { best = d; src2tgt[i] = (int)j; }
+        }
+    }
+
+    if (!mutual) {
+        for (size_t i = 0; i < src->size(); ++i)
+            if (src2tgt[i] >= 0) corrs.push_back({(int)i, src2tgt[i]});
+        return corrs;
+    }
+
+    // tgt → src 互验证
+    std::vector<int> tgt2src(tgt->size(), -1);
+    for (size_t j = 0; j < tgt->size(); ++j) {
+        float best = std::numeric_limits<float>::max();
+        for (size_t i = 0; i < src->size(); ++i) {
+            float d = fpfhDist(tgt->points[j], src->points[i]);
+            if (d < best) { best = d; tgt2src[j] = (int)i; }
+        }
+    }
+
+    for (size_t i = 0; i < src->size(); ++i) {
+        int j = src2tgt[i];
+        if (j >= 0 && tgt2src[j] == (int)i) corrs.push_back({(int)i, j});
+    }
+    return corrs;
+}
+
+} // namespace automap_pro
