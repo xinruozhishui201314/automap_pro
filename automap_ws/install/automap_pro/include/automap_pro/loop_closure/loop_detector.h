@@ -71,6 +71,8 @@ public:
     // ── 状态查询 ──────────────────────────────────────────────────────────
     size_t dbSize()    const;
     size_t queueSize() const;
+    /** 累计检测到的回环数量（用于低频数据流日志） */
+    int loopDetectedCount() const { return loop_detected_count_.load(); }
 
     // ── 回调注册 ──────────────────────────────────────────────────────────
     void registerLoopCallback(LoopConstraintCallback cb) {
@@ -115,6 +117,9 @@ private:
     rclcpp::Client<overlap_transformer_msgs::srv::ComputeDescriptor>::SharedPtr desc_client_;
     bool use_external_desc_service_ = false;
 #endif
+
+    // ── 数据流统计（低频日志）─────────────────────────────────────────────
+    std::atomic<int> loop_detected_count_{0};
 
     // ── 线程控制 ─────────────────────────────────────────────────────────
     std::atomic<bool> running_{false};
