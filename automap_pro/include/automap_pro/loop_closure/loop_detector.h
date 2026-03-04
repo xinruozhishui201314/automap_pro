@@ -89,7 +89,7 @@ private:
 
     // 描述子计算队列（Stage 0）
     std::priority_queue<PrioritizedSubmap> desc_queue_;
-    std::mutex                             desc_mutex_;
+    mutable std::mutex                   desc_mutex_;  // mutable for const queueSize()
     std::condition_variable                desc_cv_;
 
     // 几何验证队列（Stage 2，子图已有描述子后提交）

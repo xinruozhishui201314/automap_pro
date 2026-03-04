@@ -25,17 +25,17 @@ void GPSManager::addGPSMeasurement(
     double latitude, double longitude, double altitude,
     double hdop, int num_sats)
 {
-    std::lock_guard<std::mutex> lk(mutex_);
-
-    // 设置ENU原点
-    if (!enu_origin_set_) {
+    // ENU 原点仅设置一次，避免多线程竞态
+    std::call_once(enu_origin_once_, [this, latitude, longitude, altitude]() {
         enu_origin_lat_ = latitude;
         enu_origin_lon_ = longitude;
         enu_origin_alt_ = altitude;
-        enu_origin_set_ = true;
+        enu_origin_set_.store(true);
         ALOG_INFO(MOD, "ENU origin set: lat={:.6f} lon={:.6f} alt={:.2f}",
                   latitude, longitude, altitude);
-    }
+    });
+
+    std::lock_guard<std::mutex> lk(mutex_);
 
     Eigen::Vector3d pos_enu = wgs84_to_enu(latitude, longitude, altitude);
     GPSQuality quality = hdop_to_quality(hdop);
@@ -141,36 +141,82 @@ void GPSManager::try_align() {
     }
 }
 
+// 最大允许的“最近邻”时间差（秒），用于无前后双关键帧时的回退
+static constexpr double kMaxNearestDtSec = 0.1;
+// 最大允许的插值区间（秒），超过则退化为最近邻
+static constexpr double kMaxInterpIntervalSec = 0.5;
+
 /**
  * SVD 轨迹匹配算法（参考 HBA gps_factor.hpp 的 path_match 实现）
  *
  * 方法：对 GPS ENU 轨迹和 LiDAR 轨迹进行点集配准
- *   1. 在 GPS 和 LiDAR 时间窗中找最近邻对应对
+ *   1. 对每个高质量 GPS 时间戳，找「前、后」关键帧，在二者间线性插值得到 LiDAR 位置；
+ *      若无双侧关键帧或插值区间过大，则退化为 100ms 内最近邻。
  *   2. 中心化 → 协方差矩阵 → SVD → R, t
  */
 GPSAlignResult GPSManager::compute_svd_alignment() {
     GPSAlignResult result;
 
-    // 找时间对齐的 (GPS_pos, LiDAR_pos) 对
+    // 找时间对齐的 (GPS_pos, LiDAR_pos) 对：前后关键帧 + 线性插值
     struct MatchPair { Eigen::Vector3d gps_enu; Eigen::Vector3d lidar_pos; };
     std::vector<MatchPair> pairs;
 
+    if (kf_window_.empty()) return result;
+
     for (const auto& gr : gps_window_) {
         if (gr.quality < GPSQuality::HIGH) continue;
-        // 找最近 KF
-        double best_dt = 0.1;  // 100ms 时间窗
-        Eigen::Vector3d best_pos = Eigen::Vector3d::Zero();
+
+        // 找前关键帧：kt <= gr.timestamp 中最大的
+        const std::pair<double, Pose3d>* kf_prev = nullptr;
+        const std::pair<double, Pose3d>* kf_next = nullptr;
+        for (const auto& kv : kf_window_) {
+            if (kv.first <= gr.timestamp) kf_prev = &kv;
+            if (kv.first >= gr.timestamp) { kf_next = &kv; break; }
+        }
+
+        Eigen::Vector3d lidar_pos;
         bool found = false;
-        for (const auto& [kt, kpose] : kf_window_) {
-            double dt = std::abs(kt - gr.timestamp);
-            if (dt < best_dt) {
-                best_dt = dt;
-                best_pos = kpose.translation();
+
+        if (kf_prev && kf_next) {
+            double t_prev = kf_prev->first;
+            double t_next = kf_next->first;
+            double interval = t_next - t_prev;
+            if (interval <= 1e-9) {
+                lidar_pos = kf_prev->second.translation();
+                found = true;
+            } else if (interval <= kMaxInterpIntervalSec) {
+                // 线性插值：alpha in [0,1], pos = (1-alpha)*prev + alpha*next
+                double alpha = (gr.timestamp - t_prev) / interval;
+                alpha = std::max(0.0, std::min(1.0, alpha));
+                lidar_pos = (1.0 - alpha) * kf_prev->second.translation()
+                            + alpha * kf_next->second.translation();
+                found = true;
+            } else {
+                // 区间过大，退化为 100ms 内最近邻
+                double dt_prev = gr.timestamp - t_prev;
+                double dt_next = t_next - gr.timestamp;
+                if (dt_prev <= dt_next && dt_prev <= kMaxNearestDtSec) {
+                    lidar_pos = kf_prev->second.translation();
+                    found = true;
+                } else if (dt_next <= kMaxNearestDtSec) {
+                    lidar_pos = kf_next->second.translation();
+                    found = true;
+                }
+            }
+        } else if (kf_prev) {
+            if (gr.timestamp - kf_prev->first <= kMaxNearestDtSec) {
+                lidar_pos = kf_prev->second.translation();
+                found = true;
+            }
+        } else if (kf_next) {
+            if (kf_next->first - gr.timestamp <= kMaxNearestDtSec) {
+                lidar_pos = kf_next->second.translation();
                 found = true;
             }
         }
+
         if (found) {
-            pairs.push_back({gr.pos_enu, best_pos});
+            pairs.push_back({gr.pos_enu, lidar_pos});
         }
     }
 
@@ -194,6 +240,18 @@ GPSAlignResult GPSManager::compute_svd_alignment() {
         gd.z() = 0.0;  // 忽略高度
         ld.z() = 0.0;
         cov += ld * gd.transpose();  // LiDAR←GPS
+    }
+
+    // ✅ 修复：添加退化场景检查
+    Eigen::Vector3d singular_vals = svd.singularValues();
+    
+    const double min_sv = singular_vals.minCoeff();
+    const double max_sv = singular_vals.maxCoeff();
+    const double cond = (max_sv > 1e-12) ? (max_sv / min_sv) : 1e12;
+    
+    if (min_sv < 1e-6 || cond > 1e8) {
+        ALOG_WARN(MOD, "GPS alignment: degenerate covariance (cond={:.2e}), rejecting", cond);
+        return result;  // 返回失败
     }
 
     // SVD 求旋转（仅XY平面旋转，绕Z轴）

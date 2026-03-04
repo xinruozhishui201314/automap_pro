@@ -19,6 +19,11 @@ public:
         bool   use_robust_kernel     = true;
         double robust_kernel_delta   = 1.0;
         bool   verbose               = false;
+
+        // 求解失败检测参数
+        double max_cost_threshold    = 1e10;   // 最大代价阈值（超过视为发散）
+        double min_update_norm       = 1e-10;  // 最小更新范数（太小视为退化）
+        bool   check_numerical_issues = true;   // 检查数值问题
     };
 
     struct Result {
@@ -26,6 +31,18 @@ public:
         double final_cost = 0.0;
         int    iterations = 0;
         double time_ms    = 0.0;
+
+        // 失败诊断信息
+        enum class FailReason {
+            NONE = 0,
+            LINEAR_SYSTEM_SINGULAR,    // 线性系统奇异
+            NUMERICAL_ISSUES,          // 数值问题（NaN/Inf）
+            MAX_ITERATIONS_REACHED,    // 达到最大迭代次数
+            COST_DIVERGED,             // 代价发散
+            DEGENERATE_UPDATE          // 退化更新
+        };
+        FailReason fail_reason = FailReason::NONE;
+        std::string fail_message;      // 详细失败信息
     };
 
     Optimizer() = default;

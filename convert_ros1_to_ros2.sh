@@ -29,7 +29,7 @@ show_help() {
 
 选项:
   -b, --bag FILE   ROS1 bag 文件路径（必填，如 data/automap_input/.../nya_02.bag）
-  --rosbags       使用 rosbags 镜像转换（不依赖 ROS1/ROS2，适合无 Humble 环境）
+  --rosbags       强制使用 rosbags 镜像；未指定时若本地已有 ros1-to-ros2-rosbags 则优先使用且不重新构建
   -h, --help      显示此帮助
 
 转换输出: 与 bag 同目录下的 <文件名>_ros2/ 目录（ROS2 为目录格式）
@@ -136,16 +136,23 @@ if command -v rosbags-convert &>/dev/null; then
 elif command -v docker &>/dev/null; then
     CONTAINER_SRC="/workspace/$(basename "$BAG_ABS")"
     CONTAINER_DST="/workspace/${BAG_NAME}_ros2"
-    if [ "$USE_ROSBAGS_IMAGE" = true ]; then
-        if ! docker images | grep -q "$ROSBAGS_IMAGE"; then
-            log_step "构建 rosbags 转换镜像..."
+    # 判断本地是否已有 rosbags 镜像（基于 python:3.10.19-slim）；有则直接使用，不重新构建
+    has_rosbags_image() {
+        docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep -q "^${ROSBAGS_IMAGE}:"
+    }
+    # 默认优先使用已有 ros1-to-ros2-rosbags，避免拉取/构建 Humble
+    if [ "$USE_ROSBAGS_IMAGE" = true ] || has_rosbags_image; then
+        if ! has_rosbags_image; then
+            log_step "构建 rosbags 转换镜像（基于 python:3.10.19-slim）..."
             DOCKER_BUILDKIT=1 docker build -t "$ROSBAGS_IMAGE" \
                 -f "$SCRIPT_DIR/docker/converter.Dockerfile.rosbags" "$SCRIPT_DIR" || {
                 log_error "镜像构建失败"
                 exit 1
             }
+        else
+            log_info "使用已有镜像 $ROSBAGS_IMAGE（不重新构建）"
         fi
-        docker run --rm \
+        docker run --rm --user "$(id -u):$(id -g)" \
             -v "$BAG_DIR_ABS:/workspace" \
             "$ROSBAGS_IMAGE" \
             rosbags-convert --src "$CONTAINER_SRC" --dst "$CONTAINER_DST" || {
@@ -162,7 +169,7 @@ elif command -v docker &>/dev/null; then
                 exit 1
             }
         fi
-        docker run --rm \
+        docker run --rm --user "$(id -u):$(id -g)" \
             -v "$BAG_DIR_ABS:/workspace" \
             "$CONVERTER_IMAGE" \
             bash -c "

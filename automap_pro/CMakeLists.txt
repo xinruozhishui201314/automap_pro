@@ -188,12 +188,19 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/LoopConstraintMsg.msg"
   "msg/SubMapEventMsg.msg"
   "msg/MappingStatusMsg.msg"
+  "msg/SessionInfo.msg"
+  "msg/SessionList.msg"
+  "msg/CrossSessionConstraint.msg"
   "srv/SaveMap.srv"
   "srv/TriggerOptimize.srv"
   "srv/TriggerHBA.srv"
   "srv/LoadSession.srv"
   "srv/GetStatus.srv"
   "srv/TriggerGpsAlign.srv"
+  "srv/CreateSession.srv"
+  "srv/DeleteSession.srv"
+  "srv/GetSessionInfo.srv"
+  "srv/MergeSessions.srv"
   "action/RunHBA.action"
   DEPENDENCIES std_msgs sensor_msgs geometry_msgs
 )
@@ -307,6 +314,7 @@ add_library(automap_backend SHARED
   src/backend/incremental_optimizer.cpp
   src/backend/hba_optimizer.cpp
   src/backend/pose_graph.cpp
+  src/backend/optimizer.cpp
 )
 target_include_directories(automap_backend PUBLIC ${AUTOMAP_INCLUDE_DIRS})
 target_link_libraries(automap_backend automap_core automap_submap ${AUTOMAP_LIBS})

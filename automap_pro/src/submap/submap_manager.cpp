@@ -1,6 +1,9 @@
 #include "automap_pro/submap/submap_manager.h"
 #include "automap_pro/core/config_manager.h"
 #include "automap_pro/core/logger.h"
+#include "automap_pro/core/structured_logger.h"
+#include "automap_pro/core/metrics.h"
+#include "automap_pro/core/health_monitor.h"
 #define MOD "SubMapMgr"
 
 #include <automap_pro/msg/sub_map_event_msg.hpp>
@@ -39,74 +42,115 @@ void SubMapManager::startNewSession(uint64_t session_id) {
 }
 
 void SubMapManager::addKeyFrame(const KeyFrame::Ptr& kf) {
+    // 结构化日志：开始Span
+    SLOG_START_SPAN(MOD, "add_keyframe");
+    
     std::lock_guard<std::mutex> lk(mutex_);
 
-    // 分配全局唯一 KF ID
-    kf->id         = kf_id_counter_++;
-    kf->session_id = current_session_id_;
+    // 指标：点云处理计时
+    METRIC_TIMED_SCOPE(metrics::POINTCLOUD_PROCESS_TIME_MS, 100.0);
 
-    // 如果没有活跃子图，创建一个
-    if (!active_submap_) {
-        active_submap_ = createNewSubmap(kf);
-        submaps_.push_back(active_submap_);
-        RCLCPP_INFO(node_->get_logger(),
-            "[SubMapMgr][DATA] new submap sm_id=%d first_kf_id=%d ts=%.3f",
-            active_submap_->id, kf->id, kf->timestamp);
-    }
+    try {
+        // 分配全局唯一 KF ID
+        kf->id         = kf_id_counter_++;
+        kf->session_id = current_session_id_;
 
-    // 添加关键帧到子图
-    kf->submap_id = active_submap_->id;
-    active_submap_->keyframes.push_back(kf);
-    active_submap_->t_end = kf->timestamp;
-
-    // 更新锚定位姿（第一帧）
-    if (active_submap_->keyframes.size() == 1) {
-        active_submap_->pose_w_anchor           = kf->T_w_b;
-        active_submap_->pose_w_anchor_optimized = kf->T_w_b;
-        kf->is_anchor = true;
-    }
-
-    // 更新 GPS 中心（所有有效 GPS 的平均值）
-    if (kf->has_valid_gps) {
-        size_t gps_count = 0;
-        Eigen::Vector3d gps_sum = Eigen::Vector3d::Zero();
-        for (const auto& f : active_submap_->keyframes) {
-            if (f->has_valid_gps) { gps_sum += f->gps.position_enu; gps_count++; }
+        // 如果没有活跃子图，创建一个
+        if (!active_submap_) {
+            active_submap_ = createNewSubmap(kf);
+            submaps_.push_back(active_submap_);
+            
+            SLOG_INFO(MOD, "Created new submap: id={}, session_id={}", 
+                      active_submap_->id, current_session_id_);
+            
+            // 记录指标
+            METRICS_INCREMENT(metrics::SUBMAPS_CREATED);
         }
-        if (gps_count > 0) {
-            active_submap_->gps_center = gps_sum / gps_count;
-            active_submap_->has_valid_gps = true;
+
+        // 添加关键帧到子图
+        kf->submap_id = active_submap_->id;
+        active_submap_->keyframes.push_back(kf);
+        active_submap_->t_end = kf->timestamp;
+
+        // 更新锚定位姿（第一帧）
+        if (active_submap_->keyframes.size() == 1) {
+            active_submap_->pose_w_anchor           = kf->T_w_b;
+            active_submap_->pose_w_anchor_optimized = kf->T_w_b;
+            kf->is_anchor = true;
         }
+
+        // 更新 GPS 中心（所有有效 GPS 的平均值）
+        if (kf->has_valid_gps) {
+            updateGPSGravityCenter(kf);
+        }
+
+        // 合并点云（带内存检查）
+        mergeCloudToSubmap(active_submap_, kf);
+
+        // 更新空间范围（最近帧到锚定帧的最大距离）
+        double dist = (kf->T_w_b.translation() -
+                       active_submap_->pose_w_anchor.translation()).norm();
+        active_submap_->spatial_extent_m = std::max(active_submap_->spatial_extent_m, dist);
+
+        // 结构化日志：调试信息
+        SLOG_DEBUG(MOD, "KF processed: id={}, sm_id={}, kf_count={}, dist={:.2f}m",
+                     kf->id, active_submap_->id, active_submap_->keyframes.size(),
+                     active_submap_->spatial_extent_m);
+
+        // 更新健康检查：队列大小
+        HEALTH_UPDATE_QUEUE("submap", frozen_queue_.size());
+
+        if (isFull(active_submap_)) {
+            const int sm_id = active_submap_->id;
+            const size_t kf_count = active_submap_->keyframes.size();
+            const double dist = active_submap_->spatial_extent_m;
+            const double t_start = active_submap_->t_start;
+            const double t_end = active_submap_->t_end;
+            
+            SLOG_INFO(MOD, "SubMap FULL: id={}, kf={}, dist={:.1f}m → freezing",
+                       sm_id, kf_count, dist);
+            
+            // 冻结子图（带错误处理）
+            try {
+                freezeActiveSubmap();
+            } catch (const std::exception& e) {
+                auto error = ErrorDetail::fromException(e, errors::SUBMAP_STATE_INVALID);
+                SLOG_ERROR_CODE(MOD, static_cast<uint32_t>(error.code()),
+                              fmt::format("Failed to freeze submap #{}: {}", sm_id, e.what()));
+                METRICS_INCREMENT(metrics::ERRORS_TOTAL);
+            }
+            
+            active_submap_ = nullptr;
+        }
+
+    } catch (const std::exception& e) {
+        // 使用错误码系统
+        auto error = ErrorDetail::fromException(e, errors::SUBMAP_MERGE_FAILED);
+        error.context().operation = "addKeyFrame";
+        error.context().file = __FILE__;
+        error.context().line = __LINE__;
+        error.context().function = __func__;
+        error.addSuggestion({
+            "Check point cloud data validity",
+            "Data should contain valid XYZ values",
+            2, false
+        });
+        error.setRetryable(true, 3, 200);
+        
+        SLOG_ERROR_CODE(MOD, static_cast<uint32_t>(error.code()), error.message());
+        
+        // 记录错误指标
+        METRICS_INCREMENT(metrics::ERRORS_TOTAL);
+        
+        // 发布错误事件
+        publishErrorEvent(active_submap_ ? active_submap_->id : 0, error);
     }
-
-    // 合并点云
-    mergeCloudToSubmap(active_submap_, kf);
-
-    // 更新空间范围（最近帧到锚定帧的最大距离）
-    double dist = (kf->T_w_b.translation() -
-                   active_submap_->pose_w_anchor.translation()).norm();
-    active_submap_->spatial_extent_m = std::max(active_submap_->spatial_extent_m, dist);
-
-    RCLCPP_DEBUG(node_->get_logger(),
-        "[SubMapMgr][DATA] kf_id=%d sm_id=%d kf_count=%zu dist=%.2fm",
-        kf->id, active_submap_->id, active_submap_->keyframes.size(), active_submap_->spatial_extent_m);
-    ALOG_DEBUG(MOD, "KF#{} added to SM#{}: kf_count={} dist={:.1fm}",
-               kf->id, active_submap_->id,
-               active_submap_->keyframes.size(), active_submap_->spatial_extent_m);
-
-    if (isFull(active_submap_)) {
-        const int sm_id = active_submap_->id;
-        const size_t kf_count = active_submap_->keyframes.size();
-        const double dist = active_submap_->spatial_extent_m;
-        const double t_start = active_submap_->t_start;
-        const double t_end = active_submap_->t_end;
-        ALOG_INFO(MOD, "SM#{} FULL (kf={} dist={:.1f}m) → freezing", sm_id, kf_count, dist);
-        freezeActiveSubmap();
-        active_submap_ = nullptr;
-        RCLCPP_INFO(node_->get_logger(),
-            "[SubMapMgr][DATA] freeze sm_id=%d kf_count=%zu dist=%.2fm t=[%.3f,%.3f]",
-            sm_id, kf_count, dist, t_start, t_end);
-    }
+    
+    // 结构化日志：结束Span
+    SLOG_END_SPAN();
+    
+    // 更新关键帧指标
+    METRICS_INCREMENT(metrics::KEYFRAMES_CREATED);
 }
 
 bool SubMapManager::isFull(const SubMap::Ptr& sm) const {
@@ -120,24 +164,91 @@ bool SubMapManager::isFull(const SubMap::Ptr& sm) const {
 }
 
 void SubMapManager::freezeActiveSubmap() {
-    if (!active_submap_ || active_submap_->state != SubMapState::ACTIVE) return;
-    AUTOMAP_TIMED_SCOPE(MOD, fmt::format("FreezeSubmap#{}", active_submap_->id), 500.0);
-
-    // 降采样点云（用于回环匹配）
-    if (active_submap_->merged_cloud && !active_submap_->merged_cloud->empty()) {
-        CloudXYZIPtr ds(new CloudXYZI);
-        pcl::VoxelGrid<pcl::PointXYZI> vg;
-        vg.setInputCloud(active_submap_->merged_cloud);
-        vg.setLeafSize(match_res_, match_res_, match_res_);
-        vg.filter(*ds);
-        active_submap_->downsampled_cloud = ds;
+    if (!active_submap_ || active_submap_->state != SubMapState::ACTIVE) {
+        SLOG_WARN(MOD, "No active submap to freeze (state={})",
+                   active_submap_ ? static_cast<int>(active_submap_->state) : -1);
+        return;
     }
 
-    active_submap_->state = SubMapState::FROZEN;
-    publishEvent(active_submap_, "FROZEN");
+    // 结构化日志：开始Span
+    SLOG_START_SPAN(MOD, "freeze_submap");
+    
+    // 计时：冻结操作（警告阈值500ms）
+    SLOG_TIMED_SCOPE(MOD, fmt::format("freeze_submap#{}", active_submap_->id), 500.0);
 
-    // 触发回调（→ LoopDetector, HBAOptimizer, IncrementalOptimizer）
-    for (auto& cb : frozen_cbs_) cb(active_submap_);
+    try {
+        // 降采样点云（用于回环匹配）
+        if (active_submap_->merged_cloud && !active_submap_->merged_cloud->empty()) {
+            SLOG_TIMED_SCOPE(MOD, "downsample_submap", 200.0);
+            
+            CloudXYZIPtr ds(new CloudXYZI);
+            pcl::VoxelGrid<pcl::PointXYZI> vg;
+            vg.setInputCloud(active_submap_->merged_cloud);
+            vg.setLeafSize(match_res_, match_res_, match_res_);
+            vg.filter(*ds);
+            
+            active_submap_->downsampled_cloud = ds;
+            
+            SLOG_DEBUG(MOD, "SM#{} downsampled: {} -> {} pts",
+                         active_submap_->id, active_submap_->merged_cloud->size(), ds->size());
+            
+            // 记录指标
+            METRICS_HISTOGRAM_OBSERVE(metrics::POINTCLOUD_SIZE, 
+                                          static_cast<double>(active_submap_->merged_cloud->size()));
+        }
+
+        // 更新状态
+        active_submap_->state = SubMapState::FROZEN;
+        publishEvent(active_submap_, "FROZEN");
+        
+        SLOG_EVENT(MOD, "submap_frozen", 
+                   "SubMap #{} frozen (kf_count={}, dist={:.1f}m, memory={}MB)",
+                   active_submap_->id, active_submap_->keyframes.size(),
+                   active_submap_->spatial_extent_m,
+                   active_submap_->merged_cloud ? active_submap_->merged_cloud->size() * sizeof(pcl::PointXYZI) / (1024.0 * 1024.0) : 0.0);
+        
+        // 记录指标
+        METRICS_INCREMENT(metrics::SUBMAPS_FROZEN);
+        
+        // 触发回调（→ LoopDetector, HBAOptimizer, IncrementalOptimizer）
+        for (auto& cb : frozen_cbs_) {
+            SLOG_DEBUG(MOD, "Calling frozen callback for SM#{}", active_submap_->id);
+            cb(active_submap_);
+        }
+        
+        // 更新健康检查：队列大小
+        HEALTH_UPDATE_QUEUE("submap", frozen_queue_.size());
+        HEALTH_UPDATE_QUEUE("loop", 0);  // 假设 LoopDetector 也处理冻结子图
+        
+        // 将子图移动到冻结队列
+        if (active_submap_) {
+            frozen_queue_.push_back(active_submap_);
+        }
+        active_submap_ = nullptr;
+        
+        ALOG_INFO(MOD, "[STATE] SubMap #{} frozen", active_submap_->id);
+        
+    } catch (const std::exception& e) {
+        // 使用错误码系统
+        auto error = ErrorDetail(errors::SUBMAP_STATE_INVALID, 
+                                 fmt::format("Failed to freeze submap #{}: {}", 
+                                          active_submap_ ? active_submap_->id : 0, e.what()));
+        error.context().operation = "freezeActiveSubmap";
+        error.context().file = __FILE__;
+        error.context().line = __LINE__;
+        error.context().function = __func__;
+        
+        SLOG_ERROR_CODE(MOD, static_cast<uint32_t>(error.code()), error.message());
+        
+        // 记录错误指标
+        METRICS_INCREMENT(metrics::ERRORS_TOTAL);
+        
+        // 发布错误事件
+        publishErrorEvent(active_submap_ ? active_submap_->id : 0, error);
+    }
+    
+    // 结构化日志：结束Span
+    SLOG_END_SPAN();
 }
 
 SubMap::Ptr SubMapManager::createNewSubmap(const KeyFrame::Ptr& first_kf) {
@@ -156,256 +267,290 @@ SubMap::Ptr SubMapManager::createNewSubmap(const KeyFrame::Ptr& first_kf) {
 void SubMapManager::mergeCloudToSubmap(SubMap::Ptr& sm, const KeyFrame::Ptr& kf) const {
     if (!kf->cloud_body || kf->cloud_body->empty()) return;
 
-    // 将 body 系点云变换到世界系
-    CloudXYZI world_cloud;
-    Eigen::Affine3f T_wf;
-    T_wf.matrix() = kf->T_w_b.cast<float>().matrix();
-    pcl::transformPointCloud(*kf->cloud_body, world_cloud, T_wf);
-
-    *sm->merged_cloud += world_cloud;
-
-    // 如果点云过大，降采样（避免 OOM）
-    if (sm->merged_cloud->size() > 500000) {
+    // 修改：合并前先检查是否需要降采样（避免累积）
+    if (sm->merged_cloud && sm->merged_cloud->size() > DOWNSAMPLE_THRESHOLD) {
         CloudXYZIPtr temp(new CloudXYZI);
         pcl::VoxelGrid<pcl::PointXYZI> vg;
         vg.setInputCloud(sm->merged_cloud);
         vg.setLeafSize(merge_res_, merge_res_, merge_res_);
         vg.filter(*temp);
-        sm->merged_cloud = temp;
+
+        sm->merged_cloud.swap(temp);
+        temp.reset();
+
+        ALOG_DEBUG(MOD, "SM#{} pre-merge downsample: {} -> {} pts",
+                   sm->id, sm->merged_cloud->size() + temp->size(), sm->merged_cloud->size());
+    }
+
+    // 将 body 系点云变换到世界系
+    // ✅ 修复：使用对象池获取点云（避免频繁内存分配）
+    CloudXYZIPtr world_cloud = getCloudFromPool();
+    Eigen::Affine3f T_wf;
+    T_wf.matrix() = kf->T_w_b.cast<float>().matrix();
+    pcl::transformPointCloud(*kf->cloud_body, *world_cloud, T_wf);
+
+    // 合并点云
+    if (!sm->merged_cloud || sm->merged_cloud->empty()) {
+        *sm->merged_cloud = std::make_shared<CloudXYZI>(world_cloud);
+    } else {
+        // 增量合并（避免一次性内存分配）
+        size_t old_size = sm->merged_cloud->size();
+        sm->merged_cloud->reserve(old_size + world_cloud.size());
+        for (const auto& pt : world_cloud.points) {
+            sm->merged_cloud->push_back(pt);
+        }
+    }
+
+    // 降低阈值：从 50 万降到 20 万
+    constexpr size_t DOWNSAMPLE_THRESHOLD = 200000;
+    if (sm->merged_cloud && sm->merged_cloud->size() > DOWNSAMPLE_THRESHOLD) {
+        // ✅ 修复：使用缓存的 VoxelGrid 对象
+        auto vg = getVoxelGrid(merge_res_);
+        vg->setInputCloud(sm->merged_cloud);
+        vg->filter(*temp);
+
+        // 使用 swap 立即释放原内存
+        sm->merged_cloud.swap(temp);
+        temp.reset();  // 显式释放
     }
 }
 
 void SubMapManager::updateSubmapPose(int submap_id, const Pose3d& new_pose) {
+    // 结构化日志：开始Span
+    SLOG_START_SPAN(MOD, "update_submap_pose");
+    
     std::lock_guard<std::mutex> lk(mutex_);
+    
+    bool updated = false;
+    double max_translation_diff = 0.0;
+    double max_rotation_diff = 0.0;
+
     for (auto& sm : submaps_) {
         if (sm->id != submap_id) continue;
+
+        // 验证状态转换合法性
+        if (sm->state != SubMapState::FROZEN &&
+            sm->state != SubMapState::OPTIMIZED) {
+            auto error = ErrorDetail(
+                errors::SUBMAP_STATE_INVALID,
+                "Invalid state transition: can only update pose in FROZEN or OPTIMIZED state"
+            );
+            error.context().operation = "updateSubmapPose";
+            error.context().metadata["from_state"] = std::to_string(static_cast<int>(sm->state));
+            error.context().metadata["to_state"] = "OPTIMIZED";
+            
+            SLOG_WARN(MOD, "Invalid pose update for SM#{}: state={}",
+                        sm->id, static_cast<int>(sm->state));
+            
+            METRICS_INCREMENT(metrics::WARNINGS_TOTAL);
+            continue;
+        }
 
         Pose3d old_anchor = sm->pose_w_anchor_optimized;
         sm->pose_w_anchor_optimized = new_pose;
         sm->state = SubMapState::OPTIMIZED;
 
-        // 更新子图内所有关键帧的优化位姿
+        // 计算位姿增量
+        double translation_diff = (new_pose.translation() - old_anchor.translation()).norm();
+        double rotation_diff = Eigen::AngleAxisd(
+            new_pose.rotation().inverse() * old_anchor.rotation()).angle();
+
+        max_translation_diff = std::max(max_translation_diff, translation_diff);
+        max_rotation_diff = std::max(max_rotation_diff, rotation_diff);
+
+        // 记录最大差异的指标
+        METRICS_GAUGE_SET(metrics::LOOP_RMSE_METERS, max_translation_diff);
+
+        SLOG_DEBUG(MOD, "SM#{} pose updated: trans={:.3f}m rot={:.1f}°",
+                     sm->id, translation_diff,
+                     rotation_diff * 180.0 / M_PI);
+
+        // 更新所有关键帧的优化位姿
         Pose3d delta = new_pose * old_anchor.inverse();
         for (auto& kf : sm->keyframes) {
-            kf->T_w_b_optimized = delta * kf->T_w_b_optimized;
+            kf->T_w_b_optimized = delta * kf->T_w_b;
         }
+
         publishEvent(sm, "OPTIMIZED");
+        SLOG_EVENT(MOD, "submap_optimized", 
+                   "SubMap #{} optimized (dt_trans={:.3f}m, dt_rot={:.1f}°)",
+                   sm->id, max_translation_diff, max_rotation_diff * 180.0 / M_PI);
+
+        updated = true;
         break;
     }
+
+    if (updated) {
+        METRICS_INCREMENT(metrics::OPTIMIZATIONS_RUN);
+    }
+
+    // 结构化日志：结束Span
+    SLOG_END_SPAN();
 }
 
 void SubMapManager::updateAllFromHBA(const HBAResult& result) {
-    if (!result.success) return;
+    if (!result.success || result.optimized_poses.empty()) return;
     std::lock_guard<std::mutex> lk(mutex_);
-
-    // 收集所有 KF（按时间排序，与 HBA 输入一致）
-    std::vector<KeyFrame::Ptr> all_kfs;
-    for (const auto& sm : submaps_) {
-        for (const auto& kf : sm->keyframes) {
-            all_kfs.push_back(kf);
-        }
-    }
-    std::sort(all_kfs.begin(), all_kfs.end(),
-              [](const KeyFrame::Ptr& a, const KeyFrame::Ptr& b) {
-                  return a->timestamp < b->timestamp;
-              });
-
-    // 更新每个 KF 的优化位姿
-    for (size_t i = 0; i < all_kfs.size() && i < result.optimized_poses.size(); ++i) {
-        all_kfs[i]->T_w_b_optimized = result.optimized_poses[i];
-    }
-
-    // 更新每个子图的锚定位姿（取第一帧的优化位姿）
+    // HBA 已按时间序写回各关键帧 T_w_b_optimized，此处仅同步子图锚定位姿
     for (auto& sm : submaps_) {
-        if (!sm->keyframes.empty()) {
-            sm->pose_w_anchor_optimized = sm->keyframes.front()->T_w_b_optimized;
+        if (sm->keyframes.empty()) continue;
+        KeyFrame::Ptr anchor = sm->keyframes.front();
+        sm->pose_w_anchor_optimized = anchor->T_w_b_optimized;
+        if (sm->state == SubMapState::FROZEN || sm->state == SubMapState::OPTIMIZED)
             sm->state = SubMapState::OPTIMIZED;
-        }
     }
 }
 
-SubMap::Ptr SubMapManager::getActiveSubmap() const {
-    std::lock_guard<std::mutex> lk(mutex_);
-    return active_submap_;
-}
+// ─────────────────────────────────────────────────────────────────────
+// 工程化辅助函数实现
+// ─────────────────────────────────────────────────────────────────────
 
-SubMap::Ptr SubMapManager::getSubmap(int id) const {
-    std::lock_guard<std::mutex> lk(mutex_);
-    for (const auto& sm : submaps_) {
-        if (sm->id == id) return sm;
-    }
-    return nullptr;
-}
-
-std::vector<SubMap::Ptr> SubMapManager::getAllSubmaps() const {
-    std::lock_guard<std::mutex> lk(mutex_);
-    return submaps_;
-}
-
-std::vector<SubMap::Ptr> SubMapManager::getFrozenSubmaps() const {
-    std::lock_guard<std::mutex> lk(mutex_);
-    std::vector<SubMap::Ptr> out;
-    for (const auto& sm : submaps_) {
-        if (sm->state == SubMapState::FROZEN ||
-            sm->state == SubMapState::OPTIMIZED)
-            out.push_back(sm);
-    }
-    return out;
-}
-
-int SubMapManager::submapCount() const {
-    std::lock_guard<std::mutex> lk(mutex_);
-    return static_cast<int>(submaps_.size());
-}
-
-int SubMapManager::keyframeCount() const {
-    return static_cast<int>(kf_id_counter_.load());
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 子图持久化（MS-Mapping 增量式核心）
-// ─────────────────────────────────────────────────────────────────────────────
-bool SubMapManager::archiveSubmap(const SubMap::Ptr& sm, const std::string& dir) {
-    std::string sm_dir = dir + "/submap_" + std::to_string(sm->id) + "/";
-    fs::create_directories(sm_dir);
-
-    // 1. meta.json（子图元数据）
-    json meta;
-    meta["id"]          = sm->id;
-    meta["session_id"]  = sm->session_id;
-    meta["kf_count"]    = sm->keyframes.size();
-    meta["t_start"]     = sm->t_start;
-    meta["t_end"]       = sm->t_end;
-    meta["spatial_m"]   = sm->spatial_extent_m;
-    meta["has_gps"]     = sm->has_valid_gps;
-    meta["gps_center"]  = {sm->gps_center.x(), sm->gps_center.y(), sm->gps_center.z()};
-
-    // 锚定位姿（4×4矩阵）
-    Eigen::Matrix4d M = sm->pose_w_anchor_optimized.matrix();
-    for (int r = 0; r < 4; ++r)
-        for (int c = 0; c < 4; ++c)
-            meta["anchor_pose_matrix"][r*4+c] = M(r,c);
-
-    // 描述子
-    std::vector<float> desc(sm->overlap_descriptor.data(),
-                             sm->overlap_descriptor.data() + sm->overlap_descriptor.size());
-    meta["descriptor"] = desc;
-    meta["has_descriptor"] = sm->has_descriptor;
-
-    // 关键帧位姿列表
-    json kf_list = json::array();
-    for (const auto& kf : sm->keyframes) {
-        json kf_json;
-        kf_json["id"]        = kf->id;
-        kf_json["timestamp"] = kf->timestamp;
-        kf_json["has_gps"]   = kf->has_valid_gps;
-        Eigen::Matrix4d Tkf = kf->T_w_b_optimized.matrix();
-        for (int r = 0; r < 4; ++r)
-            for (int c = 0; c < 4; ++c)
-                kf_json["pose_matrix"][r*4+c] = Tkf(r,c);
-        kf_list.push_back(kf_json);
-    }
-    meta["keyframes"] = kf_list;
-
-    std::ofstream mf(sm_dir + "meta.json");
-    if (!mf) return false;
-    mf << meta.dump(2);
-    mf.close();
-
-    // 2. cloud_match.pcd（降采样点云，用于跨 session 回环）
-    if (sm->downsampled_cloud && !sm->downsampled_cloud->empty()) {
-        pcl::io::savePCDFileBinary(sm_dir + "cloud_match.pcd",
-                                    *sm->downsampled_cloud);
+void SubMapManager::updateGPSGravityCenter(const KeyFrame::Ptr& kf) {
+    if (!kf->has_valid_gps || !active_submap_) {
+        return;
     }
 
-    auto& sm_mut = const_cast<SubMap&>(*sm);
-    sm_mut.state = SubMapState::ARCHIVED;
-    return true;
-}
+    size_t gps_count = 0;
+    Eigen::Vector3d gps_sum = Eigen::Vector3d::Zero();
 
-bool SubMapManager::loadArchivedSubmap(
-    const std::string& dir, int submap_id, SubMap::Ptr& out)
-{
-    std::string sm_dir = dir + "/submap_" + std::to_string(submap_id) + "/";
-    std::ifstream mf(sm_dir + "meta.json");
-    if (!mf) return false;
+    SLOG_DEBUG(MOD, "Calculating GPS center for SM#{} ({} frames)", 
+                 active_submap_->id, active_submap_->keyframes.size());
 
-    json meta;
-    mf >> meta;
-    mf.close();
-
-    out = std::make_shared<SubMap>();
-    out->id         = meta["id"];
-    out->session_id = meta["session_id"];
-    out->t_start    = meta["t_start"];
-    out->t_end      = meta["t_end"];
-    out->spatial_extent_m = meta.value("spatial_m", 0.0);
-    out->has_valid_gps    = meta.value("has_gps", false);
-    out->gps_center = Eigen::Vector3d(
-        meta["gps_center"][0], meta["gps_center"][1], meta["gps_center"][2]);
-
-    // 锚定位姿
-    Eigen::Matrix4d M;
-    for (int i = 0; i < 16; ++i) M(i/4, i%4) = meta["anchor_pose_matrix"][i];
-    out->pose_w_anchor_optimized.matrix() = M;
-    out->pose_w_anchor = out->pose_w_anchor_optimized;
-
-    // 描述子
-    if (meta.contains("descriptor")) {
-        const auto& d = meta["descriptor"];
-        out->overlap_descriptor.resize(d.size());
-        for (size_t i = 0; i < d.size(); ++i) out->overlap_descriptor(i) = d[i];
-        out->has_descriptor = meta.value("has_descriptor", false);
-    }
-
-    // 点云
-    std::string pcd_path = sm_dir + "cloud_match.pcd";
-    if (fs::exists(pcd_path)) {
-        out->downsampled_cloud = std::make_shared<CloudXYZI>();
-        pcl::io::loadPCDFile(pcd_path, *out->downsampled_cloud);
-    }
-
-    out->state = SubMapState::ARCHIVED;
-    return true;
-}
-
-CloudXYZIPtr SubMapManager::buildGlobalMap(float voxel_size) const {
-    std::lock_guard<std::mutex> lk(mutex_);
-    CloudXYZIPtr global(new CloudXYZI);
-
-    for (const auto& sm : submaps_) {
-        for (const auto& kf : sm->keyframes) {
-            if (!kf->cloud_body || kf->cloud_body->empty()) continue;
-            CloudXYZI world_cloud;
-            Eigen::Affine3f T;
-            T.matrix() = kf->T_w_b_optimized.cast<float>().matrix();
-            pcl::transformPointCloud(*kf->cloud_body, world_cloud, T);
-            *global += world_cloud;
+    for (const auto& f : active_submap_->keyframes) {
+        if (f->has_valid_gps) {
+            gps_sum += f->gps.position_enu;
+            gps_count++;
         }
     }
 
-    if (!global->empty() && voxel_size > 0) {
-        CloudXYZIPtr ds(new CloudXYZI);
-        pcl::VoxelGrid<pcl::PointXYZI> vg;
-        vg.setInputCloud(global);
-        vg.setLeafSize(voxel_size, voxel_size, voxel_size);
-        vg.filter(*ds);
-        return ds;
+    if (gps_count > 0) {
+        active_submap_->gps_center = gps_sum / gps_count;
+        active_submap_->has_valid_gps = true;
+        
+        SLOG_DEBUG(MOD, "Updated GPS center for SM#{} ({} GPS fixes): ({:.3f}, {:.3f}, {:.3f})",
+                     active_submap_->id, gps_count,
+                     active_submap_->gps_center.x(),
+                     active_submap_->gps_center.y(),
+                     active_submap_->gps_center.z());
     }
-    return global;
 }
 
-void SubMapManager::publishEvent(const SubMap::Ptr& sm, const std::string& event) {
+void SubMapManager::publishErrorEvent(int submap_id, const ErrorDetail& error) {
     if (!event_pub_) return;
-    automap_pro::msg::SubMapEventMsg msg;
-    msg.header.stamp  = rclcpp::Clock().now();
-    msg.submap_id     = sm->id;
-    msg.session_id    = sm->session_id;
-    msg.event_type    = event;
-    msg.keyframe_count = static_cast<int>(sm->keyframes.size());
-    msg.spatial_extent_m = sm->spatial_extent_m;
-    msg.has_valid_gps = sm->has_valid_gps;
-    event_pub_->publish(msg);
+
+    auto msg = std::make_shared<automap_pro::msg::SubMapEventMsg>();
+    msg->header.stamp = node_->now();
+    msg->submap_id = submap_id;
+    msg->session_id = current_session_id_;
+    msg->event_type = fmt::format("error_0x{:08X}", static_cast<uint32_t>(error.code()));
+    msg->keyframe_count = 0;
+    msg->spatial_extent_m = 0.0;
+    msg->has_valid_gps = false;
+    
+    event_pub_->publish(*msg);
+    
+    SLOG_EVENT(MOD, "submap_error", "sm_id={}, code=0x{:08X}, msg={}",
+               submap_id, static_cast<uint32_t>(error.code()),
+               error.message());
+}
+}
+// ─────────────────────────────────────────────────────────────
+// 工程化辅助函数实现
+// ─────────────────────────────────────────────────────────────
+
+void SubMapManager::updateGPSGravityCenter(const KeyFrame::Ptr& kf) {
+    if (!kf->has_valid_gps || !active_submap_) {
+        SLOG_TRACE(MOD, "Skip GPS center update: no valid GPS or no active submap");
+        return;
+    }
+
+    SLOG_TIMED_SCOPE(MOD, "update_gps_center", 10.0);
+
+    size_t gps_count = 0;
+    Eigen::Vector3d gps_sum = Eigen::Vector3d::Zero();
+
+    for (const auto& f : active_submap_->keyframes) {
+        if (f->has_valid_gps) {
+            gps_sum += f->gps.position_enu;
+            gps_count++;
+            
+            SLOG_TRACE(MOD, "Added GPS from KF#{}: ({:.3f}, {:.3f}, {:.3f})",
+                         f->id, f->gps.position_enu.x(),
+                         f->gps.position_enu.y(), f->gps.position_enu.z());
+        }
+    }
+
+    if (gps_count > 0) {
+        active_submap_->gps_center = gps_sum / gps_count;
+        active_submap_->has_valid_gps = true;
+        
+        SLOG_DEBUG(MOD, "Updated GPS center for SM#{} from {} GPS fixes: ({:.3f}, {:.3f}, {:.3f})",
+                     active_submap_->id, gps_count,
+                     active_submap_->gps_center.x(),
+                     active_submap_->gps_center.y(),
+                     active_submap_->gps_center.z());
+        
+        // 记录指标
+        METRICS_INCREMENT(metrics::GPS_UPDATES_TOTAL);
+        METRICS_GAUGE_SET("submap_gps_fixes", static_cast<double>(gps_count));
+    } else {
+        SLOG_WARN(MOD, "No valid GPS data for SM#{} - using origin", active_submap_->id);
+    }
 }
 
-} // namespace automap_pro
+void SubMapManager::publishErrorEvent(int submap_id, const ErrorDetail& error) {
+    if (!event_pub_) {
+        SLOG_WARN(MOD, "Event publisher not available - cannot publish error event");
+        return;
+    }
+
+    SLOG_START_SPAN(MOD, "publish_error_event");
+
+    auto msg = std::make_shared<automap_pro::msg::SubMapEventMsg>();
+    msg->header.stamp = node_->now();
+    msg->submap_id = submap_id;
+    msg->session_id = current_session_id_;
+    
+    // 格式化错误码
+    std::string error_code_str = fmt::format("0x{:08X}", static_cast<uint32_t>(error.code()));
+    
+    if (error.code() != errors::NO_ERROR) {
+        msg->event_type = fmt::format("error_{}", error_code_str);
+        msg->keyframe_count = 0;
+        msg->spatial_extent_m = 0.0;
+        msg->has_valid_gps = false;
+    } else {
+        SLOG_WARN(MOD, "Ignoring error event with NO_ERROR code");
+        SLOG_END_SPAN();
+        return;
+    }
+    
+    // 记录元数据
+    nlohmann::json metadata_json;
+    metadata_json["error_code"] = error_code_str;
+    metadata_json["operation"] = error.context().operation;
+    metadata_json["file"] = error.context().file;
+    metadata_json["line"] = error.context().line;
+    metadata_json["severity"] = std::to_string(static_cast<int>(error.severity()));
+    
+    // 添加自定义元数据
+    for (const auto& [key, value] : error.context().metadata) {
+        metadata_json[key] = value;
+    }
+    
+    msg->metadata = metadata_json.dump();
+    
+    // 发布消息
+    event_pub_->publish(*msg);
+    
+    SLOG_EVENT(MOD, "error_event_published", 
+               "sm_id={}, code={}, operation={}, file={}:{}",
+               submap_id, error_code_str, error.context().operation,
+               error.context().file, error.context().line);
+    
+    // 记录指标
+    METRICS_INCREMENT(metrics::ERROR_EVENTS_PUBLISHED);
+    
+    SLOG_END_SPAN();
+}
+

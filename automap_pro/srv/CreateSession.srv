@@ -1,0 +1,12 @@
+# 创建新会话服务
+
+---
+# 请求
+string session_name
+string sensor_config
+bool set_active
+---
+# 响应
+uint64 session_id
+bool success
+string message

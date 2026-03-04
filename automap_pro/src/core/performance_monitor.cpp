@@ -104,12 +104,8 @@ void PerformanceMonitor::recordOperation(const std::string& operation, double du
     // 检查慢操作
     checkSlowOperation(operation, duration_ms);
     
-    // 记录到日志
-    LogContext ctx;
-    ctx.fields["operation"] = operation;
-    ctx.fields["duration_ms"] = std::to_string(duration_ms);
-    Logger::instance().logWithContext(LogLevel::DEBUG, ctx, 
-                                    "Performance: " + operation);
+    // 记录到日志（使用统一 ALOG 宏，避免依赖不存在的 logWithContext）
+    ALOG_DEBUG("PerfMon", "Performance: {} (duration_ms={})", operation, duration_ms);
 }
 
 PerformanceStats PerformanceMonitor::getStats(const std::string& operation) const {
@@ -259,15 +255,15 @@ PerformanceMonitor::ResourceUsage PerformanceMonitor::getResourceUsage() const {
 
 void PerformanceMonitor::backgroundReporter() {
     while (running_) {
-        std::unique_lock<std::mutex> lock(mutex_);
-        
-        // 等待report_interval或shutdown
-        if (cv_.wait_for(lock, std::chrono::duration<double>(report_interval_sec_),
-                        [this] { return !running_; })) {
-            break; // 被shutdown唤醒
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            // 等待report_interval或shutdown
+            if (cv_.wait_for(lock, std::chrono::duration<double>(report_interval_sec_),
+                            [this] { return !running_; })) {
+                break;  // 被shutdown唤醒
+            }
         }
-        
-        // 报告统计
+        // 在锁外调用 reportStats()，避免死锁（reportStats 内部会再次获取 mutex_）
         reportStats();
     }
 }
@@ -275,17 +271,8 @@ void PerformanceMonitor::backgroundReporter() {
 void PerformanceMonitor::checkSlowOperation(const std::string& operation, 
                                             double duration_ms) {
     if (duration_ms > slow_threshold_ms_) {
-        LogContext ctx;
-        ctx.fields["operation"] = operation;
-        ctx.fields["duration_ms"] = std::to_string(duration_ms);
-        ctx.fields["threshold_ms"] = std::to_string(slow_threshold_ms_);
-        
-        std::ostringstream oss;
-        oss << "Slow operation detected: " << operation 
-            << " took " << duration_ms << " ms (threshold: " 
-            << slow_threshold_ms_ << " ms)";
-        
-        Logger::instance().logWithContext(LogLevel::WARN, ctx, oss.str());
+        ALOG_WARN("PerfMon", "Slow operation detected: {} took {} ms (threshold: {} ms)",
+                  operation, duration_ms, slow_threshold_ms_);
     }
 }
 

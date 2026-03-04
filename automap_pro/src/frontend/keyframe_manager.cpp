@@ -7,7 +7,7 @@
 
 namespace automap_pro {
 
-uint64_t KeyFrameManager::next_id_ = 0;
+std::atomic<uint64_t> KeyFrameManager::next_id_{0};
 
 KeyFrameManager::KeyFrameManager() {
     const auto& cfg = ConfigManager::instance();
@@ -87,7 +87,7 @@ KeyFrame::Ptr KeyFrameManager::createKeyFrame(
     uint64_t session_id)
 {
     auto kf = std::make_shared<KeyFrame>();
-    kf->id             = ++next_id_;
+    kf->id             = next_id_.fetch_add(1) + 1;
     kf->session_id     = session_id;
     kf->timestamp      = timestamp;
     kf->T_w_b          = T_w_b;

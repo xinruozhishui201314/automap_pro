@@ -5,6 +5,7 @@
 #include <mutex>
 #include <vector>
 #include <functional>
+#include <atomic>
 
 namespace automap_pro {
 
@@ -75,9 +76,10 @@ public:
     void triggerRealign();
 
 private:
-    // ENU 原点（第一个有效GPS点确定）
+    // ENU 原点（第一个有效GPS点确定，call_once 避免多线程竞态）
     double enu_origin_lat_ = 0.0, enu_origin_lon_ = 0.0, enu_origin_alt_ = 0.0;
-    bool   enu_origin_set_ = false;
+    std::atomic<bool> enu_origin_set_{false};
+    std::once_flag    enu_origin_once_;
 
     // 滑动窗口缓存
     struct GPSRecord {

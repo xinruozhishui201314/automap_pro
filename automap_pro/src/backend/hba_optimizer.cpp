@@ -137,10 +137,12 @@ HBAResult HBAOptimizer::runHBA(const PendingTask& task) {
     hba_cfg.voxel_size      = 0.5;
     hba_cfg.enable_gps      = task.enable_gps;
 
-    // 若启用 GPS，构建 GPS 条目
+    // 若启用 GPS，构建 GPS 条目（仅采纳 HIGH/EXCELLENT 质量，避免低质量拉偏）
     if (task.enable_gps && gps_aligned_) {
         for (const auto& kf : task.keyframes) {
-            if (kf->has_valid_gps) {
+            if (kf->has_valid_gps &&
+                kf->gps.quality != GPSQuality::INVALID &&
+                kf->gps.quality != GPSQuality::LOW) {
                 hba_api::Config::GPSEntry entry;
                 entry.timestamp = kf->gps.timestamp;
                 entry.lat       = kf->gps.latitude;

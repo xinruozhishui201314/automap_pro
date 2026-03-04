@@ -88,6 +88,49 @@ private:
     // 关键帧计数（全局）
     std::atomic<uint64_t>     kf_id_counter_{0};
 
+    // ✅ 修复：VoxelGrid 对象池缓存（按分辨率索引）
+    std::unordered_map<float, std::unique_ptr<pcl::VoxelGrid<pcl::PointXYZI>>> voxel_grid_cache_;
+    mutable std::mutex vg_cache_mutex_;
+    
+    // 常用分辨率
+    static constexpr float RES_MATCH = 0.4f;
+    static constexpr float RES_MERGE = 0.1f;
+    
+    // 获取缓存的 VoxelGrid 对象
+    pcl::VoxelGrid<pcl::PointXYZI>* getVoxelGrid(float leaf_size) {
+        std::lock_guard<std::mutex> lk(vg_cache_mutex_);
+        
+        auto it = voxel_grid_cache_.find(leaf_size);
+        if (it != voxel_grid_cache_.end()) {
+            return it->second.get();
+        }
+        
+        // 创建并缓存新对象
+        auto vg = std::make_unique<pcl::VoxelGrid<pcl::PointXYZI>>();
+        vg->setLeafSize(leaf_size, leaf_size, leaf_size);
+        voxel_grid_cache_[leaf_size] = std::move(vg);
+        
+        return voxel_grid_cache_[leaf_size].get();
+    }
+
+    // ✅ 修复：点云对象池（避免频繁内存分配）
+    static constexpr size_t CLOUD_POOL_SIZE = 10;
+    std::array<CloudXYZIPtr, CLOUD_POOL_SIZE> cloud_pool_;
+    std::atomic<size_t> pool_index_{0};
+    mutable std::mutex pool_mutex_;
+    
+    // 从对象池获取点云
+    CloudXYZIPtr getCloudFromPool() {
+        std::lock_guard<std::mutex> lk(pool_mutex_);
+        size_t idx = pool_index_.fetch_add(1) % CLOUD_POOL_SIZE;
+        
+        if (!cloud_pool_[idx] || cloud_pool_[idx]->empty()) {
+            cloud_pool_[idx] = std::make_shared<CloudXYZI>();
+        }
+        
+        return cloud_pool_[idx];
+    }
+
     // 参数
     int    max_kf_       = 100;
     double max_spatial_  = 100.0;   // 米
@@ -109,3 +152,25 @@ private:
 };
 
 } // namespace automap_pro
+    // ─────────────────────────────────────────────────────────────────────
+    // 工程化辅助方法（2024-03-04）
+    // ─────────────────────────────────────────────────────────────────────
+    
+    /**
+     * @brief 更新子图的 GPS 重力中心
+     * @param kf 包含 GPS 数据的关键帧
+     * 
+     * 计算所有有效 GPS 位置的平均值作为子图的重力中心。
+     * 使用结构化日志记录计算过程，并更新指标。
+     */
+    void updateGPSGravityCenter(const KeyFrame::Ptr& kf);
+    
+    /**
+     * @brief 发布错误事件到 ROS2 话题
+     * @param submap_id 子图 ID
+     * @param error 错误详情（包含错误码、上下文、恢复建议）
+     * 
+     * 使用结构化日志记录事件，包含错误码、操作信息、文件和行号。
+     * 事件包含所有错误上下文的元数据，用于精准定位问题。
+     */
+    void publishErrorEvent(int submap_id, const automap_pro::core::ErrorDetail& error);

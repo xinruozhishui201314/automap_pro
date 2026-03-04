@@ -3,9 +3,17 @@
 #include "automap_pro/core/utils.h"
 
 #include <pcl_conversions/pcl_conversions.h>
+#include <pcl/point_types.h>
 #include <geometry_msgs/msg/pose_stamped.hpp>
+#include <geometry_msgs/msg/pose.hpp>
+#include <cmath>
+#include <algorithm>
 
 namespace automap_pro {
+
+// ─────────────────────────────────────────────────────────────────────────────
+// init
+// ─────────────────────────────────────────────────────────────────────────────
 
 void RvizPublisher::init(rclcpp::Node::SharedPtr node) {
     node_ = node;
@@ -13,146 +21,194 @@ void RvizPublisher::init(rclcpp::Node::SharedPtr node) {
     global_map_ds_res_  = cfg.visGlobalMapDownsample();
     publish_global_map_ = cfg.visPublishRate() > 0.0;
 
-    global_map_pub_    = node->create_publisher<sensor_msgs::msg::PointCloud2>("/automap/global_map", 1);
-    current_cloud_pub_ = node->create_publisher<sensor_msgs::msg::PointCloud2>("/automap/current_cloud", 1);
-    submap_cloud_pub_  = node->create_publisher<sensor_msgs::msg::PointCloud2>("/automap/submap_cloud", 1);
-    loop_marker_pub_   = node->create_publisher<visualization_msgs::msg::MarkerArray>("/automap/loop_markers", 10);
-    gps_marker_pub_    = node->create_publisher<visualization_msgs::msg::MarkerArray>("/automap/gps_markers", 10);
-    submap_boundary_pub_ = node->create_publisher<visualization_msgs::msg::MarkerArray>("/automap/submap_boundaries", 10);
-    odom_path_pub_     = node->create_publisher<nav_msgs::msg::Path>("/automap/odom_path", 1);
-    opt_path_pub_      = node->create_publisher<nav_msgs::msg::Path>("/automap/optimized_path", 1);
+    auto sensor_qos = rclcpp::SensorDataQoS();
+    auto reliable_qos = rclcpp::QoS(rclcpp::KeepLast(10)).reliable();
+    auto path_qos = rclcpp::QoS(rclcpp::KeepLast(100)).reliable();
 
-    RCLCPP_INFO(node->get_logger(), "[RvizPublisher] Initialized.");
+    // 点云
+    global_map_pub_     = node->create_publisher<sensor_msgs::msg::PointCloud2>("/automap/global_map", sensor_qos);
+    current_cloud_pub_  = node->create_publisher<sensor_msgs::msg::PointCloud2>("/automap/current_cloud", sensor_qos);
+    submap_cloud_pub_   = node->create_publisher<sensor_msgs::msg::PointCloud2>("/automap/submap_cloud", sensor_qos);
+    colored_cloud_pub_  = node->create_publisher<sensor_msgs::msg::PointCloud2>("/automap/colored_cloud", sensor_qos);
+    density_heatmap_pub_= node->create_publisher<sensor_msgs::msg::PointCloud2>("/automap/density_heatmap", sensor_qos);
+    loop_candidate_pub_ = node->create_publisher<sensor_msgs::msg::PointCloud2>("/automap/loop_candidate_cloud", sensor_qos);
+
+    // Marker
+    loop_marker_pub_      = node->create_publisher<visualization_msgs::msg::MarkerArray>("/automap/loop_markers", reliable_qos);
+    gps_marker_pub_       = node->create_publisher<visualization_msgs::msg::MarkerArray>("/automap/gps_markers", reliable_qos);
+    submap_boundary_pub_  = node->create_publisher<visualization_msgs::msg::MarkerArray>("/automap/submap_boundaries", reliable_qos);
+    submap_bbox_pub_      = node->create_publisher<visualization_msgs::msg::MarkerArray>("/automap/submap_bboxes", reliable_qos);
+    submap_graph_pub_     = node->create_publisher<visualization_msgs::msg::MarkerArray>("/automap/submap_graph", reliable_qos);
+    covariance_pub_      = node->create_publisher<visualization_msgs::msg::MarkerArray>("/automap/covariance_ellipses", reliable_qos);
+    factor_graph_pub_     = node->create_publisher<visualization_msgs::msg::MarkerArray>("/automap/factor_graph", reliable_qos);
+    gps_quality_pub_     = node->create_publisher<visualization_msgs::msg::MarkerArray>("/automap/gps_quality", reliable_qos);
+    module_status_pub_    = node->create_publisher<visualization_msgs::msg::MarkerArray>("/automap/module_status", reliable_qos);
+    frame_marker_pub_     = node->create_publisher<visualization_msgs::msg::MarkerArray>("/automap/coordinate_frames", reliable_qos);
+    active_region_pub_    = node->create_publisher<visualization_msgs::msg::MarkerArray>("/automap/active_region", reliable_qos);
+    degen_region_pub_     = node->create_publisher<visualization_msgs::msg::MarkerArray>("/automap/degeneration_regions", reliable_qos);
+    hba_result_pub_       = node->create_publisher<visualization_msgs::msg::MarkerArray>("/automap/hba_result", reliable_qos);
+    convergence_pub_      = node->create_publisher<visualization_msgs::msg::MarkerArray>("/automap/convergence", reliable_qos);
+    convergence_residual_pub_ = node->create_publisher<std_msgs::msg::Float64MultiArray>("/automap/convergence_residual", reliable_qos);
+
+    // Path
+    odom_path_pub_        = node->create_publisher<nav_msgs::msg::Path>("/automap/odom_path", path_qos);
+    opt_path_pub_         = node->create_publisher<nav_msgs::msg::Path>("/automap/optimized_path", path_qos);
+    gps_raw_path_pub_     = node->create_publisher<nav_msgs::msg::Path>("/automap/gps_raw_path", path_qos);
+    gps_aligned_path_pub_ = node->create_publisher<nav_msgs::msg::Path>("/automap/gps_aligned_path", path_qos);
+
+    kf_pose_array_pub_    = node->create_publisher<geometry_msgs::msg::PoseArray>("/automap/keyframe_poses", reliable_qos);
+
+    RCLCPP_INFO(node->get_logger(), "[RvizPublisher] Initialized (full visualization).");
 }
 
-void RvizPublisher::publishGlobalMap(const CloudXYZIPtr& cloud) {
-    if (!publish_global_map_ || !cloud || cloud->empty()) return;
-    auto ds = global_map_ds_res_ > 0 ?
-              utils::voxelDownsample(cloud, global_map_ds_res_) : cloud;
+// ─────────────────────────────────────────────────────────────────────────────
+// 1. 点云可视化
+// ─────────────────────────────────────────────────────────────────────────────
 
-    sensor_msgs::msg::PointCloud2 msg;
-    pcl::toROSMsg(*ds, msg);
-    msg.header.stamp    = node_->now();
-    msg.header.frame_id = "world";
-    global_map_pub_->publish(msg);
+void RvizPublisher::publishGlobalMap(const CloudXYZIPtr& cloud) {
+    if (!publish_global_map_ || !node_ || !cloud || cloud->empty()) return;
+    try {
+        auto ds = global_map_ds_res_ > 0 ?
+                  utils::voxelDownsample(cloud, global_map_ds_res_) : cloud;
+        if (!ds || ds->empty()) return;
+        sensor_msgs::msg::PointCloud2 msg;
+        pcl::toROSMsg(*ds, msg);
+        msg.header.stamp    = node_->now();
+        msg.header.frame_id = frame_id_;
+        global_map_pub_->publish(msg);
+    } catch (const std::exception& e) {
+        RCLCPP_ERROR(node_->get_logger(), "[RvizPublisher] publishGlobalMap failed: %s", e.what());
+    }
 }
 
 void RvizPublisher::publishCurrentCloud(const CloudXYZIPtr& cloud) {
-    if (!cloud || cloud->empty()) return;
-    sensor_msgs::msg::PointCloud2 msg;
-    pcl::toROSMsg(*cloud, msg);
-    msg.header.stamp    = node_->now();
-    msg.header.frame_id = "world";
-    current_cloud_pub_->publish(msg);
+    if (!node_ || !cloud || cloud->empty()) return;
+    try {
+        sensor_msgs::msg::PointCloud2 msg;
+        pcl::toROSMsg(*cloud, msg);
+        msg.header.stamp    = node_->now();
+        msg.header.frame_id = frame_id_;
+        current_cloud_pub_->publish(msg);
+    } catch (const std::exception& e) {
+        RCLCPP_ERROR(node_->get_logger(), "[RvizPublisher] publishCurrentCloud failed: %s", e.what());
+    }
 }
 
 void RvizPublisher::publishSubmapCloud(const SubMap::Ptr& sm) {
-    if (!sm || !sm->downsampled_cloud || sm->downsampled_cloud->empty()) return;
-    sensor_msgs::msg::PointCloud2 msg;
-    pcl::toROSMsg(*sm->downsampled_cloud, msg);
-    msg.header.stamp    = node_->now();
-    msg.header.frame_id = "world";
-    submap_cloud_pub_->publish(msg);
+    if (!node_ || !sm || !sm->downsampled_cloud || sm->downsampled_cloud->empty()) return;
+    try {
+        sensor_msgs::msg::PointCloud2 msg;
+        pcl::toROSMsg(*sm->downsampled_cloud, msg);
+        msg.header.stamp    = node_->now();
+        msg.header.frame_id = frame_id_;
+        submap_cloud_pub_->publish(msg);
+    } catch (const std::exception& e) {
+        RCLCPP_ERROR(node_->get_logger(), "[RvizPublisher] publishSubmapCloud failed: %s", e.what());
+    }
 }
 
-void RvizPublisher::publishLoopMarkers(
-        const std::vector<LoopConstraint::Ptr>& loops,
-        const std::vector<SubMap::Ptr>& submaps) {
-
-    std::map<int, Eigen::Vector3d> sm_pos;
-    for (const auto& sm : submaps) {
-        sm_pos[sm->id] = sm->pose_w_anchor_optimized.translation();
+void RvizPublisher::publishColoredCloud(const CloudXYZIPtr& cloud,
+                                         const std::string& color_mode,
+                                         const std::string& /* topic_name */) {
+    if (!node_ || !colored_cloud_pub_ || !cloud || cloud->empty()) return;
+    try {
+        pcl::PointCloud<pcl::PointXYZRGB>::Ptr rgb_cloud(new pcl::PointCloud<pcl::PointXYZRGB>);
+        rgb_cloud->resize(cloud->size());
+        float v_min = 1e9f, v_max = -1e9f;
+        for (const auto& p : cloud->points) {
+            float v = (color_mode == "height") ? static_cast<float>(p.z) : p.intensity;
+            v_min = std::min(v_min, v); v_max = std::max(v_max, v);
+        }
+        if (v_max <= v_min) v_max = v_min + 1.0f;
+        for (size_t i = 0; i < cloud->size(); ++i) {
+            rgb_cloud->points[i].x = cloud->points[i].x;
+            rgb_cloud->points[i].y = cloud->points[i].y;
+            rgb_cloud->points[i].z = cloud->points[i].z;
+            float t = (cloud->points[i].intensity - v_min) / (v_max - v_min);
+            if (color_mode == "height")
+                t = (cloud->points[i].z - v_min) / (v_max - v_min);
+            std_msgs::msg::ColorRGBA c = makeColorMap(t);
+            rgb_cloud->points[i].r = static_cast<uint8_t>(c.r * 255);
+            rgb_cloud->points[i].g = static_cast<uint8_t>(c.g * 255);
+            rgb_cloud->points[i].b = static_cast<uint8_t>(c.b * 255);
+        }
+        sensor_msgs::msg::PointCloud2 msg;
+        pcl::toROSMsg(*rgb_cloud, msg);
+        msg.header.stamp = node_->now();
+        msg.header.frame_id = frame_id_;
+        colored_cloud_pub_->publish(msg);
+    } catch (const std::exception& e) {
+        RCLCPP_ERROR(node_->get_logger(), "[RvizPublisher] publishColoredCloud failed: %s", e.what());
     }
-
-    visualization_msgs::msg::MarkerArray markers;
-    int id = 0;
-    for (const auto& lc : loops) {
-        auto it_i = sm_pos.find(lc->submap_i);
-        auto it_j = sm_pos.find(lc->submap_j);
-        if (it_i == sm_pos.end() || it_j == sm_pos.end()) continue;
-
-        visualization_msgs::msg::Marker line;
-        line.header.frame_id = "world";
-        line.header.stamp    = node_->now();
-        line.ns    = "loops";
-        line.id    = id++;
-        line.type  = visualization_msgs::msg::Marker::LINE_STRIP;
-        line.action= visualization_msgs::msg::Marker::ADD;
-        line.scale.x = 0.1;
-        line.color.r = lc->is_inter_session ? 1.0f : 0.0f;
-        line.color.g = lc->is_inter_session ? 0.5f : 1.0f;
-        line.color.b = 0.0f;
-        line.color.a = 0.8f;
-
-        geometry_msgs::msg::Point p1, p2;
-        p1.x = it_i->second.x(); p1.y = it_i->second.y(); p1.z = it_i->second.z();
-        p2.x = it_j->second.x(); p2.y = it_j->second.y(); p2.z = it_j->second.z();
-        line.points.push_back(p1);
-        line.points.push_back(p2);
-        markers.markers.push_back(line);
-    }
-    loop_marker_pub_->publish(markers);
 }
 
-void RvizPublisher::publishGPSMarkers(const std::vector<SubMap::Ptr>& submaps) {
-    visualization_msgs::msg::MarkerArray markers;
-    int id = 0;
-    for (const auto& sm : submaps) {
-        if (!sm->has_valid_gps) continue;
-        visualization_msgs::msg::Marker sphere;
-        sphere.header.frame_id = "world";
-        sphere.header.stamp    = node_->now();
-        sphere.ns    = "gps";
-        sphere.id    = id++;
-        sphere.type  = visualization_msgs::msg::Marker::SPHERE;
-        sphere.action= visualization_msgs::msg::Marker::ADD;
-        sphere.pose.position.x = sm->gps_center.x();
-        sphere.pose.position.y = sm->gps_center.y();
-        sphere.pose.position.z = sm->gps_center.z();
-        sphere.scale.x = sphere.scale.y = sphere.scale.z = 2.0;
-        sphere.color.r = 0.0f;
-        sphere.color.g = 0.5f;
-        sphere.color.b = 1.0f;
-        sphere.color.a = 0.7f;
-        markers.markers.push_back(sphere);
+void RvizPublisher::publishDensityHeatmap(const CloudXYZIPtr& cloud, float grid_size) {
+    if (!node_ || !density_heatmap_pub_ || !cloud || cloud->empty() || grid_size <= 0.f) return;
+    try {
+        std::map<std::tuple<int,int,int>, int> grid_count;
+        for (const auto& p : cloud->points) {
+            int gx = static_cast<int>(std::floor(p.x / grid_size));
+            int gy = static_cast<int>(std::floor(p.y / grid_size));
+            int gz = static_cast<int>(std::floor(p.z / grid_size));
+            grid_count[{gx, gy, gz}]++;
+        }
+        int c_max = 0;
+        for (const auto& kv : grid_count) c_max = std::max(c_max, kv.second);
+        if (c_max == 0) c_max = 1;
+        pcl::PointCloud<pcl::PointXYZRGB>::Ptr out(new pcl::PointCloud<pcl::PointXYZRGB>);
+        for (const auto& kv : grid_count) {
+            pcl::PointXYZRGB pt;
+            pt.x = (std::get<0>(kv.first) + 0.5f) * grid_size;
+            pt.y = (std::get<1>(kv.first) + 0.5f) * grid_size;
+            pt.z = (std::get<2>(kv.first) + 0.5f) * grid_size;
+            std_msgs::msg::ColorRGBA c = makeColorMap(static_cast<float>(kv.second) / c_max);
+            pt.r = static_cast<uint8_t>(c.r * 255); pt.g = static_cast<uint8_t>(c.g * 255); pt.b = static_cast<uint8_t>(c.b * 255);
+            out->push_back(pt);
+        }
+        sensor_msgs::msg::PointCloud2 msg;
+        pcl::toROSMsg(*out, msg);
+        msg.header.stamp = node_->now();
+        msg.header.frame_id = frame_id_;
+        density_heatmap_pub_->publish(msg);
+    } catch (const std::exception& e) {
+        RCLCPP_ERROR(node_->get_logger(), "[RvizPublisher] publishDensityHeatmap failed: %s", e.what());
     }
-    gps_marker_pub_->publish(markers);
 }
 
-void RvizPublisher::publishSubmapBoundaries(const std::vector<SubMap::Ptr>& submaps) {
-    visualization_msgs::msg::MarkerArray markers;
-    int id = 0;
-    for (const auto& sm : submaps) {
-        visualization_msgs::msg::Marker text;
-        text.header.frame_id = "world";
-        text.header.stamp    = node_->now();
-        text.ns    = "submap_labels";
-        text.id    = id++;
-        text.type  = visualization_msgs::msg::Marker::TEXT_VIEW_FACING;
-        text.action= visualization_msgs::msg::Marker::ADD;
-        const auto& p = sm->pose_w_anchor_optimized.translation();
-        text.pose.position.x = p.x();
-        text.pose.position.y = p.y();
-        text.pose.position.z = p.z() + 2.0;
-        text.scale.z  = 1.5;
-        text.color.r  = 1.0f;
-        text.color.g  = 1.0f;
-        text.color.b  = 0.0f;
-        text.color.a  = 1.0f;
-        text.text = "SM" + std::to_string(sm->id);
-        markers.markers.push_back(text);
+// ─────────────────────────────────────────────────────────────────────────────
+// 2. 轨迹可视化
+// ─────────────────────────────────────────────────────────────────────────────
+
+void RvizPublisher::publishOdometryPath(const std::vector<std::pair<double, Pose3d>>& path) {
+    if (!node_ || !odom_path_pub_) return;
+    nav_msgs::msg::Path msg;
+    msg.header.stamp = node_->now();
+    msg.header.frame_id = frame_id_;
+    for (const auto& [ts, pose] : path) {
+        geometry_msgs::msg::PoseStamped ps;
+        ps.header = msg.header;
+        ps.header.stamp.sec = static_cast<int32_t>(std::floor(ts));
+        ps.header.stamp.nanosec = static_cast<uint32_t>(std::round((ts - std::floor(ts)) * 1e9));
+        const auto& p = pose.translation();
+        Eigen::Quaterniond q(pose.rotation());
+        ps.pose.position.x = p.x(); ps.pose.position.y = p.y(); ps.pose.position.z = p.z();
+        ps.pose.orientation.x = q.x(); ps.pose.orientation.y = q.y(); ps.pose.orientation.z = q.z(); ps.pose.orientation.w = q.w();
+        msg.poses.push_back(ps);
     }
-    submap_boundary_pub_->publish(markers);
+    odom_path_pub_->publish(msg);
 }
 
 void RvizPublisher::publishOptimizedPath(const std::vector<SubMap::Ptr>& submaps) {
+    if (!node_ || !opt_path_pub_) return;
     nav_msgs::msg::Path path;
     path.header.stamp    = node_->now();
-    path.header.frame_id = "world";
+    path.header.frame_id = frame_id_;
 
     std::vector<std::pair<double, Pose3d>> sorted_kfs;
     for (const auto& sm : submaps) {
+        if (!sm) continue;
         for (const auto& kf : sm->keyframes) {
+            if (!kf) continue;
             sorted_kfs.push_back({kf->timestamp, kf->T_w_b_optimized});
         }
     }
@@ -168,16 +224,670 @@ void RvizPublisher::publishOptimizedPath(const std::vector<SubMap::Ptr>& submaps
         ps.header.stamp.nanosec = static_cast<uint32_t>(std::round((ts - std::floor(ts)) * 1e9));
         const auto& p = pose.translation();
         Eigen::Quaterniond q(pose.rotation());
-        ps.pose.position.x    = p.x();
-        ps.pose.position.y    = p.y();
-        ps.pose.position.z    = p.z();
-        ps.pose.orientation.x = q.x();
-        ps.pose.orientation.y = q.y();
-        ps.pose.orientation.z = q.z();
-        ps.pose.orientation.w = q.w();
+        ps.pose.position.x    = p.x(); ps.pose.position.y = p.y(); ps.pose.position.z = p.z();
+        ps.pose.orientation.x = q.x(); ps.pose.orientation.y = q.y(); ps.pose.orientation.z = q.z(); ps.pose.orientation.w = q.w();
         path.poses.push_back(ps);
     }
     opt_path_pub_->publish(path);
+}
+
+void RvizPublisher::publishKeyframePoses(const std::vector<KeyFrame::Ptr>& keyframes) {
+    if (!node_ || !kf_pose_array_pub_) return;
+    geometry_msgs::msg::PoseArray msg;
+    msg.header.stamp = node_->now();
+    msg.header.frame_id = frame_id_;
+    for (const auto& kf : keyframes) {
+        if (!kf) continue;
+        geometry_msgs::msg::Pose pose;
+        const auto& p = kf->T_w_b_optimized.translation();
+        Eigen::Quaterniond q(kf->T_w_b_optimized.rotation());
+        pose.position.x = p.x(); pose.position.y = p.y(); pose.position.z = p.z();
+        pose.orientation.x = q.x(); pose.orientation.y = q.y(); pose.orientation.z = q.z(); pose.orientation.w = q.w();
+        msg.poses.push_back(pose);
+    }
+    kf_pose_array_pub_->publish(msg);
+}
+
+void RvizPublisher::publishGPSTrajectory(const std::vector<SubMap::Ptr>& submaps, bool show_aligned) {
+    if (!node_) return;
+    nav_msgs::msg::Path raw_path, aligned_path;
+    raw_path.header.stamp = aligned_path.header.stamp = node_->now();
+    raw_path.header.frame_id = aligned_path.header.frame_id = frame_id_;
+    for (const auto& sm : submaps) {
+        if (!sm || !sm->has_valid_gps) continue;
+        geometry_msgs::msg::PoseStamped ps;
+        ps.header = raw_path.header;
+        ps.pose.position.x = sm->gps_center.x(); ps.pose.position.y = sm->gps_center.y(); ps.pose.position.z = sm->gps_center.z();
+        ps.pose.orientation.w = 1.0;
+        raw_path.poses.push_back(ps);
+        ps.pose.position.x = sm->pose_w_anchor_optimized.translation().x();
+        ps.pose.position.y = sm->pose_w_anchor_optimized.translation().y();
+        ps.pose.position.z = sm->pose_w_anchor_optimized.translation().z();
+        aligned_path.poses.push_back(ps);
+    }
+    gps_raw_path_pub_->publish(raw_path);
+    if (show_aligned && gps_aligned_path_pub_) gps_aligned_path_pub_->publish(aligned_path);
+}
+
+void RvizPublisher::publishTrajectoryComparison(
+    const std::vector<std::pair<double, Pose3d>>& odom_path,
+    const std::vector<std::pair<double, Pose3d>>& opt_path) {
+    publishOdometryPath(odom_path);
+    nav_msgs::msg::Path path;
+    path.header.stamp = node_->now();
+    path.header.frame_id = frame_id_;
+    for (const auto& [ts, pose] : opt_path) {
+        geometry_msgs::msg::PoseStamped ps;
+        ps.header = path.header;
+        const auto& p = pose.translation();
+        Eigen::Quaterniond q(pose.rotation());
+        ps.pose.position.x = p.x(); ps.pose.position.y = p.y(); ps.pose.position.z = p.z();
+        ps.pose.orientation.x = q.x(); ps.pose.orientation.y = q.y(); ps.pose.orientation.z = q.z(); ps.pose.orientation.w = q.w();
+        path.poses.push_back(ps);
+    }
+    opt_path_pub_->publish(path);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 3. 回环可视化
+// ─────────────────────────────────────────────────────────────────────────────
+
+void RvizPublisher::publishLoopMarkers(
+        const std::vector<LoopConstraint::Ptr>& loops,
+        const std::vector<SubMap::Ptr>& submaps) {
+
+    std::map<int, Eigen::Vector3d> sm_pos;
+    for (const auto& sm : submaps) {
+        if (!sm) continue;
+        sm_pos[sm->id] = sm->pose_w_anchor_optimized.translation();
+    }
+
+    visualization_msgs::msg::MarkerArray markers;
+    int id = 0;
+    for (const auto& lc : loops) {
+        auto it_i = sm_pos.find(lc->submap_i);
+        auto it_j = sm_pos.find(lc->submap_j);
+        if (it_i == sm_pos.end() || it_j == sm_pos.end()) continue;
+
+        visualization_msgs::msg::Marker line;
+        line.header.frame_id = frame_id_;
+        line.header.stamp    = node_->now();
+        line.ns    = "loops";
+        line.id    = id++;
+        line.type  = visualization_msgs::msg::Marker::LINE_STRIP;
+        line.action= visualization_msgs::msg::Marker::ADD;
+        line.scale.x = 0.12;
+        line.color.r = lc->is_inter_session ? 1.0f : 0.0f;
+        line.color.g = lc->is_inter_session ? 0.5f : 1.0f;
+        line.color.b = 0.0f;
+        line.color.a = 0.8f;
+
+        geometry_msgs::msg::Point p1, p2;
+        p1.x = it_i->second.x(); p1.y = it_i->second.y(); p1.z = it_i->second.z();
+        p2.x = it_j->second.x(); p2.y = it_j->second.y(); p2.z = it_j->second.z();
+        line.points.push_back(p1);
+        line.points.push_back(p2);
+        markers.markers.push_back(line);
+    }
+    loop_marker_pub_->publish(markers);
+}
+
+void RvizPublisher::publishLoopCandidateClouds(const SubMap::Ptr& query,
+                                                const SubMap::Ptr& candidate,
+                                                int /* loop_id */) {
+    if (!node_ || !loop_candidate_pub_ || !query || !candidate) return;
+    if ((!query->downsampled_cloud || query->downsampled_cloud->empty()) &&
+        (!candidate->downsampled_cloud || candidate->downsampled_cloud->empty())) return;
+    try {
+        CloudXYZIPtr merged(new CloudXYZI);
+        if (query->downsampled_cloud && !query->downsampled_cloud->empty())
+            *merged += *query->downsampled_cloud;
+        if (candidate->downsampled_cloud && !candidate->downsampled_cloud->empty()) {
+            CloudXYZI cand_world;
+            pcl::transformPointCloud(*candidate->downsampled_cloud, cand_world, candidate->pose_w_anchor_optimized.matrix());
+            *merged += cand_world;
+        }
+        if (merged->empty()) return;
+        sensor_msgs::msg::PointCloud2 msg;
+        pcl::toROSMsg(*merged, msg);
+        msg.header.stamp = node_->now();
+        msg.header.frame_id = frame_id_;
+        loop_candidate_pub_->publish(msg);
+    } catch (const std::exception& e) {
+        RCLCPP_ERROR(node_->get_logger(), "[RvizPublisher] publishLoopCandidateClouds failed: %s", e.what());
+    }
+}
+
+void RvizPublisher::publishLoopDetectionStatus(const SubMap::Ptr& query,
+                                                const std::vector<std::pair<int, float>>& scores) {
+    if (!node_ || !loop_marker_pub_ || scores.empty()) return;
+    visualization_msgs::msg::MarkerArray markers;
+    // 以查询子图中心为基准，沿 X 轴偏移显示各候选得分（便于在场景中定位）
+    Eigen::Vector3d base = query ? query->pose_w_anchor_optimized.translation() : Eigen::Vector3d(0, 0, 0);
+    int id = 0;
+    float max_s = 0.f;
+    for (const auto& p : scores) max_s = std::max(max_s, p.second);
+    if (max_s <= 0.f) max_s = 1.f;
+    for (size_t i = 0; i < scores.size(); ++i) {
+        Eigen::Vector3d pos = base + Eigen::Vector3d(static_cast<double>(i) * 3.0, 0.0, scores[i].second * 2.0);
+        auto m = makeSphereMarker("loop_scores", id++, pos, 0.4f, makeColorMap(scores[i].second / max_s));
+        markers.markers.push_back(m);
+    }
+    loop_marker_pub_->publish(markers);
+}
+
+void RvizPublisher::clearLoopCandidateClouds() {
+    if (!loop_candidate_pub_) return;
+    sensor_msgs::msg::PointCloud2 msg;
+    msg.header.stamp = node_->now();
+    msg.header.frame_id = frame_id_;
+    msg.width = 0;
+    msg.height = 1;
+    msg.is_dense = true;
+    loop_candidate_pub_->publish(msg);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 4. 子图可视化
+// ─────────────────────────────────────────────────────────────────────────────
+
+void RvizPublisher::publishSubmapBoundaries(const std::vector<SubMap::Ptr>& submaps) {
+    if (!node_) return;
+    visualization_msgs::msg::MarkerArray markers;
+    int id = 0;
+    for (const auto& sm : submaps) {
+        if (!sm) continue;
+        std_msgs::msg::ColorRGBA yellow;
+        yellow.r = 1.0f; yellow.g = 1.0f; yellow.b = 0.0f; yellow.a = 1.0f;
+        auto text = makeTextMarker("submap_labels", id++, sm->pose_w_anchor_optimized.translation(),
+            "SM" + std::to_string(sm->id), 1.5, &yellow);
+        markers.markers.push_back(text);
+    }
+    submap_boundary_pub_->publish(markers);
+}
+
+void RvizPublisher::publishSubmapBoundingBoxes(const std::vector<SubMap::Ptr>& submaps) {
+    if (!node_ || !submap_bbox_pub_) return;
+    visualization_msgs::msg::MarkerArray markers;
+    int id = 0;
+    for (const auto& sm : submaps) {
+        if (!sm || !sm->merged_cloud || sm->merged_cloud->empty()) continue;
+        Eigen::Vector3d min_pt(1e6, 1e6, 1e6), max_pt(-1e6, -1e6, -1e6);
+        for (const auto& p : sm->merged_cloud->points) {
+            min_pt.x() = std::min(min_pt.x(), static_cast<double>(p.x));
+            min_pt.y() = std::min(min_pt.y(), static_cast<double>(p.y));
+            min_pt.z() = std::min(min_pt.z(), static_cast<double>(p.z));
+            max_pt.x() = std::max(max_pt.x(), static_cast<double>(p.x));
+            max_pt.y() = std::max(max_pt.y(), static_cast<double>(p.y));
+            max_pt.z() = std::max(max_pt.z(), static_cast<double>(p.z));
+        }
+        Eigen::Vector3d center = (min_pt + max_pt) / 2.0;
+        Eigen::Vector3d scale = max_pt - min_pt;
+        Pose3d pose = Pose3d::Identity();
+        pose.translation() = center;
+        std_msgs::msg::ColorRGBA c;
+        c.r = 0.2f; c.g = 0.8f; c.b = 0.2f; c.a = 0.3f;
+        auto box = makeBoundingBoxMarker("submap_bbox", id++, pose, scale, c);
+        markers.markers.push_back(box);
+    }
+    submap_bbox_pub_->publish(markers);
+}
+
+void RvizPublisher::publishSubmapGraph(const std::vector<SubMap::Ptr>& submaps) {
+    if (!node_ || !submap_graph_pub_) return;
+    // 按子图 ID 排序后连接相邻子图
+    std::vector<SubMap::Ptr> sorted = submaps;
+    std::sort(sorted.begin(), sorted.end(),
+        [](const SubMap::Ptr& a, const SubMap::Ptr& b) {
+            return a->id < b->id;
+        });
+    
+    visualization_msgs::msg::MarkerArray markers;
+    int id = 0;
+    std_msgs::msg::ColorRGBA gray = makeColor(0.5f, 0.5f, 0.5f, 0.6f);
+    for (size_t i = 0; i + 1 < sorted.size(); ++i) {
+        if (!sorted[i] || !sorted[i+1]) continue;
+        Eigen::Vector3d a = sorted[i]->pose_w_anchor_optimized.translation();
+        Eigen::Vector3d b = sorted[i+1]->pose_w_anchor_optimized.translation();
+        markers.markers.push_back(makeLineMarker("submap_graph", id++, a, b, gray, 0.03));
+    }
+    submap_graph_pub_->publish(markers);
+}
+
+void RvizPublisher::publishSubmapDetail(const SubMap::Ptr& submap) {
+    if (!submap) return;
+    publishSubmapCloud(submap);
+    publishSubmapBoundingBoxes({submap});
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 5. GPS 可视化
+// ─────────────────────────────────────────────────────────────────────────────
+
+void RvizPublisher::publishGPSMarkers(const std::vector<SubMap::Ptr>& submaps) {
+    if (!node_) return;
+    visualization_msgs::msg::MarkerArray markers;
+    int id = 0;
+    for (const auto& sm : submaps) {
+        if (!sm || !sm->has_valid_gps) continue;
+        // 使用优化后位姿，与轨迹一致
+        Eigen::Vector3d pos = sm->pose_w_anchor_optimized.translation();
+        auto sphere = makeSphereMarker("gps", id++, pos, 2.0, makeColor(0.0f, 0.5f, 1.0f, 0.7f));
+        markers.markers.push_back(sphere);
+    }
+    gps_marker_pub_->publish(markers);
+}
+
+void RvizPublisher::publishGPSAlignment(const GPSAlignResult& result,
+                                        const std::vector<SubMap::Ptr>& submaps) {
+    if (!node_ || !gps_marker_pub_ || !result.success) return;
+    visualization_msgs::msg::MarkerArray markers;
+    Pose3d T_align = Pose3d(result.R_gps_lidar) * Eigen::Translation3d(result.t_gps_lidar);
+    auto axes = makeAxisMarkers("gps_align", 0, T_align, 3.0);
+    for (auto& m : axes.markers) markers.markers.push_back(std::move(m));
+    std_msgs::msg::ColorRGBA c = makeColor(0.0f, 1.0f, 0.0f, 0.8f);
+    for (const auto& sm : submaps) {
+        if (!sm || !sm->has_valid_gps) continue;
+        markers.markers.push_back(makeSphereMarker("gps_aligned", static_cast<int>(markers.markers.size()),
+            sm->pose_w_anchor_optimized.translation(), 1.5, c));
+    }
+    gps_marker_pub_->publish(markers);
+}
+
+void RvizPublisher::publishGPSQualityMarkers(const std::vector<SubMap::Ptr>& submaps) {
+    if (!node_ || !gps_quality_pub_) return;
+    visualization_msgs::msg::MarkerArray markers;
+    int id = 0;
+    for (const auto& sm : submaps) {
+        if (!sm || !sm->has_valid_gps) continue;
+        for (const auto& kf : sm->keyframes) {
+            if (!kf || !kf->has_valid_gps) continue;
+            float q = 1.0f;
+            if (kf->gps.hdop > 5.0) q = 0.2f;
+            else if (kf->gps.hdop > 2.0) q = 0.5f;
+            else if (kf->gps.hdop > 1.0) q = 0.8f;
+            std_msgs::msg::ColorRGBA c = makeColorMap(q);
+            c.a = 0.8f;
+            Eigen::Vector3d p = kf->T_w_b_optimized.translation();
+            markers.markers.push_back(makeSphereMarker("gps_quality", id++, p, 0.5, c));
+        }
+    }
+    gps_quality_pub_->publish(markers);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 6. 后端优化可视化
+// ─────────────────────────────────────────────────────────────────────────────
+
+void RvizPublisher::publishCovarianceEllipses(const std::vector<SubMap::Ptr>& submaps) {
+    if (!node_ || !covariance_pub_) return;
+    visualization_msgs::msg::MarkerArray markers;
+    int id = 0;
+    for (const auto& sm : submaps) {
+        if (!sm || sm->keyframes.empty()) continue;
+        auto* kf = sm->keyframes.front().get();
+        if (!kf) continue;
+        Eigen::Matrix3d cov_xy = kf->covariance.block<3,3>(0,0);
+        auto ell = makeCovarianceEllipse("cov", id++, kf->T_w_b_optimized, cov_xy, 2.0);
+        markers.markers.push_back(ell);
+    }
+    covariance_pub_->publish(markers);
+}
+
+void RvizPublisher::publishFactorGraph(const PoseGraph& graph) {
+    if (!node_ || !factor_graph_pub_) return;
+    visualization_msgs::msg::MarkerArray markers;
+    auto nodes = graph.allNodes();
+    auto edges = graph.allEdges();
+    std::map<int, Eigen::Vector3d> pos;
+    int id = 0;
+    for (const auto& n : nodes) {
+        pos[n.id] = n.pose_opt.translation();
+        markers.markers.push_back(makeSphereMarker("factor_nodes", id++, n.pose_opt.translation(), 0.4, makeColor(0.2f, 0.6f, 1.0f, 0.9f)));
+    }
+    std_msgs::msg::ColorRGBA odom_c = makeColor(0.5f, 0.5f, 0.5f, 0.6f);
+    std_msgs::msg::ColorRGBA loop_c = makeColor(1.0f, 0.3f, 0.0f, 0.8f);
+    std_msgs::msg::ColorRGBA gps_c  = makeColor(0.0f, 0.8f, 0.0f, 0.8f);
+    for (const auto& e : edges) {
+        auto it_from = pos.find(e.from);
+        if (it_from == pos.end()) continue;
+        // GPS 一元因子：to < 0，在节点上方画绿色小球表示约束
+        if (e.type == EdgeType::GPS && e.to < 0) {
+            Eigen::Vector3d at = it_from->second + Eigen::Vector3d(0, 0, 1.5);
+            markers.markers.push_back(makeSphereMarker("factor_gps", id++, at, 0.25, gps_c));
+            markers.markers.push_back(makeLineMarker("factor_gps", id++, it_from->second, at, gps_c, 0.03));
+            continue;
+        }
+        auto it_to = pos.find(e.to);
+        if (it_to == pos.end()) continue;
+        std_msgs::msg::ColorRGBA* c = &odom_c;
+        if (e.type == EdgeType::LOOP) c = &loop_c;
+        else if (e.type == EdgeType::GPS) c = &gps_c;
+        markers.markers.push_back(makeLineMarker("factor_edges", id++, it_from->second, it_to->second, *c, 0.02));
+    }
+    factor_graph_pub_->publish(markers);
+}
+
+void RvizPublisher::publishHBAResult(const HBAResult& result) {
+    if (!node_ || !hba_result_pub_ || !result.success) return;
+    visualization_msgs::msg::MarkerArray markers;
+    for (size_t i = 0; i < result.optimized_poses.size(); ++i) {
+        auto m = makeSphereMarker("hba_poses", static_cast<int>(i),
+            result.optimized_poses[i].translation(), 0.3, makeColor(0.0f, 0.9f, 0.4f, 0.8f));
+        markers.markers.push_back(m);
+    }
+    hba_result_pub_->publish(markers);
+}
+
+void RvizPublisher::publishOptimizationConvergence(const std::vector<double>& residuals) {
+    if (!node_ || !convergence_pub_ || residuals.empty()) return;
+    visualization_msgs::msg::MarkerArray markers;
+    visualization_msgs::msg::Marker line;
+    line.header.frame_id = frame_id_;
+    line.header.stamp = node_->now();
+    line.ns = "convergence";
+    line.id = 0;
+    line.type = visualization_msgs::msg::Marker::LINE_STRIP;
+    line.action = visualization_msgs::msg::Marker::ADD;
+    line.scale.x = 0.15;
+    line.color = makeColor(1.0f, 0.5f, 0.0f, 0.9f);
+    double max_r = *std::max_element(residuals.begin(), residuals.end());
+    if (max_r < 1e-9) max_r = 1.0;
+    // 缩放至场景可见：X 方向 1m/迭代，Y 方向 10*m 放大残差（便于在 RViz 原点附近查看）
+    const double x_scale = 1.0;
+    const double y_scale = 10.0;
+    for (size_t i = 0; i < residuals.size(); ++i) {
+        geometry_msgs::msg::Point p;
+        p.x = static_cast<double>(i) * x_scale;
+        p.y = residuals[i] * y_scale;
+        p.z = 0.0;
+        line.points.push_back(p);
+    }
+    markers.markers.push_back(line);
+    convergence_pub_->publish(markers);
+
+    // 发布残差序列供 PlotJuggler 等绘制（话题 /automap/convergence_residual）
+    if (convergence_residual_pub_) {
+        std_msgs::msg::Float64MultiArray arr;
+        arr.data.resize(residuals.size());
+        for (size_t i = 0; i < residuals.size(); ++i) arr.data[i] = residuals[i];
+        convergence_residual_pub_->publish(arr);
+    }
+}
+
+void RvizPublisher::publishPoseUpdateAnimation(const std::vector<Pose3d>& before,
+                                               const std::vector<Pose3d>& after) {
+    if (!node_ || !opt_path_pub_ || before.size() != after.size()) return;
+    nav_msgs::msg::Path path;
+    path.header.stamp = node_->now();
+    path.header.frame_id = frame_id_;
+    for (size_t i = 0; i < after.size(); ++i) {
+        geometry_msgs::msg::PoseStamped ps;
+        ps.header = path.header;
+        const auto& p = after[i].translation();
+        Eigen::Quaterniond q(after[i].rotation());
+        ps.pose.position.x = p.x(); ps.pose.position.y = p.y(); ps.pose.position.z = p.z();
+        ps.pose.orientation.x = q.x(); ps.pose.orientation.y = q.y(); ps.pose.orientation.z = q.z(); ps.pose.orientation.w = q.w();
+        path.poses.push_back(ps);
+    }
+    opt_path_pub_->publish(path);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 7. 系统状态可视化
+// ─────────────────────────────────────────────────────────────────────────────
+
+void RvizPublisher::publishCoordinateFrames(const Pose3d& base_pose, const Pose3d& sensor_pose) {
+    if (!node_ || !frame_marker_pub_) return;
+    visualization_msgs::msg::MarkerArray markers;
+    int id = 0;
+    auto addFrame = [&](const std::string& ns, const Pose3d& pose, double scale) {
+        Eigen::Vector3d o = pose.translation();
+        Eigen::Vector3d x = pose.rotation() * Eigen::Vector3d::UnitX() * scale + o;
+        Eigen::Vector3d y = pose.rotation() * Eigen::Vector3d::UnitY() * scale + o;
+        Eigen::Vector3d z = pose.rotation() * Eigen::Vector3d::UnitZ() * scale + o;
+        markers.markers.push_back(makeArrowMarker(ns, id++, o, x, makeColor(1,0,0,1), 0.03));
+        markers.markers.push_back(makeArrowMarker(ns, id++, o, y, makeColor(0,1,0,1), 0.03));
+        markers.markers.push_back(makeArrowMarker(ns, id++, o, z, makeColor(0,0,1,1), 0.03));
+    };
+    addFrame("world", Pose3d::Identity(), 2.0);
+    addFrame("base", base_pose, 1.0);
+    addFrame("sensor", sensor_pose, 0.5);
+    frame_marker_pub_->publish(markers);
+}
+
+void RvizPublisher::publishModuleStatus(const std::map<std::string, int>& module_status) {
+    if (!node_ || !module_status_pub_) return;
+    visualization_msgs::msg::MarkerArray markers;
+    int id = 0;
+    double y = 0.0;
+    for (const auto& [name, status] : module_status) {
+        std_msgs::msg::ColorRGBA c = (status == 1) ? makeColor(0.0f, 1.0f, 0.0f, 1.0f) : makeColor(1.0f, 0.0f, 0.0f, 1.0f);
+        auto text = makeTextMarker("module_status", id++, Eigen::Vector3d(0.0, y, 0.0), name + (status ? ": OK" : ": FAIL"), 0.6, &c);
+        markers.markers.push_back(text);
+        y += 1.0;
+    }
+    module_status_pub_->publish(markers);
+}
+
+void RvizPublisher::publishActiveRegion(const SubMap::Ptr& active_submap) {
+    if (!node_ || !active_region_pub_) return;
+    visualization_msgs::msg::MarkerArray markers;
+    if (active_submap && active_submap->merged_cloud && !active_submap->merged_cloud->empty()) {
+        Eigen::Vector3d c = active_submap->pose_w_anchor_optimized.translation();
+        auto sphere = makeSphereMarker("active", 0, c, active_submap->spatial_extent_m > 0 ? active_submap->spatial_extent_m : 10.0,
+            makeColor(0.2f, 0.8f, 0.2f, 0.25f));
+        markers.markers.push_back(sphere);
+    }
+    active_region_pub_->publish(markers);
+}
+
+void RvizPublisher::publishDegenerationRegions(const std::vector<std::pair<double, Pose3d>>& degraded_poses) {
+    if (!node_ || !degen_region_pub_) return;
+    visualization_msgs::msg::MarkerArray markers;
+    for (size_t i = 0; i < degraded_poses.size(); ++i) {
+        auto m = makeSphereMarker("degen", static_cast<int>(i), degraded_poses[i].second.translation(), 0.5,
+            makeColor(1.0f, 0.0f, 0.0f, 0.6f));
+        markers.markers.push_back(m);
+    }
+    degen_region_pub_->publish(markers);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 8. 工具函数
+// ─────────────────────────────────────────────────────────────────────────────
+
+void RvizPublisher::clearAllMarkers() {
+    for (const auto* pub : {loop_marker_pub_.get(), gps_marker_pub_.get(), submap_boundary_pub_.get(),
+            submap_bbox_pub_.get(), submap_graph_pub_.get(), covariance_pub_.get(), factor_graph_pub_.get(),
+            gps_quality_pub_.get(), module_status_pub_.get(), frame_marker_pub_.get(),
+            active_region_pub_.get(), degen_region_pub_.get(), hba_result_pub_.get(), convergence_pub_.get()}) {
+        if (pub) pub->publish(makeDeleteAllMarkers(""));
+    }
+}
+
+void RvizPublisher::clearMarkers(const std::string& ns) {
+    auto arr = makeDeleteAllMarkers(ns);
+    for (const auto* pub : {loop_marker_pub_.get(), gps_marker_pub_.get(), submap_boundary_pub_.get(),
+            submap_bbox_pub_.get(), submap_graph_pub_.get(), covariance_pub_.get(), factor_graph_pub_.get(),
+            gps_quality_pub_.get(), module_status_pub_.get(), frame_marker_pub_.get(),
+            active_region_pub_.get(), degen_region_pub_.get(), hba_result_pub_.get(), convergence_pub_.get()}) {
+        if (pub) pub->publish(arr);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 私有辅助
+// ─────────────────────────────────────────────────────────────────────────────
+
+CloudXYZIPtr RvizPublisher::toROSCloud(const CloudXYZIPtr& cloud, double ds_res) const {
+    if (!cloud || cloud->empty()) return nullptr;
+    if (ds_res <= 0) return cloud;
+    return utils::voxelDownsample(cloud, ds_res);
+}
+
+std_msgs::msg::ColorRGBA RvizPublisher::makeColor(float r, float g, float b, float a) const {
+    std_msgs::msg::ColorRGBA c;
+    c.r = r; c.g = g; c.b = b; c.a = a;
+    return c;
+}
+
+std_msgs::msg::ColorRGBA RvizPublisher::makeColorMap(float value, const std::string& cmap) const {
+    value = std::max(0.0f, std::min(1.0f, value));
+    float r = 0, g = 0, b = 0;
+    if (cmap == "jet") {
+        if (value < 0.25f) { r = 0; g = value * 4.0f; b = 1.0f; }
+        else if (value < 0.5f) { r = 0; g = 1.0f; b = 2.0f - value * 4.0f; }
+        else if (value < 0.75f) { r = value * 4.0f - 2.0f; g = 1.0f; b = 0; }
+        else { r = 1.0f; g = 4.0f - value * 4.0f; b = 0; }
+    } else {
+        r = value; g = 1.0f - value; b = 0.5f;
+    }
+    return makeColor(r, g, b, 1.0f);
+}
+
+visualization_msgs::msg::MarkerArray RvizPublisher::makeAxisMarkers(
+    const std::string& ns, int base_id, const Pose3d& pose, double scale) const {
+    visualization_msgs::msg::MarkerArray arr;
+    Eigen::Vector3d o = pose.translation();
+    auto addArrow = [&](int offset, const Eigen::Vector3d& dir, const std_msgs::msg::ColorRGBA& c) {
+        Eigen::Vector3d end = pose.rotation() * dir * scale + o;
+        arr.markers.push_back(makeArrowMarker(ns, base_id + offset, o, end, c, scale * 0.05));
+    };
+    addArrow(0, Eigen::Vector3d::UnitX(), makeColor(1, 0, 0, 1)); // X 红
+    addArrow(1, Eigen::Vector3d::UnitY(), makeColor(0, 1, 0, 1)); // Y 绿
+    addArrow(2, Eigen::Vector3d::UnitZ(), makeColor(0, 0, 1, 1)); // Z 蓝
+    return arr;
+}
+
+visualization_msgs::msg::Marker RvizPublisher::makeArrowMarker(
+    const std::string& ns, int id, const Eigen::Vector3d& start, const Eigen::Vector3d& end,
+    const std_msgs::msg::ColorRGBA& color, double shaft_diameter) const {
+    visualization_msgs::msg::Marker m;
+    m.header.frame_id = frame_id_;
+    m.header.stamp = node_ ? node_->now() : rclcpp::Time(0);
+    m.ns = ns;
+    m.id = id;
+    m.type = visualization_msgs::msg::Marker::ARROW;
+    m.action = visualization_msgs::msg::Marker::ADD;
+    m.scale.x = shaft_diameter;
+    m.scale.y = shaft_diameter * 2.0;
+    m.scale.z = 0.0;
+    m.points.resize(2);
+    m.points[0].x = start.x(); m.points[0].y = start.y(); m.points[0].z = start.z();
+    m.points[1].x = end.x(); m.points[1].y = end.y(); m.points[1].z = end.z();
+    m.color = color;
+    return m;
+}
+
+visualization_msgs::msg::Marker RvizPublisher::makeLineMarker(
+    const std::string& ns, int id, const Eigen::Vector3d& start, const Eigen::Vector3d& end,
+    const std_msgs::msg::ColorRGBA& color, double width) const {
+    visualization_msgs::msg::Marker m;
+    m.header.frame_id = frame_id_;
+    m.header.stamp = node_ ? node_->now() : rclcpp::Time(0);
+    m.ns = ns;
+    m.id = id;
+    m.type = visualization_msgs::msg::Marker::LINE_STRIP;
+    m.action = visualization_msgs::msg::Marker::ADD;
+    m.scale.x = width;
+    m.color = color;
+    geometry_msgs::msg::Point p1, p2;
+    p1.x = start.x(); p1.y = start.y(); p1.z = start.z();
+    p2.x = end.x(); p2.y = end.y(); p2.z = end.z();
+    m.points.push_back(p1);
+    m.points.push_back(p2);
+    return m;
+}
+
+visualization_msgs::msg::Marker RvizPublisher::makeSphereMarker(
+    const std::string& ns, int id, const Eigen::Vector3d& center,
+    double radius, const std_msgs::msg::ColorRGBA& color) const {
+    visualization_msgs::msg::Marker m;
+    m.header.frame_id = frame_id_;
+    m.header.stamp = node_ ? node_->now() : rclcpp::Time(0);
+    m.ns = ns;
+    m.id = id;
+    m.type = visualization_msgs::msg::Marker::SPHERE;
+    m.action = visualization_msgs::msg::Marker::ADD;
+    m.pose.position.x = center.x(); m.pose.position.y = center.y(); m.pose.position.z = center.z();
+    m.pose.orientation.w = 1.0;
+    m.scale.x = m.scale.y = m.scale.z = radius * 2.0;
+    m.color = color;
+    return m;
+}
+
+visualization_msgs::msg::Marker RvizPublisher::makeTextMarker(
+    const std::string& ns, int id, const Eigen::Vector3d& position,
+    const std::string& text, double size, const std_msgs::msg::ColorRGBA* color) const {
+    visualization_msgs::msg::Marker m;
+    m.header.frame_id = frame_id_;
+    m.header.stamp = node_ ? node_->now() : rclcpp::Time(0);
+    m.ns = ns;
+    m.id = id;
+    m.type = visualization_msgs::msg::Marker::TEXT_VIEW_FACING;
+    m.action = visualization_msgs::msg::Marker::ADD;
+    m.pose.position.x = position.x(); m.pose.position.y = position.y(); m.pose.position.z = position.z();
+    m.pose.orientation.w = 1.0;
+    m.scale.z = size;
+    m.text = text;
+    m.color = color ? *color : makeColor(1.0f, 1.0f, 0.0f, 1.0f);
+    return m;
+}
+
+visualization_msgs::msg::Marker RvizPublisher::makeBoundingBoxMarker(
+    const std::string& ns, int id, const Pose3d& pose,
+    const Eigen::Vector3d& scale, const std_msgs::msg::ColorRGBA& color) const {
+    visualization_msgs::msg::Marker m;
+    m.header.frame_id = frame_id_;
+    m.header.stamp = node_ ? node_->now() : rclcpp::Time(0);
+    m.ns = ns;
+    m.id = id;
+    m.type = visualization_msgs::msg::Marker::CUBE;
+    m.action = visualization_msgs::msg::Marker::ADD;
+    m.pose.position.x = pose.translation().x();
+    m.pose.position.y = pose.translation().y();
+    m.pose.position.z = pose.translation().z();
+    Eigen::Quaterniond q(pose.rotation());
+    m.pose.orientation.x = q.x(); m.pose.orientation.y = q.y(); m.pose.orientation.z = q.z(); m.pose.orientation.w = q.w();
+    m.scale.x = scale.x(); m.scale.y = scale.y(); m.scale.z = scale.z();
+    m.color = color;
+    return m;
+}
+
+visualization_msgs::msg::Marker RvizPublisher::makeCovarianceEllipse(
+    const std::string& ns, int id, const Pose3d& pose,
+    const Eigen::Matrix3d& cov_xy, double scale) const {
+    Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> es(cov_xy);
+    Eigen::Vector3d ev = es.eigenvalues().cwiseMax(1e-9).cwiseSqrt() * scale;
+    Eigen::Matrix3d R = es.eigenvectors();
+    Pose3d T = Pose3d::Identity();
+    T.translation() = pose.translation();
+    T.linear() = pose.rotation() * R;
+    std_msgs::msg::ColorRGBA c = makeColor(0.5f, 0.5f, 1.0f, 0.25f);
+    return makeBoundingBoxMarker(ns, id, T, ev * 2.0, c);
+}
+
+visualization_msgs::msg::Marker RvizPublisher::makeDeleteMarker(const std::string& ns, int id) const {
+    visualization_msgs::msg::Marker m;
+    m.header.frame_id = frame_id_;
+    m.header.stamp = node_ ? node_->now() : rclcpp::Time(0);
+    m.ns = ns;
+    m.id = id;
+    m.action = visualization_msgs::msg::Marker::DELETE;
+    return m;
+}
+
+visualization_msgs::msg::MarkerArray RvizPublisher::makeDeleteAllMarkers(const std::string& ns) const {
+    visualization_msgs::msg::MarkerArray arr;
+    visualization_msgs::msg::Marker m;
+    m.header.frame_id = frame_id_;
+    m.header.stamp = node_ ? node_->now() : rclcpp::Time(0);
+    m.ns = ns;
+    m.id = 0;
+    m.action = visualization_msgs::msg::Marker::DELETEALL;
+    arr.markers.push_back(m);
+    return arr;
 }
 
 }  // namespace automap_pro

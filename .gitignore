@@ -2,20 +2,35 @@
 # 大文件（*.bag, *.pth.tar, *.ply, *.gif, *.pdf等）由 Git LFS 管理
 # 本文件只忽略不需要版本控制的文件
 
+# ========== 数据/LFS 不提交（修改代码时不更新 LFS）==========
+# 以下为数据文件，日常提交只提交代码/配置，不提交 LFS 数据
+
+# data/ 目录全部为数据，不提交、不推送、不占用仓库空间
+data/
+automap_pro/src/modular/**/model/
+automap_pro/src/modular/**/demo/scans/
+automap_pro/src/modular/**/examples/example_data/
+automap_pro/src/modular/**/test/teaser/data/
+automap_pro/src/modular/**/test/benchmark/data/
+automap_pro/src/modular/**/Supplementary/
+automap_pro/src/modular/**/*.gif
+automap_pro/src/modular/**/*.ply
+automap_pro/src/modular/**/*.pcd
+automap_pro/src/modular/**/*.bin
+automap_pro/thrid_party/**/docs/*.gif
+docker/*.tar
+docker/*.tar.gz
+
 # ========== Docker 依赖（构建产物，可重新下载）==========
-# Docker 下载的二进制依赖
 docker/deps/downloads/
 docker/deps/*/bin/
 docker/deps/*/lib/
 docker/deps/*/include/
 docker/deps/*/share/
-
-# 第三方库构建产物
 docker/deps/*/build/
 
 # ========== 临时文件 ==========
 *.log
-# 工程统一日志目录（建图日志、fast_livo_params 等）
 logs/
 *.tmp
 *.swp
@@ -67,7 +82,6 @@ htmlcov/
 *.pid
 
 # ========== 子模块工作目录修改 ==========
-# Git 子模块的修改通常不需要提交
 docker/deps/Livox-SDK2/
 docker/deps/Open3D/
 docker/deps/TEASER-plusplus/

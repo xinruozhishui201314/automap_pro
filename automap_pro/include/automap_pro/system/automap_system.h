@@ -8,6 +8,7 @@
 #include "automap_pro/loop_closure/loop_detector.h"
 #include "automap_pro/backend/incremental_optimizer.h"
 #include "automap_pro/backend/hba_optimizer.h"
+#include "automap_pro/visualization/rviz_publisher.h"
 
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_components/register_node_macro.hpp>
@@ -64,11 +65,19 @@ private:
     LoopDetector          loop_detector_;
     IncrementalOptimizer  isam2_optimizer_;
     HBAOptimizer          hba_optimizer_;
+    RvizPublisher         rviz_publisher_;
+
+    // 回环约束缓存（用于可视化）
+    std::vector<LoopConstraint::Ptr> loop_constraints_;
+    mutable std::mutex               loop_constraints_mutex_;
 
     // ── 状态 ─────────────────────────────────────────────────────────────
     std::atomic<SystemState> state_{SystemState::IDLE};
     uint64_t current_session_id_ = 0;
     std::mutex state_mutex_;
+    
+    // 异步任务关闭请求标志
+    std::atomic<bool> shutdown_requested_{false};
 
     // 当前里程计状态缓存
     Pose3d    last_odom_pose_    = Pose3d::Identity();

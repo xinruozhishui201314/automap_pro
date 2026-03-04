@@ -62,13 +62,16 @@ std::vector<std::pair<int,int>> FpfhExtractor::findCorrespondences(
         return corrs;
     }
 
-    // tgt → src 互验证
+    // ✅ 修复：使用 KD-Tree 加速最近邻搜索（O(n log n)）
+    pcl::KdTreeFLANN<pcl::FPFHSignature33> kdtree_tgt;
+    kdtree_tgt.setInputCloud(tgt);
+    
     std::vector<int> tgt2src(tgt->size(), -1);
     for (size_t j = 0; j < tgt->size(); ++j) {
-        float best = std::numeric_limits<float>::max();
-        for (size_t i = 0; i < src->size(); ++i) {
-            float d = fpfhDist(tgt->points[j], src->points[i]);
-            if (d < best) { best = d; tgt2src[j] = (int)i; }
+        std::vector<int> indices(1);
+        std::vector<float> distances(1);
+        if (kdtree_tgt.nearestKSearch(tgt->points[j], 1, indices, distances) > 0) {
+            tgt2src[j] = indices[0];
         }
     }
 

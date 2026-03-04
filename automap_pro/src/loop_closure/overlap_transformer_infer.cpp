@@ -122,9 +122,10 @@ Eigen::VectorXf OverlapTransformerInfer::inferWithTorch(
 {
     torch::Device device(use_cuda_ ? torch::kCUDA : torch::kCPU);
 
-    // float 数组 → Tensor [1,1,H,W]，克隆一份避免悬空指针
+    // 先拷贝到局部缓冲区，避免多线程下 range_img 被修改导致悬空指针
+    std::vector<float> range_img_copy(range_img.begin(), range_img.end());
     torch::Tensor t = torch::from_blob(
-        const_cast<float*>(range_img.data()),
+        range_img_copy.data(),
         {1, 1, proj_H_, proj_W_},
         torch::kFloat32).clone();
 

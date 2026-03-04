@@ -1,7 +1,9 @@
 #include "automap_pro/backend/optimizer.h"
 #include "automap_pro/core/utils.h"
+#include "automap_pro/core/logger.h"
 
 #include <rclcpp/rclcpp.hpp>
+#include <cmath>
 
 #ifdef USE_GTSAM
 #include <gtsam/geometry/Pose3.h>
@@ -58,16 +60,24 @@ Optimizer::Result Optimizer::optimizeGTSAM(PoseGraph& graph) const {
     // Add edges
     for (const auto& edge : edges) {
         if (edge.to < 0) {
-            // GPS unary factor
-            auto gps_noise = gtsam::noiseModel::Gaussian::Information(
-                edge.information.block<3,3>(0,0));
+            // GPS unary factor: 位置约束强，旋转约束弱（使用 PriorFactor<Pose3>）
+            gtsam::Pose3 gps_prior(gtsam::Rot3(), gtsam::Point3(edge.measurement.translation()));
+            // 6x6 协方差：位置用 information 的逆，旋转用大方差（弱约束）
+            Eigen::Matrix3d pos_info = edge.information.block<3,3>(0,0);
+            Eigen::Matrix3d pos_cov = pos_info.ldlt().solve(Eigen::Matrix3d::Identity());
+            gtsam::Matrix66 cov6 = gtsam::Matrix66::Identity();
+            cov6.block<3,3>(0,0) = pos_cov;
+            cov6.block<3,3>(3,3) = 1e6 * Eigen::Matrix3d::Identity();  // 旋转弱约束
+            auto gps_noise = gtsam::noiseModel::Gaussian::Covariance(cov6);
             if (options_.use_robust_kernel) {
                 auto robust = gtsam::noiseModel::Robust::Create(
                     gtsam::noiseModel::mEstimator::Huber::Create(options_.robust_kernel_delta),
                     gps_noise);
-                // GPS prior on position only
-                gtsam::Pose3 gps_prior(gtsam::Rot3(), gtsam::Point3(edge.measurement.translation()));
-                // We can't add position-only factor in standard GTSAM, so use full pose with large rotation cov
+                factor_graph.add(gtsam::PriorFactor<gtsam::Pose3>(
+                    X(edge.from), gps_prior, robust));
+            } else {
+                factor_graph.add(gtsam::PriorFactor<gtsam::Pose3>(
+                    X(edge.from), gps_prior, gps_noise));
             }
             continue;
         }
@@ -101,7 +111,69 @@ Optimizer::Result Optimizer::optimizeGTSAM(PoseGraph& graph) const {
         gtsam::LevenbergMarquardtOptimizer lm(factor_graph, initial_values, params);
         auto optimized = lm.optimize();
 
-        // Write back
+        // ─────────────────────────────────────────────────────────────
+        // 求解失败检测
+        // ─────────────────────────────────────────────────────────────
+
+        // 检查最终代价是否过大（发散）
+        double final_error = lm.error();
+        if (options_.check_numerical_issues && final_error > options_.max_cost_threshold) {
+            result.success = false;
+            result.fail_reason = Result::FailReason::COST_DIVERGED;
+            result.fail_message = fmt::format(
+                "Optimization diverged: final_cost={} exceeds threshold {}",
+                final_error, options_.max_cost_threshold);
+            ALOG_WARN(MOD, "Optimization diverged: cost={} exceeds threshold {}",
+                final_error, options_.max_cost_threshold);
+            RCLCPP_WARN(rclcpp::get_logger("automap_pro"),
+                "[Optimizer] Optimization diverged: cost=%e (threshold=%e)", 
+                final_error, options_.max_cost_threshold);
+            result.time_ms = timer.elapsedMs();
+            return result;
+        }
+
+        // 检查迭代次数
+        int actual_iterations = static_cast<int>(lm.iterations());
+        if (actual_iterations >= options_.max_iterations) {
+            result.success = true;  // 仍然标记成功，但记录警告
+            result.fail_reason = Result::FailReason::MAX_ITERATIONS_REACHED;
+            result.fail_message = fmt::format(
+                "Reached max iterations ({}) without convergence", options_.max_iterations);
+            ALOG_WARN(MOD, "Max iterations reached: {} iters", actual_iterations);
+            RCLCPP_WARN(rclcpp::get_logger("automap_pro"),
+                "[Optimizer] Max iterations reached: %d iters", actual_iterations);
+        }
+
+        // 检查优化值是否有效（数值问题）
+        bool has_numerical_issues = false;
+        for (const auto& node : nodes) {
+            if (optimized.exists(X(node.id))) {
+                auto pose = optimized.at<gtsam::Pose3>(X(node.id));
+                // 检查 NaN/Inf
+                if (!std::isfinite(pose.x()) || !std::isfinite(pose.y()) ||
+                    !std::isfinite(pose.z()) ||
+                    !std::isfinite(pose.rotation().quaternion().w()) ||
+                    !std::isfinite(pose.rotation().quaternion().x()) ||
+                    !std::isfinite(pose.rotation().quaternion().y()) ||
+                    !std::isfinite(pose.rotation().quaternion().z())) {
+                    has_numerical_issues = true;
+                    break;
+                }
+            }
+        }
+
+        if (has_numerical_issues) {
+            result.success = false;
+            result.fail_reason = Result::FailReason::NUMERICAL_ISSUES;
+            result.fail_message = "Numerical issues detected (NaN/Inf) in optimized poses";
+            ALOG_ERROR(MOD, "Numerical issues detected in optimized poses");
+            RCLCPP_ERROR(rclcpp::get_logger("automap_pro"),
+                "[Optimizer] Numerical issues detected in optimized poses");
+            result.time_ms = timer.elapsedMs();
+            return result;
+        }
+
+        // 写回优化结果
         for (const auto& node : nodes) {
             if (optimized.exists(X(node.id))) {
                 auto pose = optimized.at<gtsam::Pose3>(X(node.id));
@@ -116,8 +188,12 @@ Optimizer::Result Optimizer::optimizeGTSAM(PoseGraph& graph) const {
         result.final_cost = lm.error();
         result.iterations = static_cast<int>(lm.iterations());
     } catch (const std::exception& e) {
-        RCLCPP_ERROR(rclcpp::get_logger("automap_pro"), "[Optimizer] GTSAM optimization failed: %s", e.what());
+        ALOG_ERROR(MOD, "GTSAM optimization failed: {}", e.what());
+        RCLCPP_ERROR(rclcpp::get_logger("automap_pro"), 
+            "[Optimizer] GTSAM optimization failed: %s", e.what());
         result.success = false;
+        result.fail_reason = Result::FailReason::LINEAR_SYSTEM_SINGULAR;
+        result.fail_message = std::string("Exception: ") + e.what();
     }
 
     result.time_ms = timer.elapsedMs();
@@ -132,7 +208,13 @@ Optimizer::Result Optimizer::optimizeGaussNewton(PoseGraph& graph) const {
     auto nodes = graph.allNodes();
     auto edges = graph.allEdges();
 
-    if (nodes.empty()) return result;
+    if (nodes.empty()) {
+        result.success = false;
+        result.fail_reason = Result::FailReason::NUMERICAL_ISSUES;
+        result.fail_message = "Empty graph: no nodes to optimize";
+        result.time_ms = timer.elapsedMs();
+        return result;
+    }
 
     // Build index map
     std::map<int, int> id_to_idx;
@@ -200,7 +282,17 @@ Optimizer::Result Optimizer::optimizeGaussNewton(PoseGraph& graph) const {
         // Solve H * dx = -b
         Eigen::VectorXd dx = H_mat.ldlt().solve(-b_vec);
 
-        if (!dx.allFinite()) break;
+        // ─────────────────────────────────────────────────────────────
+        // 求解失败检测
+        // ─────────────────────────────────────────────────────────────
+        if (!dx.allFinite()) {
+            result.success = false;
+            result.fail_reason = Result::FailReason::NUMERICAL_ISSUES;
+            result.fail_message = "GaussNewton optimization produced NaN/Inf values";
+            ALOG_ERROR(MOD, "GaussNewton optimization produced NaN/Inf in solution vector");
+            result.time_ms = timer.elapsedMs();
+            return result;
+        }
 
         // Update poses
         for (int i = 0; i < n_nodes; ++i) {

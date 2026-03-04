@@ -1,0 +1,10 @@
+# 获取会话信息服务
+
+---
+# 请求
+uint64 session_id
+---
+# 响应
+bool success
+SessionInfo session_info
+string message

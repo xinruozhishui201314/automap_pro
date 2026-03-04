@@ -1,9 +1,14 @@
 #include "automap_pro/backend/incremental_optimizer.h"
 #include "automap_pro/core/config_manager.h"
 #include "automap_pro/core/logger.h"
+#include "automap_pro/core/structured_logger.h"
+#include "automap_pro/core/metrics.h"
+#include "automap_pro/core/health_monitor.h"
+#include "automap_pro/core/error_code.h"
 #define MOD "iSAM2"
 
 #include <gtsam/base/Matrix.h>
+#include <Eigen/SVD>
 #include <chrono>
 
 namespace automap_pro {
@@ -228,10 +233,38 @@ Pose3d IncrementalOptimizer::fromPose3(const gtsam::Pose3& p) const {
 
 gtsam::noiseModel::Gaussian::shared_ptr
 IncrementalOptimizer::infoToNoise(const Mat66d& info) const {
-    // 信息矩阵 → 协方差矩阵（逆），保护数值稳定性
-    gtsam::Matrix66 cov = info.inverse().cast<double>();
-    // 强制对称
-    cov = 0.5 * (cov + cov.transpose());
+    // 检查奇异性：使用 SVD 分解判断秩和条件数
+    Eigen::JacobiSVD<Mat66d> svd(info, Eigen::ComputeFullU | Eigen::ComputeFullV);
+    
+    // 检查秩是否满秩（rank < 6 表示奇异）
+    const int rank = svd.rank();
+    if (rank < 6) {
+        ALOG_WARN("IncrementalOptimizer", 
+                  "Information matrix rank-deficient (rank={}/6), using conservative covariance", rank);
+        gtsam::Matrix66 cov = gtsam::Matrix66::Identity() * 1.0;
+        return gtsam::noiseModel::Gaussian::Covariance(cov);
+    }
+
+    // ✅ 修复：降低阈值，更早触发正则化（从 1e10 降到 1e6）
+    // ✅ 修复：对所有情况使用相对正则化（避免数值不稳定）
+    const double max_sv = svd.singularValues()(0);
+    const double min_sv = svd.singularValues()(5);
+    const double cond = (max_sv > 1e-12) ? (max_sv / min_sv) : 1e12;
+
+    // 相对正则化：info + (max_sv * 1e-3) * I
+    Mat66d info_reg = info + Mat66d::Identity() * std::max(1e-6, min_sv * 1e-3);
+    
+    gtsam::Matrix66 cov = info_reg.inverse().cast<double>();
+    cov = 0.5 * (cov + cov.transpose());  // 确保对称
+
+    // ✅ 修复：检查求逆结果是否有效
+    if (!cov.allFinite()) {
+        ALOG_ERROR(MOD, "Regularized inverse contains NaN/Inf, using fallback covariance");
+        cov = gtsam::Matrix66::Identity() * 1.0;
+        return gtsam::noiseModel::Gaussian::Covariance(cov);
+    }
+
+    ALOG_DEBUG(MOD, "InfoToNoise: cond={:.2e} reg_factor={:.2e}", cond, min_sv * 1e-3);
     return gtsam::noiseModel::Gaussian::Covariance(cov);
 }
 

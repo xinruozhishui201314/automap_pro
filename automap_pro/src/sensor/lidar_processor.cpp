@@ -88,34 +88,61 @@ CloudXYZIPtr LidarProcessor::undistort(const CloudXYZIPtr& raw,
     CloudXYZIPtr out(new CloudXYZI);
     out->resize(raw->size());
 
+    // 预处理：为每个IMU数据计算累积旋转到end
+    // 修复：从后往前积分（正确的积分方向）
+    std::vector<Eigen::Matrix3d> R_to_end(imu_data.size(), Eigen::Matrix3d::Identity());
+    for (int j = imu_data.size() - 2; j >= 0; --j) {
+        const auto& imu = imu_data[j];
+        const auto& imu_next = imu_data[j + 1];
+        double dt = imu_next.timestamp - imu.timestamp;
+        if (dt > 0) {
+            Eigen::Vector3d omega = imu.angular_velocity;
+            double angle = omega.norm() * dt;
+            if (angle > 1e-10) {
+                Eigen::AngleAxisd aa(angle, omega.normalized());
+                R_to_end[j] = aa.toRotationMatrix() * R_to_end[j + 1];
+            } else {
+                R_to_end[j] = R_to_end[j + 1];
+            }
+        }
+    }
+    
     Eigen::Matrix3d R_ref = Eigen::Matrix3d::Identity();
     double dt_total = t_end - t_start;
     if (dt_total <= 0.0) return raw;
 
     for (size_t i = 0; i < raw->size(); ++i) {
         const auto& pt = raw->points[i];
-        double alpha = static_cast<double>(i) / raw->size();
+        // 修正：使用 size() - 1 避免除以零
+        double alpha = static_cast<double>(i) / (raw->size() > 1 ? (raw->size() - 1) : 1);
         double t_pt  = t_start + alpha * dt_total;
 
-        Eigen::Matrix3d R_pt = Eigen::Matrix3d::Identity();
-        double t_prev = t_pt;
-        for (size_t j = 0; j < imu_data.size(); ++j) {
-            const auto& imu = imu_data[j];
-            if (imu.timestamp < t_pt)   continue;
-            if (imu.timestamp > t_end)  break;
-            double dt = imu.timestamp - t_prev;
-            if (dt <= 0.0) continue;
-            t_prev = imu.timestamp;
-            Eigen::Vector3d omega = imu.angular_velocity;
-            double angle = omega.norm() * dt;
-            if (angle > 1e-10) {
-                Eigen::AngleAxisd aa(angle, omega.normalized());
-                R_pt = R_pt * aa.toRotationMatrix();
-            }
+        // 找到最近的IMU数据
+        size_t imu_idx = 0;
+        for (; imu_idx < imu_data.size(); ++imu_idx) {
+            if (imu_data[imu_idx].timestamp >= t_pt) break;
         }
+        if (imu_idx >= imu_data.size()) imu_idx = imu_data.size() - 1;
 
+        // 插值旋转
+        Eigen::Matrix3d R_pt_to_end;
+        if (imu_idx == 0) {
+            R_pt_to_end = R_to_end[0];
+        } else {
+            // 在两个IMU之间插值（使用四元数更精确）
+            double ratio = (t_pt - imu_data[imu_idx-1].timestamp) / 
+                          (imu_data[imu_idx].timestamp - imu_data[imu_idx-1].timestamp);
+            ratio = std::max(0.0, std::min(1.0, ratio));  // clamp
+            
+            Eigen::Quaterniond q1(R_to_end[imu_idx]);
+            Eigen::Quaterniond q2(R_to_end[imu_idx-1]);
+            Eigen::Quaterniond q_interp = q1.slerp(ratio, q2);
+            R_pt_to_end = q_interp.toRotationMatrix();
+        }
+        
+        // 补偿：p_comp = R_to_end * p（正确的补偿方向）
         Eigen::Vector3d p(pt.x, pt.y, pt.z);
-        Eigen::Vector3d p_comp = R_ref.transpose() * R_pt * p;
+        Eigen::Vector3d p_comp = R_pt_to_end * p;
 
         auto& pt_out = out->points[i];
         pt_out.x = static_cast<float>(p_comp.x());

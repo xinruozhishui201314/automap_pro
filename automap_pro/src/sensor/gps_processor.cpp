@@ -165,6 +165,8 @@ bool GPSProcessor::jumpDetection(const Eigen::Vector3d& pos, double dt) {
     return dist <= max_allowed;
 }
 
+// 依赖 odom_history_：须由前端（拥有里程计的一方）持续调用 updateOdometryPose 注入，
+// 否则 odom_history_ 为空则本检查恒为通过，无法起到 GPS-里程计一致性校验作用。
 bool GPSProcessor::consistencyCheck(const GPSMeasurement& meas) {
     if (odom_history_.empty()) return true;
     Eigen::Vector3d odom_pos;
@@ -197,6 +199,7 @@ void GPSProcessor::updateState(bool valid) {
     if (state_ == GPSState::INIT && valid) state_ = GPSState::TRACKING;
 }
 
+// 由拥有里程计数据的节点调用（如 LivoBridge 或 VIO 输出），用于 consistencyCheck 的 GPS-里程计一致性校验。
 void GPSProcessor::updateOdometryPose(double timestamp, const Eigen::Vector3d& pos) {
     std::lock_guard<std::mutex> lk(mutex_);
     odom_history_.push_back({timestamp, pos});

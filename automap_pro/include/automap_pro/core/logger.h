@@ -151,4 +151,15 @@ private:
 #define AUTOMAP_TIMED(mod, label) \
     automap_pro::ScopedTimer _scoped_timer_##__LINE__(mod, label, 100.0)
 
+// ─────────────────────────────────────────────────────────────────────
+// 兼容旧代码的LOG_*宏（映射到ALOG_*系列）
+// 这些宏用于error_handler.cpp、performance_monitor.cpp等文件
+// ─────────────────────────────────────────────────────────────────────
+#define LOG_TRACE(msg) ALOG_TRACE("Core", msg)
+#define LOG_DEBUG(msg) ALOG_DEBUG("Core", msg)
+#define LOG_INFO(msg) ALOG_INFO("Core", msg)
+#define LOG_WARN(msg) ALOG_WARN("Core", msg)
+#define LOG_ERROR(msg) ALOG_ERROR("Core", msg)
+#define LOG_CRITICAL(msg) ALOG_CRITICAL("Core", msg)
+
 } // namespace automap_pro

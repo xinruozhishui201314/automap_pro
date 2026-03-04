@@ -1,5 +1,6 @@
 #pragma once
 #include "automap_pro/core/data_types.h"
+#include <atomic>
 #include <functional>
 #include <mutex>
 
@@ -63,7 +64,7 @@ private:
     mutable std::mutex mutex_;
     std::vector<KeyFrameCallback> cbs_;
 
-    static uint64_t next_id_;
+    static std::atomic<uint64_t> next_id_;
 };
 
 } // namespace automap_pro

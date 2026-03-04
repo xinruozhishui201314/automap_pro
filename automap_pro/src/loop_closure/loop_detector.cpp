@@ -351,7 +351,7 @@ size_t LoopDetector::dbSize() const {
 }
 
 size_t LoopDetector::queueSize() const {
-    std::lock_guard<std::mutex> lk(const_cast<std::mutex&>(desc_mutex_));
+    std::lock_guard<std::mutex> lk(desc_mutex_);
     return desc_queue_.size();
 }
 

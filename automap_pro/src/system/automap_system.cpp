@@ -1,6 +1,7 @@
 #include "automap_pro/system/automap_system.h"
 #include "automap_pro/core/config_manager.h"
 #include "automap_pro/core/logger.h"
+#include "automap_pro/backend/pose_graph.h"
 #define MOD "AutoMapSystem"
 
 #include <pcl_conversions/pcl_conversions.h>
@@ -53,13 +54,31 @@ AutoMapSystem::AutoMapSystem(const rclcpp::NodeOptions& options)
 
 AutoMapSystem::~AutoMapSystem() {
     RCLCPP_INFO(get_logger(), "[AutoMapSystem] Shutting down...");
-    // 建图结束时触发最终 HBA 优化
-    if (ConfigManager::instance().hbaOnFinish()) {
-        auto all_submaps = submap_manager_.getAllSubmaps();
-        hba_optimizer_.triggerAsync(all_submaps, /*wait=*/true);
-    }
+    
+    // 设置关闭请求标志，通知所有异步任务
+    shutdown_requested_.store(true, std::memory_order_release);
+    
+    // 先停止所有异步任务（给它们时间完成清理）
     loop_detector_.stop();
     hba_optimizer_.stop();
+    
+    // 等待异步任务完成（100ms缓冲）
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    
+    // 建图结束时触发最终 HBA 优化（如果需要）
+    if (ConfigManager::instance().hbaOnFinish()) {
+        try {
+            auto all_submaps = submap_manager_.getAllSubmaps();
+            hba_optimizer_.triggerAsync(all_submaps, /*wait=*/true);
+        } catch (const std::exception& e) {
+            RCLCPP_ERROR(get_logger(), 
+                "[AutoMapSystem] Final HBA failed: %s", e.what());
+        } catch (...) {
+            RCLCPP_ERROR(get_logger(), 
+                "[AutoMapSystem] Final HBA failed with unknown exception");
+        }
+    }
+    
     RCLCPP_INFO(get_logger(), "[AutoMapSystem] Shutdown complete.");
 }
 
@@ -100,6 +119,10 @@ void AutoMapSystem::deferredSetupModules() {
     submap_manager_.startNewSession(current_session_id_);
     submap_manager_.registerSubmapFrozenCallback(
         [this](const SubMap::Ptr& sm) { onSubmapFrozen(sm); });
+
+    // 综合可视化（前端/后端/回环/GPS/HBA）
+    rviz_publisher_.init(shared_from_this());
+    rviz_publisher_.setFrameId("map");
     RCLCPP_INFO(get_logger(), "[AutoMapSystem][DEFERRED] Step 3b: SubMapManager inited and session started");
 
     // 回环检测器
@@ -119,9 +142,15 @@ void AutoMapSystem::deferredSetupModules() {
     RCLCPP_INFO(get_logger(), "[AutoMapSystem][DEFERRED] Step 6a: init HBAOptimizer");
     hba_optimizer_.init();
     hba_optimizer_.registerDoneCallback(
-        [this](const HBAResult& result) { onHBADone(result); });
+        [weak_this = weak_from_this()](const HBAResult& result) {
+            auto shared_this = weak_this.lock();
+            if (!shared_this || shared_this->shutdown_requested_.load(std::memory_order_acquire)) {
+                return;
+            }
+            shared_this->onHBADone(result);
+        });
     hba_optimizer_.start();
-    RCLCPP_INFO(get_logger(), "[AutoMapSystem][DEFERRED] Step 6b: HBAOptimizer inited and started");
+    RCLCPP_INFO(get_logger(), "[AutoMapSystem][DEFERRED] Step 6c: HBAOptimizer started");
 
     // GPS 管理器
     RCLCPP_INFO(get_logger(), "[AutoMapSystem][DEFERRED] Step 7: register GPSManager callbacks");
@@ -167,13 +196,15 @@ void AutoMapSystem::deferredSetupModules() {
 
 void AutoMapSystem::setupPublishers() {
     RCLCPP_DEBUG(get_logger(), "[AutoMapSystem][PUB] Creating publishers");
-    odom_path_pub_  = create_publisher<nav_msgs::msg::Path>("/automap/odom_path", 1);
+    auto path_qos = rclcpp::QoS(rclcpp::KeepLast(100)).reliable();
+    auto map_qos = rclcpp::SensorDataQoS();
+    odom_path_pub_  = create_publisher<nav_msgs::msg::Path>("/automap/odom_path", path_qos);
     RCLCPP_DEBUG(get_logger(), "[AutoMapSystem][PUB] /automap/odom_path");
-    opt_path_pub_   = create_publisher<nav_msgs::msg::Path>("/automap/optimized_path", 1);
+    opt_path_pub_   = create_publisher<nav_msgs::msg::Path>("/automap/optimized_path", path_qos);
     RCLCPP_DEBUG(get_logger(), "[AutoMapSystem][PUB] /automap/optimized_path");
-    global_map_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>("/automap/global_map", 1);
+    global_map_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>("/automap/global_map", map_qos);
     RCLCPP_DEBUG(get_logger(), "[AutoMapSystem][PUB] /automap/global_map");
-    status_pub_     = create_publisher<automap_pro::msg::MappingStatusMsg>("/automap/status", 10);
+    status_pub_     = create_publisher<automap_pro::msg::MappingStatusMsg>("/automap/status", rclcpp::QoS(rclcpp::KeepLast(10)).reliable());
     RCLCPP_INFO(get_logger(), "[AutoMapSystem][PUB] All 4 publishers created (odom_path, opt_path, global_map, status)");
 }
 
@@ -318,6 +349,18 @@ void AutoMapSystem::tryCreateKeyFrame(double ts) {
     // 添加到子图（触发子图切分判断）
     submap_manager_.addKeyFrame(kf);
 
+    // GPS 对齐后，每帧带有效 GPS 的关键帧都向 iSAM2 添加 GPS 因子（持续约束）
+    if (gps_aligned_ && has_gps && kf->submap_id >= 0) {
+        Eigen::Vector3d pos_map = gps_manager_.enu_to_map(gps.position_enu);
+        Eigen::Matrix3d cov = gps.covariance;
+        if (cov.norm() < 1e-6 || !std::isfinite(cov(0, 0)))
+            cov = Eigen::Matrix3d::Identity() * 1.0;
+        isam2_optimizer_.addGPSFactor(kf->submap_id, pos_map, cov);
+    }
+
+    // 发布当前帧点云到 RViz（/automap/current_cloud）
+    try { rviz_publisher_.publishCurrentCloud(cur_cloud); } catch (const std::exception&) {}
+
     RCLCPP_INFO(get_logger(),
         "[AutoMapSystem][KF] created kf_id=%d sm_id=%d ts=%.3f pts=%zu ds_pts=%zu has_gps=%d degen=%d",
         kf->id, kf->submap_id, ts, cur_cloud->size(), cloud_ds->size(),
@@ -352,9 +395,13 @@ void AutoMapSystem::onSubmapFrozen(const SubMap::Ptr& submap) {
     if (all_sm.size() >= 2) {
         const auto& prev = all_sm[all_sm.size() - 2];
         Pose3d rel = prev->pose_w_anchor_optimized.inverse() * submap->pose_w_anchor;
-        Mat66d info = Mat66d::Identity() * 10.0;  // 里程计置信度
+        
+        // ✅ 修复：动态计算信息矩阵（根据子图质量）
+        Mat66d info = computeOdomInfoMatrix(prev, submap, rel);
+        
         isam2_optimizer_.addOdomFactor(prev->id, submap->id, rel, info);
-        RCLCPP_DEBUG(get_logger(), "[AutoMapSystem][SM] odom factor prev_sm=%d cur_sm=%d", prev->id, submap->id);
+        RCLCPP_DEBUG(get_logger(), "[AutoMapSystem][SM] odom factor prev_sm=%d cur_sm=%d info_norm=%.2e",
+                     prev->id, submap->id, info.norm());
     }
 
     // 提交到回环检测器
@@ -374,6 +421,11 @@ void AutoMapSystem::onSubmapFrozen(const SubMap::Ptr& submap) {
 // 回环检测处理
 // ─────────────────────────────────────────────────────────────────────────────
 void AutoMapSystem::onLoopDetected(const LoopConstraint::Ptr& lc) {
+    {
+        std::lock_guard<std::mutex> lk(loop_constraints_mutex_);
+        loop_constraints_.push_back(lc);
+        if (loop_constraints_.size() > 500) loop_constraints_.erase(loop_constraints_.begin());
+    }
     state_ = SystemState::LOOP_CLOSING;
     const double tx = lc->delta_T.translation().x();
     const double ty = lc->delta_T.translation().y();
@@ -436,6 +488,11 @@ void AutoMapSystem::onPoseUpdated(const std::unordered_map<int, Pose3d>& poses) 
     }
     opt_path_pub_->publish(opt_path_);
     pub_opt_path_count_++;
+
+    try {
+        auto all_sm = submap_manager_.getAllSubmaps();
+        rviz_publisher_.publishOptimizedPath(all_sm);
+    } catch (const std::exception&) { /* ignore */ }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -454,6 +511,10 @@ void AutoMapSystem::onHBADone(const HBAResult& result) {
     // 将 HBA 优化结果写回所有子图的关键帧
     submap_manager_.updateAllFromHBA(result);
 
+    try {
+        rviz_publisher_.publishHBAResult(result);
+    } catch (const std::exception&) { /* ignore */ }
+
     // 同步更新 iSAM2 线性化点（重新提交优化后位姿作为先验）
     auto all_sm = submap_manager_.getFrozenSubmaps();
     for (const auto& sm : all_sm) {
@@ -470,6 +531,10 @@ void AutoMapSystem::onGPSAligned(const GPSAlignResult& result) {
     if (!result.success) return;
 
     gps_aligned_ = true;
+    try {
+        auto all_sm = submap_manager_.getAllSubmaps();
+        rviz_publisher_.publishGPSAlignment(result, all_sm);
+    } catch (const std::exception&) { /* ignore */ }
     RCLCPP_INFO(get_logger(),
         "[AutoMapSystem][GPS] aligned rmse_m=%.2f matched=%d R_diag=[%.2f,%.2f,%.2f] t=[%.2f,%.2f,%.2f]",
         result.rmse_m, result.matched_points,
@@ -546,6 +611,72 @@ void AutoMapSystem::publishGlobalMap() {
     cloud_msg.header.frame_id = "map";
     global_map_pub_->publish(cloud_msg);
     pub_map_count_++;
+
+    // 综合可视化：子图边界/框/连接图、回环、GPS、坐标轴
+    try {
+        rviz_publisher_.publishGlobalMap(global);
+        auto all_sm = submap_manager_.getAllSubmaps();
+        rviz_publisher_.publishSubmapBoundaries(all_sm);
+        rviz_publisher_.publishSubmapBoundingBoxes(all_sm);
+        rviz_publisher_.publishSubmapGraph(all_sm);
+        rviz_publisher_.publishOptimizedPath(all_sm);
+        rviz_publisher_.publishGPSMarkers(all_sm);
+        {
+            std::lock_guard<std::mutex> lk(loop_constraints_mutex_);
+            if (!loop_constraints_.empty())
+                rviz_publisher_.publishLoopMarkers(loop_constraints_, all_sm);
+        }
+        // 因子图可视化：由当前子图 + 回环约束构建临时 PoseGraph
+        if (all_sm.size() >= 1) {
+            PoseGraph graph;
+            std::vector<SubMap::Ptr> sorted = all_sm;
+            std::sort(sorted.begin(), sorted.end(),
+                [](const SubMap::Ptr& a, const SubMap::Ptr& b) { return a->id < b->id; });
+            for (const auto& sm : sorted) {
+                if (!sm) continue;
+                GraphNode n;
+                n.id = sm->id;
+                n.pose = sm->pose_w_anchor_optimized;
+                n.pose_opt = sm->pose_w_anchor_optimized;
+                n.fixed = (sm->id == sorted.front()->id);
+                graph.addNode(n);
+            }
+            for (size_t i = 0; i + 1 < sorted.size(); ++i) {
+                GraphEdge e;
+                e.from = sorted[i]->id;
+                e.to = sorted[i + 1]->id;
+                e.type = EdgeType::ODOM;
+                graph.addEdge(e);
+            }
+            {
+                std::lock_guard<std::mutex> lk(loop_constraints_mutex_);
+                for (const auto& lc : loop_constraints_) {
+                    if (!lc || !graph.hasNode(lc->submap_i) || !graph.hasNode(lc->submap_j)) continue;
+                    GraphEdge e;
+                    e.from = lc->submap_i;
+                    e.to = lc->submap_j;
+                    e.type = EdgeType::LOOP;
+                    graph.addEdge(e);
+                }
+            }
+            for (const auto& sm : sorted) {
+                if (!sm || !sm->has_valid_gps || !graph.hasNode(sm->id)) continue;
+                GraphEdge e;
+                e.from = sm->id;
+                e.to = -1;  // 一元因子
+                e.type = EdgeType::GPS;
+                graph.addEdge(e);
+            }
+            rviz_publisher_.publishFactorGraph(graph);
+        }
+
+        Pose3d base_pose;
+        { std::lock_guard<std::mutex> lk(data_mutex_); base_pose = last_odom_pose_; }
+        rviz_publisher_.publishCoordinateFrames(base_pose, base_pose);
+    } catch (const std::exception& e) {
+        RCLCPP_DEBUG(get_logger(), "[AutoMapSystem][MAP] rviz publish skip: %s", e.what());
+    }
+
     RCLCPP_INFO(get_logger(), "[AutoMapSystem][MAP] published points=%zu voxel=%.3f", pts, voxel_size);
 }
 
@@ -666,6 +797,53 @@ void AutoMapSystem::handleLoadSession(
     res->message          = std::to_string(loaded) + " submaps loaded";
     RCLCPP_INFO(get_logger(), "[AutoMapSystem] Loaded %d submaps from session %lu",
                 loaded, req->session_id);
+}
+
+// ✅ 修复：动态计算里程计信息矩阵（根据子图质量）
+Mat66d AutoMapSystem::computeOdomInfoMatrix(
+    const SubMap::Ptr& prev,
+    const SubMap::Ptr& curr,
+    const Pose3d& rel) const
+{
+    // 基础置信度（根据子图质量）
+    double base_info = 10.0;
+    
+    // 1. 根据关键帧数量调整（关键帧越多，置信度越高）
+    double kf_factor = std::min(2.0, (double)curr->keyframes.size() / 10.0);
+    
+    // 2. 根据空间距离调整（距离越远，置信度越低）
+    double dist = (curr->pose_w_anchor.translation() - prev->pose_w_anchor.translation()).norm();
+    double dist_factor = std::max(0.1, std::exp(-dist / 50.0));  // 50米衰减到0.1
+    
+    // 3. 根据时间间隔调整（时间越长，置信度越低）
+    double dt = curr->t_start - prev->t_end;
+    double time_factor = std::max(0.1, std::exp(-dt / 60.0));  // 60秒衰减到0.1
+    
+    // 4. 根据点云质量调整（检查退化标志）
+    double quality_factor = 1.0;
+    for (const auto& kf : curr->keyframes) {
+        if (kf->livo_info.is_degenerate) {
+            quality_factor *= 0.5;  // 有退化则降低置信度
+            break;
+        }
+    }
+    
+    // 综合调整因子
+    double combined_factor = kf_factor * dist_factor * time_factor * quality_factor;
+    
+    // 计算平移和旋转信息权重
+    double trans_info = base_info * combined_factor * 10.0;   // 平移信息
+    double rot_info = base_info * combined_factor * 100.0;    // 旋转信息（通常更准确）
+    
+    // 构建信息矩阵
+    Mat66d info = Mat66d::Zero();
+    info.block<3,3>(0,0) = Eigen::Matrix3d::Identity() * trans_info;  // 平移部分
+    info.block<3,3>(3,3) = Eigen::Matrix3d::Identity() * rot_info;   // 旋转部分
+    
+    ALOG_DEBUG(MOD, "OdomInfo: kf={:.1f} dist={:.1f} dt={:.1f} quality={:.1f} -> factor={:.2f}",
+               kf_factor, dist_factor, time_factor, quality_factor, combined_factor);
+    
+    return info;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

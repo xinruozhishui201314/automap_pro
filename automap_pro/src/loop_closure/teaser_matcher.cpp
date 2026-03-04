@@ -6,6 +6,7 @@
 
 #include <pcl/common/transforms.h>
 #include <pcl/filters/voxel_grid.h>
+#include <Eigen/SVD>
 
 namespace automap_pro {
 
@@ -106,13 +107,36 @@ TeaserMatcher::Result TeaserMatcher::match(
         result.T_tgt_src = Pose3d::Identity();
         result.T_tgt_src.linear()      = solution.rotation;
         result.T_tgt_src.translation() = solution.translation;
+
+        // ✅ 修复：在 solver 作用域内计算 RMSE（避免悬空引用）
+        {
+            double sq_err = 0.0;
+            int cnt = 0;
+            auto inlier_map = solver.getTranslationInliersMap();
+            for (Eigen::Index c = 0; c < inlier_map.cols(); ++c) {
+                int idx = inlier_map(0, c);
+                if (idx < 0 || idx >= static_cast<int>(corrs.size())) continue;
+                const auto& sp = src->points[corrs[idx].first];
+                const auto& tp = tgt->points[corrs[idx].second];
+                Eigen::Vector3d pred = result.T_tgt_src.linear() *
+                    Eigen::Vector3d(sp.x, sp.y, sp.z) + result.T_tgt_src.translation();
+                Eigen::Vector3d actual(tp.x, tp.y, tp.z);
+                sq_err += (pred - actual).squaredNorm();
+                cnt++;
+            }
+            result.rmse    = cnt > 0 ? static_cast<float>(std::sqrt(sq_err / cnt)) : 1e6f;
+            result.success = (result.rmse < max_rmse_);
+        }
     }
 
-    // 计算 RMSE（内点，在 block 外使用 result 中已存的数据）
+    // 计算 RMSE（仅内点：使用 TEASER 的 translation inlier 索引）
     {
         double sq_err = 0.0;
         int cnt = 0;
-        for (size_t idx = 0; idx < corrs.size(); ++idx) {
+        auto inlier_map = solver.getTranslationInliersMap();  // 1 x num_inliers，每列为对应 corrs 的索引
+        for (Eigen::Index c = 0; c < inlier_map.cols(); ++c) {
+            int idx = inlier_map(0, c);
+            if (idx < 0 || idx >= static_cast<int>(corrs.size())) continue;
             const auto& sp = src->points[corrs[idx].first];
             const auto& tp = tgt->points[corrs[idx].second];
             Eigen::Vector3d pred = result.T_tgt_src.linear() *
@@ -125,9 +149,41 @@ TeaserMatcher::Result TeaserMatcher::match(
         result.success = (result.rmse < max_rmse_);
     }
 #else
-    // 无 TEASER++ 时回退到 SVD（仅参考用，鲁棒性低）
-    (void)src_pts; (void)tgt_pts;
-    result.success = false;
+    // 无 TEASER++ 时回退到 Umeyama/SVD 相似变换（鲁棒性低于 TEASER，但可运行）
+    Eigen::Matrix3Xd src_pts(3, corrs.size()), tgt_pts(3, corrs.size());
+    for (size_t i = 0; i < corrs.size(); ++i) {
+        const auto& sp = src->points[corrs[i].first];
+        const auto& tp = tgt->points[corrs[i].second];
+        src_pts.col(i) << sp.x, sp.y, sp.z;
+        tgt_pts.col(i) << tp.x, tp.y, tp.z;
+    }
+    Eigen::Vector3d src_centroid = src_pts.rowwise().mean();
+    Eigen::Vector3d tgt_centroid = tgt_pts.rowwise().mean();
+    Eigen::Matrix3Xd src_c = src_pts.colwise() - src_centroid;
+    Eigen::Matrix3Xd tgt_c = tgt_pts.colwise() - tgt_centroid;
+    Eigen::Matrix3d H = src_c * tgt_c.transpose();
+    Eigen::JacobiSVD<Eigen::Matrix3d> svd(H, Eigen::ComputeFullU | Eigen::ComputeFullV);
+    Eigen::Matrix3d R = svd.matrixV() * svd.matrixU().transpose();
+    if (R.determinant() < 0) {
+        Eigen::Matrix3d V = svd.matrixV();
+        V.col(2) *= -1;
+        R = V * svd.matrixU().transpose();
+    }
+    Eigen::Vector3d t = tgt_centroid - R * src_centroid;
+    result.T_tgt_src = Pose3d::Identity();
+    result.T_tgt_src.linear() = R;
+    result.T_tgt_src.translation() = t;
+    double sq_err = 0;
+    int cnt = 0;
+    for (size_t i = 0; i < corrs.size(); ++i) {
+        Eigen::Vector3d pred = R * src_pts.col(i) + t;
+        sq_err += (pred - tgt_pts.col(i)).squaredNorm();
+        cnt++;
+    }
+    result.rmse = cnt > 0 ? static_cast<float>(std::sqrt(sq_err / cnt)) : 1e6f;
+    result.inlier_ratio = 1.0f;  // SVD 无内点筛选，保守视为全部内点
+    result.success = (result.rmse < max_rmse_);
+    ALOG_DEBUG(MOD, "SVD fallback: rmse={:.3f}m success={}", result.rmse, result.success);
 #endif
 
     if (result.success) {
