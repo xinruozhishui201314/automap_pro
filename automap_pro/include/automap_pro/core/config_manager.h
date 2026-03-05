@@ -20,7 +20,7 @@ public:
     std::string outputDir()     const { return get<std::string>("system.output_dir", "/data/automap_output"); }
     int         numThreads()    const { return get<int>("system.num_threads", 8); }
 
-    // ── 传感器 ────────────────────────────────────────────
+    // ── 传感器（ROS2 话题默认从配置文件 sensor: 节读取）────────────────────────
     std::string lidarTopic()    const { return get<std::string>("sensor.lidar.topic", "/os1_cloud_node1/points"); }
     std::string imuTopic()      const { return get<std::string>("sensor.imu.topic",   "/imu/imu"); }
     std::string gpsTopic()      const { return get<std::string>("sensor.gps.topic",   "/gps/fix"); }

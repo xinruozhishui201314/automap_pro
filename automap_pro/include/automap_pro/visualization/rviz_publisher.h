@@ -133,6 +133,9 @@ public:
     /** 发布GPS质量指示（按HDOP/卫星数着色） */
     void publishGPSQualityMarkers(const std::vector<SubMap::Ptr>& submaps);
 
+    /** 发布真实GPS位置（已转换到全局地图坐标系），供 RViz 显示 */
+    void publishGPSPositionsInMap(const std::vector<Eigen::Vector3d>& positions_map);
+
     // ═══════════════════════════════════════════════════════════════════════
     // 6. 后端优化可视化
     // ═══════════════════════════════════════════════════════════════════════
@@ -209,6 +212,7 @@ private:
     rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr covariance_pub_;
     rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr factor_graph_pub_;
     rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr gps_quality_pub_;
+    rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr gps_positions_map_pub_;
     rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr module_status_pub_;
     rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr frame_marker_pub_;
     rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr active_region_pub_;

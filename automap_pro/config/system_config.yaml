@@ -70,16 +70,20 @@ system:
   enable_auto_recovery: true
   recovery_check_interval_sec: 30.0
 
-# ── 传感器接口（automap_system 读取；话题须与 fast_livo.common 同步）─────────
+# ── 传感器接口（全工程唯一来源：IMU/Lidar/Camera/GPS 话题均由此读取）────────────
 sensor:
   lidar:
-    topic:    "/os1_cloud_node1/points"   # ← 与 fast_livo.common.lid_topic 同步
+    topic:    "/os1_cloud_node1/points"   # 点云话题，launch 会注入到 fast_livo common.lid_topic
     type:     "OUSTER"                    # LIVOX | OUSTER | VELODYNE | HESAI
     frame_id: "os_sensor"
   imu:
-    topic:    "/os1_cloud_node1/imu"      # ← 与 fast_livo.common.imu_topic 同步
+    topic:    "/os1_cloud_node1/imu"      # IMU 话题，launch 会注入到 fast_livo common.imu_topic
     frame_id: "os_imu"
     frequency: 100.0                      # Ouster OS1 内置 IMU：100 Hz
+  camera:
+    enabled:  false                       # 是否启用相机（LIVO 时 true）
+    topic:    "/camera/image_raw"         # 图像话题，launch 会注入到 fast_livo common.img_topic
+    frame_id: "camera"
   gps:
     enabled:  false
     topic:    "/gps/fix"

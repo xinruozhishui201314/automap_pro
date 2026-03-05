@@ -195,6 +195,14 @@ Visualization Manager:
         Reliability Policy: Reliable
         Value: /automap/gps_aligned_path
       Use Fixed Frame: true
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: 真实GPS位置(地图系)
+      Topic:
+        Depth: 5
+        Reliability Policy: Reliable
+        Value: /automap/gps_positions_map
+      Use Fixed Frame: true
 
     # ═══════════════════════════════════════════════════════════════
     # 可选：子图、后端、其他

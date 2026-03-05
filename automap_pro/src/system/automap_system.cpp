@@ -641,6 +641,19 @@ void AutoMapSystem::publishGlobalMap() {
         rviz_publisher_.publishSubmapGraph(all_sm);
         rviz_publisher_.publishOptimizedPath(all_sm);
         rviz_publisher_.publishGPSMarkers(all_sm);
+        // 真实 GPS 位置转换到地图系后发布（供 RViz 显示）
+        {
+            std::vector<Eigen::Vector3d> gps_positions_map;
+            for (const auto& sm : all_sm) {
+                if (!sm) continue;
+                for (const auto& kf : sm->keyframes) {
+                    if (!kf || !kf->has_valid_gps) continue;
+                    gps_positions_map.push_back(gps_manager_.enu_to_map(kf->gps.position_enu));
+                }
+            }
+            if (!gps_positions_map.empty())
+                rviz_publisher_.publishGPSPositionsInMap(gps_positions_map);
+        }
         {
             std::lock_guard<std::mutex> lk(loop_constraints_mutex_);
             if (!loop_constraints_.empty())

@@ -282,11 +282,14 @@ def _get_fast_livo2_params_impl(config):
 
     lidar = sensor.get("lidar") if isinstance(sensor.get("lidar"), dict) else {}
     imu = sensor.get("imu") if isinstance(sensor.get("imu"), dict) else {}
+    camera = sensor.get("camera") if isinstance(sensor.get("camera"), dict) else {}
     common_src = fl2.get("common") if isinstance(fl2.get("common"), dict) else {}
     common = dict(common_src)
-    common["lid_topic"] = (lidar.get("topic") or "/livox/lidar").strip() or "/livox/lidar"
-    common["imu_topic"] = (imu.get("topic") or "/livox/imu").strip() or "/livox/imu"
-    common["img_topic"] = (common.get("img_topic") or "/left/image_raw").strip() or "/left/image_raw"
+    # 传感器话题统一从 sensor: 节读取（默认从配置文件）
+    common["lid_topic"] = (lidar.get("topic") or common.get("lid_topic") or "/livox/lidar").strip() or "/livox/lidar"
+    common["imu_topic"] = (imu.get("topic") or common.get("imu_topic") or "/livox/imu").strip() or "/livox/imu"
+    img_from_sensor = (camera.get("topic") or "").strip()
+    common["img_topic"] = img_from_sensor or (common.get("img_topic") or "/left/image_raw").strip() or "/left/image_raw"
 
     params = {"common": common}
     

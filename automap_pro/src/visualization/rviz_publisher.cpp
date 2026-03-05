@@ -43,6 +43,7 @@ void RvizPublisher::init(rclcpp::Node::SharedPtr node) {
     covariance_pub_      = node->create_publisher<visualization_msgs::msg::MarkerArray>("/automap/covariance_ellipses", reliable_qos);
     factor_graph_pub_     = node->create_publisher<visualization_msgs::msg::MarkerArray>("/automap/factor_graph", reliable_qos);
     gps_quality_pub_     = node->create_publisher<visualization_msgs::msg::MarkerArray>("/automap/gps_quality", reliable_qos);
+    gps_positions_map_pub_ = node->create_publisher<visualization_msgs::msg::MarkerArray>("/automap/gps_positions_map", reliable_qos);
     module_status_pub_    = node->create_publisher<visualization_msgs::msg::MarkerArray>("/automap/module_status", reliable_qos);
     frame_marker_pub_     = node->create_publisher<visualization_msgs::msg::MarkerArray>("/automap/coordinate_frames", reliable_qos);
     active_region_pub_    = node->create_publisher<visualization_msgs::msg::MarkerArray>("/automap/active_region", reliable_qos);
@@ -62,7 +63,7 @@ void RvizPublisher::init(rclcpp::Node::SharedPtr node) {
     RCLCPP_INFO(node->get_logger(),
         "[RvizPublisher][TOPIC] publish: /automap/global_map, /automap/current_cloud, /automap/submap_cloud, /automap/colored_cloud, "
         "/automap/density_heatmap, /automap/loop_candidate_cloud, /automap/loop_markers, /automap/gps_markers, /automap/submap_boundaries, "
-        "/automap/submap_bboxes, /automap/submap_graph, /automap/covariance_ellipses, /automap/factor_graph, /automap/gps_quality, "
+        "/automap/submap_bboxes, /automap/submap_graph, /automap/covariance_ellipses, /automap/factor_graph, /automap/gps_quality, /automap/gps_positions_map, "
         "/automap/module_status, /automap/coordinate_frames, /automap/active_region, /automap/degeneration_regions, /automap/hba_result, "
         "/automap/convergence, /automap/convergence_residual, /automap/odom_path, /automap/optimized_path, /automap/gps_raw_path, "
         "/automap/gps_aligned_path, /automap/keyframe_poses");
@@ -522,6 +523,21 @@ void RvizPublisher::publishGPSQualityMarkers(const std::vector<SubMap::Ptr>& sub
     gps_quality_pub_->publish(markers);
 }
 
+void RvizPublisher::publishGPSPositionsInMap(const std::vector<Eigen::Vector3d>& positions_map) {
+    if (!node_ || !gps_positions_map_pub_) return;
+    if (positions_map.empty()) {
+        gps_positions_map_pub_->publish(makeDeleteAllMarkers("gps_positions_map"));
+        return;
+    }
+    visualization_msgs::msg::MarkerArray markers;
+    std_msgs::msg::ColorRGBA c = makeColor(0.0f, 0.8f, 0.4f, 0.85f);  // 青绿色，表示真实 GPS 位置（地图系）
+    for (size_t i = 0; i < positions_map.size(); ++i) {
+        markers.markers.push_back(
+            makeSphereMarker("gps_positions_map", static_cast<int>(i), positions_map[i], 0.8, c));
+    }
+    gps_positions_map_pub_->publish(markers);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // 6. 后端优化可视化
 // ─────────────────────────────────────────────────────────────────────────────
@@ -706,9 +722,9 @@ void RvizPublisher::publishDegenerationRegions(const std::vector<std::pair<doubl
 
 void RvizPublisher::clearAllMarkers() {
     auto arr = makeDeleteAllMarkers("");
-    for (auto* pub : {loop_marker_pub_.get(), gps_marker_pub_.get(), submap_boundary_pub_.get(),
-            submap_bbox_pub_.get(), submap_graph_pub_.get(), covariance_pub_.get(), factor_graph_pub_.get(),
-            gps_quality_pub_.get(), module_status_pub_.get(), frame_marker_pub_.get(),
+    for (auto* pub : {loop_marker_pub_.get(), gps_marker_pub_.get(), gps_positions_map_pub_.get(),
+            submap_boundary_pub_.get(), submap_bbox_pub_.get(), submap_graph_pub_.get(), covariance_pub_.get(),
+            factor_graph_pub_.get(), gps_quality_pub_.get(), module_status_pub_.get(), frame_marker_pub_.get(),
             active_region_pub_.get(), degen_region_pub_.get(), hba_result_pub_.get(), convergence_pub_.get()}) {
         if (pub) pub->publish(arr);
     }
@@ -716,9 +732,9 @@ void RvizPublisher::clearAllMarkers() {
 
 void RvizPublisher::clearMarkers(const std::string& ns) {
     auto arr = makeDeleteAllMarkers(ns);
-    for (auto* pub : {loop_marker_pub_.get(), gps_marker_pub_.get(), submap_boundary_pub_.get(),
-            submap_bbox_pub_.get(), submap_graph_pub_.get(), covariance_pub_.get(), factor_graph_pub_.get(),
-            gps_quality_pub_.get(), module_status_pub_.get(), frame_marker_pub_.get(),
+    for (auto* pub : {loop_marker_pub_.get(), gps_marker_pub_.get(), gps_positions_map_pub_.get(),
+            submap_boundary_pub_.get(), submap_bbox_pub_.get(), submap_graph_pub_.get(), covariance_pub_.get(),
+            factor_graph_pub_.get(), gps_quality_pub_.get(), module_status_pub_.get(), frame_marker_pub_.get(),
             active_region_pub_.get(), degen_region_pub_.get(), hba_result_pub_.get(), convergence_pub_.get()}) {
         if (pub) pub->publish(arr);
     }
