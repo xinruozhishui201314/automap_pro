@@ -59,7 +59,13 @@ void RvizPublisher::init(rclcpp::Node::SharedPtr node) {
 
     kf_pose_array_pub_    = node->create_publisher<geometry_msgs::msg::PoseArray>("/automap/keyframe_poses", reliable_qos);
 
-    RCLCPP_INFO(node->get_logger(), "[RvizPublisher] Initialized (full visualization).");
+    RCLCPP_INFO(node->get_logger(),
+        "[RvizPublisher][TOPIC] publish: /automap/global_map, /automap/current_cloud, /automap/submap_cloud, /automap/colored_cloud, "
+        "/automap/density_heatmap, /automap/loop_candidate_cloud, /automap/loop_markers, /automap/gps_markers, /automap/submap_boundaries, "
+        "/automap/submap_bboxes, /automap/submap_graph, /automap/covariance_ellipses, /automap/factor_graph, /automap/gps_quality, "
+        "/automap/module_status, /automap/coordinate_frames, /automap/active_region, /automap/degeneration_regions, /automap/hba_result, "
+        "/automap/convergence, /automap/convergence_residual, /automap/odom_path, /automap/optimized_path, /automap/gps_raw_path, "
+        "/automap/gps_aligned_path, /automap/keyframe_poses");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

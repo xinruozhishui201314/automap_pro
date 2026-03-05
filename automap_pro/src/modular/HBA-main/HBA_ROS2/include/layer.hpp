@@ -75,7 +75,7 @@ public:
     }
 
     /// @brief 初始化mthreads, mem_costs, pcds, hessians
-    /// @param total_layer_num_ 
+    /// @param total_layer_num_
     void init_storage(int total_layer_num_)
     {
         mthreads.resize(thread_num);
@@ -85,7 +85,14 @@ public:
         pose_vec.resize(pose_size);
 
 #ifdef FULL_HESS
-        if(layer_num < total_layer_num_)// 若非全局Ba
+        // 防护：pose_size < WIN_SIZE 或 gap_num < 0 时 hessian_size 可能为负，resize 会触发 vector::_M_default_append 崩溃
+        if (pose_size < WIN_SIZE || gap_num < 0) {
+            std::cerr << "[HBA][layer] pose_size=" << pose_size << " < WIN_SIZE(" << WIN_SIZE
+                      << ") 或 gap_num=" << gap_num << " < 0，跳过 hessians 分配，避免 std::length_error。"
+                      << " 请确保 LIO 已输出足够位姿再启动 HBA。" << std::endl;
+            hessians.resize(0);
+        }
+        else if(layer_num < total_layer_num_)// 若非全局Ba
         {
             // 计算除开最后一个线程外的Hessian矩阵大小, 即：线程数*（窗口大小-1）*窗口大小/2 * 除开最后一个线程外每个线程的任务量
             // (WIN_SIZE - 1) * WIN_SIZE / 2计算的是一个窗口内的Hessian有多少个hessian矩阵，因为hessian矩阵是两个位姿之间就会存在一个
@@ -95,12 +102,17 @@ public:
             {
                 hessian_size += (last_win_size - 1) * last_win_size / 2; // 计算最后一个线程不满窗口的Hessian矩阵数量
             }
+            if (hessian_size < 0) {
+                std::cerr << "[HBA][layer] hessian_size 计算为负(" << hessian_size << ")，使用 0 避免崩溃。" << std::endl;
+                hessian_size = 0;
+            }
             hessians.resize(hessian_size);
             std::cout << "hessian_size:" << hessian_size << endl;
         }
         else// 全局Ba
         {
             int hessian_size = pose_size * (pose_size - 1) / 2;
+            if (hessian_size < 0) hessian_size = 0;
             hessians.resize(hessian_size);
             std::cout << "hessian_size:" << hessian_size << endl;
         }

@@ -14,13 +14,18 @@
     或
     sudo python3 scripts/fix_ros2_bag_metadata.py data/automap_input/nya_02_slam_imu_to_lidar/nya_02_ros2
 """
+import os
 import re
 import sys
 from pathlib import Path
 
 
 def fix_metadata(metadata_path: Path) -> bool:
-    text = metadata_path.read_text(encoding="utf-8")
+    try:
+        text = metadata_path.read_text(encoding="utf-8")
+    except Exception as e:
+        print(f"[fix_ros2_bag_metadata] 读取失败: {metadata_path} {e}", file=sys.stderr)
+        raise
     original = text
     # 1) 空列表改为空字符串，避免 yaml-cpp bad conversion
     text = re.sub(r"offered_qos_profiles:\s*\[\]\s*", "offered_qos_profiles: ''\n", text)
@@ -32,7 +37,17 @@ def fix_metadata(metadata_path: Path) -> bool:
     )
     if text == original:
         return False
-    metadata_path.write_text(text, encoding="utf-8")
+    if not os.access(metadata_path, os.W_OK):
+        print(f"[fix_ros2_bag_metadata] 无写权限: {metadata_path}，请执行: chmod u+w {metadata_path}", file=sys.stderr)
+        sys.exit(3)
+    try:
+        metadata_path.write_text(text, encoding="utf-8")
+    except PermissionError as e:
+        print(f"[fix_ros2_bag_metadata] 写入失败(权限): {metadata_path} {e}", file=sys.stderr)
+        sys.exit(3)
+    except Exception as e:
+        print(f"[fix_ros2_bag_metadata] 写入失败: {metadata_path} {e}", file=sys.stderr)
+        raise
     return True
 
 
@@ -45,10 +60,14 @@ def main():
     if not metadata_path.is_file():
         print(f"未找到: {metadata_path}", file=sys.stderr)
         sys.exit(2)
-    if fix_metadata(metadata_path):
-        print(f"已修复: {metadata_path}")
-    else:
-        print(f"无需修改: {metadata_path}")
+    try:
+        if fix_metadata(metadata_path):
+            print(f"已修复: {metadata_path}")
+        else:
+            print(f"无需修改: {metadata_path}")
+    except Exception as e:
+        print(f"[fix_ros2_bag_metadata] 异常: {e}", file=sys.stderr)
+        raise
 
 
 if __name__ == "__main__":

@@ -31,7 +31,9 @@ void FastLIVO2Adapter::init(rclcpp::Node::SharedPtr node) {
     path_pub_ = node->create_publisher<nav_msgs::msg::Path>("/automap/odom_path", 1);
 
     initialized_ = true;
-    RCLCPP_INFO(node->get_logger(), "[FastLIVO2Adapter] Subscribed to %s, %s", odom_topic.c_str(), cloud_topic.c_str());
+    RCLCPP_INFO(node->get_logger(),
+        "[FastLIVO2Adapter][TOPIC] subscribe: %s, %s | publish: /automap/odometry, /automap/odom_path",
+        odom_topic.c_str(), cloud_topic.c_str());
 }
 
 void FastLIVO2Adapter::registerPoseCallback(PoseCallback cb) {

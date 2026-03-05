@@ -1,4 +1,5 @@
 #include "hba.hpp"
+#include <fstream>
 
 std::vector<GPS_Factor::gps_imu_pose3d> gps_pose_vec;
 
@@ -7,6 +8,8 @@ HBA::HBA(int total_layer_num_, std::string data_path_, int thread_num_, GPS_Fact
 {
     total_layer_num = total_layer_num_;
     data_path = data_path_;
+    if (!data_path.empty() && data_path.back() != '/')
+        data_path += '/';
     thread_num = thread_num_;
 
     layers.resize(total_layer_num);
@@ -16,31 +19,92 @@ HBA::HBA(int total_layer_num_, std::string data_path_, int thread_num_, GPS_Fact
         layers[i].thread_num = thread_num;
     }
     layers[0].data_path = data_path;
-    std::vector<mypcl::pose> lio_pose_orig = mypcl::read_pose(data_path + "pose.json");
+    const std::string pose_path = data_path + "pose.json";
+    
+    // 第 1 步：检查 pose.json 文件状态
+    std::cerr << "[HBA] [INIT] Step 1: 检查 LIO 位姿文件: " << pose_path << std::endl;
+    std::ifstream pose_check(pose_path);
+    const bool pose_file_exists = pose_check.is_open();
+    std::streamsize pose_file_size = 0;
+    if (pose_file_exists) {
+        pose_check.seekg(0, std::ios::end);
+        pose_file_size = pose_check.tellg();
+        pose_check.close();
+    }
+    std::cerr << "[HBA] [INIT]   存在=" << (pose_file_exists ? "yes" : "no")
+              << " 大小=" << pose_file_size << " 字节"
+              << " 可读=" << (pose_file_exists && std::ifstream(pose_path).good() ? "yes" : "no")
+              << std::endl;
+    
+    // 第 2 步：读取 LIO 位姿
+    std::cerr << "[HBA] [INIT] Step 2: 读取 LIO 位姿数据..." << std::endl;
+    std::vector<mypcl::pose> lio_pose_orig = mypcl::read_pose(pose_path);
+    std::cerr << "[HBA] [INIT]   读取完成: lio_pose_orig.size()=" << lio_pose_orig.size() << std::endl;
+    
+    if (lio_pose_orig.empty()) {
+        std::cerr << "[HBA] [WARN] LIO 位姿为空！诊断信息：" << std::endl;
+        std::cerr << "[HBA] [WARN]   1. ros2 bag play 是否成功？检查上方 [ros2-1] 与 [BAG] 日志" << std::endl;
+        std::cerr << "[HBA] [WARN]   2. config 与 bag 话题是否一致？比对 fast_livo 订阅的话题与 bag 内容" << std::endl;
+        std::cerr << "[HBA] [WARN]   3. fast_livo 是否已启动且处理数据？检查 [fastlivo_mapping-2] [fast_livo] 日志" << std::endl;
+        std::cerr << "[HBA] [WARN]   4. pose.json 写入是否有权限问题？ls -la " << data_path << std::endl;
+    }
+    
+    // 第 3 步：处理 GPS 融合（如启用）
     std::vector<mypcl::pose> lio_pose_tran;
-    //layers[0].pose_vec
     if(enable_gps_factor == true)
     {
+        std::cerr << "[HBA] [INIT] Step 3: 启用 GPS 融合，读取 GPS 数据..." << std::endl;
         if(gps_imu_info == true)
         {
             gps_pose_vec = gps_factor_func.read_gps_imu_data(data_path + "gps_imu_data.json");
+            std::cerr << "[HBA] [INIT]   GPS-IMU 融合模式: gps_pose_vec.size()=" << gps_pose_vec.size() << std::endl;
         }
         else
         {
             gps_pose_vec = gps_factor_func.read_gps_raw_info(data_path + "gps_raw_data.json", data_path);
+            std::cerr << "[HBA] [INIT]   GPS 原始模式: gps_pose_vec.size()=" << gps_pose_vec.size() << std::endl;
         }
-        std::cout << "gps pose size = " << gps_pose_vec.size() << std::endl;
-        std::cout << "lio pose size = " << lio_pose_orig.size() << std::endl;
         index_interpolate.reserve(gps_pose_vec.size());
         lio_pose_tran.reserve(gps_pose_vec.size() + lio_pose_orig.size());
-
-        // 执行GPS点插值前请备份你的PCD文件
+        
+        std::cerr << "[HBA] [INIT]   执行 GPS-LIO 插值..." << std::endl;
         interpolate_pose(lio_pose_orig, lio_pose_tran, gps_factor_func.gps_time, lidar_time);
+        std::cerr << "[HBA] [INIT]   插值后: lio_pose_tran.size()=" << lio_pose_tran.size() << std::endl;
         layers[0].pose_vec = lio_pose_tran;
     }
     else
     {
+        std::cerr << "[HBA] [INIT] Step 3: GPS 融合禁用，直接使用 LIO 位姿" << std::endl;
         layers[0].pose_vec = lio_pose_orig;
+    }
+
+    // 第 4 步：位姿充分性检查与优雅降级
+    std::cerr << "[HBA] [INIT] Step 4: 位姿充分性检查 (WIN_SIZE=" << WIN_SIZE << ")" << std::endl;
+    std::cerr << "[HBA] [INIT]   最终位姿数量: " << layers[0].pose_vec.size() << std::endl;
+    
+    if (layers[0].pose_vec.size() == 0) {
+        std::cerr << "[HBA] [FATAL] ====== 零位姿错误 =====" << std::endl;
+        std::cerr << "[HBA] [FATAL] pose_vec.size()=0，无任何位姿数据！" << std::endl;
+        std::cerr << "[HBA] [FATAL] 可能的原因：" << std::endl;
+        std::cerr << "[HBA] [FATAL]   1. [BAG] ros2 bag play 异常退出或未启动" << std::endl;
+        std::cerr << "[HBA] [FATAL]   2. [fast_livo] 订阅话题不匹配（config 中的 topic 名与 bag 不符）" << std::endl;
+        std::cerr << "[HBA] [FATAL]   3. fast_livo 运行异常（检查 [fastlivo_mapping-2] 日志）" << std::endl;
+        std::cerr << "[HBA] [FATAL] pose_path=" << pose_path << " data_path=" << data_path << std::endl;
+        throw std::runtime_error("HBA: zero poses (pos_size=0, bag_play_or_livo_failed)");
+    }
+    else if (layers[0].pose_vec.size() < static_cast<size_t>(WIN_SIZE)) {
+        std::cerr << "[HBA] [WARN] ====== 位姿不足警告 =====" << std::endl;
+        std::cerr << "[HBA] [WARN] pose_vec.size()=" << layers[0].pose_vec.size()
+                  << " < WIN_SIZE(" << WIN_SIZE << ")，数据可能未完全加载" << std::endl;
+        std::cerr << "[HBA] [WARN] 可能原因：" << std::endl;
+        std::cerr << "[HBA] [WARN]   1. fast_livo 仍在处理数据，pose.json 未完全写入" << std::endl;
+        std::cerr << "[HBA] [WARN]   2. bag 回放速度过快或系统资源不足" << std::endl;
+        std::cerr << "[HBA] [WARN]   3. 激光点云 topic 质量问题（丢包或延迟）" << std::endl;
+        std::cerr << "[HBA] [WARN] 建议：重新运行或增加 bag 回放延迟（--rate 0.5）" << std::endl;
+        std::cerr << "[HBA] [WARN] 当前继续初始化（可能导致后续优化问题）" << std::endl;
+    }
+    else {
+        std::cerr << "[HBA] [INFO] 位姿充分: " << layers[0].pose_vec.size() << " >= " << WIN_SIZE << " ✓" << std::endl;
     }
 
     layers[0].init_layer_param();

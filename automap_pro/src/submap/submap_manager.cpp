@@ -33,7 +33,7 @@ void SubMapManager::init(rclcpp::Node::SharedPtr node) {
     node_ = node;
     event_pub_ = node->create_publisher<automap_pro::msg::SubMapEventMsg>(
         "/automap/submap_event", 50);
-    RCLCPP_INFO(node->get_logger(), "[SubMapMgr][DATA] inited event_pub=/automap/submap_event");
+    RCLCPP_INFO(node->get_logger(), "[SubMapMgr][TOPIC] publish: /automap/submap_event");
 }
 
 void SubMapManager::startNewSession(uint64_t session_id) {
@@ -395,6 +395,65 @@ void SubMapManager::updateAllFromHBA(const HBAResult& result) {
         if (sm->state == SubMapState::FROZEN || sm->state == SubMapState::OPTIMIZED)
             sm->state = SubMapState::OPTIMIZED;
     }
+}
+
+// ── 查询接口实现（头文件声明，此前未实现会导致 undefined symbol）────────────────────
+SubMap::Ptr SubMapManager::getActiveSubmap() const {
+    std::lock_guard<std::mutex> lk(mutex_);
+    return active_submap_;
+}
+
+SubMap::Ptr SubMapManager::getSubmap(int id) const {
+    std::lock_guard<std::mutex> lk(mutex_);
+    for (const auto& sm : submaps_) {
+        if (sm->id == id) return sm;
+    }
+    return nullptr;
+}
+
+std::vector<SubMap::Ptr> SubMapManager::getAllSubmaps() const {
+    std::lock_guard<std::mutex> lk(mutex_);
+    return submaps_;
+}
+
+std::vector<SubMap::Ptr> SubMapManager::getFrozenSubmaps() const {
+    std::lock_guard<std::mutex> lk(mutex_);
+    std::vector<SubMap::Ptr> out;
+    for (const auto& sm : submaps_) {
+        if (sm->state == SubMapState::FROZEN || sm->state == SubMapState::OPTIMIZED)
+            out.push_back(sm);
+    }
+    return out;
+}
+
+int SubMapManager::submapCount() const {
+    std::lock_guard<std::mutex> lk(mutex_);
+    return static_cast<int>(submaps_.size());
+}
+
+int SubMapManager::keyframeCount() const {
+    std::lock_guard<std::mutex> lk(mutex_);
+    int n = 0;
+    for (const auto& sm : submaps_) {
+        n += static_cast<int>(sm->keyframes.size());
+    }
+    return n;
+}
+
+CloudXYZIPtr SubMapManager::buildGlobalMap(float voxel_size) const {
+    std::lock_guard<std::mutex> lk(mutex_);
+    CloudXYZIPtr combined = std::make_shared<CloudXYZI>();
+    for (const auto& sm : submaps_) {
+        if (!sm->merged_cloud || sm->merged_cloud->empty()) continue;
+        *combined += *sm->merged_cloud;
+    }
+    if (combined->empty()) return combined;
+    CloudXYZIPtr out = std::make_shared<CloudXYZI>();
+    pcl::VoxelGrid<pcl::PointXYZI> vg;
+    vg.setInputCloud(combined);
+    vg.setLeafSize(voxel_size, voxel_size, voxel_size);
+    vg.filter(*out);
+    return out;
 }
 
 // ─────────────────────────────────────────────────────────────────────

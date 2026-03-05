@@ -3,6 +3,7 @@
 #include "automap_pro/core/structured_logger.h"
 #include "automap_pro/core/metrics.h"
 #include "automap_pro/core/health_monitor.h"
+#include "automap_pro/core/error_monitor.h"
 
 #define MOD "Diagnostics"
 
@@ -19,23 +20,26 @@ void DiagnosticsService::init(rclcpp::Node::SharedPtr node) {
     // Create diagnostics publisher
     diagnostics_pub_ = node_->create_publisher<automap_pro::msg::DiagnosticMsg>(
         "/automap/diagnostics", 10);
-    
     // Create status service
     status_service_ = node_->create_service<automap_pro::srv::GetStatus>(
         "/automap/get_status",
         std::bind(&DiagnosticsService::handleGetStatus, this,
                  std::placeholders::_1, std::placeholders::_2));
-    
     // Create diagnostics service
     diagnostics_service_ = node_->create_service<automap_pro::srv::GetDiagnostics>(
         "/automap/get_diagnostics",
         std::bind(&DiagnosticsService::handleGetDiagnostics, this,
                  std::placeholders::_1, std::placeholders::_2));
-    
+    RCLCPP_INFO(node_->get_logger(),
+        "[Diagnostics][TOPIC] publish: /automap/diagnostics | services: /automap/get_status, /automap/get_diagnostics");
     ALOG_INFO(MOD, "DiagnosticsService initialized");
 }
 
 void DiagnosticsService::start() {
+    // 启动错误监控（滑动窗口统计 + 告警阈值检查）
+    if (!ErrorMonitor::instance().isRunning()) {
+        ErrorMonitor::instance().start();
+    }
     // Publish initial status
     publishSystemStatus();
     
@@ -178,6 +182,18 @@ std::string DiagnosticsService::exportToJson() const {
     j["performance"] = nlohmann::json::object();
     for (const auto& [name, profile] : performance_profiles_) {
         j["performance"][name] = profile.toJson();
+    }
+    
+    // 错误监控统计（按 error_code 的滑动窗口）
+    try {
+        j["error_monitor"] = nlohmann::json::parse(
+            ErrorMonitor::instance().generateDiagnosticsReport());
+    } catch (const std::exception& e) {
+        ALOG_WARN(MOD, "ErrorMonitor report failed: {}", e.what());
+        j["error_monitor"] = nlohmann::json::object();
+    } catch (...) {
+        ALOG_WARN(MOD, "ErrorMonitor report failed: unknown exception");
+        j["error_monitor"] = nlohmann::json::object();
     }
     
     return j.dump(2);

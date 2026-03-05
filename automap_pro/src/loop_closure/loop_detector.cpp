@@ -51,6 +51,7 @@ void LoopDetector::init(rclcpp::Node::SharedPtr node) {
 
     constraint_pub_ = node->create_publisher<automap_pro::msg::LoopConstraintMsg>(
         "/automap/loop_constraint", 100);
+    RCLCPP_INFO(node->get_logger(), "[LoopDetector][TOPIC] publish: /automap/loop_constraint");
 
     RCLCPP_INFO(node->get_logger(),
         "[LoopDetector] Initialized (workers=%d, OT=%s, TEASER=%s)",

@@ -135,8 +135,8 @@ fast_livo:
   common:
     lid_topic:          "/velodyne_points"          # M2DGR: Velodyne VLP-32C 点云
     imu_topic:          "/handsfree/imu"            # M2DGR: Xsens IMU
-    img_topic:          "/camera/head/image_raw/compressed"  # M2DGR: 前视相机(Cam-head)
-    img_en:             1       # 0=LIO-only; 1=LIVO（启用相机-激光融合）
+    img_topic:          "/camera/head/image_raw/compressed"  # M2DGR: 前视相机(Cam-head)，bag 为 CompressedImage
+    img_en:             0       # M2DGR bag 仅含 CompressedImage，Fast-LIVO 订阅 Image，故用 LIO-only；若需 LIVO 请先 republish 为 Image 或改 img_topic 为未压缩话题
     lidar_en:           1
     ros_driver_bug_fix: false
 

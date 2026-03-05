@@ -154,7 +154,11 @@ OptimizationResult IncrementalOptimizer::commitAndUpdate() {
         try {
             auto p = current_estimate_.at<gtsam::Pose3>(SM(id));
             poses[id] = fromPose3(p);
-        } catch (...) {}
+        } catch (const std::exception& e) {
+            ALOG_ERROR(MOD, "iSAM2 extract pose sm_id={} exception: {}", id, e.what());
+        } catch (...) {
+            ALOG_ERROR(MOD, "iSAM2 extract pose sm_id={} unknown exception (not in estimate?)", id);
+        }
     }
 
     OptimizationResult res;
@@ -177,7 +181,11 @@ Pose3d IncrementalOptimizer::getPose(int sm_id) const {
             return Pose3d::Identity();
         auto p = current_estimate_.at<gtsam::Pose3>(SM(sm_id));
         return fromPose3(p);
+    } catch (const std::exception& e) {
+        ALOG_ERROR(MOD, "getPose(sm_id={}) exception: {}", sm_id, e.what());
+        return Pose3d::Identity();
     } catch (...) {
+        ALOG_ERROR(MOD, "getPose(sm_id={}) unknown exception", sm_id);
         return Pose3d::Identity();
     }
 }
@@ -189,7 +197,11 @@ std::unordered_map<int, Pose3d> IncrementalOptimizer::getAllPoses() const {
         try {
             auto p = current_estimate_.at<gtsam::Pose3>(SM(kv.first));
             out[kv.first] = fromPose3(p);
-        } catch (...) {}
+        } catch (const std::exception& e) {
+            ALOG_ERROR(MOD, "getAllPoses sm_id={} exception: {}", kv.first, e.what());
+        } catch (...) {
+            ALOG_ERROR(MOD, "getAllPoses sm_id={} unknown exception", kv.first);
+        }
     }
     return out;
 }

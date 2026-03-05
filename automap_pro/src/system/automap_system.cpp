@@ -1,6 +1,7 @@
 #include "automap_pro/system/automap_system.h"
 #include "automap_pro/core/config_manager.h"
 #include "automap_pro/core/logger.h"
+#include "automap_pro/core/error_monitor.h"
 #include "automap_pro/backend/pose_graph.h"
 #define MOD "AutoMapSystem"
 
@@ -106,6 +107,11 @@ void AutoMapSystem::deferredSetupModules() {
     }
     RCLCPP_INFO(get_logger(), "[AutoMapSystem][DEFERRED] Step 1: deferredSetupModules entered (shared_from_this now valid)");
 
+    // 启动错误监控（滑动窗口统计 + 告警阈值）
+    if (!ErrorMonitor::instance().isRunning()) {
+        ErrorMonitor::instance().start();
+    }
+
     const auto& cfg = ConfigManager::instance();
 
     // 分配新 session ID
@@ -199,13 +205,11 @@ void AutoMapSystem::setupPublishers() {
     auto path_qos = rclcpp::QoS(rclcpp::KeepLast(100)).reliable();
     auto map_qos = rclcpp::SensorDataQoS();
     odom_path_pub_  = create_publisher<nav_msgs::msg::Path>("/automap/odom_path", path_qos);
-    RCLCPP_DEBUG(get_logger(), "[AutoMapSystem][PUB] /automap/odom_path");
     opt_path_pub_   = create_publisher<nav_msgs::msg::Path>("/automap/optimized_path", path_qos);
-    RCLCPP_DEBUG(get_logger(), "[AutoMapSystem][PUB] /automap/optimized_path");
     global_map_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>("/automap/global_map", map_qos);
-    RCLCPP_DEBUG(get_logger(), "[AutoMapSystem][PUB] /automap/global_map");
     status_pub_     = create_publisher<automap_pro::msg::MappingStatusMsg>("/automap/status", rclcpp::QoS(rclcpp::KeepLast(10)).reliable());
-    RCLCPP_INFO(get_logger(), "[AutoMapSystem][PUB] All 4 publishers created (odom_path, opt_path, global_map, status)");
+    RCLCPP_INFO(get_logger(),
+        "[AutoMapSystem][TOPIC] publish: /automap/odom_path, /automap/optimized_path, /automap/global_map, /automap/status");
 }
 
 void AutoMapSystem::setupServices() {
@@ -359,7 +363,11 @@ void AutoMapSystem::tryCreateKeyFrame(double ts) {
     }
 
     // 发布当前帧点云到 RViz（/automap/current_cloud）
-    try { rviz_publisher_.publishCurrentCloud(cur_cloud); } catch (const std::exception&) {}
+    try { rviz_publisher_.publishCurrentCloud(cur_cloud); } catch (const std::exception& e) {
+        RCLCPP_WARN(get_logger(), "[AutoMapSystem][EXCEPTION] publishCurrentCloud: %s", e.what());
+    } catch (...) {
+        RCLCPP_WARN(get_logger(), "[AutoMapSystem][EXCEPTION] publishCurrentCloud: unknown exception");
+    }
 
     RCLCPP_INFO(get_logger(),
         "[AutoMapSystem][KF] created kf_id=%lu sm_id=%d ts=%.3f pts=%zu ds_pts=%zu has_gps=%d degen=%d",
@@ -492,7 +500,11 @@ void AutoMapSystem::onPoseUpdated(const std::unordered_map<int, Pose3d>& poses) 
     try {
         auto all_sm = submap_manager_.getAllSubmaps();
         rviz_publisher_.publishOptimizedPath(all_sm);
-    } catch (const std::exception&) { /* ignore */ }
+    } catch (const std::exception& e) {
+        RCLCPP_WARN(get_logger(), "[AutoMapSystem][EXCEPTION] publishOptimizedPath: %s", e.what());
+    } catch (...) {
+        RCLCPP_WARN(get_logger(), "[AutoMapSystem][EXCEPTION] publishOptimizedPath: unknown exception");
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -513,7 +525,11 @@ void AutoMapSystem::onHBADone(const HBAResult& result) {
 
     try {
         rviz_publisher_.publishHBAResult(result);
-    } catch (const std::exception&) { /* ignore */ }
+    } catch (const std::exception& e) {
+        RCLCPP_WARN(get_logger(), "[AutoMapSystem][EXCEPTION] publishHBAResult: %s", e.what());
+    } catch (...) {
+        RCLCPP_WARN(get_logger(), "[AutoMapSystem][EXCEPTION] publishHBAResult: unknown exception");
+    }
 
     // 同步更新 iSAM2 线性化点（重新提交优化后位姿作为先验）
     auto all_sm = submap_manager_.getFrozenSubmaps();
@@ -534,7 +550,11 @@ void AutoMapSystem::onGPSAligned(const GPSAlignResult& result) {
     try {
         auto all_sm = submap_manager_.getAllSubmaps();
         rviz_publisher_.publishGPSAlignment(result, all_sm);
-    } catch (const std::exception&) { /* ignore */ }
+    } catch (const std::exception& e) {
+        RCLCPP_WARN(get_logger(), "[AutoMapSystem][EXCEPTION] publishGPSAlignment: %s", e.what());
+    } catch (...) {
+        RCLCPP_WARN(get_logger(), "[AutoMapSystem][EXCEPTION] publishGPSAlignment: unknown exception");
+    }
     RCLCPP_INFO(get_logger(),
         "[AutoMapSystem][GPS] aligned rmse_m=%.2f matched=%d R_diag=[%.2f,%.2f,%.2f] t=[%.2f,%.2f,%.2f]",
         result.rmse_m, result.matched_points,
@@ -674,7 +694,9 @@ void AutoMapSystem::publishGlobalMap() {
         { std::lock_guard<std::mutex> lk(data_mutex_); base_pose = last_odom_pose_; }
         rviz_publisher_.publishCoordinateFrames(base_pose, base_pose);
     } catch (const std::exception& e) {
-        RCLCPP_DEBUG(get_logger(), "[AutoMapSystem][MAP] rviz publish skip: %s", e.what());
+        RCLCPP_WARN(get_logger(), "[AutoMapSystem][EXCEPTION] rviz map publish: %s", e.what());
+    } catch (...) {
+        RCLCPP_WARN(get_logger(), "[AutoMapSystem][EXCEPTION] rviz map publish: unknown exception");
     }
 
     RCLCPP_INFO(get_logger(), "[AutoMapSystem][MAP] published points=%zu voxel=%.3f", pts, voxel_size);
@@ -712,8 +734,13 @@ void AutoMapSystem::handleSaveMap(
         res->output_path = req->output_dir;
         res->message     = "Map saved successfully";
     } catch (const std::exception& e) {
+        RCLCPP_ERROR(get_logger(), "[AutoMapSystem][EXCEPTION] SaveMap failed: %s", e.what());
         res->success = false;
         res->message = e.what();
+    } catch (...) {
+        RCLCPP_ERROR(get_logger(), "[AutoMapSystem][EXCEPTION] SaveMap failed: unknown exception");
+        res->success = false;
+        res->message = "unknown exception";
     }
     state_ = SystemState::MAPPING;
 }

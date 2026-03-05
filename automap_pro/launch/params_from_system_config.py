@@ -16,6 +16,7 @@
 import os
 import re
 import sys
+import traceback
 import yaml
 
 # 环节日志：精准定位，grep "LINK_4_PARAMS" 可追踪参数生成层全流程
@@ -31,6 +32,20 @@ def _diag(msg, level="INFO", tag="DIAG"):
     else:
         sys.stderr.write("{} {}\n".format(prefix, msg))
     sys.stderr.flush()
+
+
+def _log_exception(step_name, e, tag="EXCEPTION"):
+    """统一记录异常：类型、消息、堆栈，便于精准定位问题原因。"""
+    _diag("step=[{}] exception_type={} message={}".format(
+        step_name, type(e).__name__, str(e)), level="ERROR", tag=tag)
+    try:
+        tb = traceback.format_exc()
+        if tb:
+            for line in tb.strip().split("\n"):
+                sys.stderr.write("{} [params_from_system_config][{}]   {}\n".format(_LINK4, tag, line))
+        sys.stderr.flush()
+    except Exception:
+        pass
 
 
 def load_system_config(path):
@@ -66,6 +81,7 @@ def load_system_config(path):
         return {}
     except Exception as e:
         _diag("load_system_config: 未知错误 path={} err={}".format(path_str, e), level="ERROR", tag="CONFIG")
+        _log_exception("load_system_config", e, tag="CONFIG")
         return {}
 
 
@@ -105,7 +121,9 @@ def _safe_bool(val, default=False):
 def get_overlap_transformer_params(config):
     """
     从 system_config 的 loop_closure.overlap_transformer 生成 descriptor_server 节点参数。
-    节点使用 proj_H/proj_W，与 range_image.height/width 一一对应。
+    节点使用 proj_H/proj_W。兼容两种写法：
+    - 顶层 proj_H/proj_W（如 system_config_M2DGR.yaml）
+    - range_image.height/width（与 proj_H/proj_W 一一对应）
     使用 _safe_* 避免配置缺失或类型不符时报错。
     """
     if not isinstance(config, dict):
@@ -113,12 +131,15 @@ def get_overlap_transformer_params(config):
     ot = config.get("loop_closure") if isinstance(config.get("loop_closure"), dict) else {}
     ot = ot.get("overlap_transformer") if isinstance(ot.get("overlap_transformer"), dict) else {}
     ri = ot.get("range_image") if isinstance(ot.get("range_image"), dict) else {}
+    # 优先顶层 proj_H/proj_W（M2DGR 等），否则用 range_image.height/width
+    proj_h = _safe_int(ot.get("proj_H"), _safe_int(ri.get("height"), 64))
+    proj_w = _safe_int(ot.get("proj_W"), _safe_int(ri.get("width"), 900))
     return {
         "model_path": ot.get("model_path") if isinstance(ot.get("model_path"), str) else "",
         "fov_up": _safe_float(ot.get("fov_up"), 3.0),
         "fov_down": _safe_float(ot.get("fov_down"), -25.0),
-        "proj_H": _safe_int(ri.get("height"), 64),
-        "proj_W": _safe_int(ri.get("width"), 900),
+        "proj_H": proj_h,
+        "proj_W": proj_w,
         "max_range": _safe_float(ot.get("max_range"), 80.0),
     }
 
@@ -231,16 +252,33 @@ def _sanitize_fast_livo_params_recursive(obj):
 
 def get_fast_livo2_params(config):
     """
-    从 system_config 的 sensor + frontend.fast_livo2 生成 fastlivo_mapping 节点参数。
-    lid_topic / imu_topic 来自 sensor.lidar.topic 与 sensor.imu.topic；其余与 frontend.fast_livo2 各段一一对应。
+    从 system_config 的 sensor + frontend.fast_livo2（或顶层 fast_livo，如 M2DGR 配置）生成 fastlivo_mapping 节点参数。
+    lid_topic / imu_topic 来自 sensor.lidar.topic 与 sensor.imu.topic；其余与 fast_livo 各段一一对应。
     必填字符串参数（common.img_topic、evo.seq_name 等）保证非空，避免节点 "expected [string] got [not set]"。
     同时生成 parameter_blackboard 命名空间的相机参数，供 vk::camera_loader 使用。
+    兼容：优先 frontend.fast_livo2，若无则使用顶层 fast_livo（如 system_config_M2DGR.yaml）。
     """
+    try:
+        return _get_fast_livo2_params_impl(config)
+    except Exception as e:
+        _log_exception("get_fast_livo2_params", e, tag="EXCEPTION")
+        _diag("返回空参数字典，fast_livo 将使用节点默认或启动失败", level="WARN", tag="CONFIG")
+        return {"common": {"lid_topic": "/livox/lidar", "imu_topic": "/livox/imu", "img_topic": "/left/image_raw"},
+                "parameter_blackboard": {"model": "Pinhole", "width": 752, "height": 480, "scale": 1.0,
+                                         "fx": 425.0, "fy": 426.0, "cx": 386.0, "cy": 241.0,
+                                         "d0": 0.0, "d1": 0.0, "d2": 0.0, "d3": 0.0},
+                "evo": {"seq_name": "default", "pose_output_en": False}}
+
+
+def _get_fast_livo2_params_impl(config):
+    """get_fast_livo2_params 的实际实现，内部异常由外层捕获并记录。"""
     if not isinstance(config, dict):
         config = {}
     sensor = config.get("sensor") if isinstance(config.get("sensor"), dict) else {}
     frontend = config.get("frontend") if isinstance(config.get("frontend"), dict) else {}
     fl2 = frontend.get("fast_livo2") if isinstance(frontend.get("fast_livo2"), dict) else {}
+    if not fl2 and isinstance(config.get("fast_livo"), dict):
+        fl2 = config.get("fast_livo")
 
     lidar = sensor.get("lidar") if isinstance(sensor.get("lidar"), dict) else {}
     imu = sensor.get("imu") if isinstance(sensor.get("imu"), dict) else {}
@@ -254,22 +292,25 @@ def get_fast_livo2_params(config):
     
     # -------------------------------------------------------------------------
     # 添加 parameter_blackboard 相机参数（供 vk::camera_loader::loadFromRosNs 使用）
-    # 从 sensor.camera_left 读取相机内参，映射到 vikit PinholeCamera 格式
+    # vikit camera_loader.h 期望键名：model, width, height, scale, fx, fy, cx, cy, d0-d3（非 cam_*）
+    # 优先 sensor.camera_left，否则用 fast_livo.camera_calib（如 M2DGR 配置）
     # -------------------------------------------------------------------------
     cam_left = sensor.get("camera_left") if isinstance(sensor.get("camera_left"), dict) else {}
+    if not cam_left and isinstance(fl2.get("camera_calib"), dict):
+        cam_left = fl2["camera_calib"]
     params["parameter_blackboard"] = {
-        "cam_model": "Pinhole",
-        "cam_width": _safe_int(cam_left.get("image_width"), 752),
-        "cam_height": _safe_int(cam_left.get("image_height"), 480),
-        "cam_fx": _safe_float(cam_left.get("fx"), 425.0),
-        "cam_fy": _safe_float(cam_left.get("fy"), 426.0),
-        "cam_cx": _safe_float(cam_left.get("cx"), 386.0),
-        "cam_cy": _safe_float(cam_left.get("cy"), 241.0),
-        "cam_d0": _safe_float(cam_left.get("k1"), 0.0),
-        "cam_d1": _safe_float(cam_left.get("k2"), 0.0),
-        "cam_d2": _safe_float(cam_left.get("p1"), 0.0),
-        "cam_d3": _safe_float(cam_left.get("p2"), 0.0),
+        "model": "Pinhole",
+        "width": _safe_int(cam_left.get("image_width") or cam_left.get("width"), 752),
+        "height": _safe_int(cam_left.get("image_height") or cam_left.get("height"), 480),
         "scale": 1.0,
+        "fx": _safe_float(cam_left.get("fx"), 425.0),
+        "fy": _safe_float(cam_left.get("fy"), 426.0),
+        "cx": _safe_float(cam_left.get("cx"), 386.0),
+        "cy": _safe_float(cam_left.get("cy"), 241.0),
+        "d0": _safe_float(cam_left.get("k1"), 0.0),
+        "d1": _safe_float(cam_left.get("k2"), 0.0),
+        "d2": _safe_float(cam_left.get("p1"), 0.0),
+        "d3": _safe_float(cam_left.get("p2"), 0.0),
     }
     for section in ("extrin_calib", "time_offset", "preprocess", "vio", "imu", "lio",
                     "local_map", "uav", "publish", "evo", "pcd_save", "image_save"):
@@ -318,6 +359,13 @@ def get_fast_livo2_params(config):
             return [_drop_empty_keys(x) for x in obj]
         return obj
     params = _drop_empty_keys(params)
+
+    # ── 诊断：parameter_blackboard 必须含 model（camera_loader 第一项检查），便于精准排查 Camera model not specified
+    pb = params.get("parameter_blackboard") if isinstance(params.get("parameter_blackboard"), dict) else {}
+    _diag("get_fast_livo2_params 返回: parameter_blackboard 键列表={}".format(sorted(pb.keys())), tag="KEYS")
+    _diag("parameter_blackboard.model={!r} (camera_loader 需非空)".format(pb.get("model")), tag="KEYS")
+    if not (pb.get("model") or "").strip():
+        _diag("parameter_blackboard.model 为空，fast_livo 将报 Camera model not correctly specified", level="WARN", tag="CONFIG")
 
     return params
 
@@ -446,7 +494,11 @@ def write_fast_livo_params_file(config, output_path, config_path=None):
         _diag("config 为空或非 dict，fast_livo 将使用默认参数", level="WARN", tag="CONFIG")
     elif not (isinstance(config.get("frontend"), dict) and isinstance(config.get("frontend", {}).get("fast_livo2"), dict)):
         _diag("config 缺少 frontend.fast_livo2，部分 fast_livo 参数将使用默认值", level="WARN", tag="CONFIG")
-    params = get_fast_livo2_params(config)
+    try:
+        params = get_fast_livo2_params(config)
+    except Exception as e:
+        _log_exception("write_fast_livo_params_file(get_fast_livo2_params)", e, tag="WRITE")
+        params = {}
     _diag("get_fast_livo2_params 返回 top-level 键: {}".format(list(params.keys()) if isinstance(params, dict) else type(params).__name__), tag="CONFIG")
 
     # 写入前再次剔除任意层级的空键/非字符串键
@@ -499,9 +551,13 @@ def write_fast_livo_params_file(config, output_path, config_path=None):
 
     # ROS2 params-file：节点名（无前导 /） + ros__parameters，避免部分 rcl 解析 /laserMapping 时产生空键 parameter ''
     content = {"laserMapping": {"ros__parameters": flat}}
-    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    with open(output_path, "w", encoding="utf-8") as f:
-        yaml.dump(content, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+    try:
+        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+        with open(output_path, "w", encoding="utf-8") as f:
+            yaml.dump(content, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+    except Exception as e:
+        _log_exception("write_fast_livo_params_file(写入文件)", e, tag="WRITE")
+        raise
     out_real = os.path.realpath(output_path) if os.path.exists(output_path) else None
     _diag("file written: {} (size_bytes={})".format(out_abs, os.path.getsize(output_path)), tag="WRITE")
     _diag("output_path(realpath_after_write)={}".format(out_real), tag="PATHS")

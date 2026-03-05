@@ -30,7 +30,7 @@ void HBAWrapper::init(rclcpp::Node::SharedPtr node) {
     optimizer_.setOptions(opts);
 
     optimized_path_pub_ = node->create_publisher<nav_msgs::msg::Path>("/automap/optimized_path", 1);
-    RCLCPP_INFO(node->get_logger(), "[HBAWrapper] Initialized (max_iter=%d).", max_iterations_);
+    RCLCPP_INFO(node->get_logger(), "[HBAWrapper][TOPIC] publish: /automap/optimized_path | Initialized (max_iter=%d).", max_iterations_);
 }
 
 void HBAWrapper::start() {

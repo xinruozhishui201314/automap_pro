@@ -46,6 +46,8 @@ public:
     pub_pose = this->create_publisher<geometry_msgs::msg::PoseArray>("/poseArrayTopic", 10);
     pub_trajectory = this->create_publisher<visualization_msgs::msg::Marker>("/trajectory_marker", 100);
     pub_pose_number = this->create_publisher<visualization_msgs::msg::MarkerArray>("/pose_number", 100);
+    RCLCPP_INFO(this->get_logger(),
+        "[HBA_visualize][TOPIC] publish: /cloud_map, /cloud_debug, /poseArrayTopic, /trajectory_marker, /pose_number");
 
     load_Parameters();
 

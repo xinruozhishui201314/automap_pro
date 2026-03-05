@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # AutoMap-Pro Online Mapping Launch (ROS2)
-# 从 system_config.yaml 读取并启动：fast-livo2、overlap_transformer_ros2、HBA、automap_system
+# 全工程唯一配置：仅使用 config:= 传入的 YAML；fast-livo2、overlap_transformer、HBA、automap_system 均从此 config 读参
 
 import os
 from ament_index_python.packages import get_package_share_directory
@@ -24,7 +24,9 @@ def _load_system_config(context):
 def _launch_nodes_with_system_config(context, *args, **kwargs):
     config_path = LaunchConfiguration("config").perform(context)
     pkg_share = get_package_share_directory("automap_pro")
-    rviz_config_default = os.path.join(pkg_share, "config", "automap.rviz")
+    rviz_config_default = os.path.join(pkg_share, "rviz", "automap.rviz")
+    if not os.path.isfile(rviz_config_default):
+        rviz_config_default = os.path.join(pkg_share, "config", "automap.rviz")
 
     # 从 system_config 生成各组件参数（launch 与 params_from_system_config 同目录）
     launch_dir = os.path.dirname(os.path.abspath(__file__))
@@ -114,18 +116,17 @@ def _launch_nodes_with_system_config(context, *args, **kwargs):
             output="screen", parameters=[hba_visualize_params], condition=IfCondition(use_hba_visualize),
         ))
 
-    # AutoMap System 节点：话题映射由 system_config.yaml 决定，不使用固定的 remappings
+    # AutoMap System 节点：读取 config_file 参数（非 config），话题映射由 system_config 决定
     automap_node = Node(
         package="automap_pro",
         executable="automap_system_node",
         name="automap_system",
         output="screen",
         parameters=[
-            {"config": LaunchConfiguration("config")},
+            {"config_file": config_path},
             {"output_dir": LaunchConfiguration("output_dir")},
             {"use_sim_time": LaunchConfiguration("use_sim_time", default="false")},
         ],
-        # 移除固定 remappings，让系统从 system_config.yaml 读取话题名
     )
     nodes.append(automap_node)
 
@@ -146,6 +147,14 @@ def _launch_nodes_with_system_config(context, *args, **kwargs):
         arguments=["0", "0", "0", "0", "0", "0", "world", "map"],
     )
     nodes.append(static_tf)
+    # Fast-LIVO2 使用 frame_id=camera_init，RViz Fixed Frame=map；需发布 map->camera_init 才能显示点云/轨迹
+    map_camera_init_tf = Node(
+        package="tf2_ros",
+        executable="static_transform_publisher",
+        name="map_camera_init_tf",
+        arguments=["0", "0", "0", "0", "0", "0", "map", "camera_init"],
+    )
+    nodes.append(map_camera_init_tf)
 
     return nodes
 

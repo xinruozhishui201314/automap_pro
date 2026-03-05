@@ -261,6 +261,7 @@ add_library(automap_core SHARED
   src/core/logger.cpp
   src/core/utils.cpp
   src/core/error_code.cpp
+  src/core/error_monitor.cpp
   src/core/health_monitor_impl.cpp
 )
 target_include_directories(automap_core PUBLIC ${AUTOMAP_INCLUDE_DIRS})

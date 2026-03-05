@@ -43,7 +43,7 @@ void LivoBridge::init(rclcpp::Node::SharedPtr node) {
 
     connected_ = true;
     RCLCPP_INFO(node->get_logger(),
-        "[LivoBridge][DATA] inited odom=%s cloud=%s kfinfo=%s gps=%s",
+        "[LivoBridge][TOPIC] subscribe: odom=%s cloud=%s kfinfo=%s gps=%s",
         cfg.fastLivoOdomTopic().c_str(),
         cfg.fastLivoCloudTopic().c_str(),
         cfg.fastLivoKFInfoTopic().c_str(),

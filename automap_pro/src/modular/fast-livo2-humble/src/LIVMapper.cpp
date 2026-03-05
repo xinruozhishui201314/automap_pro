@@ -140,6 +140,20 @@ void LIVMapper::readParameters(rclcpp::Node::SharedPtr &node)
   try_declare.template operator()<bool>("publish.pub_effect_point_en", false);
   try_declare.template operator()<bool>("publish.dense_map_en", false);
 
+  // parameter_blackboard（camera_loader 使用）：必须 declare 后 launch 传入的 override 才会生效（automatically_declare=false 时）
+  try_declare.template operator()<std::string>("parameter_blackboard.model", "Pinhole");
+  try_declare.template operator()<int>("parameter_blackboard.width", 752);
+  try_declare.template operator()<int>("parameter_blackboard.height", 480);
+  try_declare.template operator()<double>("parameter_blackboard.scale", 1.0);
+  try_declare.template operator()<double>("parameter_blackboard.fx", 425.0);
+  try_declare.template operator()<double>("parameter_blackboard.fy", 426.0);
+  try_declare.template operator()<double>("parameter_blackboard.cx", 386.0);
+  try_declare.template operator()<double>("parameter_blackboard.cy", 241.0);
+  try_declare.template operator()<double>("parameter_blackboard.d0", 0.0);
+  try_declare.template operator()<double>("parameter_blackboard.d1", 0.0);
+  try_declare.template operator()<double>("parameter_blackboard.d2", 0.0);
+  try_declare.template operator()<double>("parameter_blackboard.d3", 0.0);
+
   // get parameter
   this->node->get_parameter("common.lid_topic", lid_topic);
   this->node->get_parameter("common.imu_topic", imu_topic);
@@ -221,15 +235,13 @@ void LIVMapper::initializeComponents(rclcpp::Node::SharedPtr &node)
 
   if (img_en) {
     // ── LIVO mode: load camera model from parameter_blackboard namespace ─────
-    // Requires a camera YAML (e.g. camera_pinhole.yaml) passed as a second
-    // --params-file alongside avia.yaml.  camera_loader.h looks for parameters
-    // named "parameter_blackboard.<key>" using dot separator; the YAML must
-    // expose them under ros__parameters: parameter_blackboard: <key>.
-    // Known issue: camera_loader.h uses ns+"/" (slash) separator which is
-    // invalid in ROS2 parameter names – rclcpp maps it to an empty-name
-    // parameter causing "parameter '' has invalid type" crash.  Until
-    // camera_loader.h is updated to use dot separator, LIVO mode requires
-    // building camera_loader with the patched version below.
+    // parameter_blackboard.* 已在 readParameters() 中 declare，launch 传入的 override 会生效。
+    if (this->node->has_parameter("parameter_blackboard.model")) {
+      std::string pb_model = this->node->get_parameter("parameter_blackboard.model").get_value<std::string>();
+      RCLCPP_INFO(this->node->get_logger(), "[fast_livo] [DIAG] parameter_blackboard.model='%s' (before camera_loader)", pb_model.c_str());
+    } else {
+      RCLCPP_WARN(this->node->get_logger(), "[fast_livo] [DIAG] parameter_blackboard.model 未找到，camera_loader 将失败");
+    }
     if (!vk::camera_loader::loadFromRosNs(this->node, "parameter_blackboard", vio_manager->cam)) {
       RCLCPP_ERROR(this->node->get_logger(),
         "[fast_livo] Camera model not correctly specified. "
@@ -330,6 +342,14 @@ void LIVMapper::initializeSubscribersAndPublishers(rclcpp::Node::SharedPtr &node
   pubImuPropOdom = this->node->create_publisher<nav_msgs::msg::Odometry>("/LIVO2/imu_propagate", 10000);
   imu_prop_timer = this->node->create_wall_timer(0.004s, std::bind(&LIVMapper::imu_prop_callback, this));
   voxelmap_manager->voxel_map_pub_= this->node->create_publisher<visualization_msgs::msg::MarkerArray>("/planes", 10000);
+
+  RCLCPP_INFO(this->node->get_logger(),
+      "[fast_livo][TOPIC] subscribe: lid=%s imu=%s img=%s",
+      lid_topic.c_str(), imu_topic.c_str(), img_topic.c_str());
+  RCLCPP_INFO(this->node->get_logger(),
+      "[fast_livo][TOPIC] publish: /cloud_registered, /visualization_marker, /cloud_visual_sub_map_before, /cloud_effected, "
+      "/Laser_map, /aft_mapped_to_init, /path, /planner_normal, /voxels, /dyn_obj, /dyn_obj_removed, /dyn_obj_dbg_hist, "
+      "/mavros/vision_pose/pose, /rgb_img, /LIVO2/imu_propagate, /planes");
 }
 
 void LIVMapper::handleFirstFrame() 
@@ -456,8 +476,9 @@ void LIVMapper::handleVIO()
   }
 }
 
-void LIVMapper::handleLIO() 
-{    
+void LIVMapper::handleLIO()
+{
+  static constexpr int kLioLogIntervalFrames = 30;  // 每 N 帧打印一次 LIO 日志，降低终端刷屏
   euler_cur = RotMtoEuler(_state.rot_end);
   if(mat_pre_en && fout_pre.is_open()) {
     fout_pre << setw(20) << LidarMeasures.last_lio_update_time - _first_lidar_time << " " << euler_cur.transpose() * 57.3 << " "
@@ -559,7 +580,9 @@ void LIVMapper::handleLIO()
   // 计算平面协方差：在 init_plane 中，通过雅可比传播将点的不确定性传播到平面参数的不确定性
   // 匹配判断：在 build_single_residual 中，结合平面和点的不确定性，判断点是否属于该平面
   voxelmap_manager->UpdateVoxelMap(voxelmap_manager->pv_list_);
-  std::cout << "[ LIO ] Update Voxel Map" << std::endl;
+  if ((frame_num + 1) % kLioLogIntervalFrames == 0) {
+    std::cout << "[ LIO ] Update Voxel Map" << std::endl;
+  }
   _pv_list = voxelmap_manager->pv_list_;
   
   double t4 = omp_get_wtime();
@@ -601,18 +624,20 @@ void LIVMapper::handleLIO()
   // printf("\033[1;36m[ LIO mapping time ]: current scan: icp: %0.6f secs, map incre: %0.6f secs, total: %0.6f secs.\033[0m\n"
   //         "\033[1;36m[ LIO mapping time ]: average: icp: %0.6f secs, map incre: %0.6f secs, total: %0.6f secs.\033[0m\n",
   //         t2 - t1, t4 - t3, t4 - t0, aver_time_icp, aver_time_map_inre, aver_time_consu);
-  printf("\033[1;34m+-------------------------------------------------------------+\033[0m\n");
-  printf("\033[1;34m|                         LIO Mapping Time                    |\033[0m\n");
-  printf("\033[1;34m+-------------------------------------------------------------+\033[0m\n");
-  printf("\033[1;34m| %-29s | %-27s |\033[0m\n", "Algorithm Stage", "Time (secs)");
-  printf("\033[1;34m+-------------------------------------------------------------+\033[0m\n");
-  printf("\033[1;36m| %-29s | %-27f |\033[0m\n", "DownSample", t_down - t0);
-  printf("\033[1;36m| %-29s | %-27f |\033[0m\n", "ICP", t2 - t1);
-  printf("\033[1;36m| %-29s | %-27f |\033[0m\n", "updateVoxelMap", t4 - t3);
-  printf("\033[1;34m+-------------------------------------------------------------+\033[0m\n");
-  printf("\033[1;36m| %-29s | %-27f |\033[0m\n", "Current Total Time", t4 - t0);
-  printf("\033[1;36m| %-29s | %-27f |\033[0m\n", "Average Total Time", aver_time_consu);
-  printf("\033[1;34m+-------------------------------------------------------------+\033[0m\n");
+  if (frame_num % kLioLogIntervalFrames == 0) {
+    printf("\033[1;34m+-------------------------------------------------------------+\033[0m\n");
+    printf("\033[1;34m|                         LIO Mapping Time                    |\033[0m\n");
+    printf("\033[1;34m+-------------------------------------------------------------+\033[0m\n");
+    printf("\033[1;34m| %-29s | %-27s |\033[0m\n", "Algorithm Stage", "Time (secs)");
+    printf("\033[1;34m+-------------------------------------------------------------+\033[0m\n");
+    printf("\033[1;36m| %-29s | %-27f |\033[0m\n", "DownSample", t_down - t0);
+    printf("\033[1;36m| %-29s | %-27f |\033[0m\n", "ICP", t2 - t1);
+    printf("\033[1;36m| %-29s | %-27f |\033[0m\n", "updateVoxelMap", t4 - t3);
+    printf("\033[1;34m+-------------------------------------------------------------+\033[0m\n");
+    printf("\033[1;36m| %-29s | %-27f |\033[0m\n", "Current Total Time", t4 - t0);
+    printf("\033[1;36m| %-29s | %-27f |\033[0m\n", "Average Total Time", aver_time_consu);
+    printf("\033[1;34m+-------------------------------------------------------------+\033[0m\n");
+  }
 
   euler_cur = RotMtoEuler(_state.rot_end);
   if(mat_out_en && fout_out.is_open()) {
@@ -879,7 +904,10 @@ void LIVMapper::imu_cbk(const sensor_msgs::msg::Imu::ConstSharedPtr &msg_in)
   if (!imu_en) return;
 
   if (last_timestamp_lidar < 0.0) return;
-  RCLCPP_INFO(this->node->get_logger(), "get imu at time: %.6f", stamp2Sec(msg_in->header.stamp));
+  static double s_last_imu_log_sec = -1e9;
+  const double t = stamp2Sec(msg_in->header.stamp);
+  const bool should_log = (t - s_last_imu_log_sec >= 5.0);
+  if (should_log) s_last_imu_log_sec = t;
   sensor_msgs::msg::Imu::SharedPtr msg(new sensor_msgs::msg::Imu(*msg_in));
   msg->header.stamp = sec2Stamp(stamp2Sec(msg->header.stamp) - imu_time_offset);
   double timestamp = stamp2Sec(msg->header.stamp);
@@ -913,7 +941,9 @@ void LIVMapper::imu_cbk(const sensor_msgs::msg::Imu::ConstSharedPtr &msg_in)
   last_timestamp_imu = timestamp;
 
   imu_buffer.push_back(msg);
-  cout<<"got imu: "<<timestamp<<" imu size "<<imu_buffer.size()<<endl;
+  if (should_log) {
+    RCLCPP_INFO(this->node->get_logger(), "get imu at time: %.6f, imu size %zu", t, imu_buffer.size());
+  }
   mtx_buffer.unlock();
   if (imu_prop_enable)
   {

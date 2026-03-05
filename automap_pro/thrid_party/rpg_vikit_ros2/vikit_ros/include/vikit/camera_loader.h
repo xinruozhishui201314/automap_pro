@@ -10,6 +10,7 @@
 #include <vikit/polynomial_camera.h>
 #include <vikit/params_helper.h>
 #include "rclcpp/rclcpp.hpp"
+#include "rclcpp/logger.hpp"
 
 namespace vk {
 namespace camera_loader {
@@ -53,11 +54,15 @@ inline bool loadFromRosNs(rclcpp::Node::SharedPtr node, const std::string& ns, v
   };
 
   // 读取相机模型类型；"model" 对应 YAML 中的 parameter_blackboard.model
+  const std::string full_model_key = ns + sep + "model";
   const std::string cam_model = get_str("model");
   if (cam_model.empty()) {
+    RCLCPP_ERROR(node->get_logger(),
+      "[camera_loader] parameter '%s' is empty or missing; ensure parameter_blackboard.model is declared and passed via launch.", full_model_key.c_str());
     cam = nullptr;
     return false;
   }
+  RCLCPP_DEBUG(node->get_logger(), "[camera_loader] %s='%s'", full_model_key.c_str(), cam_model.c_str());
 
   if(cam_model == "Ocam")
   {
@@ -104,6 +109,8 @@ inline bool loadFromRosNs(rclcpp::Node::SharedPtr node, const std::string& ns, v
   }
   else
   {
+    RCLCPP_ERROR(node->get_logger(),
+      "[camera_loader] unknown camera model '%s'; supported: Ocam, Pinhole, EquidistantCamera, PolynomialCamera, ATAN", cam_model.c_str());
     cam = nullptr;
     res = false;
   }

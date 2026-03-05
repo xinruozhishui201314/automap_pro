@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 # AutoMap-Pro Offline / Bag Replay Launch (ROS2)
-# 从 system_config.yaml 读取并启动：fast-livo2、overlap_transformer_ros2、HBA、automap_system
+# 全工程唯一配置：仅使用 config:= 传入的 YAML，不生成 fast_livo_params.yaml；fast-livo2 / HBA / automap_system 均从此 config 读参
 
 import os
+import sys
+import subprocess
+import traceback
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, ExecuteProcess, OpaqueFunction
@@ -10,23 +13,47 @@ from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
+_LP = "[automap_offline]"
+
+
+def _log_launch_exception(step_name, e):
+    """记录 launch 内异常，便于看到问题原因。"""
+    sys.stderr.write("{} [EXCEPTION] step={} type={} message={}\n".format(
+        _LP, step_name, type(e).__name__, str(e)))
+    try:
+        for line in traceback.format_exc().strip().split("\n"):
+            sys.stderr.write("{} [EXCEPTION]   {}\n".format(_LP, line))
+    except Exception:
+        pass
+    sys.stderr.flush()
+
 
 def _launch_nodes_offline(context, *args, **kwargs):
     config_path = LaunchConfiguration("config").perform(context)
-    pkg_share = get_package_share_directory("automap_pro")
-    rviz_config_default = os.path.join(pkg_share, "config", "automap.rviz")
+    try:
+        pkg_share = get_package_share_directory("automap_pro")
+    except Exception as e:
+        _log_launch_exception("get_package_share_directory(automap_pro)", e)
+        pkg_share = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        sys.stderr.write("{} [FALLBACK] 使用 launch 相对路径 pkg_share={}\n".format(_LP, pkg_share))
+        sys.stderr.flush()
+    # RViz 配置在 rviz/ 目录，非 config/（config/ 仅放 system_config 等）
+    rviz_config_default = os.path.join(pkg_share, "rviz", "automap.rviz")
+    if not os.path.isfile(rviz_config_default):
+        rviz_config_default = os.path.join(pkg_share, "config", "automap.rviz")
     launch_dir = os.path.dirname(os.path.abspath(__file__))
-    # fast_livo 参数固定从 automap_pro/config/system_config.yaml 读取，不使用 config:= 传入的其它配置
-    config_dir = os.path.join(os.path.dirname(launch_dir), "config")
-    system_config_yaml_path = os.path.join(config_dir, "system_config.yaml")
-    if launch_dir not in __import__("sys").path:
-        __import__("sys").path.insert(0, launch_dir)
+    if launch_dir not in sys.path:
+        sys.path.insert(0, launch_dir)
+    ot_params = {"model_path": ""}
+    fl2_params = {}
+    hba_params = {}
+    hba_cal_mme_params = {}
+    hba_visualize_params = {}
     try:
         from params_from_system_config import (
             load_system_config,
             get_overlap_transformer_params,
             get_fast_livo2_params,
-            write_fast_livo_params_file,
             get_hba_params,
             get_hba_cal_mme_params,
             get_hba_visualize_params,
@@ -36,23 +63,11 @@ def _launch_nodes_offline(context, *args, **kwargs):
         hba_params = get_hba_params(system_config)
         hba_cal_mme_params = get_hba_cal_mme_params(system_config)
         hba_visualize_params = get_hba_visualize_params(system_config)
-        # fast_livo 固定使用 automap_pro/config/system_config.yaml，不使用 config:= 传入的其它配置
-        if os.path.isfile(system_config_yaml_path):
-            system_config_for_fast_livo = load_system_config(system_config_yaml_path)
-            fl2_params = get_fast_livo2_params(system_config_for_fast_livo)
-            config_used_for_fast_livo_path = system_config_yaml_path
-        else:
-            system_config_for_fast_livo = system_config
-            fl2_params = get_fast_livo2_params(system_config)
-            config_used_for_fast_livo_path = config_path
-    except Exception:
-        ot_params = {"model_path": ""}
-        fl2_params = {}
-        hba_params = {}
-        hba_cal_mme_params = {}
-        hba_visualize_params = {}
-        system_config_for_fast_livo = None
-        config_used_for_fast_livo_path = None
+        fl2_params = get_fast_livo2_params(system_config)
+    except Exception as e:
+        _log_launch_exception("加载 config 或生成参数(load_system_config/get_*_params)", e)
+        sys.stderr.write("{} [FALLBACK] 使用空/默认参数继续启动，部分节点可能不可用\n".format(_LP))
+        sys.stderr.flush()
 
     use_external_frontend = LaunchConfiguration("use_external_frontend", default="false")
     use_external_overlap = LaunchConfiguration("use_external_overlap", default="false")
@@ -61,57 +76,42 @@ def _launch_nodes_offline(context, *args, **kwargs):
     use_hba_visualize = LaunchConfiguration("use_hba_visualize", default="false")
     nodes = []
 
-    # Fast-LIVO2：用 ExecuteProcess + --params-file 直接加载我们写的 YAML，避免 launch 合并参数时产生 parameter ''
-    # 参数来源固定为 automap_pro/config/system_config.yaml（与 config:= 无关）
-    # 日志目录：优先环境变量 AUTOMAP_LOG_DIR（与工程统一 logs/ 一致），否则 automap_pro/logs
+    # Fast-LIVO2：参数与全工程一致，仅来自唯一 config:= 传入的配置文件（不生成 fast_livo_params.yaml）
     if fl2_params:
-        log_dir = os.environ.get("AUTOMAP_LOG_DIR") or os.path.join(os.path.dirname(launch_dir), "logs")
-        os.makedirs(log_dir, exist_ok=True)
-        fl2_params_path = os.path.join(log_dir, "fast_livo_params.yaml")
-        fl2_params_abs = os.path.abspath(fl2_params_path)
-        fl2_params_real = os.path.realpath(fl2_params_path) if os.path.exists(fl2_params_path) else "(file not yet written)"
-        launch_file_abs = os.path.abspath(__file__)
-        launch_dir_abs = os.path.abspath(launch_dir)
-        log_dir_abs = os.path.abspath(log_dir)
         config_abs = os.path.abspath(config_path) if config_path else None
-        import sys
-        _lp = "[LINK_3_LAUNCH]"
-        sys.stderr.write("{} [PATHS] launch_file(absolute)={}\n".format(_lp, launch_file_abs))
-        sys.stderr.write("{} [PATHS] launch_dir(absolute)={}\n".format(_lp, launch_dir_abs))
-        sys.stderr.write("{} [PATHS] log_dir(absolute)={}\n".format(_lp, log_dir_abs))
-        sys.stderr.write("{} [PATHS] config_path(raw)={}\n".format(_lp, config_path))
-        sys.stderr.write("{} [PATHS] config_path(absolute)={}\n".format(_lp, config_abs))
-        sys.stderr.write("{} [PATHS] fast_livo_config(used)={}\n".format(_lp, config_used_for_fast_livo_path or "(none)"))
-        sys.stderr.write("{} [PATHS] fast_livo_params_path(raw)={}\n".format(_lp, fl2_params_path))
-        sys.stderr.write("{} [PATHS] fast_livo_params_path(absolute)={}\n".format(_lp, fl2_params_abs))
-        sys.stderr.write("{} [PATHS] fast_livo_params_path(realpath)={}\n".format(_lp, fl2_params_real))
-        sys.stderr.write("{} [PATHS] params_file_for_fast_livo(use_this_in_grep)={}\n".format(_lp, fl2_params_abs))
+        sys.stderr.write("{} [CONFIG] 唯一配置文件(全工程): config_path={}\n".format(_LP, config_abs or config_path))
+        sys.stderr.write("{} [CONFIG] fast_livo 参数来源: 同上 config，无 fast_livo_params.yaml\n".format(_LP))
+        pb = fl2_params.get("parameter_blackboard") if isinstance(fl2_params.get("parameter_blackboard"), dict) else {}
+        sys.stderr.write("{} [FAST_LIVO_PARAMS] fl2_params 顶层键: {}\n".format(_LP, sorted(fl2_params.keys())))
+        sys.stderr.write("{} [FAST_LIVO_PARAMS] parameter_blackboard 键: {}, model={!r}\n".format(
+            _LP, sorted(pb.keys()), pb.get("model")))
+        if not (pb.get("model") or "").strip():
+            sys.stderr.write("{} [FAST_LIVO_PARAMS] [WARN] parameter_blackboard.model 为空，将导致 Camera model not specified\n".format(_LP))
+            if "parameter_blackboard" not in fl2_params or not isinstance(fl2_params["parameter_blackboard"], dict):
+                fl2_params["parameter_blackboard"] = {}
+            fl2_params["parameter_blackboard"].setdefault("model", "Pinhole")
+            fl2_params["parameter_blackboard"].setdefault("width", 752)
+            fl2_params["parameter_blackboard"].setdefault("height", 480)
+            fl2_params["parameter_blackboard"].setdefault("scale", 1.0)
+            for k in ("fx", "fy", "cx", "cy", "d0", "d1", "d2", "d3"):
+                fl2_params["parameter_blackboard"].setdefault(k, 0.0 if k.startswith("d") else 400.0)
+            sys.stderr.write("{} [FAST_LIVO_PARAMS] 已注入兜底 parameter_blackboard.model=Pinhole\n".format(_LP))
         sys.stderr.flush()
-        write_fast_livo_params_file(system_config_for_fast_livo, fl2_params_path, config_path=config_used_for_fast_livo_path)
-        fl2_params_real_after = os.path.realpath(fl2_params_path) if os.path.exists(fl2_params_path) else fl2_params_abs
-        sys.stderr.write("{} [PATHS] fast_livo_params_path(realpath_after_write)={}\n".format(_lp, fl2_params_real_after))
-        # 使用绝对路径传给 --params-file，避免子进程 cwd 不同导致读错文件
-        fast_livo_cmd = ["ros2", "run", "fast_livo", "fastlivo_mapping", "--ros-args", "-r", "__node:=laserMapping", "-p", "use_sim_time:=true", "--params-file", fl2_params_abs]
-        sys.stderr.write("{} [CMD] fastlivo_mapping full_cmd={}\n".format(_lp, fast_livo_cmd))
-        sys.stderr.write("{} [CMD] --params-file value(absolute)={}\n".format(_lp, fl2_params_abs))
-        sys.stderr.write("{} [DIAG] 若 ros2-2 仍报 parameter ''，请确认建图前已编译 fast_livo；启动后应看到 stderr: [fast_livo] main: automatically_declare_parameters_from_overrides=false\n".format(_lp))
+        fast_livo_params = [fl2_params, {"use_sim_time": True}]
         try:
-            import subprocess
-            p = subprocess.run(["ros2", "pkg", "prefix", "fast_livo"], capture_output=True, text=True, timeout=5)
-            if p.returncode == 0 and p.stdout:
-                prefix = p.stdout.strip()
-                import os as _os
-                exe_path = _os.path.join(prefix, "lib", "fast_livo", "fastlivo_mapping")
-                sys.stderr.write("{} [DIAG] fast_livo 安装路径 prefix={} exe={}\n".format(_lp, prefix, exe_path))
+            get_package_share_directory("fast_livo")
+            nodes.append(Node(
+                package="fast_livo",
+                executable="fastlivo_mapping",
+                name="laserMapping",
+                parameters=fast_livo_params,
+                output="screen",
+                condition=IfCondition(use_external_frontend),
+            ))
         except Exception as e:
-            sys.stderr.write("{} [DIAG] 无法解析 fast_livo 安装路径: {}\n".format(_lp, e))
-        sys.stderr.flush()
-        from launch.actions import ExecuteProcess as EP
-        nodes.append(EP(
-            cmd=fast_livo_cmd,
-            output="screen",
-            condition=IfCondition(use_external_frontend),
-        ))
+            _log_launch_exception("创建 fast_livo Node(get_package_share_directory 或 Node())", e)
+            sys.stderr.write("{} [FALLBACK] 未添加 fast_livo 节点，请检查 fast_livo 是否已编译安装\n".format(_LP))
+            sys.stderr.flush()
 
     try:
         nodes.append(Node(
@@ -119,44 +119,160 @@ def _launch_nodes_offline(context, *args, **kwargs):
             name="overlap_transformer_descriptor_server", output="screen",
             parameters=[ot_params], condition=IfCondition(use_external_overlap),
         ))
-    except Exception:
-        pass
+    except Exception as e:
+        _log_launch_exception("创建 overlap_transformer_ros2 Node", e)
+        sys.stderr.write("{} [FALLBACK] 未添加 overlap_transformer 节点\n".format(_LP))
+        sys.stderr.flush()
 
     # HBA 模块节点（参数来自 system_config.backend.hba / hba_cal_mme / hba_visualize）
     if hba_params:
-        nodes.append(Node(
-            package="hba", namespace="hba", executable="hba", name="hba_node",
-            output="screen", parameters=[hba_params], condition=IfCondition(use_hba),
-        ))
+        try:
+            nodes.append(Node(
+                package="hba", namespace="hba", executable="hba", name="hba_node",
+                output="screen", parameters=[hba_params], condition=IfCondition(use_hba),
+            ))
+        except Exception as e:
+            _log_launch_exception("创建 HBA 主节点", e)
+            sys.stderr.write("{} [FALLBACK] 未添加 hba_node\n".format(_LP))
+            sys.stderr.flush()
     if hba_cal_mme_params:
-        nodes.append(Node(
-            package="hba", namespace="cal_MME", executable="calculate_MME", name="cal_MME_node",
-            output="screen", parameters=[hba_cal_mme_params], condition=IfCondition(use_hba_cal_mme),
-        ))
+        try:
+            nodes.append(Node(
+                package="hba", namespace="cal_MME", executable="calculate_MME", name="cal_MME_node",
+                output="screen", parameters=[hba_cal_mme_params], condition=IfCondition(use_hba_cal_mme),
+            ))
+        except Exception as e:
+            _log_launch_exception("创建 HBA cal_MME 节点", e)
     if hba_visualize_params:
-        nodes.append(Node(
-            package="hba", namespace="visualize", executable="visualize", name="visualize_node",
-            output="screen", parameters=[hba_visualize_params], condition=IfCondition(use_hba_visualize),
-        ))
+        try:
+            nodes.append(Node(
+                package="hba", namespace="visualize", executable="visualize", name="visualize_node",
+                output="screen", parameters=[hba_visualize_params], condition=IfCondition(use_hba_visualize),
+            ))
+        except Exception as e:
+            _log_launch_exception("创建 HBA visualize 节点", e)
 
-    # AutoMap System 节点：话题映射由 system_config.yaml 决定，不使用固定的 remappings
-    # remappings 会覆盖系统配置中的话题名，导致话题不匹配
-    nodes.append(Node(
-        package="automap_pro", executable="automap_system_node", name="automap_system",
-        output="screen",
-        parameters=[{"config": LaunchConfiguration("config")}, {"use_sim_time": True}],
-        # 移除固定 remappings，让系统从 system_config.yaml 读取话题名
-    ))
-    nodes.append(Node(
-        package="rviz2", executable="rviz2", name="rviz",
-        arguments=["-d", rviz_config_default], output="screen",
-        condition=IfCondition(LaunchConfiguration("use_rviz")),
-    ))
-    nodes.append(Node(
-        package="tf2_ros", executable="static_transform_publisher", name="world_map_tf",
-        arguments=["0", "0", "0", "0", "0", "0", "world", "map"],
-    ))
+    # AutoMap System 节点：话题映射由 system_config 决定；节点读取的是 config_file 参数（非 config）
+    config_path_str = (config_path or "").strip() if config_path else ""
+    if not config_path_str:
+        sys.stderr.write("{} [WARN] config_path 为空，automap_system 将使用默认配置\n".format(_LP))
+        sys.stderr.flush()
+    try:
+        nodes.append(Node(
+            package="automap_pro", executable="automap_system_node", name="automap_system",
+            output="screen",
+            parameters=[{"config_file": config_path_str}, {"use_sim_time": True}],
+        ))
+    except Exception as e:
+        _log_launch_exception("创建 automap_system Node", e)
+        sys.stderr.write("{} [ERROR] automap_system 节点未添加，建图核心不可用\n".format(_LP))
+        sys.stderr.flush()
+    try:
+        nodes.append(Node(
+            package="rviz2", executable="rviz2", name="rviz",
+            arguments=["-d", rviz_config_default], output="screen",
+            condition=IfCondition(LaunchConfiguration("use_rviz")),
+        ))
+    except Exception as e:
+        _log_launch_exception("创建 rviz2 Node", e)
+    try:
+        nodes.append(Node(
+            package="tf2_ros", executable="static_transform_publisher", name="world_map_tf",
+            arguments=["0", "0", "0", "0", "0", "0", "world", "map"],
+        ))
+    except Exception as e:
+        _log_launch_exception("创建 static_transform_publisher Node", e)
+    # Fast-LIVO2 使用 frame_id=camera_init，RViz Fixed Frame=map；需发布 map->camera_init 才能显示点云/轨迹
+    try:
+        nodes.append(Node(
+            package="tf2_ros", executable="static_transform_publisher", name="map_camera_init_tf",
+            arguments=["0", "0", "0", "0", "0", "0", "map", "camera_init"],
+        ))
+    except Exception as e:
+        _log_launch_exception("创建 map_camera_init_tf Node", e)
     return nodes
+
+
+def _log_bag_topics(bag_file):
+    """调用 ros2 bag info 或读取 metadata.yaml 获取 bag 内发布的话题名称。"""
+    topics = []
+
+    def parse_ros2_bag_info_stdout(stdout):
+        """解析 ros2 bag info 输出：支持 'Topics:' 与 'Topic information:' 两种节标题及多种行格式。"""
+        out_topics = []
+        in_topics = False
+        for line in stdout.splitlines():
+            stripped = line.strip()
+            if stripped == "Topics:" or "Topic information" in stripped:
+                in_topics = True
+                continue
+            if not in_topics or not stripped:
+                if in_topics and not stripped:
+                    break
+                continue
+            # 格式1: "  /topic_name: msg_type (count msgs)"
+            parts = stripped.split(":", 1)
+            if len(parts) >= 1 and parts[0].strip().startswith("/"):
+                out_topics.append(parts[0].strip())
+                continue
+            # 格式2: "Topic: /name | Type: ..." (Humble ros2 bag info)
+            if "Topic:" in stripped and "/" in stripped:
+                for seg in stripped.replace("|", " ").split():
+                    if seg.startswith("/") and seg not in out_topics:
+                        out_topics.append(seg)
+                        break
+        return out_topics
+
+    try:
+        result = subprocess.run(
+            ["ros2", "bag", "info", bag_file],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            env=os.environ.copy(),
+        )
+        if result.returncode == 0 and result.stdout:
+            topics = parse_ros2_bag_info_stdout(result.stdout)
+    except FileNotFoundError:
+        pass  # 下方用 metadata 回退
+    except subprocess.TimeoutExpired:
+        sys.stderr.write("{} [BAG] [WARN] ros2 bag info 超时，尝试从 metadata 读取\n".format(_LP))
+    except Exception as e:
+        sys.stderr.write("{} [BAG] [WARN] ros2 bag info 失败: {}，尝试从 metadata 读取\n".format(_LP, e))
+
+    # 回退：bag 目录下的 metadata.yaml（rosbag2 标准结构）
+    if not topics and bag_file:
+        try:
+            import yaml
+            meta_dir = bag_file if os.path.isdir(bag_file) else os.path.dirname(bag_file)
+            meta_path = os.path.join(meta_dir, "metadata.yaml")
+            if os.path.isfile(meta_path):
+                with open(meta_path, "r", encoding="utf-8") as f:
+                    data = yaml.safe_load(f)
+                for t in (data or {}).get("rosbag2_bagfile_information", {}).get("topics_with_message_count", []):
+                    name = (t.get("topic_metadata") or {}).get("name")
+                    if name and name not in topics:
+                        topics.append(name)
+        except Exception:
+            pass
+    return topics
+
+
+def _log_bag_path(context, *args, **kwargs):
+    """启动时打印 bag 路径、bag 内发布的话题名称与依赖提示。"""
+    bag_file = LaunchConfiguration("bag_file").perform(context)
+    sys.stderr.write("{} [BAG] 离线回放 bag_file={}\n".format(_LP, bag_file))
+
+    topics = _log_bag_topics(bag_file)
+    if topics:
+        sys.stderr.write("{} [BAG] rosbag2 将发布的话题 ({} 个): {}\n".format(
+            _LP, len(topics), ", ".join(topics)))
+    else:
+        sys.stderr.write("{} [BAG] 无法获取 bag 话题列表（请确认 bag 路径正确且为 ROS2 格式）\n".format(_LP))
+
+    sys.stderr.write("{} [BAG] 若 ros2 bag play 报 Exception on parsing info file / bad conversion，将无数据；odom 来自 fast_livo，请确保 config 中 lid_topic/imu_topic 与 bag 一致\n".format(_LP))
+    sys.stderr.write("{} [BAG] 离线模式默认不启动 standalone HBA 节点(use_hba=false)，后端优化由 automap_system 内 HBAOptimizer 负责\n".format(_LP))
+    sys.stderr.flush()
 
 
 def generate_launch_description():
@@ -169,9 +285,10 @@ def generate_launch_description():
         DeclareLaunchArgument("use_rviz", default_value="true", description="Whether to start RViz"),
         DeclareLaunchArgument("use_external_frontend", default_value="true", description="true=use verified fast_livo node (modular); false=use internal FastLIVO2Wrapper (ESIKF)"),
         DeclareLaunchArgument("use_external_overlap", default_value="false", description="Launch OverlapTransformer descriptor (params from system_config)"),
-        DeclareLaunchArgument("use_hba", default_value="true", description="Launch HBA backend node (params from system_config.backend.hba)"),
+        DeclareLaunchArgument("use_hba", default_value="false", description="Launch standalone HBA node (reads pose.json at startup; offline 时默认 false 避免零位姿崩溃，优化由 automap_system 内 HBAOptimizer 负责)"),
         DeclareLaunchArgument("use_hba_cal_mme", default_value="false", description="Launch HBA cal_MME node (params from system_config.backend.hba_cal_mme)"),
         DeclareLaunchArgument("use_hba_visualize", default_value="false", description="Launch HBA visualize node (params from system_config.backend.hba_visualize)"),
+        OpaqueFunction(function=_log_bag_path),
         ExecuteProcess(cmd=["ros2", "bag", "play", LaunchConfiguration("bag_file"), "--rate", LaunchConfiguration("rate"), "--clock"], output="screen"),
         OpaqueFunction(function=_launch_nodes_offline),
     ])

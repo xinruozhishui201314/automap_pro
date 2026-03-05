@@ -6,85 +6,107 @@ Panels:
 Visualization Manager:
   Class: ""
   Displays:
-    # ─── 全局选项：Fixed Frame 建议用 map（建图）或 camera_init（仅前端） ───
+    # ═══════════════════════════════════════════════════════════════
+    # 1. 地图坐标系（Map Coordinate Frame）
+    # ═══════════════════════════════════════════════════════════════
+    - Class: rviz_default_plugins/Grid
+      Enabled: true
+      Name: 地图网格
+      Normal Cell Count: 0
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Plane: XY
+      Plane Cell Count: 50
+      Reference Frame: <Fixed Frame>
+      Value: true
     - Class: rviz_default_plugins/Axes
       Enabled: true
-      Length: 2
-      Name: Axes
-      Radius: 0.1
+      Length: 3
+      Name: 地图坐标系
+      Radius: 0.15
       Reference Frame: <Fixed Frame>
-
-    # ─── 前端 FAST-LIVO2 ───
-    - Alpha: 1
-      Autocompute Value Bounds: true
-      Class: rviz_default_plugins/PointCloud2
-      Color: 239; 41; 41
-      Decay Time: 0
+    - Class: rviz_default_plugins/TF
       Enabled: true
-      Name: cloud_registered
-      Size (m): 0.01
-      Topic:
-        Depth: 5
-        Reliability Policy: Reliable
-        Value: /cloud_registered
-      Use Fixed Frame: true
-    - Alpha: 0.8
-      Class: rviz_default_plugins/Path
-      Enabled: true
-      Name: path_frontend
-      Topic:
-        Depth: 5
-        Reliability Policy: Reliable
-        Value: /path
-      Use Fixed Frame: true
+      Frame Timeout: 15
+      Frames:
+        All Enabled: true
+      Marker Scale: 0.5
+      Name: TF
+      Show Arrows: true
+      Show Axes: true
+      Show Names: true
+      Tree:
+        {}
+      Update Interval: 0
+      Value: true
 
-    # ─── 建图系统：点云 ───
+    # ═══════════════════════════════════════════════════════════════
+    # 2. 整个地图点云（Global Map Point Cloud）
+    # ═══════════════════════════════════════════════════════════════
     - Alpha: 0.9
       Autocompute Value Bounds: true
       Class: rviz_default_plugins/PointCloud2
-      Color: 41; 239; 41
+      Color: 120; 200; 120
       Decay Time: 0
       Enabled: true
-      Name: automap_global_map
-      Size (m): 0.02
+      Name: 全局地图点云
+      Size (m): 0.025
       Topic:
         Depth: 5
         Reliability Policy: Best Effort
         Value: /automap/global_map
       Use Fixed Frame: true
-    - Alpha: 0.8
+
+    # ═══════════════════════════════════════════════════════════════
+    # 3. 当前帧点云（Current Frame Point Cloud）
+    # ═══════════════════════════════════════════════════════════════
+    - Alpha: 1
       Autocompute Value Bounds: true
       Class: rviz_default_plugins/PointCloud2
       Color: 41; 171; 239
-      Decay Time: 0.5
+      Decay Time: 0.3
       Enabled: true
-      Name: automap_current_cloud
-      Size (m): 0.015
+      Name: 当前帧点云(automap)
+      Size (m): 0.02
       Topic:
         Depth: 5
         Reliability Policy: Best Effort
         Value: /automap/current_cloud
       Use Fixed Frame: true
-    - Alpha: 0.7
+    - Alpha: 1
       Autocompute Value Bounds: true
       Class: rviz_default_plugins/PointCloud2
-      Color: 239; 171; 41
-      Decay Time: 0
+      Color: 239; 80; 80
+      Decay Time: 0.2
       Enabled: true
-      Name: automap_colored_cloud
-      Size (m): 0.02
+      Name: 当前帧点云(前端LIO)
+      Size (m): 0.015
       Topic:
         Depth: 5
-        Reliability Policy: Best Effort
-        Value: /automap/colored_cloud
+        Reliability Policy: Reliable
+        Value: /cloud_registered
       Use Fixed Frame: true
 
-    # ─── 建图系统：轨迹 ───
+    # ═══════════════════════════════════════════════════════════════
+    # 4. 运动轨迹（Motion Trajectory）
+    # ═══════════════════════════════════════════════════════════════
     - Alpha: 1
       Class: rviz_default_plugins/Path
-      Color: 255; 128; 0
+      Color: 255; 165; 0
       Enabled: true
-      Name: automap_odom_path
+      Name: 前端轨迹(path)
+      Topic:
+        Depth: 5
+        Reliability Policy: Reliable
+        Value: /path
+      Use Fixed Frame: true
+    - Alpha: 1
+      Class: rviz_default_plugins/Path
+      Color: 255; 200; 50
+      Enabled: true
+      Name: 里程计轨迹(odom)
       Topic:
         Depth: 5
         Reliability Policy: Reliable
@@ -92,9 +114,9 @@ Visualization Manager:
       Use Fixed Frame: true
     - Alpha: 1
       Class: rviz_default_plugins/Path
-      Color: 0; 255; 0
+      Color: 0; 255; 100
       Enabled: true
-      Name: automap_optimized_path
+      Name: 优化后轨迹(optimized)
       Topic:
         Depth: 5
         Reliability Policy: Reliable
@@ -102,53 +124,44 @@ Visualization Manager:
       Use Fixed Frame: true
     - Class: rviz_default_plugins/PoseArray
       Enabled: true
-      Name: automap_keyframe_poses
+      Name: 关键帧位姿
       Topic:
         Depth: 5
         Reliability Policy: Reliable
         Value: /automap/keyframe_poses
       Use Fixed Frame: true
 
-    # ─── 回环检测 ───
+    # ═══════════════════════════════════════════════════════════════
+    # 5. 回环约束（Loop Closure Constraints）
+    # ═══════════════════════════════════════════════════════════════
     - Class: rviz_default_plugins/MarkerArray
       Enabled: true
-      Name: automap_loop_markers
+      Name: 回环约束
       Topic:
         Depth: 5
         Reliability Policy: Reliable
         Value: /automap/loop_markers
       Use Fixed Frame: true
-
-    # ─── 子图可视化 ───
-    - Class: rviz_default_plugins/MarkerArray
+    - Alpha: 0.8
+      Autocompute Value Bounds: true
+      Class: rviz_default_plugins/PointCloud2
+      Color: 255; 100; 255
+      Decay Time: 0
       Enabled: true
-      Name: automap_submap_boundaries
+      Name: 回环候选点云
+      Size (m): 0.02
       Topic:
         Depth: 5
-        Reliability Policy: Reliable
-        Value: /automap/submap_boundaries
-      Use Fixed Frame: true
-    - Class: rviz_default_plugins/MarkerArray
-      Enabled: true
-      Name: automap_submap_bboxes
-      Topic:
-        Depth: 5
-        Reliability Policy: Reliable
-        Value: /automap/submap_bboxes
-      Use Fixed Frame: true
-    - Class: rviz_default_plugins/MarkerArray
-      Enabled: true
-      Name: automap_submap_graph
-      Topic:
-        Depth: 5
-        Reliability Policy: Reliable
-        Value: /automap/submap_graph
+        Reliability Policy: Best Effort
+        Value: /automap/loop_candidate_cloud
       Use Fixed Frame: true
 
-    # ─── GPS ───
+    # ═══════════════════════════════════════════════════════════════
+    # 6. GPS 约束（GPS Constraints）
+    # ═══════════════════════════════════════════════════════════════
     - Class: rviz_default_plugins/MarkerArray
       Enabled: true
-      Name: automap_gps_markers
+      Name: GPS约束/标记
       Topic:
         Depth: 5
         Reliability Policy: Reliable
@@ -156,75 +169,103 @@ Visualization Manager:
       Use Fixed Frame: true
     - Class: rviz_default_plugins/MarkerArray
       Enabled: true
-      Name: automap_gps_quality
+      Name: GPS质量
       Topic:
         Depth: 5
         Reliability Policy: Reliable
         Value: /automap/gps_quality
       Use Fixed Frame: true
-
-    # ─── 后端 / HBA ───
-    - Class: rviz_default_plugins/MarkerArray
+    - Alpha: 0.9
+      Class: rviz_default_plugins/Path
+      Color: 100; 200; 255
       Enabled: true
-      Name: automap_coordinate_frames
+      Name: GPS原始轨迹
+      Topic:
+        Depth: 5
+        Reliability Policy: Reliable
+        Value: /automap/gps_raw_path
+      Use Fixed Frame: true
+    - Alpha: 0.9
+      Class: rviz_default_plugins/Path
+      Color: 50; 255; 200
+      Enabled: true
+      Name: GPS对齐轨迹
+      Topic:
+        Depth: 5
+        Reliability Policy: Reliable
+        Value: /automap/gps_aligned_path
+      Use Fixed Frame: true
+
+    # ═══════════════════════════════════════════════════════════════
+    # 可选：子图、后端、其他
+    # ═══════════════════════════════════════════════════════════════
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: false
+      Name: 子图边界
+      Topic:
+        Depth: 5
+        Reliability Policy: Reliable
+        Value: /automap/submap_boundaries
+      Use Fixed Frame: true
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: false
+      Name: 子图包围盒
+      Topic:
+        Depth: 5
+        Reliability Policy: Reliable
+        Value: /automap/submap_bboxes
+      Use Fixed Frame: true
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: false
+      Name: 子图图
+      Topic:
+        Depth: 5
+        Reliability Policy: Reliable
+        Value: /automap/submap_graph
+      Use Fixed Frame: true
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: false
+      Name: 坐标轴(后端)
       Topic:
         Depth: 5
         Reliability Policy: Reliable
         Value: /automap/coordinate_frames
       Use Fixed Frame: true
     - Class: rviz_default_plugins/MarkerArray
-      Enabled: true
-      Name: automap_hba_result
-      Topic:
-        Depth: 5
-        Reliability Policy: Reliable
-        Value: /automap/hba_result
-      Use Fixed Frame: true
-    - Class: rviz_default_plugins/MarkerArray
-      Enabled: true
-      Name: automap_covariance_ellipses
+      Enabled: false
+      Name: 协方差椭圆
       Topic:
         Depth: 5
         Reliability Policy: Reliable
         Value: /automap/covariance_ellipses
       Use Fixed Frame: true
     - Class: rviz_default_plugins/MarkerArray
-      Enabled: true
-      Name: automap_factor_graph
+      Enabled: false
+      Name: 因子图
       Topic:
         Depth: 5
         Reliability Policy: Reliable
         Value: /automap/factor_graph
       Use Fixed Frame: true
-
-    # ─── 可选：密度热力图、活跃区域、退化区域 ───
-    - Alpha: 0.8
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: false
+      Name: HBA结果
+      Topic:
+        Depth: 5
+        Reliability Policy: Reliable
+        Value: /automap/hba_result
+      Use Fixed Frame: true
+    - Alpha: 0.7
       Autocompute Value Bounds: true
       Class: rviz_default_plugins/PointCloud2
       Decay Time: 0
       Enabled: false
-      Name: automap_density_heatmap
-      Size (m): 0.05
+      Name: 彩色点云
+      Size (m): 0.02
       Topic:
         Depth: 5
         Reliability Policy: Best Effort
-        Value: /automap/density_heatmap
-      Use Fixed Frame: true
-    - Class: rviz_default_plugins/MarkerArray
-      Enabled: false
-      Name: automap_active_region
-      Topic:
-        Depth: 5
-        Reliability Policy: Reliable
-        Value: /automap/active_region
-      Use Fixed Frame: true
-    - Class: rviz_default_plugins/MarkerArray
-      Enabled: false
-      Name: automap_degeneration_regions
-      Topic:
-        Depth: 5
-        Reliability Policy: Reliable
-        Value: /automap/degeneration_regions
+        Value: /automap/colored_cloud
       Use Fixed Frame: true
   Global Options:
     Background Color: 48; 48; 48

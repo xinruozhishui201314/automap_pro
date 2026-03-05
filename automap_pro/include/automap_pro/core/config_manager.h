@@ -13,6 +13,7 @@ public:
     }
 
     void load(const std::string& yaml_path);
+    void loadFromFile(const std::string& yaml_path) { load(yaml_path); }  // 别名，nodes 使用
 
     // ── 系统 ──────────────────────────────────────────────
     std::string systemName()    const { return get<std::string>("system.name",    "AutoMap-Pro"); }
@@ -24,6 +25,8 @@ public:
     std::string imuTopic()      const { return get<std::string>("sensor.imu.topic",   "/imu/imu"); }
     std::string gpsTopic()      const { return get<std::string>("sensor.gps.topic",   "/gps/fix"); }
     bool        gpsEnabled()    const { return get<bool>("sensor.gps.enabled", false); }
+    bool        cameraEnabled() const { return get<bool>("sensor.camera.enabled", false); }
+    std::string cameraTopic()   const { return get<std::string>("sensor.camera.topic", "/camera/image_raw"); }
 
     // ── 前端 FAST-LIVO2 ───────────────────────────────────
     std::string fastLivoOdomTopic()  const { return get<std::string>("frontend.odom_topic",  "/aft_mapped_to_init"); }
@@ -52,6 +55,20 @@ public:
     int    gpsGoodSamplesNeeded()const { return get<int>("gps.good_samples_needed", 30); }
     bool   gpsAddConstraintsOnAlign() const { return get<bool>("gps.add_constraints_on_align", true); }
     double gpsFactorIntervalM() const { return get<double>("gps.factor_interval_m", 5.0); }
+    // GPS 质量/滤波（gps_processor / gps_fusion 使用；可选，缺省用默认值）
+    double gpsExcellentHDOP()   const { return get<double>("gps.quality_excellent_hdop", 0.8); }
+    double gpsHighHDOP()        const { return get<double>("gps.quality_high_hdop", 1.5); }
+    double gpsMediumHDOP()      const { return get<double>("gps.quality_medium_hdop", 3.0); }
+    double gpsMaxJump()         const { return get<double>("gps.max_jump_m", 10.0); }
+    double gpsMaxVelocity()     const { return get<double>("gps.max_velocity_ms", 30.0); }
+    double gpsChi2Threshold()   const { return get<double>("gps.chi2_threshold", 7.815); }
+    int    gpsConsecutiveValid()const { return get<int>("gps.consecutive_valid_required", 3); }
+    bool   gpsJumpDetection()   const { return get<bool>("gps.jump_detection_enabled", true); }
+    bool   gpsConsistencyCheck()const { return get<bool>("gps.consistency_check_enabled", true); }
+    Eigen::Vector3d gpsCovExcellent() const;
+    Eigen::Vector3d gpsCovHigh()     const;
+    Eigen::Vector3d gpsCovMedium()   const;
+    Eigen::Vector3d gpsCovLow()      const;
 
     // ── 回环检测 ──────────────────────────────────────────
     double overlapThreshold()   const { return get<double>("loop_closure.overlap_threshold", 0.3); }
@@ -94,6 +111,9 @@ public:
     // ── 地图 ──────────────────────────────────────────────
     double mapVoxelSize()       const { return get<double>("map.voxel_size", 0.1); }
     bool   mapStatisticalFilter()const{ return get<bool>("map.statistical_filter", true); }
+    bool   mapStatFilter()        const { return mapStatisticalFilter(); }  // 别名，map_filter 使用
+    int    mapStatFilterMeanK() const { return get<int>("map.statistical_filter_mean_k", 50); }
+    double mapStatFilterStdMul()const { return get<double>("map.statistical_filter_std_mul", 1.0); }
 
     // ── 会话 ──────────────────────────────────────────────
     bool   multiSessionEnabled()const { return get<bool>("session.multi_session", false); }

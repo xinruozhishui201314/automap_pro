@@ -24,7 +24,7 @@
 
 - **HBA**：`HBA-main/HBA_ROS2/launch/hba_launch.py`、`cal_MME_launch.py`、`visualize_launch.py`  
   可传入 `system_config_path:=/path/to/automap_pro/config/system_config.yaml` 以与主配置一致。
-- **fast-livo2**：`fast-livo2-humble/launch/*.launch.py` 为不同雷达/数据集的示例，主流程使用 automap_pro launch + 生成的 `fast_livo_params.yaml`。
+- **fast-livo2**：`fast-livo2-humble/launch/*.launch.py` 为不同雷达/数据集的示例；主流程使用 automap_pro launch，fast_livo 参数与全工程一致，来自唯一 config 文件（不生成 fast_livo_params.yaml）。
 
 ---
 
