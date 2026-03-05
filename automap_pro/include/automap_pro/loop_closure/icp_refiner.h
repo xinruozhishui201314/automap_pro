@@ -107,7 +107,7 @@ public:
                        const CloudXYZIPtr& tgt) const;
     
     // 统计信息
-    Eigen::Matrix6d computeCorrespondenceCovariance(
+    Mat66d computeCorrespondenceCovariance(
         const CloudXYZIPtr& src, const CloudXYZIPtr& tgt,
         const Pose3d& T_src_tgt) const;
 

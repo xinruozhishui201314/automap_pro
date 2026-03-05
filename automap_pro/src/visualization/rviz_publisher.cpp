@@ -4,6 +4,7 @@
 
 #include <pcl_conversions/pcl_conversions.h>
 #include <pcl/point_types.h>
+#include <pcl/common/transforms.h>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/pose.hpp>
 #include <cmath>
@@ -18,8 +19,8 @@ namespace automap_pro {
 void RvizPublisher::init(rclcpp::Node::SharedPtr node) {
     node_ = node;
     const auto& cfg = ConfigManager::instance();
-    global_map_ds_res_  = cfg.visGlobalMapDownsample();
-    publish_global_map_ = cfg.visPublishRate() > 0.0;
+    global_map_ds_res_  = static_cast<float>(cfg.mapVoxelSize());
+    publish_global_map_ = true;
 
     auto sensor_qos = rclcpp::SensorDataQoS();
     auto reliable_qos = rclcpp::QoS(rclcpp::KeepLast(10)).reliable();
@@ -698,17 +699,18 @@ void RvizPublisher::publishDegenerationRegions(const std::vector<std::pair<doubl
 // ─────────────────────────────────────────────────────────────────────────────
 
 void RvizPublisher::clearAllMarkers() {
-    for (const auto* pub : {loop_marker_pub_.get(), gps_marker_pub_.get(), submap_boundary_pub_.get(),
+    auto arr = makeDeleteAllMarkers("");
+    for (auto* pub : {loop_marker_pub_.get(), gps_marker_pub_.get(), submap_boundary_pub_.get(),
             submap_bbox_pub_.get(), submap_graph_pub_.get(), covariance_pub_.get(), factor_graph_pub_.get(),
             gps_quality_pub_.get(), module_status_pub_.get(), frame_marker_pub_.get(),
             active_region_pub_.get(), degen_region_pub_.get(), hba_result_pub_.get(), convergence_pub_.get()}) {
-        if (pub) pub->publish(makeDeleteAllMarkers(""));
+        if (pub) pub->publish(arr);
     }
 }
 
 void RvizPublisher::clearMarkers(const std::string& ns) {
     auto arr = makeDeleteAllMarkers(ns);
-    for (const auto* pub : {loop_marker_pub_.get(), gps_marker_pub_.get(), submap_boundary_pub_.get(),
+    for (auto* pub : {loop_marker_pub_.get(), gps_marker_pub_.get(), submap_boundary_pub_.get(),
             submap_bbox_pub_.get(), submap_graph_pub_.get(), covariance_pub_.get(), factor_graph_pub_.get(),
             gps_quality_pub_.get(), module_status_pub_.get(), frame_marker_pub_.get(),
             active_region_pub_.get(), degen_region_pub_.get(), hba_result_pub_.get(), convergence_pub_.get()}) {

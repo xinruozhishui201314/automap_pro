@@ -242,20 +242,19 @@ GPSAlignResult GPSManager::compute_svd_alignment() {
         cov += ld * gd.transpose();  // LiDAR←GPS
     }
 
-    // ✅ 修复：添加退化场景检查
+    // SVD 求旋转（仅XY平面旋转，绕Z轴）
+    Eigen::JacobiSVD<Eigen::Matrix3d> svd(cov, Eigen::ComputeFullU | Eigen::ComputeFullV);
+
+    // ✅ 退化场景检查
     Eigen::Vector3d singular_vals = svd.singularValues();
-    
     const double min_sv = singular_vals.minCoeff();
     const double max_sv = singular_vals.maxCoeff();
     const double cond = (max_sv > 1e-12) ? (max_sv / min_sv) : 1e12;
-    
     if (min_sv < 1e-6 || cond > 1e8) {
         ALOG_WARN(MOD, "GPS alignment: degenerate covariance (cond={:.2e}), rejecting", cond);
         return result;  // 返回失败
     }
 
-    // SVD 求旋转（仅XY平面旋转，绕Z轴）
-    Eigen::JacobiSVD<Eigen::Matrix3d> svd(cov, Eigen::ComputeFullU | Eigen::ComputeFullV);
     Eigen::Matrix3d R = svd.matrixU() * svd.matrixV().transpose();
 
     // 反射修正

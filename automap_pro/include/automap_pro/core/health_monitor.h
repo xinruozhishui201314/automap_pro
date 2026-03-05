@@ -11,6 +11,7 @@
  */
 
 #include <string>
+#include <cstring>
 #include <map>
 #include <vector>
 #include <memory>
@@ -70,8 +71,8 @@ struct HealthReport {
     std::vector<std::string> errors;         // 错误列表
     std::string summary;                   // 摘要信息
 
-    HealthReport() : overall_state(HealthState::HEALTHY),
-                       timestamp(std::chrono::system_clock::now()) {}
+    HealthReport() : timestamp(std::chrono::system_clock::now()),
+                     overall_state(HealthState::HEALTHY) {}
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -89,6 +90,16 @@ struct HealthMonitorConfig {
     double queue_size_warning_threshold = 100;  // 队列大小警告阈值
     double queue_size_critical_threshold = 500; // 队列大小严重阈值
     int optimization_timeout_threshold_ms = 10000;  // 优化超时阈值（ms）
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 健康检查结果（单次检查项返回）
+// ─────────────────────────────────────────────────────────────────────────────
+struct HealthCheckResult {
+    std::string name;
+    HealthState state = HealthState::HEALTHY;
+    std::string message;
+    std::map<std::string, HealthCheckItem> items;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -237,7 +248,7 @@ private:
     std::shared_ptr<rclcpp::Publisher<automap_pro::msg::MappingStatusMsg>> health_pub_;
     std::vector<std::shared_ptr<HealthChecker>> checkers_;
 
-    std::mutex mutex_;
+    mutable std::mutex mutex_;
     std::atomic<bool> running_{false};
     std::thread check_thread_;
     std::thread heartbeat_thread_;
@@ -263,8 +274,8 @@ private:
 #define HEALTH_UPDATE_CPU(percent) \
     HealthMonitor::instance().updateResourceMetrics(0.0, percent, 0, 0, 0)
 #define HEALTH_UPDATE_QUEUE(type, size) \
-    HealthMonitor::instance().updateResourceMetrics(0.0, 0.0, (type == "submap" ? size : 0), \
-                                                (type == "loop" ? size : 0), 0)
+    HealthMonitor::instance().updateResourceMetrics(0.0, 0.0, (std::strcmp(type, "submap") == 0 ? (size) : 0), \
+                                                (std::strcmp(type, "loop") == 0 ? (size) : 0), 0)
 
 #define HEALTH_UPDATE_LIDAR(timeout) \
     HealthMonitor::instance().updateSensorLiDAR(0.0, timeout)

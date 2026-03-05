@@ -260,6 +260,8 @@ add_library(automap_core SHARED
   src/core/config_manager.cpp
   src/core/logger.cpp
   src/core/utils.cpp
+  src/core/error_code.cpp
+  src/core/health_monitor_impl.cpp
 )
 target_include_directories(automap_core PUBLIC ${AUTOMAP_INCLUDE_DIRS})
 # 必须与 ament_target_dependencies 一致：全部用普通形式（无 PUBLIC/PRIVATE），否则 CMake 报 keyword/plain 混用
@@ -333,6 +335,16 @@ target_link_libraries(automap_map automap_core automap_submap ${AUTOMAP_LIBS})
 ament_target_dependencies(automap_map ${AUTOMAP_AMENT_DEPS})
 
 # ──────────────────────────────────────────────────────────
+# 库：automap_visualization（RvizPublisher）
+# ──────────────────────────────────────────────────────────
+add_library(automap_visualization SHARED
+  src/visualization/rviz_publisher.cpp
+)
+target_include_directories(automap_visualization PUBLIC ${AUTOMAP_INCLUDE_DIRS})
+target_link_libraries(automap_visualization automap_core automap_submap ${AUTOMAP_LIBS})
+ament_target_dependencies(automap_visualization ${AUTOMAP_AMENT_DEPS})
+
+# ──────────────────────────────────────────────────────────
 # Composable Node 组件库（供 Component Container 加载）
 # ──────────────────────────────────────────────────────────
 add_library(automap_system_component SHARED
@@ -342,6 +354,7 @@ target_include_directories(automap_system_component PUBLIC ${AUTOMAP_INCLUDE_DIR
 target_link_libraries(automap_system_component
   automap_core automap_frontend automap_submap
   automap_loop_closure automap_backend automap_map
+  automap_visualization
   ${AUTOMAP_LIBS}
 )
 ament_target_dependencies(automap_system_component ${AUTOMAP_AMENT_DEPS})
@@ -355,8 +368,13 @@ rclcpp_components_register_node(automap_system_component
 # ──────────────────────────────────────────────────────────
 add_executable(automap_system_node_standalone src/nodes/automap_system_node.cpp)
 target_include_directories(automap_system_node_standalone PRIVATE ${AUTOMAP_INCLUDE_DIRS})
+# 显式链接 component 及其依赖，并允许 .so 中存在未定义符号（运行时由 loader 解析）
 target_link_libraries(automap_system_node_standalone
-  automap_system_component ${AUTOMAP_LIBS})
+  automap_system_component
+  automap_submap automap_map automap_visualization automap_backend automap_loop_closure
+  automap_frontend automap_core
+  ${AUTOMAP_LIBS})
+target_link_options(automap_system_node_standalone PRIVATE "LINKER:--allow-shlib-undefined")
 ament_target_dependencies(automap_system_node_standalone ${AUTOMAP_AMENT_DEPS})
 set_target_properties(automap_system_node_standalone PROPERTIES OUTPUT_NAME automap_system)
 
@@ -366,7 +384,7 @@ set_target_properties(automap_system_node_standalone PROPERTIES OUTPUT_NAME auto
 install(TARGETS
   automap_core automap_frontend automap_submap
   automap_loop_closure automap_backend automap_map
-  automap_system_component
+  automap_visualization automap_system_component
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib
   RUNTIME DESTINATION lib/${PROJECT_NAME}
@@ -382,6 +400,6 @@ ament_export_include_directories(include)
 ament_export_libraries(
   automap_core automap_frontend automap_submap
   automap_loop_closure automap_backend automap_map
-  automap_system_component)
+  automap_visualization automap_system_component)
 ament_export_dependencies(${AUTOMAP_AMENT_DEPS} Eigen3 PCL OpenCV GTSAM)
 ament_package()

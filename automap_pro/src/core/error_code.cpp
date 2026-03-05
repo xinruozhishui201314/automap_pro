@@ -3,6 +3,7 @@
 #include <sstream>
 #include <iomanip>
 #include <thread>
+#include <fmt/core.h>
 
 namespace automap_pro {
 
@@ -260,125 +261,11 @@ ErrorComponent stringToComponent(const std::string& str) {
 }
 
 std::string getErrorDescription(ErrorCodeEx code) {
-    // 按组件分组
-    switch (code.code) {
-        // 传感器
-        case static_cast<uint32_t>(errors::LIDAR_TIMEOUT):
-            return "LiDAR data timeout - no point cloud received within expected interval";
-        case static_cast<uint32_t>(errors::LIDAR_POINT_COUNT_LOW):
-            return "LiDAR point count below minimum threshold";
-        case static_cast<uint32_t>(errors::IMU_DATA_INVALID):
-            return "IMU data contains invalid values (NaN or out of range)";
-        case static_cast<uint32_t>(errors::IMU_BIAS_HIGH):
-            return "IMU bias exceeds acceptable threshold";
-        case static_cast<uint32_t>(errors::GPS_HDOP_HIGH):
-            return "GPS HDOP value indicates poor satellite geometry";
-        case static_cast<uint32_t>(errors::GPS_SATELLITES_LOW):
-            return "Insufficient GPS satellites for reliable positioning";
-        case static_cast<uint32_t>(errors::GPS_NO_FIX):
-            return "GPS receiver has no position fix";
-        case static_cast<uint32_t>(errors::SENSOR_SYNC_FAILED):
-            return "Failed to synchronize timestamps across sensors";
-
-        // 前端
-        case static_cast<uint32_t>(errors::ODOMETRY_DIVERGED):
-            return "Odometry estimation diverged - position uncertainty exceeded threshold";
-        case static_cast<uint32_t>(errors::KEYFRAME_CREATE_FAILED):
-            return "Failed to create keyframe - insufficient or invalid data";
-        case static_cast<uint32_t>(errors::KEYFRAME_LOW_QUALITY):
-            return "Keyframe quality below threshold - high covariance detected";
-        case static_cast<uint32_t>(errors::LIVO_BRIDGE_FAILED):
-            return "FAST-LIVO2 bridge communication failed";
-        case static_cast<uint32_t>(errors::GPS_ALIGN_FAILED):
-            return "GPS-LiDAR trajectory alignment failed - insufficient correspondences";
-
-        // 子图
-        case static_cast<uint32_t>(errors::SUBMAP_OVERFLOW):
-            return "SubMap exceeded maximum size limit";
-        case static_cast<uint32_t>(errors::SUBMAP_EMPTY):
-            return "Attempted to operate on empty SubMap";
-        case static_cast<uint32_t>(errors::SUBMAP_MERGE_FAILED):
-            return "Failed to merge point clouds in SubMap";
-        case static_cast<uint32_t>(errors::SUBMAP_STATE_INVALID):
-            return "Invalid SubMap state transition attempted";
-        case static_cast<uint32_t>(errors::SESSION_LOAD_FAILED):
-            return "Failed to load archived session data";
-        case static_cast<uint32_t>(errors::SESSION_SAVE_FAILED):
-            return "Failed to save session data to disk";
-        case static_cast<uint32_t>(errors::ARCHIVE_CORRUPTED):
-            return "Archive data is corrupted or incomplete";
-
-        // 回环
-        case static_cast<uint32_t>(errors::LOOP_CLOSURE_REJECTED):
-            return "Loop closure candidate rejected - geometric verification failed";
-        case static_cast<uint32_t>(errors::LOOP_NO_CANDIDATES):
-            return "No loop closure candidates found in database";
-        case static_cast<uint32_t>(errors::DESCRIPTOR_COMPUTE_FAIL):
-            return "Failed to compute overlap descriptor";
-        case static_cast<uint32_t>(errors::TEASER_MATCH_FAIL):
-            return "TEASER++ matching failed - insufficient inliers";
-        case static_cast<uint32_t>(errors::TEASER_RMSE_HIGH):
-            return "TEASER++ match RMSE exceeds acceptable threshold";
-
-        // 后端
-        case static_cast<uint32_t>(errors::ISAM2_UPDATE_FAILED):
-            return "iSAM2 optimization update failed - numerical issues detected";
-        case static_cast<uint32_t>(errors::ISAM2_COVARIANCE_FAIL):
-            return "Failed to compute covariance from iSAM2 result";
-        case static_cast<uint32_t>(errors::ISAM2_DIVERGED):
-            return "iSAM2 optimization diverged - cost increased beyond threshold";
-        case static_cast<uint32_t>(errors::HBA_OPTIMIZATION_FAIL):
-            return "HBA optimization failed to converge";
-        case static_cast<uint32_t>(errors::HBA_TIMEOUT):
-            return "HBA optimization exceeded time limit";
-        case static_cast<uint32_t>(errors::POSEGRAPH_ADD_FAILED):
-            return "Failed to add factor to pose graph";
-
-        // 地图
-        case static_cast<uint32_t>(errors::MAP_BUILD_FAILED):
-            return "Failed to build global map";
-        case static_cast<uint32_t>(errors::MAP_MEMORY_LIMIT):
-            return "Global map memory limit exceeded";
-        case static_cast<uint32_t>(errors::MAP_EXPORT_FAILED):
-            return "Failed to export map to file";
-
-        // IO
-        case static_cast<uint32_t>(errors::FILE_NOT_FOUND):
-            return "Required file not found";
-        case static_cast<uint32_t>(errors::FILE_READ_ERROR):
-            return "Error reading file";
-        case static_cast<uint32_t>(errors::FILE_WRITE_ERROR):
-            return "Error writing file";
-        case static_cast<uint32_t>(errors::PCD_LOAD_FAILED):
-            return "Failed to load PCD point cloud file";
-        case static_cast<uint32_t>(errors::PCD_SAVE_FAILED):
-            return "Failed to save PCD point cloud file";
-
-        // 系统
-        case static_cast<uint32_t>(errors::OUT_OF_MEMORY):
-            return "System out of memory - allocation failed";
-        case static_cast<uint32_t>(errors::MEMORY_ALLOCATION_FAIL):
-            return "Memory allocation failed";
-        case static_cast<uint32_t>(errors::CONFIG_LOAD_FAILED):
-            return "Failed to load configuration file";
-        case static_cast<uint32_t>(errors::CONFIG_PARSE_ERROR):
-            return "Error parsing configuration file";
-        case static_cast<uint32_t>(errors::CONFIG_KEY_MISSING):
-            return "Required configuration key is missing";
-
-        // 外部库
-        case static_cast<uint32_t>(errors::TORCH_MODEL_LOAD_FAIL):
-            return "Failed to load PyTorch/LibTorch model";
-        case static_cast<uint32_t>(errors::TORCH_INFERENCE_FAIL):
-            return "PyTorch/LibTorch inference failed";
-        case static_cast<uint32_t>(errors::TEASER_EXCEPTION):
-            return "TEASER++ library threw exception";
-
-        case static_cast<uint32_t>(errors::SUCCESS):
-            return "Success";
-        default:
-            return "Unknown error";
-    }
+    if (code == errors::SUCCESS) return "Success";
+    std::ostringstream oss;
+    oss << error_utils::componentToString(code.component())
+        << " error (0x" << std::hex << std::setw(8) << std::setfill('0') << code.code << std::dec << ")";
+    return oss.str();
 }
 
 std::vector<RecoverySuggestion> getDefaultSuggestions(ErrorCodeEx code) {

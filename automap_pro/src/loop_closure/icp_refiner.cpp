@@ -217,8 +217,7 @@ IcpRefiner::Result IcpRefiner::refineGICP(const CloudXYZIPtr& src,
     gicp.setInputTarget(tgt_proc);
     gicp.setMaxCorrespondenceDistance(config_.max_correspondence_distance);
     gicp.setMaximumIterations(config_.max_iterations);
-    gicp.setCorrespondenceEstimation(
-        pcl::GeneralizedIterativeClosestPoint<pcl::PointXYZI, pcl::PointXYZI>::Reciprocal);
+    // GICP 默认对应估计即可；PCL 1.12 中 Reciprocal 枚举可能不可用
     
     CloudXYZI aligned;
     Eigen::Matrix4f init = initial.cast<float>().matrix();
@@ -248,7 +247,7 @@ IcpRefiner::Result IcpRefiner::refineNDT(const CloudXYZIPtr& src,
     CloudXYZIPtr src_proc = preprocessCloud(src);
     CloudXYZIPtr tgt_proc = preprocessCloud(tgt);
     
-    pcl::NormalDistributionsTransform<pcl::PointXYZI> ndt;
+    pcl::NormalDistributionsTransform<pcl::PointXYZI, pcl::PointXYZI> ndt;
     ndt.setInputSource(src_proc);
     ndt.setInputTarget(tgt_proc);
     ndt.setResolution(config_.ndt_resolution);
@@ -311,11 +310,11 @@ bool IcpRefiner::validateResult(const Result& res, const CloudXYZIPtr& src,
 // 计算对应关系协方差
 // ─────────────────────────────────────────────────────────────────────────────
 
-Eigen::Matrix6d IcpRefiner::computeCorrespondenceCovariance(
+Mat66d IcpRefiner::computeCorrespondenceCovariance(
     const CloudXYZIPtr& src, const CloudXYZIPtr& tgt,
     const Pose3d& T_src_tgt) const {
     
-    Eigen::Matrix6d cov = Eigen::Matrix6d::Zero();
+    Mat66d cov = Mat66d::Zero();
     
     auto correspondences = findCorrespondences(src, tgt, T_src_tgt, 
                                              config_.max_correspondence_distance);

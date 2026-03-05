@@ -180,6 +180,9 @@ private:
     // ── 工具 ─────────────────────────────────────────────────────────────
     void saveMapToFiles(const std::string& output_dir);
     std::string stateToString(SystemState s) const;
+    Mat66d computeOdomInfoMatrix(const SubMap::Ptr& prev,
+                                 const SubMap::Ptr& curr,
+                                 const Pose3d& rel) const;
 };
 
 } // namespace automap_pro

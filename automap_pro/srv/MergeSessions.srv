@@ -1,6 +1,4 @@
 # 合并会话服务
-
----
 # 请求
 uint64[] session_ids
 string merged_name

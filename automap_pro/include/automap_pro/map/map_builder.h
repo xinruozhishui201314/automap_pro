@@ -3,6 +3,7 @@
 #include <memory>
 #include <vector>
 #include <mutex>
+#include <condition_variable>
 #include <functional>
 #include <queue>
 #include <thread>
@@ -116,6 +117,7 @@ private:
     
     // 后台构建线程
     std::queue<BuildTask> build_queue_;
+    std::condition_variable build_cv_;
     std::thread build_thread_;
     std::atomic<bool> running_;
     std::atomic<bool> build_pending_;
@@ -147,7 +149,7 @@ private:
     
     // 辅助函数
     void transformCloudToWorld(const CloudXYZIPtr& cloud, const Pose3d& T_w_b,
-                              CloudXYZIPtr& output) const;
+                              CloudXYZI& output) const;
     void mergeCloud(const CloudXYZIPtr& src, CloudXYZIPtr& dst);
     void saveIntermediateMap(const std::string& suffix) const;
     void notifyProgressCallbacks(int processed, int total);

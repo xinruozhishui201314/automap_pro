@@ -7,6 +7,7 @@
 #include <queue>
 #include <functional>
 
+#include <thread>
 #include <pcl/point_types.h>
 #include <pcl/point_cloud.h>
 #include <pcl/filters/voxel_grid.h>
@@ -119,12 +120,13 @@ private:
     void processUpdateTask(const UpdateTask& task);
     
     // KD树管理
+    void ensureKDTree() const;
     void updateKDTree();
     void buildKDTree();
     
     // 辅助函数
-    void transformCloud(const CloudXYZIPtr& input, const Pose3d& T, 
-                      CloudXYZIPtr& output) const;
+    void transformCloud(const CloudXYZIPtr& input, const Pose3d& T,
+                      CloudXYZI& output) const;
     void downsampleCloud(CloudXYZIPtr& cloud, float voxel_size) const;
     void updateMapBounds(const CloudXYZIPtr& cloud);
     void notifyUpdateCallbacks();

@@ -1,6 +1,4 @@
 # 创建新会话服务
-
----
 # 请求
 string session_name
 string sensor_config

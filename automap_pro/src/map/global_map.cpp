@@ -68,7 +68,7 @@ void GlobalMap::addCloud(const CloudXYZIPtr& cloud, const Pose3d& T_w_b) {
     
     // 变换到世界坐标系
     CloudXYZIPtr transformed(new CloudXYZI);
-    transformCloud(cloud, T_w_b, *transformed);
+    transformCloud(cloud, T_w_b, *transformed);  // output by ref
     
     // 按距离过滤
     CloudXYZIPtr filtered(new CloudXYZI);
@@ -170,7 +170,7 @@ void GlobalMap::processUpdateTask(const UpdateTask& task) {
     
     // 变换到世界坐标系
     CloudXYZIPtr transformed(new CloudXYZI);
-    transformCloud(task.cloud, task.pose, *transformed);
+    transformCloud(task.cloud, task.pose, *transformed);  // output by ref
     
     // 按距离过滤
     CloudXYZIPtr filtered(new CloudXYZI);

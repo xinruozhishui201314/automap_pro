@@ -45,6 +45,7 @@ MapExporter::~MapExporter() {
             std::lock_guard<std::mutex> lk(mutex_);
             ExportTask empty_task;
             export_queue_.push(empty_task);
+            export_cv_.notify_one();
         }
         export_thread_.join();
     }
@@ -451,6 +452,7 @@ void MapExporter::exportAllAsync(const std::vector<SubMap::Ptr>& submaps,
         std::lock_guard<std::mutex> lk(mutex_);
         export_queue_.push(task);
         export_pending_ = true;
+        export_cv_.notify_one();
     }
     
     ALOG_DEBUG(MOD, "Queued async export: {}", output_name);
@@ -561,7 +563,7 @@ void MapExporter::exportThreadLoop() {
         ExportTask task;
         {
             std::unique_lock<std::mutex> lk(mutex_);
-            export_queue_.wait(lk, [this] {
+            export_cv_.wait(lk, [this] {
                 return !export_queue_.empty() || !running_.load();
             });
             

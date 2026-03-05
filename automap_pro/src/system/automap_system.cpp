@@ -142,12 +142,12 @@ void AutoMapSystem::deferredSetupModules() {
     RCLCPP_INFO(get_logger(), "[AutoMapSystem][DEFERRED] Step 6a: init HBAOptimizer");
     hba_optimizer_.init();
     hba_optimizer_.registerDoneCallback(
-        [weak_this = weak_from_this()](const HBAResult& result) {
+        [this, weak_this = weak_from_this()](const HBAResult& result) {
             auto shared_this = weak_this.lock();
-            if (!shared_this || shared_this->shutdown_requested_.load(std::memory_order_acquire)) {
+            if (!shared_this || shutdown_requested_.load(std::memory_order_acquire)) {
                 return;
             }
-            shared_this->onHBADone(result);
+            onHBADone(result);
         });
     hba_optimizer_.start();
     RCLCPP_INFO(get_logger(), "[AutoMapSystem][DEFERRED] Step 6c: HBAOptimizer started");
@@ -362,7 +362,7 @@ void AutoMapSystem::tryCreateKeyFrame(double ts) {
     try { rviz_publisher_.publishCurrentCloud(cur_cloud); } catch (const std::exception&) {}
 
     RCLCPP_INFO(get_logger(),
-        "[AutoMapSystem][KF] created kf_id=%d sm_id=%d ts=%.3f pts=%zu ds_pts=%zu has_gps=%d degen=%d",
+        "[AutoMapSystem][KF] created kf_id=%lu sm_id=%d ts=%.3f pts=%zu ds_pts=%zu has_gps=%d degen=%d",
         kf->id, kf->submap_id, ts, cur_cloud->size(), cloud_ds->size(),
         has_gps ? 1 : 0, last_livo_info_.is_degenerate ? 1 : 0);
     ALOG_DEBUG(MOD, "KF#{} created: pts={} ds_pts={} has_gps={} livo_degen={}",

@@ -1,8 +1,7 @@
 # 加载会话服务
-
----
 # 请求
 uint64 session_id
+string session_dir
 bool set_active
 ---
 # 响应
@@ -10,3 +9,5 @@ bool success
 string message
 uint32 num_submaps
 uint32 num_keyframes
+uint32 submaps_loaded
+uint32 descriptors_loaded

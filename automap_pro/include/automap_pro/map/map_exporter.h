@@ -5,7 +5,9 @@
 #include <vector>
 #include <map>
 #include <mutex>
+#include <condition_variable>
 #include <functional>
+#include <queue>
 
 #include <pcl/point_types.h>
 #include <pcl/point_cloud.h>
@@ -172,6 +174,7 @@ private:
     
     // 后台导出线程
     std::queue<ExportTask> export_queue_;
+    std::condition_variable export_cv_;
     std::thread export_thread_;
     std::atomic<bool> running_;
     std::atomic<bool> export_pending_;

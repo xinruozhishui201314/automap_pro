@@ -252,13 +252,26 @@ prepare_workspace() {
         print_info "符号链接已存在"
     fi
 
-    # 可选：fast-livo2-humble 或 fast-livo2-humble.disabled（融合模式时编译并启动）
+    # 可选：fast-livo2-humble（仓库根 或 automap_pro/src/modular 下）
     FAST_LIVO_DIR=""
+    FAST_LIVO_LINK_RELATIVE=""   # 非空时使用相对路径链入（容器内可解析到 src/automap_pro/...）
     [ -d "${SCRIPT_DIR}/fast-livo2-humble" ] && FAST_LIVO_DIR="${SCRIPT_DIR}/fast-livo2-humble"
     [ -z "${FAST_LIVO_DIR}" ] && [ -d "${SCRIPT_DIR}/fast-livo2-humble.disabled" ] && FAST_LIVO_DIR="${SCRIPT_DIR}/fast-livo2-humble.disabled"
+    [ -z "${FAST_LIVO_DIR}" ] && [ -d "${PROJECT_DIR}/src/modular/fast-livo2-humble" ] && FAST_LIVO_DIR="${PROJECT_DIR}/src/modular/fast-livo2-humble" && FAST_LIVO_LINK_RELATIVE="automap_pro/src/modular/fast-livo2-humble"
+    [ -z "${FAST_LIVO_DIR}" ] && [ -d "${PROJECT_DIR}/src/modular/fast-livo2-humble.disabled" ] && FAST_LIVO_DIR="${PROJECT_DIR}/src/modular/fast-livo2-humble.disabled" && FAST_LIVO_LINK_RELATIVE="automap_pro/src/modular/fast-livo2-humble.disabled"
     if [ -n "${FAST_LIVO_DIR}" ]; then
-        if [ ! -L "${WORKSPACE_DIR}/src/fast_livo" ] && [ ! -d "${WORKSPACE_DIR}/src/fast_livo" ]; then
-            ln -sf "${FAST_LIVO_DIR}" "${WORKSPACE_DIR}/src/fast_livo"
+        # 若已有链接/目录但指向无效（如曾指向仓库根下已删除的目录），则重建
+        NEED_LINK=true
+        if [ -L "${WORKSPACE_DIR}/src/fast_livo" ] || [ -d "${WORKSPACE_DIR}/src/fast_livo" ]; then
+            [ -d "${WORKSPACE_DIR}/src/fast_livo" ] && NEED_LINK=false || true
+        fi
+        if [ "$NEED_LINK" = true ]; then
+            rm -f "${WORKSPACE_DIR}/src/fast_livo"
+            if [ -n "${FAST_LIVO_LINK_RELATIVE}" ]; then
+                (cd "${WORKSPACE_DIR}/src" && ln -sf "${FAST_LIVO_LINK_RELATIVE}" "fast_livo")
+            else
+                ln -sf "${FAST_LIVO_DIR}" "${WORKSPACE_DIR}/src/fast_livo"
+            fi
             print_success "✓ 已链入 $(basename "${FAST_LIVO_DIR}") → src/fast_livo"
         else
             print_info "fast_livo 已存在"
@@ -282,7 +295,7 @@ build_project() {
         if docker run --rm \
             -v "${WORKSPACE_DIR}:/root/automap_ws:rw" \
             "${IMAGE_NAME}" \
-            /bin/bash -c "rm -rf /root/automap_ws/build /root/automap_ws/build_teaserpp /root/automap_ws/install /root/automap_ws/log && echo 'cleaned'"; then
+            /bin/bash -c "rm -rf /root/automap_ws/build /root/automap_ws/build_teaserpp /root/automap_ws/build_sophus /root/automap_ws/build_ceres /root/automap_ws/install /root/automap_ws/log && echo 'cleaned'"; then
             print_success "✓ 清理完成"
         else
             print_error "✗ 清理失败（若曾用 sudo 编译，请在本机执行: sudo rm -rf ${WORKSPACE_DIR}/build ${WORKSPACE_DIR}/build_teaserpp ${WORKSPACE_DIR}/install ${WORKSPACE_DIR}/log）"
@@ -295,7 +308,9 @@ build_project() {
     if [ ! -f "${WORKSPACE_DIR}/install/automap_pro/share/automap_pro/package.xml" ]; then
         NEED_BUILD=true
     fi
-    if [ "$NEED_BUILD" = false ] && [ -d "${SCRIPT_DIR}/fast-livo2-humble" ] || [ -d "${SCRIPT_DIR}/fast-livo2-humble.disabled" ]; then
+    HAVE_FAST_LIVO_SRC=false
+    [ -d "${SCRIPT_DIR}/fast-livo2-humble" ] || [ -d "${SCRIPT_DIR}/fast-livo2-humble.disabled" ] || [ -d "${PROJECT_DIR}/src/modular/fast-livo2-humble" ] || [ -d "${PROJECT_DIR}/src/modular/fast-livo2-humble.disabled" ] && HAVE_FAST_LIVO_SRC=true
+    if [ "$NEED_BUILD" = false ] && [ "$HAVE_FAST_LIVO_SRC" = true ]; then
         if [ ! -f "${WORKSPACE_DIR}/install/fast_livo/share/fast_livo/package.xml" ]; then
             NEED_BUILD=true
             print_info "检测到 fast-livo2-humble 源码，但未编译，将执行完整编译"
@@ -317,10 +332,18 @@ build_project() {
     FAST_LIVO_DIR=""
     [ -d "${SCRIPT_DIR}/fast-livo2-humble" ] && FAST_LIVO_DIR="${SCRIPT_DIR}/fast-livo2-humble"
     [ -z "${FAST_LIVO_DIR}" ] && [ -d "${SCRIPT_DIR}/fast-livo2-humble.disabled" ] && FAST_LIVO_DIR="${SCRIPT_DIR}/fast-livo2-humble.disabled"
+    [ -z "${FAST_LIVO_DIR}" ] && [ -d "${PROJECT_DIR}/src/modular/fast-livo2-humble" ] && FAST_LIVO_DIR="${PROJECT_DIR}/src/modular/fast-livo2-humble"
+    [ -z "${FAST_LIVO_DIR}" ] && [ -d "${PROJECT_DIR}/src/modular/fast-livo2-humble.disabled" ] && FAST_LIVO_DIR="${PROJECT_DIR}/src/modular/fast-livo2-humble.disabled"
     if [ -n "${FAST_LIVO_DIR}" ]; then
+        # 必须挂载为容器内 src/fast_livo，否则 colcon 会把「指向 automap_pro/...」的符号链接当成 automap_pro 子目录，忽略 fast_livo 包
         FAST_LIVO_MOUNT="-v ${FAST_LIVO_DIR}:/root/automap_ws/src/fast_livo:ro"
         print_info "将编译 fast_livo ($(basename "${FAST_LIVO_DIR}"))"
     fi
+
+    # thrid_party：优先使用含 Sophus 的路径（本仓库为 automap_pro/thrid_party），否则仓库根
+    THRID_PARTY_DIR="${PROJECT_DIR}/thrid_party"
+    [ ! -d "${THRID_PARTY_DIR}/Sophus" ] && [ -d "${SCRIPT_DIR}/thrid_party" ] && THRID_PARTY_DIR="${SCRIPT_DIR}/thrid_party"
+    THRID_PARTY_MOUNT="-v ${THRID_PARTY_DIR}:/root/automap_ws/src/thrid_party:ro"
 
     docker run --rm \
         --gpus all \
@@ -329,7 +352,7 @@ build_project() {
         -v /tmp/.X11-unix:/tmp/.X11-unix:rw \
         -v "${WORKSPACE_DIR}:/root/automap_ws:rw" \
         -v "${PROJECT_DIR}:/root/automap_ws/src/automap_pro:ro" \
-        -v "${SCRIPT_DIR}/thrid_party:/root/automap_ws/src/thrid_party:ro" \
+        ${THRID_PARTY_MOUNT} \
         ${MAPPING_MOUNT} \
         ${FAST_LIVO_MOUNT} \
         "${IMAGE_NAME}" \
@@ -361,19 +384,25 @@ build_project() {
               echo '========================================'
               colcon build --packages-select hba --cmake-args -DCMAKE_BUILD_TYPE=Release
             fi
-            if [ -d /root/mapping/TEASER-plusplus-master ]; then
+            # TEASER++ 源码：优先仓库根，否则 automap_pro/src/modular（本仓库实际路径）
+            TEASER_SRC=\"\"
+            [ -d /root/mapping/TEASER-plusplus-master ] && TEASER_SRC=/root/mapping/TEASER-plusplus-master
+            [ -z \"\${TEASER_SRC}\" ] && [ -d /root/mapping/automap_pro/src/modular/TEASER-plusplus-master ] && TEASER_SRC=/root/mapping/automap_pro/src/modular/TEASER-plusplus-master
+            if [ -n \"\${TEASER_SRC}\" ]; then
               echo '========================================'
               echo '编译 TEASER++ (上游源码，优先于系统版本）'
               echo '========================================'
               # 源码在只读挂载 /root/mapping 下，必须在可写的 automap_ws 内建 build 目录
-              TEASER_SRC=/root/mapping/TEASER-plusplus-master
               TEASER_BUILD=/root/automap_ws/build_teaserpp
               mkdir -p /root/automap_ws/install/teaserpp
               mkdir -p \"\${TEASER_BUILD}\" && cd \"\${TEASER_BUILD}\"
-              PMC_SRC=/root/mapping/thrid_party/pmc-master
-              TINYPLY_SRC=/root/mapping/thrid_party/tinyply
-              SPECTRA_SRC=/root/mapping/thrid_party/spectra
-              GOOGLETEST_SRC=/root/mapping/thrid_party/googletest
+              # thrid_party：优先使用含 pmc-master 的路径（本仓库为 automap_pro/thrid_party）
+              MAP_THRID=/root/mapping/automap_pro/thrid_party
+              [ ! -d \"\${MAP_THRID}/pmc-master\" ] && MAP_THRID=/root/mapping/thrid_party
+              PMC_SRC=\"\${MAP_THRID}/pmc-master\"
+              TINYPLY_SRC=\"\${MAP_THRID}/tinyply\"
+              SPECTRA_SRC=\"\${MAP_THRID}/spectra\"
+              GOOGLETEST_SRC=\"\${MAP_THRID}/googletest\"
               if [ ! -d \"\${PMC_SRC}\" ]; then
                 echo \"✗ 错误: PMC 源码不存在于 \${PMC_SRC}\"
                 exit 1
@@ -415,7 +444,13 @@ build_project() {
               echo \"TEASER-plusplus-master 未找到，将使用系统安装的 TEASER++（如果存在）\"
               echo \"========================================\"
             fi
-            if [ -d src/fast_livo ]; then
+            # 确保 src/fast_livo 存在：优先使用挂载；若无则从 mapping 链入（automap_pro/src/modular/fast-livo2-humble）
+            if [ ! -f src/fast_livo/package.xml ] && [ -d /root/mapping/automap_pro/src/modular/fast-livo2-humble ]; then
+              rm -f src/fast_livo 2>/dev/null || true
+              ln -sfn /root/mapping/automap_pro/src/modular/fast-livo2-humble src/fast_livo
+              echo \"[INFO] 已从 mapping 链入 fast-livo2-humble → src/fast_livo\"
+            fi
+            if [ -f src/fast_livo/package.xml ]; then
               echo '========================================'
               echo '编译 vikit_common / vikit_ros (rpg_vikit_ros2 本地)'
               echo '========================================'
@@ -448,12 +483,18 @@ build_project() {
                   echo \"⚠ Ceres 安装未找到 CeresConfig.cmake，Sophus 将关闭测试编译\"
                 fi
               fi
-              colcon build --packages-select Sophus --cmake-args -DCMAKE_BUILD_TYPE=Release \${SOPHUS_CMAKE_EXTRA}
+              # Sophus 无 package.xml，不能用 colcon；用 cmake 单独编译并安装到 install/sophus
+              SOPHUS_SRC=/root/automap_ws/src/thrid_party/Sophus
+              SOPHUS_BUILD=/root/automap_ws/build_sophus
+              SOPHUS_INSTALL=/root/automap_ws/install/sophus
+              mkdir -p \"\${SOPHUS_BUILD}\" \"\${SOPHUS_INSTALL}\"
+              (cd \"\${SOPHUS_BUILD}\" && cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=\"\${SOPHUS_INSTALL}\" -DSOPHUS_INSTALL=ON \${SOPHUS_CMAKE_EXTRA} \"\${SOPHUS_SRC}\" && make -j\$(nproc) && make install)
+              export CMAKE_PREFIX_PATH=\"\${SOPHUS_INSTALL}:\$CMAKE_PREFIX_PATH\"
               source install/setup.bash
               echo '========================================'
               echo '编译 fast_livo (fast-livo2-humble)'
               echo '========================================'
-              colcon build --packages-select fast_livo --cmake-args -DCMAKE_BUILD_TYPE=Release
+              colcon build --paths src/fast_livo --cmake-args -DCMAKE_BUILD_TYPE=Release -DSophus_DIR=\"\${SOPHUS_INSTALL}/share/sophus/cmake\"
             fi
             echo '========================================'
             echo '编译 automap_pro'

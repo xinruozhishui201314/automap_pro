@@ -32,6 +32,7 @@
 #include <iomanip>
 #include <thread>
 #include <unistd.h>
+#include <fstream>
 
 namespace automap_pro {
 
@@ -45,9 +46,12 @@ public:
     std::string parent_span_id;
     std::string operation;
 
+    static thread_local std::string current_module;
+
     static TraceContext& current() {
         static thread_local TraceContext current_;
-        static thread_local std::string current_module;
+        return current_;
+    }
 
     static TraceContext create(const std::string& op) {
         TraceContext ctx;
@@ -146,8 +150,6 @@ struct StructuredLoggerConfig {
     bool include_hostname = true;       // 包含主机名
 };
 
-;
-
 // ─────────────────────────────────────────────────────────────────────────────
 // 结构化日志器
 // ─────────────────────────────────────────────────────────────────────────────
@@ -213,7 +215,7 @@ public:
     void logEvent(const std::string& module, const std::string& event_type,
                   const std::string& msg,
                   const std::map<std::string, std::string>& metadata = {}) {
-        auto entry = createEntry(module, "info", event_type, ": " + event_type, metadata);
+        auto entry = createEntry(module, "info", msg, metadata);
         entry.metadata["event_type"] = event_type;
         writeStructuredLog(entry);
         ALOG_INFO("StructuredLogger", "[{}] EVENT: {}", module, msg);
@@ -243,7 +245,7 @@ public:
         }
         if (config_.include_hostname) {
             char hostname[256];
-            gethostname(hostname);
+            gethostname(hostname, sizeof(hostname));
             entry.metadata["hostname"] = hostname;
         }
         return entry;
@@ -298,7 +300,7 @@ public:
             auto file_sink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(
                 config_.json_log_path + ".log",
                 config_.json_log_max_size,
-                config_.json_log_max_files,
+                config_.json_log_max_files
             );
             file_sink->set_pattern("[%Y-%m-%d %H:%M:%S.%e][%L][%n] %v");
             sinks.push_back(file_sink);
@@ -372,8 +374,6 @@ public:
         else                      logger->set_level(spdlog::level::info);
     }
 
-};
-
 private:
     StructuredLogger() = default;
     std::shared_ptr<spdlog::logger> json_logger_;
@@ -423,23 +423,23 @@ private:
 // ─────────────────────────────────────────────────────────────────────────────
 
 #define SLOG_TRACE(mod, msg, ...) \
-    StructuredLogger::instance().trace(mod, fmt::format(msg, ##__VA_ARGS__)
+    automap_pro::StructuredLogger::instance().trace(mod, fmt::format(msg, ##__VA_ARGS__))
 #define SLOG_DEBUG(mod, msg, ...) \
-    StructuredLogger::instance().debug(mod, fmt::format(msg, ##__VA_ARGS__)
+    automap_pro::StructuredLogger::instance().debug(mod, fmt::format(msg, ##__VA_ARGS__))
 #define SLOG_INFO(mod, msg, ...) \
-    StructuredLogger::instance().info(mod, fmt::format(msg, ##__VA_ARGS__)
+    automap_pro::StructuredLogger::instance().info(mod, fmt::format(msg, ##__VA_ARGS__))
 #define SLOG_WARN(mod, msg, ...) \
-    StructuredLogger::instance().warn(mod, fmt::format(msg, ##__VA_ARGS__)
+    automap_pro::StructuredLogger::instance().warn(mod, fmt::format(msg, ##__VA_ARGS__))
 #define SLOG_ERROR(mod, msg, ...) \
-    StructuredLogger::instance().error(mod, fmt::format(msg, ##__VA_ARGS__)
+    automap_pro::StructuredLogger::instance().error(mod, fmt::format(msg, ##__VA_ARGS__))
 #define SLOG_CRITICAL(mod, msg, ...) \
-    StructuredLogger::instance().critical(mod, fmt::format(msg, ##__VA_ARGS__)
+    automap_pro::StructuredLogger::instance().critical(mod, fmt::format(msg, ##__VA_ARGS__))
 #define SLOG_ERROR_CODE(mod, code, msg, ...) \
-    StructuredLogger::instance().logError(mod, code, fmt::format(msg, ##__VA_ARGS__)
+    automap_pro::StructuredLogger::instance().logError(mod, code, fmt::format(msg, ##__VA_ARGS__))
 #define SLOG_TIMING(mod, op, ms) \
-    StructuredLogger::instance().logTiming(mod, op, ms)
+    automap_pro::StructuredLogger::instance().logTiming(mod, op, ms)
 #define SLOG_EVENT(mod, type, msg, ...) \
-    StructuredLogger::instance().logEvent(mod, type, fmt::format(msg, ##__VA_ARGS__)
+    automap_pro::StructuredLogger::instance().logEvent(mod, type, fmt::format(msg, ##__VA_ARGS__))
 
 // RAII 计时
 #define SLOG_TIMED_SCOPE(mod, op, warn_ms) \

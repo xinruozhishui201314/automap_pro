@@ -5,6 +5,8 @@
 #include <rclcpp/rclcpp.hpp>
 #include <cmath>
 
+#define MOD "Optimizer"
+
 #ifdef USE_GTSAM
 #include <gtsam/geometry/Pose3.h>
 #include <gtsam/slam/PriorFactor.h>

@@ -3,6 +3,7 @@
 #include <pcl/common/transforms.h>
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/filters/statistical_outlier_removal.h>
+#include <pcl/io/pcd_io.h>
 #include <filesystem>
 #include <algorithm>
 
@@ -53,6 +54,7 @@ MapBuilder::~MapBuilder() {
             std::lock_guard<std::mutex> lk(mutex_);
             BuildTask empty_task;
             build_queue_.push(empty_task);
+            build_cv_.notify_one();
         }
         build_thread_.join();
     }
@@ -130,6 +132,7 @@ void MapBuilder::buildAsyncFromKeyFrames(const std::vector<KeyFrame::Ptr>& keyfr
 
         build_queue_.push(task);
         build_pending_ = true;
+        build_cv_.notify_one();
     }
 
     ALOG_DEBUG(MOD, "Queued async build: {} keyframes (queue size: {})",
@@ -342,7 +345,7 @@ void MapBuilder::buildThreadLoop() {
         BuildTask task;
         {
             std::unique_lock<std::mutex> lk(mutex_);
-            build_queue_.wait(lk, [this] {
+            build_cv_.wait(lk, [this] {
                 return !build_queue_.empty() || !running_.load();
             });
             
@@ -575,7 +578,8 @@ void MapBuilder::saveIntermediateMap(const std::string& suffix) const {
         
         std::string path = config_.save_dir + "/map_" + timestamp + suffix + ".pcd";
         
-        pcl::io::savePCDFileBinary(path, *base_map_);
+        pcl::PCDWriter writer;
+        writer.writeBinary(path, *base_map_);
         
         ALOG_DEBUG(MOD, "Saved intermediate map: {}", path);
     } catch (const std::exception& e) {

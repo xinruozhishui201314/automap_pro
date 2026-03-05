@@ -128,26 +128,6 @@ TeaserMatcher::Result TeaserMatcher::match(
             result.success = (result.rmse < max_rmse_);
         }
     }
-
-    // 计算 RMSE（仅内点：使用 TEASER 的 translation inlier 索引）
-    {
-        double sq_err = 0.0;
-        int cnt = 0;
-        auto inlier_map = solver.getTranslationInliersMap();  // 1 x num_inliers，每列为对应 corrs 的索引
-        for (Eigen::Index c = 0; c < inlier_map.cols(); ++c) {
-            int idx = inlier_map(0, c);
-            if (idx < 0 || idx >= static_cast<int>(corrs.size())) continue;
-            const auto& sp = src->points[corrs[idx].first];
-            const auto& tp = tgt->points[corrs[idx].second];
-            Eigen::Vector3d pred = result.T_tgt_src.linear() *
-                Eigen::Vector3d(sp.x, sp.y, sp.z) + result.T_tgt_src.translation();
-            Eigen::Vector3d actual(tp.x, tp.y, tp.z);
-            sq_err += (pred - actual).squaredNorm();
-            cnt++;
-        }
-        result.rmse    = cnt > 0 ? static_cast<float>(std::sqrt(sq_err / cnt)) : 1e6f;
-        result.success = (result.rmse < max_rmse_);
-    }
 #else
     // 无 TEASER++ 时回退到 Umeyama/SVD 相似变换（鲁棒性低于 TEASER，但可运行）
     Eigen::Matrix3Xd src_pts(3, corrs.size()), tgt_pts(3, corrs.size());

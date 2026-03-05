@@ -10,19 +10,6 @@
 namespace automap_pro {
 
 // ─────────────────────────────────────────────────────────────────────
-// 辅助函数实现
-// ─────────────────────────────────────────────────────────────────────
-std::string healthStateToString(HealthState state) {
-    switch (state) {
-        case HealthState::HEALTHY:    return "HEALTHY";
-        case HealthState::DEGRADED:   return "DEGRADED";
-        case HealthState::UNHEALTHY: return "UNHEALTHY";
-        case HealthState::CRITICAL:   return "CRITICAL";
-        default:                      return "UNKNOWN";
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────
 // ResourceHealthChecker 实现
 // ─────────────────────────────────────────────────────────────────────
 ResourceHealthChecker::ResourceHealthChecker(const HealthMonitorConfig& config)
@@ -612,7 +599,13 @@ HealthReport HealthMonitor::performHealthCheck() {
     // Execute all checkers
     for (auto& checker : checkers_) {
         auto result = checker->check();
-        report.items[result.name] = result;
+        HealthCheckItem item;
+        item.name = result.name;
+        item.state = result.state;
+        item.message = result.message;
+        item.is_ok = (result.state == HealthState::HEALTHY);
+        item.last_check_time = std::chrono::system_clock::now();
+        report.items[result.name] = item;
     }
     
     // Determine overall state
@@ -668,9 +661,11 @@ void HealthMonitor::publishHealthReport(const HealthReport& report) {
     health_pub_->publish(*msg);
     
     // Structured logging
+    std::string err_str, warn_str;
+    for (const auto& e : report.errors) err_str += e + "; ";
+    for (const auto& w : report.warnings) warn_str += w + "; ";
     SLOG_EVENT(MOD, "health_report", "State={}, Summary={}, Errors={}, Warnings={}",
-               report.overall_state, report.summary,
-               fmt::format("{}", report.errors), fmt::format("{}", report.warnings));
+               healthStateToString(report.overall_state), report.summary, err_str, warn_str);
 }
 
 void HealthMonitor::checkLoop() {
@@ -688,7 +683,7 @@ void HealthMonitor::checkLoop() {
             }
             current_state_ = report.overall_state;
             
-            SLOG_EVENT(MOD, "health_state_change", "State changed to {}", report.overall_state);
+            SLOG_EVENT(MOD, "health_state_change", "State changed to {}", healthStateToString(report.overall_state));
         }
         
         // Check if we need to trigger degradation
@@ -696,7 +691,7 @@ void HealthMonitor::checkLoop() {
             for (auto& cb : degradation_callbacks_) {
                 cb(report);
             }
-            SLOG_WARN(MOD, "Triggering degradation due to state={}", report.overall_state);
+            SLOG_WARN(MOD, "Triggering degradation due to state={}", healthStateToString(report.overall_state));
         }
         
         // Check if we need to trigger recovery
@@ -704,7 +699,7 @@ void HealthMonitor::checkLoop() {
             for (auto& cb : recovery_callbacks_) {
                 cb(report);
             }
-            SLOG_INFO(MOD, "Triggering recovery due to state={}", report.overall_state);
+            SLOG_INFO(MOD, "Triggering recovery due to state={}", healthStateToString(report.overall_state));
         }
         
         // Sleep until next check

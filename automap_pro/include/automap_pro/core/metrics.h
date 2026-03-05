@@ -20,6 +20,7 @@
 #include <sstream>
 #include <algorithm>
 #include <iomanip>
+#include <rclcpp/rclcpp.hpp>
 
 namespace automap_pro {
 
@@ -521,7 +522,7 @@ public:
     }
 
 private:
-    std::mutex mutex_;
+    mutable std::mutex mutex_;
     std::map<std::string, std::shared_ptr<MetricCounter>> counters_;
     std::map<std::string, std::shared_ptr<MetricGauge>> gauges_;
     std::map<std::string, std::shared_ptr<MetricTimer>> timers_;
@@ -609,8 +610,15 @@ private:
 #define METRICS_REGISTER_HISTOGRAM(name, help, buckets) \
     MetricsRegistry::instance().registerHistogram(name, help, buckets)
 
-#define METRICS_INCREMENT(name, delta) \
+#define METRICS_INCREMENT_ONE(name) \
+    MetricsRegistry::instance().incrementCounter(name, 1.0)
+#define METRICS_INCREMENT_TWO(name, delta) \
     MetricsRegistry::instance().incrementCounter(name, delta)
+#define METRICS_INCREMENT(...) \
+    GET_METRICS_INCREMENT_OPT(__VA_ARGS__, 2, 1)(__VA_ARGS__)
+#define GET_METRICS_INCREMENT_OPT(_1, _2, N, ...) METRICS_INCREMENT_IMPL##N
+#define METRICS_INCREMENT_IMPL1(_1) METRICS_INCREMENT_ONE(_1)
+#define METRICS_INCREMENT_IMPL2(_1, _2) METRICS_INCREMENT_TWO(_1, _2)
 
 #define METRICS_GAUGE_SET(name, value) \
     MetricsRegistry::instance().setGauge(name, value)

@@ -1,4 +1,5 @@
 #include "automap_pro/backend/pose_graph.h"
+#include "automap_pro/core/logger.h"
 #include <queue>
 #include <algorithm>
 

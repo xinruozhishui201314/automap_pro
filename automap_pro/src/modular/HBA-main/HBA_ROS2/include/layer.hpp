@@ -21,8 +21,11 @@
 #include "mypcl.hpp"
 
 #define FULL_HESS
-#define WIN_SIZE 10 // 窗口大小，即一个窗口内的位姿数量
-#define GAP 5       // 步长
+// 使用 HBA_ 前缀避免与系统/Eigen 等头文件中的 WIN_SIZE/GAP 宏冲突
+#define HBA_WIN_SIZE 10 // 窗口大小，即一个窗口内的位姿数量
+#define HBA_GAP 5       // 步长
+#define WIN_SIZE HBA_WIN_SIZE
+#define GAP HBA_GAP
 
 /***********************这个头文件的作用是存放分层的功能块************************/
 class LAYER
