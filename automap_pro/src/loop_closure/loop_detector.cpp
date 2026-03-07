@@ -218,10 +218,19 @@ void LoopDetector::onDescriptorReady(const SubMap::Ptr& submap) {
     }
     if (valid_candidates.empty()) return;
 
+    // 入队时深拷贝 query 点云，避免 worker 处理时读 SubMap::downsampled_cloud 与 buildGlobalMap 等并发
+    CloudXYZIPtr query_cloud_copy;
+    if (submap->downsampled_cloud && !submap->downsampled_cloud->empty()) {
+        query_cloud_copy = std::make_shared<CloudXYZI>();
+        *query_cloud_copy = *submap->downsampled_cloud;
+        ALOG_INFO(MOD, "enqueue MatchTask query_id={} query_cloud_pts={} candidates={}",
+                  submap->id, query_cloud_copy->size(), valid_candidates.size());
+    }
+
     // 提交到 TEASER++ 匹配队列（Stage 2）
     {
         std::lock_guard<std::mutex> lk(match_mutex_);
-        match_queue_.push({submap, valid_candidates});
+        match_queue_.push({submap, query_cloud_copy, valid_candidates});
     }
     match_cv_.notify_one();
 }
@@ -242,41 +251,94 @@ void LoopDetector::matchWorkerLoop() {
             task = std::move(match_queue_.front());
             match_queue_.pop();
         }
-        processMatchTask(task);
+        ALOG_DEBUG(MOD, "[tid={}] step=match_dequeue query_id={} candidates={}",
+                   automap_pro::logThreadId(), task.query ? task.query->id : -1, task.candidates.size());
+        
+        try {
+            processMatchTask(task);
+        } catch (const std::exception& e) {
+            ALOG_ERROR(MOD, "[tid={}] step=match_worker_exception query_id={} what={}", 
+                      automap_pro::logThreadId(), task.query ? task.query->id : -1, e.what());
+        } catch (...) {
+            ALOG_ERROR(MOD, "[tid={}] step=match_worker_unknown_exception query_id={}", 
+                      automap_pro::logThreadId(), task.query ? task.query->id : -1);
+        }
     }
 }
 
 void LoopDetector::processMatchTask(const MatchTask& task) {
+    const unsigned tid = automap_pro::logThreadId();
     IcpRefiner icp;
     const auto& query = task.query;
-    if (!query->downsampled_cloud || query->downsampled_cloud->empty()) return;
+    // 优先使用入队时拷贝的 query_cloud，避免读 SubMap::downsampled_cloud 与主线程并发
+    CloudXYZIPtr query_cloud = task.query_cloud;
+    if (!query_cloud || query_cloud->empty()) {
+        CloudXYZIPtr query_ref = query ? query->downsampled_cloud : nullptr;
+        if (!query_ref || query_ref->empty()) {
+            ALOG_DEBUG(MOD, "[tid={}] step=task_skip query_id={} query_cloud null/empty", tid, query ? query->id : -1);
+            return;
+        }
+        query_cloud = std::make_shared<CloudXYZI>();
+        *query_cloud = *query_ref;
+        ALOG_INFO(MOD, "[tid={}] step=task_fallback_copy query_id={} query_pts={} (no enqueue copy)", tid, query->id, query_cloud->size());
+    }
 
-    ALOG_INFO(MOD, "Processing match task: query=SM#{} candidates={}",
-              task.query->id, task.candidates.size());
+    ALOG_INFO(MOD, "[tid={}] step=task_start query_id={} query_cloud_ptr={} query_cloud_use_count={} query_pts={} candidates={}",
+              tid, query ? query->id : -1, static_cast<const void*>(query_cloud.get()), query_cloud.use_count(), query_cloud->size(), task.candidates.size());
     AUTOMAP_TIMED_SCOPE(MOD, fmt::format("GeomVerify SM#{}", task.query->id), 3000.0);
 
     for (const auto& cand : task.candidates) {
         ALOG_DEBUG(MOD, "  Checking candidate SM#{} score={:.3f}", cand.submap_id, cand.score);
         SubMap::Ptr target;
+        CloudXYZIPtr target_ref;  // 在持锁下取得强引用，避免读 submap 与主线程并发
         {
             std::shared_lock<std::shared_mutex> lk(db_mutex_);
             for (const auto& sm : db_submaps_) {
                 if (sm->id == cand.submap_id && sm->session_id == cand.session_id) {
-                    target = sm; break;
+                    target = sm;
+                    target_ref = sm->downsampled_cloud;  // 持锁时拷贝 shared_ptr，保证生命周期
+                    break;
                 }
             }
         }
-        if (!target || !target->downsampled_cloud || target->downsampled_cloud->empty()) continue;
+        if (!target_ref || target_ref->empty()) continue;
+
+        // 深拷贝 target 点云，避免 PCL/TEASER 与主线程竞争
+        CloudXYZIPtr target_cloud = std::make_shared<CloudXYZI>();
+        *target_cloud = *target_ref;
+
+        ALOG_INFO(MOD, "[tid={}] step=cand_geom query_id={} target_id={} target_ref_use_count={} target_cloud_ptr={} target_pts={} score={:.3f}",
+                   tid, query->id, target->id, target_ref.use_count(), static_cast<const void*>(target_cloud.get()), target_cloud->size(), cand.score);
 
         // Stage 2: TEASER++ 粗配准
         auto t0 = std::chrono::steady_clock::now();
-        TeaserMatcher::Result teaser_res = teaser_matcher_.match(
-            query->downsampled_cloud,
-            target->downsampled_cloud,
-            Pose3d::Identity());
-
+        ALOG_INFO(MOD, "[tid={}] step=teaser_call_enter query_id={} target_id={} query_cloud_ptr={} query_use_count={} query_pts={} target_cloud_ptr={} target_use_count={} target_pts={}",
+                  tid, query->id, target->id, static_cast<const void*>(query_cloud.get()), query_cloud.use_count(), query_cloud->size(),
+                  static_cast<const void*>(target_cloud.get()), target_cloud.use_count(), target_cloud->size());
+        TeaserMatcher::Result teaser_res;
+        try {
+            ALOG_DEBUG(MOD, "[tid={}] step=match_invoke query_id={} target_id={}", tid, query->id, target->id);
+            teaser_res = teaser_matcher_.match(
+                query_cloud,
+                target_cloud,
+                Pose3d::Identity());
+            ALOG_DEBUG(MOD, "[tid={}] step=match_returned query_id={} target_id={} success={}", 
+                      tid, query->id, target->id, teaser_res.success);
+        } catch (const std::exception& e) {
+            ALOG_ERROR(MOD, "[tid={}] step=match_exception query_id={} target_id={} exception={}", 
+                      tid, query->id, target->id, e.what());
+            // 不重新throw，继续处理下一个候选（loop closure是可选的）
+            continue;
+        } catch (...) {
+            ALOG_ERROR(MOD, "[tid={}] step=match_exception query_id={} target_id={} unknown_exception", 
+                      tid, query->id, target->id);
+            continue;
+        }
         double teaser_ms = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - t0).count();
+        ALOG_INFO(MOD, "[tid={}] step=teaser_result query_id={} target_id={} success={} inlier={:.2f} corrs={} rmse={:.3f}m ms={:.1f} ptr_src_after={} ptr_tgt_after={}",
+                   tid, query->id, target->id, teaser_res.success, teaser_res.inlier_ratio, teaser_res.num_correspondences, teaser_res.rmse, teaser_ms,
+                   static_cast<const void*>(query_cloud.get()), static_cast<const void*>(target_cloud.get()));
 
         if (!teaser_res.success || teaser_res.inlier_ratio < min_inlier_ratio_) continue;
 
@@ -286,7 +348,7 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
 
         if (use_icp_refine_) {
             auto icp_res = icp.refine(
-                query->downsampled_cloud, target->downsampled_cloud, final_T);
+                query_cloud, target_cloud, final_T);
             if (icp_res.converged && icp_res.rmse < final_rmse) {
                 final_T    = icp_res.T_refined;
                 final_rmse = icp_res.rmse;

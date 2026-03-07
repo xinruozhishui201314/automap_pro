@@ -86,6 +86,14 @@ void GlobalMap::addCloud(const CloudXYZIPtr& cloud, const Pose3d& T_w_b) {
     // 合并到全局地图
     *global_cloud_ += *filtered;
     
+    // 首次或前几次添加时打 INFO，便于确认点云系与变换正确（grep GLOBAL_MAP_DIAG）
+    static int add_cloud_call_count = 0;
+    if (++add_cloud_call_count <= 3) {
+        const Eigen::Vector3d t = T_w_b.translation();
+        ALOG_INFO(MOD, "[GLOBAL_MAP_DIAG] addCloud #%d: pts=%zu T_w_b=[%.2f,%.2f,%.2f] total=%zu (cloud in body frame)",
+                  add_cloud_call_count, filtered->size(), t.x(), t.y(), t.z(), global_cloud_->size());
+    }
+    
     // 更新地图边界
     updateMapBounds(filtered);
     

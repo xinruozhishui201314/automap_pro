@@ -3,6 +3,7 @@
 #include "automap_pro/core/logger.h"
 #define MOD "HBAOptimizer"
 
+#include <rclcpp/rclcpp.hpp>
 #include <chrono>
 #include <algorithm>
 
@@ -71,14 +72,41 @@ void HBAOptimizer::triggerAsync(
         queue_cv_.notify_one();
         trigger_count_++;
     }
-    ALOG_INFO(MOD, "HBA triggerAsync: submaps={} keyframes={} gps={} trigger_count={}",
-              sm_count, kf_count, gps_aligned_ ? 1 : 0, trigger_count_);
+    size_t queue_depth = 0;
+    { std::lock_guard<std::mutex> lk(queue_mutex_); queue_depth = pending_queue_.size(); }
+    RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+        "[HBA][STATE] enqueue submaps=%zu keyframes=%zu gps=%d trigger_count=%d queue_depth=%zu",
+        sm_count, kf_count, gps_aligned_ ? 1 : 0, trigger_count_, queue_depth);
+    ALOG_INFO(MOD, "HBA triggerAsync: submaps={} keyframes={} gps={} trigger_count={} queue_depth={}",
+              sm_count, kf_count, gps_aligned_ ? 1 : 0, trigger_count_, queue_depth);
 
     if (wait) {
-        // 等待队列清空（阻塞）
-        while (!pending_queue_.empty() || hba_running_.load()) {
+        waitUntilIdleFor(std::chrono::milliseconds(0));  // 无超时：一直等
+    }
+}
+
+bool HBAOptimizer::isIdle() const {
+    std::lock_guard<std::mutex> lk(queue_mutex_);
+    return pending_queue_.empty() && !hba_running_.load();
+}
+
+size_t HBAOptimizer::queueDepth() const {
+    std::lock_guard<std::mutex> lk(queue_mutex_);
+    size_t n = pending_queue_.size();
+    if (hba_running_.load()) n += 1;
+    return n;
+}
+
+void HBAOptimizer::waitUntilIdleFor(std::chrono::milliseconds timeout_ms) {
+    if (timeout_ms.count() <= 0) {
+        while (running_.load() && !isIdle()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
+        return;
+    }
+    auto deadline = std::chrono::steady_clock::now() + timeout_ms;
+    while (std::chrono::steady_clock::now() < deadline && !isIdle()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
 }
 
@@ -110,6 +138,9 @@ void HBAOptimizer::workerLoop() {
         }
 
         hba_running_ = true;
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[HBA][STATE] optimization start keyframes=%zu gps=%d (running=1)",
+            task.keyframes.size(), task.enable_gps ? 1 : 0);
         ALOG_INFO(MOD, "HBA optimization starting: kf_count={} gps={}",
                   task.keyframes.size(), task.enable_gps);
         AUTOMAP_TIMED_SCOPE(MOD, "HBA full optimize", 60000.0);
@@ -117,9 +148,14 @@ void HBAOptimizer::workerLoop() {
         hba_running_ = false;
 
         if (result.success) {
+            RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                "[HBA][STATE] optimization done success=1 MME=%.4f elapsed=%.1fms poses=%zu (running=0)",
+                result.final_mme, result.elapsed_ms, result.optimized_poses.size());
             ALOG_INFO(MOD, "HBA done: MME={:.4f} elapsed={:.1f}ms kf={}",
                       result.final_mme, result.elapsed_ms, result.optimized_poses.size());
         } else {
+            RCLCPP_WARN(rclcpp::get_logger("automap_system"),
+                "[HBA][STATE] optimization done success=0 elapsed=%.1fms (running=0)", result.elapsed_ms);
             ALOG_ERROR(MOD, "HBA failed after {:.1f}ms", result.elapsed_ms);
         }
         for (auto& cb : done_cbs_) cb(result);
@@ -127,10 +163,10 @@ void HBAOptimizer::workerLoop() {
 }
 
 HBAResult HBAOptimizer::runHBA(const PendingTask& task) {
-    const auto& cfg = ConfigManager::instance();
     HBAResult result;
 
 #ifdef USE_HBA_API
+    const auto& cfg = ConfigManager::instance();
     hba_api::Config hba_cfg;
     hba_cfg.total_layer_num = cfg.hbaTotalLayers();
     hba_cfg.thread_num      = cfg.hbaThreadNum();
@@ -182,9 +218,10 @@ HBAResult HBAOptimizer::runHBA(const PendingTask& task) {
         optimizer.addKeyFrame(input);
     }
 
-    // 执行 HBA 优化
+    // 执行 HBA 优化（进度输出到终端，与 [HBA][STATE] 一致）
     auto api_result = optimizer.optimize([](int cur, int total, float pct) {
-        printf("[HBA] Layer %d/%d  %.0f%%\n", cur, total, pct);
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[HBA][STATE] layer %d/%d %.0f%%", cur, total, pct);
     });
 
     if (api_result.success) {
@@ -198,6 +235,8 @@ HBAResult HBAOptimizer::runHBA(const PendingTask& task) {
         result.optimized_poses = api_result.optimized_poses;
     } else {
         result.success = false;
+        RCLCPP_WARN(rclcpp::get_logger("automap_system"),
+            "[HBA][BACKEND] HBA failed: %s", api_result.error_msg.c_str());
         fprintf(stderr, "[HBAOptimizer] HBA failed: %s\n",
                 api_result.error_msg.c_str());
     }
@@ -208,6 +247,8 @@ HBAResult HBAOptimizer::runHBA(const PendingTask& task) {
     for (const auto& kf : task.keyframes) {
         result.optimized_poses.push_back(kf->T_w_b);
     }
+    RCLCPP_WARN(rclcpp::get_logger("automap_system"),
+        "[HBA][BACKEND] hba_api not available, skipping optimization");
     fprintf(stderr, "[HBAOptimizer] hba_api not available, skipping optimization\n");
 #endif
 

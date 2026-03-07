@@ -14,8 +14,28 @@ which is included as part of this source code package.
 #include <vikit/camera_loader.h>
 #include <rclcpp/exceptions.hpp>
 #include <cstdio>
+#include <chrono>
+#include <ctime>
+#include <filesystem>
 
 using namespace Sophus;
+
+namespace {
+/// 返回当前宿主机时间字符串，便于离线回放时与日志前的 sim time 区分（格式: YYYY-MM-DD HH:MM:SS.mmm）
+inline std::string hostTimeString() {
+  auto now = std::chrono::system_clock::now();
+  auto t = std::chrono::system_clock::to_time_t(now);
+  auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
+  std::tm buf;
+  std::tm* ptm = ::localtime_r(&t, &buf);
+  if (!ptm) return "[host: ???]";
+  char s[64];
+  std::snprintf(s, sizeof(s), "%04d-%02d-%02d %02d:%02d:%02d.%03ld",
+                ptm->tm_year + 1900, ptm->tm_mon + 1, ptm->tm_mday,
+                ptm->tm_hour, ptm->tm_min, ptm->tm_sec, static_cast<long>(ms.count()));
+  return std::string("[host: ") + s + "]";
+}
+}
 LIVMapper::LIVMapper(rclcpp::Node::SharedPtr &node, std::string node_name, const rclcpp::NodeOptions & options)
     : node(std::make_shared<rclcpp::Node>(node_name, options)),
       extT(0, 0, 0),
@@ -125,6 +145,7 @@ void LIVMapper::readParameters(rclcpp::Node::SharedPtr &node)
   try_declare.template operator()<bool>("pcd_save.pcd_save_en", false);
   try_declare.template operator()<bool>("pcd_save.colmap_output_en", false);
   try_declare.template operator()<double>("pcd_save.filter_size_pcd", 0.5);
+  try_declare.template operator()<std::string>("pcd_save.output_dir", "/data/automap_output");
   try_declare.template operator()<bool>("debug_log.mat_pre_en", false);
   try_declare.template operator()<bool>("debug_log.mat_out_en", false);
   try_declare.template operator()<bool>("debug_log.imu_log_en", false);
@@ -200,6 +221,9 @@ void LIVMapper::readParameters(rclcpp::Node::SharedPtr &node)
   this->node->get_parameter("pcd_save.pcd_save_en", pcd_save_en);
   this->node->get_parameter("pcd_save.colmap_output_en", colmap_output_en);
   this->node->get_parameter("pcd_save.filter_size_pcd", filter_size_pcd);
+  this->node->get_parameter("pcd_save.output_dir", pcd_output_dir_);
+  if (!pcd_output_dir_.empty() && pcd_output_dir_.back() == '/') pcd_output_dir_.pop_back();
+  if (pcd_save_en) std::cout << "[ LIO ] PCD save enabled, output_dir=" << pcd_output_dir_ << " (与后端 output_dir 一致)" << std::endl;
   this->node->get_parameter("debug_log.mat_pre_en", mat_pre_en);
   this->node->get_parameter("debug_log.mat_out_en", mat_out_en);
   this->node->get_parameter("debug_log.imu_log_en", imu_log_en);
@@ -312,7 +336,14 @@ void LIVMapper::initializeFiles()
       }
   }
   if(colmap_output_en) fout_points.open(std::string(ROOT_DIR) + "Log/Colmap/sparse/0/points3D.txt", std::ios::out);
-  if(pcd_save_en) fout_lidar_pos.open(std::string(ROOT_DIR) + "Log/pcd/lidar_poses.txt", std::ios::out);
+  if (pcd_save_en) {
+    try {
+      std::filesystem::create_directories(pcd_output_dir_);
+    } catch (const std::exception& e) {
+      std::cerr << "[ LIO ] init: failed to create pcd_output_dir " << pcd_output_dir_ << ": " << e.what() << std::endl;
+    }
+    fout_lidar_pos.open(pcd_output_dir_ + "/lidar_poses.txt", std::ios::out);
+  }
   if(img_save_en) fout_visual_pos.open(std::string(ROOT_DIR) + "Log/image/image_poses.txt", std::ios::out);
   if(mat_pre_en) fout_pre.open(DEBUG_FILE_DIR("mat_pre.txt"), std::ios::out);
   if(mat_out_en) fout_out.open(DEBUG_FILE_DIR("mat_out.txt"), std::ios::out);
@@ -340,7 +371,7 @@ void LIVMapper::initializeSubscribersAndPublishers(rclcpp::Node::SharedPtr &node
   mavros_pose_publisher = this->node->create_publisher<geometry_msgs::msg::PoseStamped>("/mavros/vision_pose/pose", 10);
   pubImage = it.advertise("/rgb_img", 1);
   pubImuPropOdom = this->node->create_publisher<nav_msgs::msg::Odometry>("/LIVO2/imu_propagate", 10000);
-  imu_prop_timer = this->node->create_wall_timer(0.004s, std::bind(&LIVMapper::imu_prop_callback, this));
+  // IMU 传播改为数据触发：收到 IMU 后在 imu_cbk 末尾调用 imu_prop_callback()，不再使用定时器，避免阻塞
   voxelmap_manager->voxel_map_pub_= this->node->create_publisher<visualization_msgs::msg::MarkerArray>("/planes", 10000);
 
   RCLCPP_INFO(this->node->get_logger(),
@@ -478,7 +509,7 @@ void LIVMapper::handleVIO()
 
 void LIVMapper::handleLIO()
 {
-  static constexpr int kLioLogIntervalFrames = 30;  // 每 N 帧打印一次 LIO 日志，降低终端刷屏
+  static constexpr int kLioLogIntervalFrames = 3000;  // 每 N 帧打印一次 LIO 日志，降低终端刷屏
   euler_cur = RotMtoEuler(_state.rot_end);
   if(mat_pre_en && fout_pre.is_open()) {
     fout_pre << setw(20) << LidarMeasures.last_lio_update_time - _first_lidar_time << " " << euler_cur.transpose() * 57.3 << " "
@@ -489,15 +520,21 @@ void LIVMapper::handleLIO()
   if (feats_undistort->empty() || (feats_undistort == nullptr)) 
   {
     std::cout << "[ LIO ]: No point!!!" << std::endl;
+    static int lio_no_point_count = 0;
+    lio_no_point_count++;
+    if (lio_no_point_count <= 5 || lio_no_point_count % 200 == 0)
+      RCLCPP_WARN(this->node->get_logger(), "[fast_livo][LIO] frame skipped (no points), /cloud_registered not published (count=%d). Check preprocess/lid_topic.", lio_no_point_count);
     return;
   }
-  // 降采样
-  double t0 = omp_get_wtime();
+  // 使用宿主机单调时钟计算耗时（与 use_sim_time 无关，便于离线回放时看真实算力）
+  using WallClock = std::chrono::steady_clock;
+  auto t0_wall = WallClock::now();
 
+  // 降采样
   downSizeFilterSurf.setInputCloud(feats_undistort);
   downSizeFilterSurf.filter(*feats_down_body);
-  
-  double t_down = omp_get_wtime();
+
+  auto t_down_wall = WallClock::now();
   // 点云传递 feats_down_world_ 和 feats_down_size_
   feats_down_size = feats_down_body->points.size();
   voxelmap_manager->feats_down_body_ = feats_down_body;
@@ -512,7 +549,7 @@ void LIVMapper::handleLIO()
     voxelmap_manager->BuildVoxelMap();
   }
   // 状态估计
-  double t1 = omp_get_wtime();
+  auto t1_wall = WallClock::now();
 
   voxelmap_manager->StateEstimation(state_propagat);
   // 返回更新状态
@@ -523,7 +560,7 @@ void LIVMapper::handleLIO()
   // 其他信息：point_crossmat（点的反对称矩阵）、normal 等
   _pv_list = voxelmap_manager->pv_list_;
 
-  double t2 = omp_get_wtime();
+  auto t2_wall = WallClock::now();
 
   if (imu_prop_enable) 
   {
@@ -562,7 +599,7 @@ void LIVMapper::handleLIO()
   publish_odometry(pubOdomAftMapped);
 
   // 地图更新，计算点的协方差并更新体素地图。
-  double t3 = omp_get_wtime();
+  auto t3_wall = WallClock::now();
 
   PointCloudXYZI::Ptr world_lidar(new PointCloudXYZI());
   // 将雷达坐标系 -> 世界坐标系
@@ -584,8 +621,12 @@ void LIVMapper::handleLIO()
     std::cout << "[ LIO ] Update Voxel Map" << std::endl;
   }
   _pv_list = voxelmap_manager->pv_list_;
-  
-  double t4 = omp_get_wtime();
+
+  auto t4_wall = WallClock::now();
+  double t_down_sec = std::chrono::duration<double>(t_down_wall - t0_wall).count();
+  double t_icp_sec = std::chrono::duration<double>(t2_wall - t1_wall).count();
+  double t_map_sec = std::chrono::duration<double>(t4_wall - t3_wall).count();
+  double t_total_sec = std::chrono::duration<double>(t4_wall - t0_wall).count();
   // 如果开启了滑窗功能，移除距离当前位置过远的体素，以控制内存占用。
   if(voxelmap_manager->config_setting_.map_sliding_en)
   {
@@ -603,7 +644,13 @@ void LIVMapper::handleLIO()
   }
   *pcl_w_wait_pub = *laserCloudWorld;
   // 发布当前帧的点云到 ROS
-  publish_frame_world(pubLaserCloudFullRes, vio_manager);
+  try {
+    publish_frame_world(pubLaserCloudFullRes, vio_manager);
+  } catch (const std::exception& e) {
+    RCLCPP_ERROR(this->node->get_logger(), "[fast_livo][EXCEPTION] publish_frame_world: %s", e.what());
+  } catch (...) {
+    RCLCPP_ERROR(this->node->get_logger(), "[fast_livo][EXCEPTION] publish_frame_world: unknown exception");
+  }
   // 可选，发布有效特征点（即参与了状态估计的点）
   if (pub_effect_point_en) publish_effect_world(pubLaserCloudEffect, voxelmap_manager->ptpl_list_);
   if (voxelmap_manager->config_setting_.is_pub_plane_map_) voxelmap_manager->pubVoxelMap();
@@ -611,7 +658,7 @@ void LIVMapper::handleLIO()
   publish_mavros(mavros_pose_publisher);
 
   frame_num++;
-  aver_time_consu = aver_time_consu * (frame_num - 1) / frame_num + (t4 - t0) / frame_num;
+  aver_time_consu = aver_time_consu * (frame_num - 1) / frame_num + t_total_sec / frame_num;
 
   // aver_time_icp = aver_time_icp * (frame_num - 1) / frame_num + (t2 - t1) / frame_num;
   // aver_time_map_inre = aver_time_map_inre * (frame_num - 1) / frame_num + (t4 - t3) / frame_num;
@@ -626,15 +673,15 @@ void LIVMapper::handleLIO()
   //         t2 - t1, t4 - t3, t4 - t0, aver_time_icp, aver_time_map_inre, aver_time_consu);
   if (frame_num % kLioLogIntervalFrames == 0) {
     printf("\033[1;34m+-------------------------------------------------------------+\033[0m\n");
-    printf("\033[1;34m|                         LIO Mapping Time                    |\033[0m\n");
+    printf("\033[1;34m|              LIO Mapping Time (host wall clock)            |\033[0m\n");
     printf("\033[1;34m+-------------------------------------------------------------+\033[0m\n");
     printf("\033[1;34m| %-29s | %-27s |\033[0m\n", "Algorithm Stage", "Time (secs)");
     printf("\033[1;34m+-------------------------------------------------------------+\033[0m\n");
-    printf("\033[1;36m| %-29s | %-27f |\033[0m\n", "DownSample", t_down - t0);
-    printf("\033[1;36m| %-29s | %-27f |\033[0m\n", "ICP", t2 - t1);
-    printf("\033[1;36m| %-29s | %-27f |\033[0m\n", "updateVoxelMap", t4 - t3);
+    printf("\033[1;36m| %-29s | %-27f |\033[0m\n", "DownSample", t_down_sec);
+    printf("\033[1;36m| %-29s | %-27f |\033[0m\n", "ICP", t_icp_sec);
+    printf("\033[1;36m| %-29s | %-27f |\033[0m\n", "updateVoxelMap", t_map_sec);
     printf("\033[1;34m+-------------------------------------------------------------+\033[0m\n");
-    printf("\033[1;36m| %-29s | %-27f |\033[0m\n", "Current Total Time", t4 - t0);
+    printf("\033[1;36m| %-29s | %-27f |\033[0m\n", "Current Total Time", t_total_sec);
     printf("\033[1;36m| %-29s | %-27f |\033[0m\n", "Average Total Time", aver_time_consu);
     printf("\033[1;34m+-------------------------------------------------------------+\033[0m\n");
   }
@@ -651,8 +698,14 @@ void LIVMapper::savePCD()
 {
   if (pcd_save_en && (pcl_wait_save->points.size() > 0 || pcl_wait_save_intensity->points.size() > 0) && pcd_save_interval < 0) 
   {
-    std::string raw_points_dir = std::string(ROOT_DIR) + "Log/pcd/all_raw_points.pcd";
-    std::string downsampled_points_dir = std::string(ROOT_DIR) + "Log/pcd/all_downsampled_points.pcd";
+    std::string raw_points_dir = pcd_output_dir_ + "/all_raw_points.pcd";
+    std::string downsampled_points_dir = pcd_output_dir_ + "/all_downsampled_points.pcd";
+    try {
+      std::filesystem::create_directories(std::filesystem::path(raw_points_dir).parent_path());
+    } catch (const std::exception& e) {
+      std::cerr << "[ LIO ] savePCD: failed to create directory " << pcd_output_dir_ << ": " << e.what() << std::endl;
+      return;
+    }
     pcl::PCDWriter pcd_writer;
 
     if (img_en)
@@ -708,13 +761,15 @@ void LIVMapper::run(rclcpp::Node::SharedPtr &node)
       rate.sleep();
       continue;
     }
-    handleFirstFrame();
-
-    processImu();
-
-    // if (!p_imu->imu_time_init) continue;
-
-    stateEstimationAndMapping();
+    try {
+      handleFirstFrame();
+      processImu();
+      stateEstimationAndMapping();
+    } catch (const std::exception& e) {
+      RCLCPP_ERROR(this->node->get_logger(), "[fast_livo][EXCEPTION] run loop: %s (continuing)", e.what());
+    } catch (...) {
+      RCLCPP_ERROR(this->node->get_logger(), "[fast_livo][EXCEPTION] run loop: unknown exception (continuing)");
+    }
   }
   savePCD();
 }
@@ -878,17 +933,18 @@ void LIVMapper::RGBpointBodyLidarToIMU(PointType const *const pi, PointType *con
 
 void LIVMapper::standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &msg)
 {
+  // RCLCPP_INFO(this->node->get_logger(), "get point cloud at time: %.6f %s", stamp2Sec(msg->header.stamp), hostTimeString().c_str());
   if (!lidar_en) return;
   mtx_buffer.lock();
 
   double cur_head_time = stamp2Sec(msg->header.stamp) + lidar_time_offset;
+  // RCLCPP_INFO(this->node->get_logger(), "get lidar at time: %.6f", cur_head_time);
   // cout<<"got feature"<<endl;
   if (cur_head_time < last_timestamp_lidar)
   {
     RCLCPP_ERROR(this->node->get_logger(),"lidar loop back, clear buffer");
     lid_raw_data_buffer.clear();
   }
-  // ROS_INFO("get point cloud at time: %.6f", stamp2Sec(msg->header.stamp));
   PointCloudXYZI::Ptr ptr(new PointCloudXYZI());
   p_pre->process(msg, ptr);
   lid_raw_data_buffer.push_back(ptr);
@@ -906,6 +962,7 @@ void LIVMapper::imu_cbk(const sensor_msgs::msg::Imu::ConstSharedPtr &msg_in)
   if (last_timestamp_lidar < 0.0) return;
   static double s_last_imu_log_sec = -1e9;
   const double t = stamp2Sec(msg_in->header.stamp);
+  // RCLCPP_INFO(this->node->get_logger(), "get imu at time: %.6f", t);
   const bool should_log = (t - s_last_imu_log_sec >= 5.0);
   if (should_log) s_last_imu_log_sec = t;
   sensor_msgs::msg::Imu::SharedPtr msg(new sensor_msgs::msg::Imu(*msg_in));
@@ -914,7 +971,10 @@ void LIVMapper::imu_cbk(const sensor_msgs::msg::Imu::ConstSharedPtr &msg_in)
 
   if (fabs(last_timestamp_lidar - timestamp) > 0.5 && (!ros_driver_fix_en))
   {
-    RCLCPP_WARN(this->node->get_logger(), "IMU and LiDAR not synced! delta time: %lf .\n", last_timestamp_lidar - timestamp);
+    RCLCPP_WARN(this->node->get_logger(), "IMU and LiDAR not synced! delta time: %lf . %s",
+               last_timestamp_lidar - timestamp, hostTimeString().c_str());
+    RCLCPP_WARN(this->node->get_logger(), "last_timestamp_lidar: %.6f, timestamp: %.6f %s",
+               last_timestamp_lidar, timestamp, hostTimeString().c_str());
   }
 
   if (ros_driver_fix_en) timestamp += std::round(last_timestamp_lidar - timestamp);
@@ -926,13 +986,13 @@ void LIVMapper::imu_cbk(const sensor_msgs::msg::Imu::ConstSharedPtr &msg_in)
   {
     mtx_buffer.unlock();
     sig_buffer.notify_all();
-    RCLCPP_ERROR(this->node->get_logger(), "imu loop back, offset: %lf \n", last_timestamp_imu - timestamp);
+    RCLCPP_ERROR(this->node->get_logger(), "imu loop back, offset: %lf %s", last_timestamp_imu - timestamp, hostTimeString().c_str());
     return;
   }
 
   if (last_timestamp_imu > 0.0 && timestamp > last_timestamp_imu + 0.2)
   {
-    RCLCPP_WARN(this->node->get_logger(), "imu time stamp Jumps %0.4lf seconds \n", timestamp - last_timestamp_imu);
+    RCLCPP_WARN(this->node->get_logger(), "imu time stamp Jumps %0.4lf seconds %s", timestamp - last_timestamp_imu, hostTimeString().c_str());
     mtx_buffer.unlock();
     sig_buffer.notify_all();
     return;
@@ -942,7 +1002,7 @@ void LIVMapper::imu_cbk(const sensor_msgs::msg::Imu::ConstSharedPtr &msg_in)
 
   imu_buffer.push_back(msg);
   if (should_log) {
-    RCLCPP_INFO(this->node->get_logger(), "get imu at time: %.6f, imu size %zu", t, imu_buffer.size());
+    RCLCPP_INFO(this->node->get_logger(), "get imu at time: %.6f, imu size %zu %s", t, imu_buffer.size(), hostTimeString().c_str());
   }
   mtx_buffer.unlock();
   if (imu_prop_enable)
@@ -952,6 +1012,8 @@ void LIVMapper::imu_cbk(const sensor_msgs::msg::Imu::ConstSharedPtr &msg_in)
     newest_imu = *msg;
     new_imu = true;
     mtx_buffer_imu_prop.unlock();
+    // 数据触发：收到 IMU 即执行一次传播，不依赖定时器
+    imu_prop_callback();
   }
   sig_buffer.notify_all();
 }
@@ -1050,7 +1112,12 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
     {
       // If not push the lidar into measurement data buffer
       meas.lidar = lid_raw_data_buffer.front(); // push the first lidar topic
-      if (meas.lidar->points.size() <= 1) return false;
+      if (meas.lidar->points.size() <= 1) {
+        static int skip_log = 0;
+        if (++skip_log <= 3 || skip_log % 200 == 0)
+          RCLCPP_WARN(this->node->get_logger(), "[fast_livo][SYNC] ONLY_LIO: skip lidar frame (points.size=%zu <= 1), sync_packages=false", meas.lidar->points.size());
+        return false;
+      }
 
       meas.lidar_frame_beg_time = lid_header_time_buffer.front();                                                // generate lidar_frame_beg_time
       meas.lidar_frame_end_time = meas.lidar_frame_beg_time + meas.lidar->points.back().curvature / double(1000); // calc lidar scan end time
@@ -1059,10 +1126,10 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
     }
 
     if (imu_en && last_timestamp_imu < meas.lidar_frame_end_time)
-    { // waiting imu message needs to be
-      // larger than _lidar_frame_end_time,
-      // make sure complete propagate.
-      // ROS_ERROR("out sync");
+    { // waiting imu message needs to be >= lidar_frame_end_time for complete propagate
+      static int wait_imu_log = 0;
+      if (++wait_imu_log <= 2 || wait_imu_log % 1000 == 0)
+        RCLCPP_DEBUG(this->node->get_logger(), "[fast_livo][SYNC] ONLY_LIO: waiting_imu last_imu_ts=%.3f < lidar_end_ts=%.3f (sync=false)", last_timestamp_imu, meas.lidar_frame_end_time);
       return false;
     }
 
@@ -1084,7 +1151,7 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
 
     meas.lio_vio_flg = LIO; // process lidar topic, so timestamp should be lidar scan end.
     meas.measures.push_back(m);
-    // ROS_INFO("ONlY HAS LiDAR and IMU, NO IMAGE!");
+    // 设计：处理一帧雷达 → 发一帧 /cloud_registered；不在此打 sync_ok 日志，避免刷屏
     lidar_pushed = false; // sync one whole lidar scan.
     return true;
 
@@ -1319,19 +1386,57 @@ void LIVMapper::publish_frame_world(const rclcpp::Publisher<sensor_msgs::msg::Po
     }
   }
 
-  /*** Publish Frame ***/
+  /*** Publish Frame（点云为空则不发布，后端不处理空点云）***/
   sensor_msgs::msg::PointCloud2 laserCloudmsg;
+  bool cloud_has_points = false;
   if (slam_mode_ == LIVO && LidarMeasures.lio_vio_flg == VIO)
   {
-    pcl::toROSMsg(*laserCloudWorldRGB, laserCloudmsg);
+    cloud_has_points = !laserCloudWorldRGB->empty();
+    if (cloud_has_points)
+      pcl::toROSMsg(*laserCloudWorldRGB, laserCloudmsg);
   }
   if (slam_mode_ == ONLY_LIO || slam_mode_ == ONLY_LO)
-  { 
-    pcl::toROSMsg(*pcl_w_wait_pub, laserCloudmsg); 
+  {
+    cloud_has_points = !pcl_w_wait_pub->empty();
+    if (cloud_has_points)
+      pcl::toROSMsg(*pcl_w_wait_pub, laserCloudmsg);
   }
-  laserCloudmsg.header.stamp = this->node->get_clock()->now(); //.fromSec(last_timestamp_lidar);
-  laserCloudmsg.header.frame_id = "camera_init";
-  pubLaserCloudFullRes->publish(laserCloudmsg);
+  if (cloud_has_points)
+  {
+    try {
+      static int pub_count = 0;
+      pub_count++;
+      size_t pts = (slam_mode_ == ONLY_LIO || slam_mode_ == ONLY_LO) ? pcl_w_wait_pub->size() : laserCloudWorldRGB->size();
+      using Clock = std::chrono::steady_clock;
+      static auto s_last_pub_wall = Clock::now();
+      auto t_before = Clock::now();
+      double delta_ms = 1e-6 * std::chrono::duration_cast<std::chrono::microseconds>(t_before - s_last_pub_wall).count();
+      double frame_ts = (LidarMeasures.lio_vio_flg == VIO) ? LidarMeasures.measures.back().vio_time : LidarMeasures.measures.back().lio_time;
+      if (pub_count <= 10 || pub_count % 500 == 0)
+        RCLCPP_INFO(this->node->get_logger(), "[fast_livo][PUB] about_to_publish #%d ts=%.3f pts=%zu delta_since_last_pub_ms=%.0f", pub_count, frame_ts, pts, pub_count > 1 ? delta_ms : 0.0);
+      laserCloudmsg.header.stamp = this->node->get_clock()->now(); //.fromSec(last_timestamp_lidar);
+      laserCloudmsg.header.frame_id = "camera_init";
+      pubLaserCloudFullRes->publish(laserCloudmsg);
+      auto t_after = Clock::now();
+      s_last_pub_wall = t_after;
+      double publish_duration_ms = 1e-6 * std::chrono::duration_cast<std::chrono::microseconds>(t_after - t_before).count();
+      if (pub_count <= 10 || pub_count % 500 == 0)
+        RCLCPP_INFO(this->node->get_logger(), "[fast_livo][PUB] published #%d done (publish() took %.2f ms; if >>10ms may block run loop)", pub_count, publish_duration_ms);
+    } catch (const std::exception& e) {
+      RCLCPP_ERROR(this->node->get_logger(), "[fast_livo][EXCEPTION] publish /cloud_registered: %s", e.what());
+    } catch (...) {
+      RCLCPP_ERROR(this->node->get_logger(), "[fast_livo][EXCEPTION] publish /cloud_registered: unknown exception");
+    }
+  }
+  else
+  {
+    static int skip_log = 0;
+    skip_log++;
+    if (skip_log <= 5)
+      RCLCPP_WARN(this->node->get_logger(), "[fast_livo][PUB] skip /cloud_registered #%d (empty LIO frame → backend receives no cloud; see '[ LIO ]: No point!!!' above)", skip_log);
+    else if (skip_log % 200 == 0)
+      RCLCPP_DEBUG(this->node->get_logger(), "[fast_livo][PUB] skip /cloud_registered (empty) total_skip=%d (throttled)", skip_log);
+  }
 
   /**************** save map ****************/
   /* 1. make sure you have enough memories
@@ -1387,7 +1492,7 @@ void LIVMapper::publish_frame_world(const rclcpp::Publisher<sensor_msgs::msg::Po
     }
     if ((pcl_wait_save->size() > 0 || pcl_wait_save_intensity->size() > 0) && pcd_save_interval > 0 && scan_wait_num >= pcd_save_interval)
     {
-      string all_points_dir(string(string(ROOT_DIR) + "Log/pcd/") + ss_time.str() + string(".pcd"));
+      string all_points_dir(pcd_output_dir_ + "/" + ss_time.str() + string(".pcd"));
 
       pcl::PCDWriter pcd_writer;
 

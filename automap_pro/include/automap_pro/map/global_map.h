@@ -29,7 +29,7 @@ namespace automap_pro {
 class GlobalMap {
 public:
     struct Config {
-        float voxel_size = 0.1f;           // 降采样体素大小
+        float voxel_size = 0.2f;           // 降采样体素大小（至少 0.2 避免 PCL 溢出）
         float max_distance = 200.0f;        // 最大距离（超出丢弃）
         int   max_points = 5000000;         // 最大点数（超出触发降采样）
         bool  enable_background_update = true;  // 启用后台异步更新

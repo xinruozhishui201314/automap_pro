@@ -1,5 +1,0 @@
-
-bool success
-string message
-float64 elapsed_seconds
-float64 final_mme

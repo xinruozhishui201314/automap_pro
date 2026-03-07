@@ -92,6 +92,7 @@ public:
   bool lidar_map_inited = false, pcd_save_en = false, img_save_en = false, pub_effect_point_en = false, pose_output_en = false, ros_driver_fix_en = false, hilti_en = false;
   bool mat_pre_en = false, mat_out_en = false, imu_log_en = false;
   int img_save_interval = 1, pcd_save_interval = -1, pcd_save_type = 0;
+  std::string pcd_output_dir_ = "/data/automap_output";  // PCD/轨迹保存目录，与后端 output_dir 一致
   int pub_scan_num = 1;
 
   StatesGroup imu_propagate, latest_ekf_state;
@@ -182,7 +183,7 @@ public:
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudDynDbg;
   image_transport::Publisher pubImage;
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr mavros_pose_publisher;
-  rclcpp::TimerBase::SharedPtr imu_prop_timer;
+  // IMU 传播已改为数据触发（imu_cbk 内调用 imu_prop_callback），不再使用定时器
   rclcpp::Node::SharedPtr node;
 
   int frame_num = 0;

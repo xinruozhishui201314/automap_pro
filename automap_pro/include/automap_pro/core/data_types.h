@@ -130,7 +130,8 @@ struct LoopConstraint {
     int      keyframe_i = -1, keyframe_j = -1;
     uint64_t session_i = 0,  session_j = 0;
 
-    Pose3d   delta_T = Pose3d::Identity();    // T_i_j（从j到i的相对变换）
+    /** T_i_j：子图 j 在子图 i 系下的位姿（target=i, source=j），用于 BetweenFactor(i, j, delta_T) */
+    Pose3d   delta_T = Pose3d::Identity();
     Mat66d   information = Mat66d::Identity();
 
     float    overlap_score = 0.0f;

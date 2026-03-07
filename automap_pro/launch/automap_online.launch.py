@@ -24,9 +24,12 @@ def _load_system_config(context):
 def _launch_nodes_with_system_config(context, *args, **kwargs):
     config_path = LaunchConfiguration("config").perform(context)
     pkg_share = get_package_share_directory("automap_pro")
-    rviz_config_default = os.path.join(pkg_share, "rviz", "automap.rviz")
-    if not os.path.isfile(rviz_config_default):
-        rviz_config_default = os.path.join(pkg_share, "config", "automap.rviz")
+    rviz_frontend_config = os.path.join(pkg_share, "rviz", "automap_frontend.rviz")
+    rviz_backend_config = os.path.join(pkg_share, "rviz", "automap_backend.rviz")
+    if not os.path.isfile(rviz_frontend_config):
+        rviz_frontend_config = os.path.join(pkg_share, "rviz", "automap.rviz")
+    if not os.path.isfile(rviz_backend_config):
+        rviz_backend_config = os.path.join(pkg_share, "rviz", "automap.rviz")
 
     # 从 system_config 生成各组件参数（launch 与 params_from_system_config 同目录）
     launch_dir = os.path.dirname(os.path.abspath(__file__))
@@ -79,7 +82,7 @@ def _launch_nodes_with_system_config(context, *args, **kwargs):
                 name="laserMapping",
                 parameters=[fl2_params],
                 output="screen",
-                condition=IfCondition(use_external_frontend),
+                condition=IfCondition(PythonExpression([use_external_frontend, " == 'true'"])),
             )
             nodes.append(fast_livo_node)
     except Exception:
@@ -93,7 +96,7 @@ def _launch_nodes_with_system_config(context, *args, **kwargs):
             name="overlap_transformer_descriptor_server",
             output="screen",
             parameters=[ot_params],
-            condition=IfCondition(use_external_overlap),
+            condition=IfCondition(PythonExpression([use_external_overlap, " == 'true'"])),
         )
         nodes.append(overlap_node)
     except Exception:
@@ -103,17 +106,17 @@ def _launch_nodes_with_system_config(context, *args, **kwargs):
     if hba_params:
         nodes.append(Node(
             package="hba", namespace="hba", executable="hba", name="hba_node",
-            output="screen", parameters=[hba_params], condition=IfCondition(use_hba),
+            output="screen", parameters=[hba_params], condition=IfCondition(PythonExpression([use_hba, " == 'true'"])),
         ))
     if hba_cal_mme_params:
         nodes.append(Node(
             package="hba", namespace="cal_MME", executable="calculate_MME", name="cal_MME_node",
-            output="screen", parameters=[hba_cal_mme_params], condition=IfCondition(use_hba_cal_mme),
+            output="screen", parameters=[hba_cal_mme_params], condition=IfCondition(PythonExpression([use_hba_cal_mme, " == 'true'"])),
         ))
     if hba_visualize_params:
         nodes.append(Node(
             package="hba", namespace="visualize", executable="visualize", name="visualize_node",
-            output="screen", parameters=[hba_visualize_params], condition=IfCondition(use_hba_visualize),
+            output="screen", parameters=[hba_visualize_params], condition=IfCondition(PythonExpression([use_hba_visualize, " == 'true'"])),
         ))
 
     # AutoMap System 节点：读取 config_file 参数（非 config），话题映射由 system_config 决定
@@ -130,15 +133,25 @@ def _launch_nodes_with_system_config(context, *args, **kwargs):
     )
     nodes.append(automap_node)
 
-    rviz_node = Node(
+    # 两个 RViz：前端仅显示 LIO/前端，后端仅显示全局地图/优化/回环/GPS/子图
+    rviz_frontend_node = Node(
         package="rviz2",
         executable="rviz2",
-        name="rviz",
-        arguments=["-d", rviz_config_default],
+        name="rviz_frontend",
+        arguments=["-d", rviz_frontend_config],
         output="screen",
-        condition=IfCondition(LaunchConfiguration("use_rviz")),
+        condition=IfCondition(PythonExpression([LaunchConfiguration("use_rviz"), " == 'true'"])),
     )
-    nodes.append(rviz_node)
+    nodes.append(rviz_frontend_node)
+    rviz_backend_node = Node(
+        package="rviz2",
+        executable="rviz2",
+        name="rviz_backend",
+        arguments=["-d", rviz_backend_config],
+        output="screen",
+        condition=IfCondition(PythonExpression([LaunchConfiguration("use_rviz"), " == 'true'"])),
+    )
+    nodes.append(rviz_backend_node)
 
     static_tf = Node(
         package="tf2_ros",
@@ -201,9 +214,10 @@ def generate_launch_description():
     )
 
     bag_file = LaunchConfiguration("bag_file")
-    bag_given = IfCondition(PythonExpression("'", bag_file, "' != ''"))
+    # Humble: PythonExpression 只接受 1 个参数（可为 list of Substitutions），不能写 PythonExpression("'", bag_file, "' != ''")
+    bag_given = IfCondition(PythonExpression(["'", bag_file, "' != ''"]))
     rosbag_play = ExecuteProcess(
-        cmd=["ros2", "bag", "play", bag_file, "--rate", "1.0", "--clock"],
+        cmd=["ros2", "bag", "play", bag_file, "--rate", "0.5", "--clock"],
         output="screen",
         condition=bag_given,
     )

@@ -1,6 +1,7 @@
 #include "automap_pro/frontend/gps_manager.h"
 #include "automap_pro/core/config_manager.h"
 #include "automap_pro/core/logger.h"
+#include "automap_pro/core/map_frame_config.h"
 
 #include <GeographicLib/LocalCartesian.hpp>
 #include <Eigen/SVD>
@@ -25,7 +26,7 @@ void GPSManager::addGPSMeasurement(
     double latitude, double longitude, double altitude,
     double hdop, int num_sats)
 {
-    // ENU 原点仅设置一次，避免多线程竞态
+    // ENU 原点仅设置一次，避免多线程竞态；并写入 map_frame.cfg 供后端统一使用
     std::call_once(enu_origin_once_, [this, latitude, longitude, altitude]() {
         enu_origin_lat_ = latitude;
         enu_origin_lon_ = longitude;
@@ -33,6 +34,8 @@ void GPSManager::addGPSMeasurement(
         enu_origin_set_.store(true);
         ALOG_INFO(MOD, "ENU origin set: lat={:.6f} lon={:.6f} alt={:.2f}",
                   latitude, longitude, altitude);
+        std::string cfg_path = ConfigManager::instance().mapFrameConfigPath();
+        MapFrameConfig::write(cfg_path, latitude, longitude, altitude);
     });
 
     std::lock_guard<std::mutex> lk(mutex_);

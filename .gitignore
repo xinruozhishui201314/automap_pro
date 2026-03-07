@@ -31,7 +31,8 @@ docker/deps/*/build/
 
 # ========== 临时文件 ==========
 *.log
-logs/
+logs/*
+!logs/README.md
 *.tmp
 *.swp
 *~
@@ -80,6 +81,12 @@ htmlcov/
 # ========== 系统文件 ==========
 *.cache
 *.pid
+
+# ========== ROS2 工作空间构建产物（不提交）==========
+automap_ws/install/
+automap_ws/build/
+automap_ws/build_*/
+automap_ws/log/
 
 # ========== 子模块工作目录修改 ==========
 docker/deps/Livox-SDK2/

@@ -28,8 +28,31 @@
 #include <mutex>
 #include <atomic>
 #include <thread>
+#include <queue>
+#include <deque>
+#include <condition_variable>
+#include <chrono>
 
 namespace automap_pro {
+
+/** 按时间戳对齐：帧队列只存 (ts, cloud)，pose/cov/kfinfo 由 worker 从缓存按 ts 查询 */
+struct FrameToProcess {
+    double ts = 0.0;
+    CloudXYZIPtr cloud;
+};
+
+/** 里程计按时间戳缓存，worker 用 get(cloud_ts) 对齐 */
+struct OdomCacheEntry {
+    double ts = 0.0;
+    Pose3d pose = Pose3d::Identity();
+    Mat66d cov  = Mat66d::Identity() * 1e-4;
+};
+
+/** KFinfo 按时间戳缓存，worker 用 get(cloud_ts) 对齐 */
+struct KFinfoCacheEntry {
+    double ts = 0.0;
+    LivoKeyFrameInfo info;
+};
 
 /**
  * AutoMapSystem —— 主控制层（Composable Node）
@@ -79,10 +102,32 @@ private:
     // 异步任务关闭请求标志
     std::atomic<bool> shutdown_requested_{false};
 
-    // 当前里程计状态缓存
+    // 后端帧队列：只存 (ts, cloud)，worker 按 ts 从 odom/kfinfo 缓存对齐，不阻塞回调
+    static constexpr size_t kMaxFrameQueueSize = 500;
+    std::queue<FrameToProcess> frame_queue_;
+    std::mutex                frame_queue_mutex_;
+    std::condition_variable   frame_queue_cv_;
+    std::thread               backend_worker_;
+    std::atomic<int>          frame_queue_dropped_{0};
+    void backendWorkerLoop();
+
+    // 按时间戳缓存的 odom / kfinfo，有界、非阻塞写，worker 按帧 ts 对齐读取
+    static constexpr size_t kMaxOdomCacheSize   = 1000;
+    static constexpr size_t kMaxKFinfoCacheSize = 1000;
+    std::deque<OdomCacheEntry>   odom_cache_;
+    std::mutex                   odom_cache_mutex_;
+    std::deque<KFinfoCacheEntry> kfinfo_cache_;
+    std::mutex                   kfinfo_cache_mutex_;
+    void odomCacheAdd(double ts, const Pose3d& pose, const Mat66d& cov);
+    bool odomCacheGet(double ts, Pose3d& out_pose, Mat66d& out_cov);
+    void kfinfoCacheAdd(double ts, const LivoKeyFrameInfo& info);
+    bool kfinfoCacheGet(double ts, LivoKeyFrameInfo& out_info);
+
+    // 当前里程计/点云状态缓存（pose 与 cloud 同帧：由 onCloud 触发 KF，保证用到的 last_odom_pose_ 已由本帧 odom 更新）
     Pose3d    last_odom_pose_    = Pose3d::Identity();
     double    last_odom_ts_      = -1.0;
     CloudXYZIPtr last_cloud_;
+    double    last_cloud_ts_    = -1.0;  // 点云时间戳，用于日志与一致性检查
     Mat66d    last_cov_          = Mat66d::Identity() * 1e-4;
     mutable std::mutex data_mutex_;
 
@@ -96,9 +141,17 @@ private:
     // 子图计数（用于 HBA 周期触发）
     int  frozen_submap_count_ = 0;
 
+    // 地图体素大小（init 时从 ConfigManager 缓存，避免 publishGlobalMap 回调中访问单例导致析构顺序 SIGSEGV）
+    float map_voxel_size_ = 0.2f;
+
     // 首次数据到达日志（各打一次，便于确认数据流）
     std::atomic<bool> first_odom_logged_{false};
     std::atomic<bool> first_cloud_logged_{false};
+    // 传感器空闲结束建图：上次收到点云的墙钟时间；超时后触发最终处理并退出
+    std::chrono::steady_clock::time_point last_sensor_data_wall_time_{std::chrono::steady_clock::now()};
+    std::atomic<bool> sensor_idle_finish_triggered_{false};
+    // 后端已处理的点云帧计数（用于每帧日志）
+    std::atomic<int> backend_cloud_frames_processed_{0};
     // 周期性状态汇总（每 10 次 status 打一条，约 10s）
     int status_publish_count_ = 0;
     // 低频数据流日志：各模块收发/发布计数（每 15s 打一条）
@@ -122,10 +175,8 @@ private:
     rclcpp::Service<automap_pro::srv::TriggerGpsAlign>::SharedPtr trigger_gps_srv_;
     rclcpp::Service<automap_pro::srv::LoadSession>::SharedPtr     load_session_srv_;
 
-    // ── 定时器 ────────────────────────────────────────────────────────────
-    rclcpp::TimerBase::SharedPtr status_timer_;
-    rclcpp::TimerBase::SharedPtr map_pub_timer_;
-    rclcpp::TimerBase::SharedPtr data_flow_timer_;  // 低频数据流汇总（约 15s）
+    // ── 定时器（仅保留一次性 deferred init）────────────────────────────────
+    // status/map/data_flow 已改为数据触发：在 backendWorkerLoop 中按处理帧数触发，见 setupTimers 注释
     rclcpp::TimerBase::SharedPtr deferred_init_timer_;
 
     // ── 初始化 ────────────────────────────────────────────────────────────
@@ -144,7 +195,13 @@ private:
     void onGPS(double ts, double lat, double lon, double alt, double hdop, int sats);
 
     // ── 内部处理 ──────────────────────────────────────────────────────────
+    /** 从当前 last_* 读取并创建 KF（兼容旧调用） */
     void tryCreateKeyFrame(double ts);
+    /** 使用入参创建 KF；optional_livo_info 非空时用于日志（时间戳对齐），否则读 last_livo_info_ */
+    void tryCreateKeyFrame(double ts, const Pose3d& pose, const Mat66d& cov, const CloudXYZIPtr& cloud,
+                           const LivoKeyFrameInfo* optional_livo_info = nullptr);
+    /** 将世界系点云转为 body 系（T_b_w * cloud），用于 frontend.cloud_frame=world 时避免全局图双重变换 */
+    CloudXYZIPtr transformWorldToBody(const CloudXYZIPtr& world_cloud, const Pose3d& T_w_b) const;
     void onSubmapFrozen(const SubMap::Ptr& submap);
     void onLoopDetected(const LoopConstraint::Ptr& lc);
     void onPoseUpdated(const std::unordered_map<int, Pose3d>& poses);

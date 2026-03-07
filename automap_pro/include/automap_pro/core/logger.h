@@ -21,8 +21,14 @@
 #include <chrono>
 #include <mutex>
 #include <filesystem>
+#include <thread>
 
 namespace automap_pro {
+
+/** 返回当前线程的短 ID（0～99999），用于日志精确定位多线程并发问题 */
+inline unsigned logThreadId() {
+    return static_cast<unsigned>(std::hash<std::thread::id>{}(std::this_thread::get_id()) % 100000u);
+}
 
 class Logger {
 public:

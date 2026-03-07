@@ -69,7 +69,7 @@ public:
         
         // 输入预处理
         bool  downsample_before_refine = true;
-        float  downsample_voxel_size = 0.1f;
+        float  downsample_voxel_size = 0.2f;  // 至少 0.2 避免 PCL 体素溢出
         
         // 验证
         bool  validate_result = true;

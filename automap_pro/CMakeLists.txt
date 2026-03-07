@@ -258,6 +258,7 @@ endif()
 # ──────────────────────────────────────────────────────────
 add_library(automap_core SHARED
   src/core/config_manager.cpp
+  src/core/map_frame_config.cpp
   src/core/logger.cpp
   src/core/utils.cpp
   src/core/error_code.cpp
@@ -395,6 +396,7 @@ install(TARGETS automap_system_node_standalone
 install(DIRECTORY include/ DESTINATION include)
 install(DIRECTORY config/ DESTINATION share/${PROJECT_NAME}/config)
 install(DIRECTORY launch/ DESTINATION share/${PROJECT_NAME}/launch)
+install(PROGRAMS launch/run_under_gdb.sh DESTINATION share/${PROJECT_NAME}/launch)
 install(DIRECTORY rviz/ DESTINATION share/${PROJECT_NAME}/rviz)
 
 ament_export_include_directories(include)

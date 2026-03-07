@@ -9,7 +9,6 @@ import traceback
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, ExecuteProcess, OpaqueFunction
-from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
@@ -37,10 +36,13 @@ def _launch_nodes_offline(context, *args, **kwargs):
         pkg_share = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
         sys.stderr.write("{} [FALLBACK] 使用 launch 相对路径 pkg_share={}\n".format(_LP, pkg_share))
         sys.stderr.flush()
-    # RViz 配置在 rviz/ 目录，非 config/（config/ 仅放 system_config 等）
-    rviz_config_default = os.path.join(pkg_share, "rviz", "automap.rviz")
-    if not os.path.isfile(rviz_config_default):
-        rviz_config_default = os.path.join(pkg_share, "config", "automap.rviz")
+    # RViz 配置：前端 / 后端分两个窗口
+    rviz_frontend_config = os.path.join(pkg_share, "rviz", "automap_frontend.rviz")
+    rviz_backend_config = os.path.join(pkg_share, "rviz", "automap_backend.rviz")
+    if not os.path.isfile(rviz_frontend_config):
+        rviz_frontend_config = os.path.join(pkg_share, "rviz", "automap.rviz")
+    if not os.path.isfile(rviz_backend_config):
+        rviz_backend_config = os.path.join(pkg_share, "rviz", "automap.rviz")
     launch_dir = os.path.dirname(os.path.abspath(__file__))
     if launch_dir not in sys.path:
         sys.path.insert(0, launch_dir)
@@ -57,6 +59,7 @@ def _launch_nodes_offline(context, *args, **kwargs):
             get_hba_params,
             get_hba_cal_mme_params,
             get_hba_visualize_params,
+            write_fast_livo_params_file,
         )
         system_config = load_system_config(config_path)
         ot_params = get_overlap_transformer_params(system_config)
@@ -69,18 +72,19 @@ def _launch_nodes_offline(context, *args, **kwargs):
         sys.stderr.write("{} [FALLBACK] 使用空/默认参数继续启动，部分节点可能不可用\n".format(_LP))
         sys.stderr.flush()
 
-    use_external_frontend = LaunchConfiguration("use_external_frontend", default="false")
-    use_external_overlap = LaunchConfiguration("use_external_overlap", default="false")
-    use_hba = LaunchConfiguration("use_hba", default="true")
-    use_hba_cal_mme = LaunchConfiguration("use_hba_cal_mme", default="false")
-    use_hba_visualize = LaunchConfiguration("use_hba_visualize", default="false")
+    # 在 OpaqueFunction 内用 .perform(context) 读参数，按需添加节点，避免 IfCondition/PythonExpression 触发 Humble 的 TypeError
+    use_external_frontend_val = LaunchConfiguration("use_external_frontend", default="false").perform(context).strip().lower() == "true"
+    use_external_overlap_val = LaunchConfiguration("use_external_overlap", default="false").perform(context).strip().lower() == "true"
+    use_hba_val = LaunchConfiguration("use_hba", default="true").perform(context).strip().lower() == "true"
+    use_hba_cal_mme_val = LaunchConfiguration("use_hba_cal_mme", default="false").perform(context).strip().lower() == "true"
+    use_hba_visualize_val = LaunchConfiguration("use_hba_visualize", default="false").perform(context).strip().lower() == "true"
     nodes = []
 
-    # Fast-LIVO2：参数与全工程一致，仅来自唯一 config:= 传入的配置文件（不生成 fast_livo_params.yaml）
-    if fl2_params:
+    # Fast-LIVO2：参数写入临时 YAML 再以 parameters=[path] 传入，避免将含 bool 的 dict 交给 launch 序列化触发 "name 'true' is not defined"（launch_ros 已知问题）
+    if fl2_params and use_external_frontend_val:
         config_abs = os.path.abspath(config_path) if config_path else None
         sys.stderr.write("{} [CONFIG] 唯一配置文件(全工程): config_path={}\n".format(_LP, config_abs or config_path))
-        sys.stderr.write("{} [CONFIG] fast_livo 参数来源: 同上 config，无 fast_livo_params.yaml\n".format(_LP))
+        sys.stderr.write("{} [CONFIG] fast_livo 参数来源: 同上 config，写入临时 YAML 再加载\n".format(_LP))
         pb = fl2_params.get("parameter_blackboard") if isinstance(fl2_params.get("parameter_blackboard"), dict) else {}
         sys.stderr.write("{} [FAST_LIVO_PARAMS] fl2_params 顶层键: {}\n".format(_LP, sorted(fl2_params.keys())))
         sys.stderr.write("{} [FAST_LIVO_PARAMS] parameter_blackboard 键: {}, model={!r}\n".format(
@@ -97,57 +101,65 @@ def _launch_nodes_offline(context, *args, **kwargs):
                 fl2_params["parameter_blackboard"].setdefault(k, 0.0 if k.startswith("d") else 400.0)
             sys.stderr.write("{} [FAST_LIVO_PARAMS] 已注入兜底 parameter_blackboard.model=Pinhole\n".format(_LP))
         sys.stderr.flush()
-        fast_livo_params = [fl2_params, {"use_sim_time": True}]
         try:
+            import yaml as _yaml
+            fast_livo_params_file = "/tmp/automap_fl_params_offline_{}.yaml".format(os.getpid())
+            write_fast_livo_params_file(system_config, fast_livo_params_file, config_path)
+            with open(fast_livo_params_file, "r", encoding="utf-8") as _f:
+                _data = _yaml.safe_load(_f)
+            _node_key = "laserMapping" if "laserMapping" in _data else "/laserMapping"
+            _data.setdefault(_node_key, {}).setdefault("ros__parameters", {})["use_sim_time"] = True
+            with open(fast_livo_params_file, "w", encoding="utf-8") as _f:
+                _yaml.dump(_data, _f, default_flow_style=False, allow_unicode=True, sort_keys=False)
             get_package_share_directory("fast_livo")
             nodes.append(Node(
                 package="fast_livo",
                 executable="fastlivo_mapping",
                 name="laserMapping",
-                parameters=fast_livo_params,
+                parameters=[fast_livo_params_file],
                 output="screen",
-                condition=IfCondition(use_external_frontend),
             ))
         except Exception as e:
             _log_launch_exception("创建 fast_livo Node(get_package_share_directory 或 Node())", e)
             sys.stderr.write("{} [FALLBACK] 未添加 fast_livo 节点，请检查 fast_livo 是否已编译安装\n".format(_LP))
             sys.stderr.flush()
 
-    try:
-        nodes.append(Node(
-            package="overlap_transformer_ros2", executable="descriptor_server",
-            name="overlap_transformer_descriptor_server", output="screen",
-            parameters=[ot_params], condition=IfCondition(use_external_overlap),
-        ))
-    except Exception as e:
-        _log_launch_exception("创建 overlap_transformer_ros2 Node", e)
-        sys.stderr.write("{} [FALLBACK] 未添加 overlap_transformer 节点\n".format(_LP))
-        sys.stderr.flush()
+    if use_external_overlap_val:
+        try:
+            nodes.append(Node(
+                package="overlap_transformer_ros2", executable="descriptor_server",
+                name="overlap_transformer_descriptor_server", output="screen",
+                parameters=[ot_params],
+            ))
+        except Exception as e:
+            _log_launch_exception("创建 overlap_transformer_ros2 Node", e)
+            sys.stderr.write("{} [FALLBACK] 未添加 overlap_transformer 节点\n".format(_LP))
+            sys.stderr.flush()
 
     # HBA 模块节点（参数来自 system_config.backend.hba / hba_cal_mme / hba_visualize）
-    if hba_params:
+    if hba_params and use_hba_val:
         try:
             nodes.append(Node(
                 package="hba", namespace="hba", executable="hba", name="hba_node",
-                output="screen", parameters=[hba_params], condition=IfCondition(use_hba),
+                output="screen", parameters=[hba_params],
             ))
         except Exception as e:
             _log_launch_exception("创建 HBA 主节点", e)
             sys.stderr.write("{} [FALLBACK] 未添加 hba_node\n".format(_LP))
             sys.stderr.flush()
-    if hba_cal_mme_params:
+    if hba_cal_mme_params and use_hba_cal_mme_val:
         try:
             nodes.append(Node(
                 package="hba", namespace="cal_MME", executable="calculate_MME", name="cal_MME_node",
-                output="screen", parameters=[hba_cal_mme_params], condition=IfCondition(use_hba_cal_mme),
+                output="screen", parameters=[hba_cal_mme_params],
             ))
         except Exception as e:
             _log_launch_exception("创建 HBA cal_MME 节点", e)
-    if hba_visualize_params:
+    if hba_visualize_params and use_hba_visualize_val:
         try:
             nodes.append(Node(
                 package="hba", namespace="visualize", executable="visualize", name="visualize_node",
-                output="screen", parameters=[hba_visualize_params], condition=IfCondition(use_hba_visualize),
+                output="screen", parameters=[hba_visualize_params],
             ))
         except Exception as e:
             _log_launch_exception("创建 HBA visualize 节点", e)
@@ -157,24 +169,40 @@ def _launch_nodes_offline(context, *args, **kwargs):
     if not config_path_str:
         sys.stderr.write("{} [WARN] config_path 为空，automap_system 将使用默认配置\n".format(_LP))
         sys.stderr.flush()
+    run_automap_under_gdb = LaunchConfiguration("run_automap_under_gdb", default="false").perform(context).lower() == "true"
+    # launch_ros Node 的 prefix 多元素 list 会被错误拼接；用包装脚本可靠调用 gdb
+    gdb_wrapper = os.path.join(launch_dir, "run_under_gdb.sh")
+    automap_prefix = [gdb_wrapper] if (run_automap_under_gdb and os.path.isfile(gdb_wrapper)) else []
+    if run_automap_under_gdb:
+        if automap_prefix:
+            sys.stderr.write("{} [GDB] automap_system_node 将以 GDB 启动，崩溃时自动打印 backtrace\n".format(_LP))
+        else:
+            sys.stderr.write("{} [GDB] 未找到 {}，请安装 gdb 并确保 launch 目录存在 run_under_gdb.sh，跳过 GDB\n".format(_LP, gdb_wrapper))
+        sys.stderr.flush()
     try:
         nodes.append(Node(
             package="automap_pro", executable="automap_system_node", name="automap_system",
             output="screen",
             parameters=[{"config_file": config_path_str}, {"use_sim_time": True}],
+            prefix=automap_prefix,
         ))
     except Exception as e:
         _log_launch_exception("创建 automap_system Node", e)
         sys.stderr.write("{} [ERROR] automap_system 节点未添加，建图核心不可用\n".format(_LP))
         sys.stderr.flush()
-    try:
-        nodes.append(Node(
-            package="rviz2", executable="rviz2", name="rviz",
-            arguments=["-d", rviz_config_default], output="screen",
-            condition=IfCondition(LaunchConfiguration("use_rviz")),
-        ))
-    except Exception as e:
-        _log_launch_exception("创建 rviz2 Node", e)
+    use_rviz_val = LaunchConfiguration("use_rviz", default="true").perform(context).strip().lower() == "true"
+    if use_rviz_val:
+        try:
+            nodes.append(Node(
+                package="rviz2", executable="rviz2", name="rviz_frontend",
+                arguments=["-d", rviz_frontend_config], output="screen",
+            ))
+            nodes.append(Node(
+                package="rviz2", executable="rviz2", name="rviz_backend",
+                arguments=["-d", rviz_backend_config], output="screen",
+            ))
+        except Exception as e:
+            _log_launch_exception("创建 rviz2 Node", e)
     try:
         nodes.append(Node(
             package="tf2_ros", executable="static_transform_publisher", name="world_map_tf",
@@ -281,13 +309,14 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument("config", default_value=config_default, description="Path to system_config.yaml"),
         DeclareLaunchArgument("bag_file", default_value=os.path.expanduser("~/data/mapping.db3"), description="Path to rosbag2"),
-        DeclareLaunchArgument("rate", default_value="1.0", description="Playback rate"),
+        DeclareLaunchArgument("rate", default_value="0.5", description="Playback rate (0.5=half speed, 1.0=realtime)"),
         DeclareLaunchArgument("use_rviz", default_value="true", description="Whether to start RViz"),
         DeclareLaunchArgument("use_external_frontend", default_value="true", description="true=use verified fast_livo node (modular); false=use internal FastLIVO2Wrapper (ESIKF)"),
         DeclareLaunchArgument("use_external_overlap", default_value="false", description="Launch OverlapTransformer descriptor (params from system_config)"),
         DeclareLaunchArgument("use_hba", default_value="false", description="Launch standalone HBA node (reads pose.json at startup; offline 时默认 false 避免零位姿崩溃，优化由 automap_system 内 HBAOptimizer 负责)"),
         DeclareLaunchArgument("use_hba_cal_mme", default_value="false", description="Launch HBA cal_MME node (params from system_config.backend.hba_cal_mme)"),
         DeclareLaunchArgument("use_hba_visualize", default_value="false", description="Launch HBA visualize node (params from system_config.backend.hba_visualize)"),
+        DeclareLaunchArgument("run_automap_under_gdb", default_value="false", description="Run automap_system_node under GDB; on crash prints full backtrace (requires gdb in container)"),
         OpaqueFunction(function=_log_bag_path),
         ExecuteProcess(cmd=["ros2", "bag", "play", LaunchConfiguration("bag_file"), "--rate", LaunchConfiguration("rate"), "--clock"], output="screen"),
         OpaqueFunction(function=_launch_nodes_offline),

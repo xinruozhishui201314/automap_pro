@@ -6,7 +6,6 @@ import os
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, OpaqueFunction
-from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
@@ -14,7 +13,12 @@ from launch_ros.actions import Node
 def _launch_nodes_incremental(context, *args, **kwargs):
     config_path = LaunchConfiguration("config").perform(context)
     pkg_share = get_package_share_directory("automap_pro")
-    rviz_config_default = os.path.join(pkg_share, "config", "automap.rviz")
+    rviz_frontend_config = os.path.join(pkg_share, "rviz", "automap_frontend.rviz")
+    rviz_backend_config = os.path.join(pkg_share, "rviz", "automap_backend.rviz")
+    if not os.path.isfile(rviz_frontend_config):
+        rviz_frontend_config = os.path.join(pkg_share, "rviz", "automap.rviz")
+    if not os.path.isfile(rviz_backend_config):
+        rviz_backend_config = os.path.join(pkg_share, "rviz", "automap.rviz")
     launch_dir = os.path.dirname(os.path.abspath(__file__))
     if launch_dir not in __import__("sys").path:
         __import__("sys").path.insert(0, launch_dir)
@@ -40,50 +44,51 @@ def _launch_nodes_incremental(context, *args, **kwargs):
         hba_cal_mme_params = {}
         hba_visualize_params = {}
 
-    use_external_frontend = LaunchConfiguration("use_external_frontend", default="false")
-    use_external_overlap = LaunchConfiguration("use_external_overlap", default="false")
-    use_hba = LaunchConfiguration("use_hba", default="true")
-    use_hba_cal_mme = LaunchConfiguration("use_hba_cal_mme", default="false")
-    use_hba_visualize = LaunchConfiguration("use_hba_visualize", default="false")
+    use_external_frontend_val = LaunchConfiguration("use_external_frontend", default="false").perform(context).strip().lower() == "true"
+    use_external_overlap_val = LaunchConfiguration("use_external_overlap", default="false").perform(context).strip().lower() == "true"
+    use_hba_val = LaunchConfiguration("use_hba", default="true").perform(context).strip().lower() == "true"
+    use_hba_cal_mme_val = LaunchConfiguration("use_hba_cal_mme", default="false").perform(context).strip().lower() == "true"
+    use_hba_visualize_val = LaunchConfiguration("use_hba_visualize", default="false").perform(context).strip().lower() == "true"
+    use_rviz_val = LaunchConfiguration("use_rviz", default="true").perform(context).strip().lower() == "true"
     nodes = []
 
     # fast-livo2 节点：只使用从 system_config 生成的参数
-    # 注意：移除 camera_pinhole.yaml 避免参数冲突
     try:
         get_package_share_directory("fast_livo")
-        if fl2_params:
+        if fl2_params and use_external_frontend_val:
             nodes.append(Node(
                 package="fast_livo", executable="fastlivo_mapping", name="laserMapping",
                 parameters=[fl2_params],
-                output="screen", condition=IfCondition(use_external_frontend),
+                output="screen",
             ))
     except Exception:
         pass
 
-    try:
-        nodes.append(Node(
-            package="overlap_transformer_ros2", executable="descriptor_server",
-            name="overlap_transformer_descriptor_server", output="screen",
-            parameters=[ot_params], condition=IfCondition(use_external_overlap),
-        ))
-    except Exception:
-        pass
+    if use_external_overlap_val:
+        try:
+            nodes.append(Node(
+                package="overlap_transformer_ros2", executable="descriptor_server",
+                name="overlap_transformer_descriptor_server", output="screen",
+                parameters=[ot_params],
+            ))
+        except Exception:
+            pass
 
     # HBA 模块节点（参数来自 system_config.backend.hba / hba_cal_mme / hba_visualize）
-    if hba_params:
+    if hba_params and use_hba_val:
         nodes.append(Node(
             package="hba", namespace="hba", executable="hba", name="hba_node",
-            output="screen", parameters=[hba_params], condition=IfCondition(use_hba),
+            output="screen", parameters=[hba_params],
         ))
-    if hba_cal_mme_params:
+    if hba_cal_mme_params and use_hba_cal_mme_val:
         nodes.append(Node(
             package="hba", namespace="cal_MME", executable="calculate_MME", name="cal_MME_node",
-            output="screen", parameters=[hba_cal_mme_params], condition=IfCondition(use_hba_cal_mme),
+            output="screen", parameters=[hba_cal_mme_params],
         ))
-    if hba_visualize_params:
+    if hba_visualize_params and use_hba_visualize_val:
         nodes.append(Node(
             package="hba", namespace="visualize", executable="visualize", name="visualize_node",
-            output="screen", parameters=[hba_visualize_params], condition=IfCondition(use_hba_visualize),
+            output="screen", parameters=[hba_visualize_params],
         ))
 
     nodes.append(Node(
@@ -98,11 +103,15 @@ def _launch_nodes_incremental(context, *args, **kwargs):
         ],
         remappings=[("/livox/lidar", "/livox/lidar"), ("/livox/imu", "/livox/imu"), ("/gps/fix", "/gps/fix")],
     ))
-    nodes.append(Node(
-        package="rviz2", executable="rviz2", name="rviz",
-        arguments=["-d", rviz_config_default], output="screen",
-        condition=IfCondition(LaunchConfiguration("use_rviz")),
-    ))
+    if use_rviz_val:
+        nodes.append(Node(
+            package="rviz2", executable="rviz2", name="rviz_frontend",
+            arguments=["-d", rviz_frontend_config], output="screen",
+        ))
+        nodes.append(Node(
+            package="rviz2", executable="rviz2", name="rviz_backend",
+            arguments=["-d", rviz_backend_config], output="screen",
+        ))
     nodes.append(Node(
         package="tf2_ros", executable="static_transform_publisher", name="world_map_tf",
         arguments=["0", "0", "0", "0", "0", "0", "world", "map"],

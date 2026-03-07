@@ -4,12 +4,11 @@ AutoMap-Pro: Composable Node 启动文件
 
 架构：
   - fast_livo：独立进程 (fastlivo_mapping)
-      参数来源：从 system_config.yaml 的 fast_livo: 节自动生成临时 ROS2
-               params 文件 (/tmp/automap_fl_params_<pid>.yaml)，通过
-               --params-file 传入，无需单独维护 avia.yaml。
+      参数来源：由 params_from_system_config.get_fast_livo2_params 从 system_config 的
+               sensor: + fast_livo: 节合并生成临时 ROS2 params 文件，话题唯一来自 sensor:。
   - automap_system：composable=true 时在 Component Container 内加载
 
-数据流：rosbag → <lid_topic>, <imu_topic>  （话题名由 system_config.yaml 的 fast_livo.common 节决定）
+数据流：rosbag → <lid_topic>, <imu_topic>  （话题名唯一来自 system_config 的 sensor: 节）
         → fast_livo → /aft_mapped_to_init, /cloud_registered, /fast_livo/keyframe_info
         → automap_system
 
@@ -20,8 +19,15 @@ AutoMap-Pro: Composable Node 启动文件
 """
 
 import os
+import sys
 import yaml
 import tempfile
+
+# 与 offline/online launch 一致：从 sensor + fast_livo 合并生成 params，话题唯一来自 sensor
+_launch_dir = os.path.dirname(os.path.abspath(__file__))
+if _launch_dir not in sys.path:
+    sys.path.insert(0, _launch_dir)
+from params_from_system_config import get_fast_livo2_params
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
@@ -35,12 +41,11 @@ from launch_ros.descriptions import ComposableNode
 from launch_ros.substitutions import FindPackageShare
 
 
-# ── OpaqueFunction：从 system_config.yaml 生成 fast_livo ROS2 params ──────────
+# ── OpaqueFunction：从 system_config 合并 sensor + fast_livo 生成 fast_livo ROS2 params ──
 def _setup_fast_livo(context, *args, **kwargs):
     """
-    在 launch 时读取 system_config.yaml 的 fast_livo: 节，
-    转换为 ROS2 --params-file 格式并写入临时文件，
-    返回 fastlivo_mapping 的 ExecuteProcess action。
+    在 launch 时读取 system_config，用 get_fast_livo2_params 合并 sensor 与 fast_livo，
+    话题（lid_topic/imu_topic/img_topic）唯一来自 sensor: 节，写入临时 params 文件。
     """
     config_file = LaunchConfiguration('config').perform(context)
 
@@ -49,22 +54,24 @@ def _setup_fast_livo(context, *args, **kwargs):
         raise FileNotFoundError(
             f"[automap_composable] config file not found: {config_file}")
 
-    with open(config_file, 'r') as f:
+    with open(config_file, 'r', encoding='utf-8') as f:
         cfg = yaml.safe_load(f)
+    if not cfg:
+        raise RuntimeError(f"[automap_composable] config empty or invalid: {config_file}")
 
-    fl_params = cfg.get('fast_livo')
-    if not fl_params:
+    if not cfg.get('fast_livo') and not (cfg.get('frontend') or {}).get('fast_livo2'):
         raise RuntimeError(
-            f"[automap_composable] 'fast_livo:' section missing in {config_file}. "
-            "All fast_livo parameters must be defined under 'fast_livo:' key.")
+            f"[automap_composable] 'fast_livo:' (or frontend.fast_livo2) missing in {config_file}. "
+            "Required for extrin_calib, preprocess, etc.")
+
+    # 话题唯一来自 sensor: 节，与 offline/online launch 一致
+    fl_params = get_fast_livo2_params(cfg)
 
     # ── 生成 ROS2 /**:ros__parameters: YAML ─────────────────────────────────
-    # 手动写顶层 "/**:" 避免 PyYAML 将 * 字符引号化导致 rcl 解析失败
     tmp_path = f'/tmp/automap_fl_params_{os.getpid()}.yaml'
-    with open(tmp_path, 'w') as f:
+    with open(tmp_path, 'w', encoding='utf-8') as f:
         f.write('/**:\n')
         f.write('  ros__parameters:\n')
-        # 将 fast_livo: 节的内容缩进 4 空格写入
         inner = yaml.dump(fl_params,
                           default_flow_style=False,
                           allow_unicode=True,
@@ -157,15 +164,25 @@ def generate_launch_description():
         parameters=[{'config_file': config, 'use_sim_time': use_sim_time}],
     )
 
-    # ── RViz2（可选）──────────────────────────────────────────────────────
-    rviz_config = PathJoinSubstitution([
-        FindPackageShare('automap_pro'), 'rviz', 'automap.rviz'])
-    rviz_node = Node(
+    # ── RViz2（可选）：前端 / 后端各一个窗口 ─────────────────────────────────
+    rviz_frontend_config = PathJoinSubstitution([
+        FindPackageShare('automap_pro'), 'rviz', 'automap_frontend.rviz'])
+    rviz_backend_config = PathJoinSubstitution([
+        FindPackageShare('automap_pro'), 'rviz', 'automap_backend.rviz'])
+    rviz_frontend_node = Node(
         condition=IfCondition(use_rviz),
         package='rviz2',
         executable='rviz2',
-        name='rviz2',
-        arguments=['-d', rviz_config],
+        name='rviz_frontend',
+        arguments=['-d', rviz_frontend_config],
+        output='screen',
+    )
+    rviz_backend_node = Node(
+        condition=IfCondition(use_rviz),
+        package='rviz2',
+        executable='rviz2',
+        name='rviz_backend',
+        arguments=['-d', rviz_backend_config],
         output='screen',
     )
 
@@ -186,5 +203,6 @@ def generate_launch_description():
         fast_livo_action,      # OpaqueFunction: 生成临时 params 并启动 fast_livo
         composable_container,
         automap_node,
-        rviz_node,
+        rviz_frontend_node,
+        rviz_backend_node,
     ])

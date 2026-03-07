@@ -11,7 +11,7 @@ Visualization Manager:
     # ═══════════════════════════════════════════════════════════════
     - Class: rviz_default_plugins/Grid
       Enabled: true
-      Name: 地图网格
+      Name: map grid
       Normal Cell Count: 0
       Offset:
         X: 0
@@ -24,7 +24,7 @@ Visualization Manager:
     - Class: rviz_default_plugins/Axes
       Enabled: true
       Length: 3
-      Name: 地图坐标系
+      Name: map frame
       Radius: 0.15
       Reference Frame: <Fixed Frame>
     - Class: rviz_default_plugins/TF
@@ -44,18 +44,21 @@ Visualization Manager:
 
     # ═══════════════════════════════════════════════════════════════
     # 2. 整个地图点云（Global Map Point Cloud）
+    # 优化：更大点尺寸、按强度/高度着色、更大缓冲，提升清晰度
     # ═══════════════════════════════════════════════════════════════
-    - Alpha: 0.9
+    - Alpha: 0.95
       Autocompute Value Bounds: true
+      Axis: Z
       Class: rviz_default_plugins/PointCloud2
       Color: 120; 200; 120
+      Color Transformer: Intensity
       Decay Time: 0
       Enabled: true
-      Name: 全局地图点云
-      Size (m): 0.025
+      Name: global map Point cloud
+      Size (m): 0.045
       Topic:
-        Depth: 5
-        Reliability Policy: Best Effort
+        Depth: 30
+        Reliability Policy: Reliable
         Value: /automap/global_map
       Use Fixed Frame: true
 
@@ -68,7 +71,7 @@ Visualization Manager:
       Color: 41; 171; 239
       Decay Time: 0.3
       Enabled: true
-      Name: 当前帧点云(automap)
+      Name: curr cloud
       Size (m): 0.02
       Topic:
         Depth: 5
@@ -81,7 +84,7 @@ Visualization Manager:
       Color: 239; 80; 80
       Decay Time: 0.2
       Enabled: true
-      Name: 当前帧点云(前端LIO)
+      Name: front LIO cloud
       Size (m): 0.015
       Topic:
         Depth: 5
@@ -96,7 +99,7 @@ Visualization Manager:
       Class: rviz_default_plugins/Path
       Color: 255; 165; 0
       Enabled: true
-      Name: 前端轨迹(path)
+      Name: front path
       Topic:
         Depth: 5
         Reliability Policy: Reliable
@@ -106,7 +109,7 @@ Visualization Manager:
       Class: rviz_default_plugins/Path
       Color: 255; 200; 50
       Enabled: true
-      Name: 里程计轨迹(odom)
+      Name: odom path
       Topic:
         Depth: 5
         Reliability Policy: Reliable
@@ -116,7 +119,7 @@ Visualization Manager:
       Class: rviz_default_plugins/Path
       Color: 0; 255; 100
       Enabled: true
-      Name: 优化后轨迹(optimized)
+      Name: optimized odom path
       Topic:
         Depth: 5
         Reliability Policy: Reliable
@@ -124,7 +127,7 @@ Visualization Manager:
       Use Fixed Frame: true
     - Class: rviz_default_plugins/PoseArray
       Enabled: true
-      Name: 关键帧位姿
+      Name: keyframe_poses
       Topic:
         Depth: 5
         Reliability Policy: Reliable
@@ -136,9 +139,9 @@ Visualization Manager:
     # ═══════════════════════════════════════════════════════════════
     - Class: rviz_default_plugins/MarkerArray
       Enabled: true
-      Name: 回环约束
+      Name: loop constraints
       Topic:
-        Depth: 5
+        Depth: 10
         Reliability Policy: Reliable
         Value: /automap/loop_markers
       Use Fixed Frame: true
@@ -148,7 +151,7 @@ Visualization Manager:
       Color: 255; 100; 255
       Decay Time: 0
       Enabled: true
-      Name: 回环候选点云
+      Name: loop_candidate_cloud
       Size (m): 0.02
       Topic:
         Depth: 5
@@ -161,9 +164,9 @@ Visualization Manager:
     # ═══════════════════════════════════════════════════════════════
     - Class: rviz_default_plugins/MarkerArray
       Enabled: true
-      Name: GPS约束/标记
+      Name: GPS Constraints / Marker
       Topic:
-        Depth: 5
+        Depth: 10
         Reliability Policy: Reliable
         Value: /automap/gps_markers
       Use Fixed Frame: true
@@ -179,7 +182,7 @@ Visualization Manager:
       Class: rviz_default_plugins/Path
       Color: 100; 200; 255
       Enabled: true
-      Name: GPS原始轨迹
+      Name: GPS origin path
       Topic:
         Depth: 5
         Reliability Policy: Reliable
@@ -189,7 +192,7 @@ Visualization Manager:
       Class: rviz_default_plugins/Path
       Color: 50; 255; 200
       Enabled: true
-      Name: GPS对齐轨迹
+      Name: GPS aligned_path
       Topic:
         Depth: 5
         Reliability Policy: Reliable
@@ -197,9 +200,9 @@ Visualization Manager:
       Use Fixed Frame: true
     - Class: rviz_default_plugins/MarkerArray
       Enabled: true
-      Name: 真实GPS位置(地图系)
+      Name: true GPS postitions
       Topic:
-        Depth: 5
+        Depth: 10
         Reliability Policy: Reliable
         Value: /automap/gps_positions_map
       Use Fixed Frame: true
@@ -217,7 +220,7 @@ Visualization Manager:
       Use Fixed Frame: true
     - Class: rviz_default_plugins/MarkerArray
       Enabled: false
-      Name: 子图包围盒
+      Name: submap_bboxes
       Topic:
         Depth: 5
         Reliability Policy: Reliable
@@ -225,7 +228,7 @@ Visualization Manager:
       Use Fixed Frame: true
     - Class: rviz_default_plugins/MarkerArray
       Enabled: false
-      Name: 子图图
+      Name: submap
       Topic:
         Depth: 5
         Reliability Policy: Reliable
@@ -233,7 +236,7 @@ Visualization Manager:
       Use Fixed Frame: true
     - Class: rviz_default_plugins/MarkerArray
       Enabled: false
-      Name: 坐标轴(后端)
+      Name: cooordinate_backend
       Topic:
         Depth: 5
         Reliability Policy: Reliable
@@ -241,7 +244,7 @@ Visualization Manager:
       Use Fixed Frame: true
     - Class: rviz_default_plugins/MarkerArray
       Enabled: false
-      Name: 协方差椭圆
+      Name: covariance_ellipses
       Topic:
         Depth: 5
         Reliability Policy: Reliable
@@ -249,7 +252,7 @@ Visualization Manager:
       Use Fixed Frame: true
     - Class: rviz_default_plugins/MarkerArray
       Enabled: false
-      Name: 因子图
+      Name: factor_graph
       Topic:
         Depth: 5
         Reliability Policy: Reliable
@@ -257,7 +260,7 @@ Visualization Manager:
       Use Fixed Frame: true
     - Class: rviz_default_plugins/MarkerArray
       Enabled: false
-      Name: HBA结果
+      Name: hba_result
       Topic:
         Depth: 5
         Reliability Policy: Reliable
@@ -268,7 +271,7 @@ Visualization Manager:
       Class: rviz_default_plugins/PointCloud2
       Decay Time: 0
       Enabled: false
-      Name: 彩色点云
+      Name: colored_cloud
       Size (m): 0.02
       Topic:
         Depth: 5

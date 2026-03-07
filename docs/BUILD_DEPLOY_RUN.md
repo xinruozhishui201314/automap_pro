@@ -1,46 +1,44 @@
 # AutoMap-Pro 编译/部署/运行说明
 
-> 重构约定：**automap_start.sh** 为推荐入口；唯一配置 `system_config.yaml`；Docker 镜像 `automap-env:humble`；工作空间 `automap_ws`。
+> **主入口**：**run_automap.sh**（支持 --offline/--config/--bag-file/--bag-rate/--gdb）。可选：automap_start.sh。唯一主配置 `system_config.yaml`；Docker 镜像 `automap-env:humble`；工作空间 `automap_ws`。
 
 ---
 
 ## 0. Executive Summary
 
-- **推荐入口**：仓库根目录执行 `bash automap_start.sh`，一键完成编译（容器内）与运行（bag 播放 + 建图 + RViz2）。
-- **唯一配置**：`automap_pro/config/system_config.yaml`，overlap_transformer / HBA / fast-livo2 参数均由此文件或由其生成的参数文件提供。
-- **Launch**：入口为 `automap_pro/launch/automap_composable.launch.py`（Composable 零拷贝）或 offline/online；`automap_start.sh` 默认调用 composable。
-- **路径**：宿主机 `automap_ws/`、`automap_pro/`、`data/`、`logs/`、`output/`；容器内 `/workspace/automap_ws`、`/workspace/data`、`/workspace/logs`、`/workspace/output`；源码由宿主机 `automap_pro/` 等挂载到容器 `automap_ws/src/`。
-- **日志**：统一写入宿主机 `logs/automap_YYYYMMDD_HHMMSS/`，容器内 `AUTOMAP_LOG_DIR=/workspace/logs`。
-- **前端**：默认 Fast-LIVO2（Composable 或独立进程），由 `system_config.yaml` 与 launch 参数控制。
+- **推荐入口**：仓库根目录执行 `bash run_automap.sh`（或 `bash run_automap.sh --offline --bag-file <path> --config <yaml>`），一键完成编译（容器内）与运行（离线/在线 + 建图 + RViz2）。
+- **主配置**：`automap_pro/config/system_config.yaml`，可通过 `--config` 指定其它（如 `system_config_M2DGR.yaml`）；overlap_transformer / HBA / fast-livo2 参数均由此或由其生成。
+- **Launch**：离线为 `automap_offline.launch.py`，在线为 `automap_online.launch.py`；由 `run_automap.sh` 根据模式选择。
+- **路径（run_automap.sh）**：宿主机 `automap_ws/`、`automap_pro/`、`data/`、`logs/`；建图输出由配置 `system.output_dir` 决定（默认 `/data/automap_output`，容器内挂载为 `data/automap_output`）。日志：宿主机 `logs/`（automap.log、build.log、full.log），容器内运行日志 tee 到 `/root/run_logs/full.log` 挂载回宿主机。
+- **前端**：默认 Fast-LIVO2，由 `system_config.yaml` 与 launch 参数 `use_external_frontend` 控制。
 
 ---
 
-## 1. 工程目录约定（重构后）
+## 1. 工程目录约定
 
 | 路径 | 说明 |
 |------|------|
-| `automap_start.sh` | **推荐入口**：一键编译 & 运行 |
-| `automap_ws/` | ROS2 工作空间（build/install/log 在此；Docker 挂载） |
+| `run_automap.sh` | **主入口**：一键编译 & 运行（--offline/--config/--bag-file/--bag-rate/--gdb） |
+| `automap_start.sh` | 可选入口：简化 build/run（默认 nya_02_ros2） |
+| `automap_ws/` | ROS2 工作空间（build/install 在此；Docker 挂载） |
 | `automap_pro/` | 主包源码（挂载到容器内 `automap_ws/src/automap_pro`） |
-| `automap_pro/config/system_config.yaml` | 唯一系统主配置 |
-| `automap_pro/launch/` | automap_composable / offline / online / visualization |
-| `data/` | 输入 bag 与数据集 |
-| `logs/` | 运行日志（每次运行子目录 `automap_YYYYMMDD_HHMMSS`） |
-| `output/` | 建图输出 |
+| `automap_pro/config/system_config.yaml` | 系统主配置（可 --config 指定其它 yaml） |
+| `automap_pro/launch/` | automap_offline / automap_online |
+| `data/` | 输入 bag 与数据集；建图输出默认 `data/automap_output/` |
+| `logs/` | 运行日志（automap.log、build.log、full.log；可用 --log-dir 覆盖） |
 | `docker/` | 镜像与 Dockerfile（`automap-env:humble`） |
-| `scripts/` | 辅助脚本（如 GitHub 上传、验证） |
+| `scripts/` | 辅助脚本（Bag 修复、诊断、验证等） |
 
-### 1.1 容器内路径（automap_start.sh）
+### 1.1 容器内路径（run_automap.sh）
 
 | 容器内路径 | 宿主机路径 |
 |------------|------------|
-| `/workspace/automap_ws` | `automap_ws/` |
-| `/workspace/data/bag` | `data/automap_input/nya_02_slam_imu_to_lidar/nya_02_ros2/`（bag 所在目录） |
-| `/workspace/logs` | `logs/automap_YYYYMMDD_HHMMSS/` |
-| `/workspace/output` | `output/` |
-| `/workspace/automap_ws/src/automap_pro` | `automap_pro/` |
-| `/workspace/automap_ws/src/fast_livo` | `automap_pro/src/modular/fast-livo2-humble` |
-| `/workspace/automap_ws/src/hba` | `automap_pro/src/modular/HBA-main/HBA_ROS2`（或 HBA-main） |
+| `/root/automap_ws` | `automap_ws/` |
+| `/root/automap_ws/src/automap_pro` | `automap_pro/` |
+| `/data` | `data/`（含 bag 与 automap_output） |
+| `/root/run_logs` | `logs/`（或 --log-dir 指定；full.log） |
+| `/root/automap_ws/src/fast_livo` | 来自 `automap_pro/src/modular/fast-livo2-humble` 或仓库根 |
+| `/root/automap_ws/src/hba` | 来自 `HBA-main/HBA_ROS2`（脚本链入） |
 
 ---
 
@@ -55,14 +53,17 @@
 
 ## 3. 构建
 
-### 3.1 使用 automap_start.sh（推荐）
+### 3.1 使用 run_automap.sh（推荐）
 
 ```bash
-# 在仓库根目录
-bash automap_start.sh --build
+# 在仓库根目录：仅编译
+bash run_automap.sh --build-only
+
+# 清理后重新编译
+bash run_automap.sh --build-only --clean
 ```
 
-在容器内执行：source ROS2、colcon build、产物在挂载的 `automap_ws/build` 与 `automap_ws/install`。
+在容器内执行：source ROS2、链入依赖、colcon build（overlap_transformer_msgs → overlap_transformer_ros2 → hba → TEASER++ → fast_livo → automap_pro），产物在挂载的 `automap_ws/build` 与 `automap_ws/install`。
 
 ### 3.2 宿主机本地构建
 
@@ -77,20 +78,23 @@ source install/setup.bash
 
 ## 4. 运行
 
-### 4.1 使用 automap_start.sh（推荐）
+### 4.1 使用 run_automap.sh（推荐）
 
 ```bash
-# 一键编译 + 运行
-bash automap_start.sh
+# 一键编译 + 运行（在线）
+bash run_automap.sh
 
 # 仅运行（须先编译）
-bash automap_start.sh --run
+bash run_automap.sh --run-only
 
-# 指定 bag、不启 RViz
-bash automap_start.sh --run --bag /path/to/xxx.db3 --no-rviz
+# 离线回放 + 指定 bag 与配置
+bash run_automap.sh --offline --bag-file data/automap_input/M2DGR/street_03_ros2 --config system_config_M2DGR.yaml --bag-rate 0.5
+
+# 不启 RViz
+bash run_automap.sh --offline --bag-file <path> --no-rviz
 ```
 
-脚本会：挂载 volume、启动容器、播放 bag、执行 `ros2 launch automap_pro automap_composable.launch.py config:=... use_rviz:=true/false`。
+脚本会：挂载 volume、启动容器、离线时播放 bag、执行 `ros2 launch automap_pro automap_offline.launch.py`（或 online）并传入 config、bag_file、rate、use_rviz 等。
 
 ### 4.2 直接调用 launch（宿主机或容器内）
 

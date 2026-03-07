@@ -2,6 +2,7 @@
 #include "automap_pro/core/logger.h"
 #include "automap_pro/core/error_code.h"
 #include "automap_pro/core/error_monitor.h"
+#include <rclcpp/rclcpp.hpp>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
@@ -32,21 +33,25 @@ void ConfigManager::load(const std::string& yaml_path) {
     } catch (const YAML::BadFile& e) {
         std::string err = fmt::format("YAML bad file '{}': {}", yaml_path, e.what());
         ALOG_ERROR("ConfigManager", "{}", err);
+        RCLCPP_ERROR(rclcpp::get_logger("automap_system"), "[ConfigManager][EXCEPTION] %s", err.c_str());
         ErrorMonitor::instance().recordError(ErrorDetail(errors::CONFIG_LOAD_FAILED, err));
         throw std::runtime_error(err);
     } catch (const YAML::ParserException& e) {
         std::string err = fmt::format("YAML parse error in '{}': {}", yaml_path, e.what());
         ALOG_ERROR("ConfigManager", "{}", err);
+        RCLCPP_ERROR(rclcpp::get_logger("automap_system"), "[ConfigManager][EXCEPTION] %s", err.c_str());
         ErrorMonitor::instance().recordError(ErrorDetail(errors::CONFIG_PARSE_ERROR, err));
         throw std::runtime_error(err);
     } catch (const YAML::Exception& e) {
         std::string err = fmt::format("YAML exception loading '{}': {}", yaml_path, e.what());
         ALOG_ERROR("ConfigManager", "{}", err);
+        RCLCPP_ERROR(rclcpp::get_logger("automap_system"), "[ConfigManager][EXCEPTION] %s", err.c_str());
         ErrorMonitor::instance().recordError(ErrorDetail(errors::CONFIG_LOAD_FAILED, err));
         throw std::runtime_error(err);
     } catch (const std::exception& e) {
         std::string err = fmt::format("Failed to load config '{}': {}", yaml_path, e.what());
         ALOG_ERROR("ConfigManager", "{}", err);
+        RCLCPP_ERROR(rclcpp::get_logger("automap_system"), "[ConfigManager][EXCEPTION] %s", err.c_str());
         ErrorMonitor::instance().recordException(e, errors::CONFIG_LOAD_FAILED);
         throw;
     }
@@ -99,9 +104,11 @@ std::vector<std::string> ConfigManager::previousSessionDirs() const {
         }
     } catch (const YAML::Exception& e) {
         ALOG_WARN("ConfigManager", "Failed to read previous_session_dirs: {}", e.what());
+        RCLCPP_WARN(rclcpp::get_logger("automap_system"), "[ConfigManager][EXCEPTION] previous_session_dirs: %s", e.what());
         ErrorMonitor::instance().recordError(ErrorDetail(errors::CONFIG_PARSE_ERROR, std::string("previous_session_dirs: ") + e.what()));
     } catch (const std::exception& e) {
         ALOG_WARN("ConfigManager", "Exception reading previous_session_dirs: {}", e.what());
+        RCLCPP_WARN(rclcpp::get_logger("automap_system"), "[ConfigManager][EXCEPTION] previous_session_dirs: %s", e.what());
         ErrorMonitor::instance().recordException(e, errors::CONFIG_KEY_NOT_FOUND);
     }
     return dirs;

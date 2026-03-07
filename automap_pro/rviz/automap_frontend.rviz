@@ -1,0 +1,87 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+  - Class: rviz_common/Views
+    Name: Views
+Visualization Manager:
+  Class: ""
+  Displays:
+    # ═══════════════════════════════════════════════════════════════
+    # 前端 RViz：仅显示 LIO/前端信息（轨迹、点云、TF）
+    # ═══════════════════════════════════════════════════════════════
+    - Class: rviz_default_plugins/Grid
+      Enabled: true
+      Name: map grid
+      Normal Cell Count: 0
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Plane: XY
+      Plane Cell Count: 50
+      Reference Frame: <Fixed Frame>
+      Value: true
+    - Class: rviz_default_plugins/Axes
+      Enabled: true
+      Length: 3
+      Name: map frame
+      Radius: 0.15
+      Reference Frame: <Fixed Frame>
+    - Class: rviz_default_plugins/TF
+      Enabled: true
+      Frame Timeout: 15
+      Frames:
+        All Enabled: true
+      Marker Scale: 0.5
+      Name: TF
+      Show Arrows: true
+      Show Axes: true
+      Show Names: true
+      Tree:
+        {}
+      Update Interval: 0
+      Value: true
+
+    # 前端 LIO 点云（fast_livo 输出）
+    - Alpha: 1
+      Autocompute Value Bounds: true
+      Class: rviz_default_plugins/PointCloud2
+      Color: 239; 80; 80
+      Decay Time: 0.2
+      Enabled: true
+      Name: front LIO cloud
+      Size (m): 0.015
+      Topic:
+        Depth: 5
+        Reliability Policy: Reliable
+        Value: /cloud_registered
+      Use Fixed Frame: true
+
+    # 前端 LIO 轨迹（/path 由 fast_livo 发布）
+    - Alpha: 1
+      Class: rviz_default_plugins/Path
+      Color: 255; 165; 0
+      Enabled: true
+      Name: front path
+      Topic:
+        Depth: 5
+        Reliability Policy: Reliable
+        Value: /path
+      Use Fixed Frame: true
+  Global Options:
+    Background Color: 48; 48; 48
+    Fixed Frame: map
+  Name: ""
+  Tools:
+    - Class: rviz_default_plugins/Interact
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/Select
+  Value: true
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Distance: 80
+      Name: Current View
+      Pitch: 0.4
+      Yaw: 0.6
+    Saved: ~

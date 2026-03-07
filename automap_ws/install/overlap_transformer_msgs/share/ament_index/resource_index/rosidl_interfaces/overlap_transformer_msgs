@@ -1,4 +1,0 @@
-srv/ComputeDescriptor.idl
-srv/ComputeDescriptor.srv
-srv/ComputeDescriptor_Request.msg
-srv/ComputeDescriptor_Response.msg

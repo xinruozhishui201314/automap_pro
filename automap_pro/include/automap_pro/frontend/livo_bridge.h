@@ -63,7 +63,9 @@ public:
     bool isConnected()   const { return connected_.load(); }
     int  odomCount()     const { return odom_count_.load(); }
     int  cloudCount()    const { return cloud_count_.load(); }
+    int  emptyCloudCount() const { return empty_cloud_count_.load(); }
     double lastOdomTs()  const { std::lock_guard<std::mutex> lk(mutex_); return last_odom_ts_; }
+    double lastCloudTs() const { std::lock_guard<std::mutex> lk(mutex_); return last_cloud_ts_; }
 
 private:
     rclcpp::Node::SharedPtr node_;
@@ -77,7 +79,9 @@ private:
     std::atomic<bool>  connected_{false};
     std::atomic<int>   odom_count_{0};
     std::atomic<int>   cloud_count_{0};
+    std::atomic<int>   empty_cloud_count_{0};
     double             last_odom_ts_ = 0.0;
+    double             last_cloud_ts_ = 0.0;
 
     std::vector<OdomCallback>   odom_cbs_;
     std::vector<CloudCallback>  cloud_cbs_;

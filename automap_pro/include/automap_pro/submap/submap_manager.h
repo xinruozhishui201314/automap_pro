@@ -78,7 +78,7 @@ public:
     // ── 全局点云构建 ──────────────────────────────────────────────────────
 
     /** 构建全局合并点云（使用优化后位姿） */
-    CloudXYZIPtr buildGlobalMap(float voxel_size = 0.1f) const;
+    CloudXYZIPtr buildGlobalMap(float voxel_size = 0.2f) const;
 
     /** 更新子图的 GPS 重力中心 */
     void updateGPSGravityCenter(const KeyFrame::Ptr& kf);
@@ -102,7 +102,7 @@ private:
     
     // 常用分辨率
     static constexpr float RES_MATCH = 0.4f;
-    static constexpr float RES_MERGE = 0.1f;
+    static constexpr float RES_MERGE = 0.2f;
     
     // 获取缓存的 VoxelGrid 对象（const 版本供 mergeCloudToSubmap 使用）
     pcl::VoxelGrid<pcl::PointXYZI>* getVoxelGrid(float leaf_size) const {
@@ -144,7 +144,7 @@ private:
     double max_spatial_  = 100.0;   // 米
     double max_temporal_ = 60.0;    // 秒
     double match_res_    = 0.4;     // 降采样分辨率（用于回环匹配）
-    double merge_res_    = 0.1;     // 降采样分辨率（合并地图）
+    double merge_res_    = 0.2;     // 降采样分辨率（合并地图，至少 0.2 避免 PCL 溢出）
 
     rclcpp::Node::SharedPtr node_;
     rclcpp::Publisher<automap_pro::msg::SubMapEventMsg>::SharedPtr event_pub_;
@@ -153,7 +153,10 @@ private:
 
     // ── 私有方法 ──────────────────────────────────────────────────────────
     SubMap::Ptr createNewSubmap(const KeyFrame::Ptr& first_kf);
+    /** 无参版本仅用于兼容；实际冻结请用传入 submap 的版本，且须在未持 mutex_ 时调用，避免回调内 getFrozenSubmaps 死锁 */
     void        freezeActiveSubmap();
+    /** 对指定子图执行冻结并触发回调；调用方不得持有 mutex_（回调中会调用 getFrozenSubmaps） */
+    void        freezeActiveSubmap(const SubMap::Ptr& sm);
     bool        isFull(const SubMap::Ptr& sm) const;
     void        mergeCloudToSubmap(SubMap::Ptr& sm, const KeyFrame::Ptr& kf) const;
     void        publishEvent(const SubMap::Ptr& sm, const std::string& event);

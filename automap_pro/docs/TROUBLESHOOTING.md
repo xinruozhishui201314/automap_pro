@@ -246,6 +246,27 @@ docker exec <container_id> tail -f /root/.ros/log/*/*/automap_system.log
 
 ---
 
+### 问题 B3：Fast-LIVO 刷屏 `IMU and LiDAR not synced! delta time: 0.5~0.6`
+
+**现象**：
+```
+[laserMapping]: IMU and LiDAR not synced! delta time: 0.616468 .
+[laserMapping]: last_timestamp_lidar: 1628249941.730370, timestamp: 1628249941.113902
+```
+即 LiDAR 时间戳领先 IMU 约 0.5s 以上，告警持续刷屏。
+
+**原因**：
+1. **Bag 回放过快**：若 `rate` > 1.0，数据按时间戳间隔被压缩播放，LiDAR 帧先到、IMU 尚未“跟上”，触发同步检查。
+2. **数据集时间基准不一致**：录制时 LiDAR 与 IMU 使用不同时钟（如 LiDAR 为扫描结束时间、IMU 为采样时间），导致同一时刻两者 header.stamp 相差约 0.5s。
+
+**处理（按顺序尝试）**：
+1. **按传感器正常频率回放**：确保使用 `--rate 1.0`（实时）或 `--bag-rate 0.5`（半速），避免“读得太快”。
+   - 示例：`run_automap.sh --offline --bag-file <path> --config system_config_M2DGR.yaml --bag-rate 1.0`
+2. **对齐 LiDAR/IMU 时间（推荐用于 M2DGR 等已知不同步数据集）**：在对应 `system_config_*.yaml` 的 `fast_livo.common` 中设置 `ros_driver_bug_fix: true`，算法会将 IMU 时间对齐到 LiDAR，告警消失且 LIO 正常解算。
+3. 若仍异常，检查 bag 内 `/velodyne_points` 与 IMU 话题的 `header.stamp` 是否同源、是否有固定偏移。
+
+---
+
 ### 问题 C：RViz 界面无显示（点云/轨迹都不见）
 
 **现象**：RViz 能启动，但 3D 视图里没有点云、路径或任何内容；或状态栏提示 “No transform from [camera_init] to [map]”。
@@ -269,14 +290,22 @@ docker exec <container_id> tail -f /root/.ros/log/*/*/automap_system.log
 
 ---
 
-### 问题 C2：pcl::VoxelGrid::applyFilter — Leaf size is too small
+### 问题 C2：pcl::VoxelGrid::applyFilter — Leaf size is too small / automap_system 崩溃 (exit code -11)
 
-**现象**：fast_livo 日志中反复出现：
-```
-[pcl::VoxelGrid::applyFilter] Leaf size is too small for the input dataset. Integer indices would overflow.
-```
+**现象**：
+- 日志出现：`[pcl::VoxelGrid::applyFilter] Leaf size is too small for the input dataset. Integer indices would overflow.`
+- 随后 `automap_system_node` 可能崩溃 (SIGSEGV, exit code -11)。
 
-**说明**：PCL 体素滤波的 leaf size 过小，导致索引溢出警告；当前不影响 LIO 主流程（点云仍会下采样或跳过该步）。若需消除警告，可在 `system_config` 中适当调大 Fast-LIVO 的体素/降采样相关参数（如 `preprocess` 中的 leaf size），或升级/打补丁 PCL 以使用更大整数范围。
+**原因**：PCL 的 VoxelGrid 使用 int 作为体素网格索引，当点云范围大且 leaf size 过小时，(max-min)/leaf_size 超过整数范围会导致溢出并可能崩溃。
+
+**已做修复**（源码）：
+- **utils**：`voxelDownsample` 在调用 PCL 前做溢出检查。PCL 内部检查 `(dx*dy*dz) > INT_MAX` 会告警并返回原云；单轴过大仍可能导致后续线性索引溢出与 SIGSEGV。因此将单轴上限设为 `kMaxVoxelAxisIndex=1290`（约 INT_MAX 的立方根），保证 `dx*dy*dz <= INT_MAX`，超限时自动放大 leaf 或返回无体素滤波的副本，避免触发 PCL 告警与崩溃。
+- **SubMapManager**：子图冻结、合并前后的体素降采样均改为调用 `utils::voxelDownsample`，不再直接使用 `pcl::VoxelGrid`，从而避免未校验的大范围点云触发崩溃。
+- **RvizPublisher**：全局地图发布时的二次降采样也统一走 `utils::voxelDownsample`。
+
+若仍出现该警告（例如来自 fast_livo 前端），可在 `system_config` 中适当调大 Fast-LIVO 的体素/降采样相关参数；automap 后端建图与发布路径已防护。
+
+**精准定位崩溃位置**：根据终端最后一条 `[AutoMapSystem][MAP]` / `[Utils] [MAP]` 日志可判断崩溃阶段；小点云（≤25 万点）已自动走单次体素滤波避免分块循环内 SIGSEGV。详见 **[LOGGING_AND_DIAGNOSIS.md](LOGGING_AND_DIAGNOSIS.md)**；配合 `--gdb` 或 core dump 可得到完整 backtrace，见 [DEBUG_WITH_GDB.md](DEBUG_WITH_GDB.md)。
 
 ---
 

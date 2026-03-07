@@ -1,4 +1,5 @@
 #pragma once
+#include <algorithm>
 #include <string>
 #include <yaml-cpp/yaml.h>
 #include <Eigen/Dense>
@@ -19,6 +20,10 @@ public:
     std::string systemName()    const { return get<std::string>("system.name",    "AutoMap-Pro"); }
     std::string outputDir()     const { return get<std::string>("system.output_dir", "/data/automap_output"); }
     int         numThreads()    const { return get<int>("system.num_threads", 8); }
+    /** 传感器数据空闲超过该秒数且队列已空时，触发最终处理并结束建图（需同时开启 auto_finish_on_sensor_idle） */
+    double      sensorIdleTimeoutSec() const { return std::max(1.0, get<double>("system.sensor_idle_timeout_sec", 10.0)); }
+    /** 是否在传感器空闲超时后自动执行最终 HBA、导出地图并结束建图 */
+    bool        autoFinishOnSensorIdle() const { return get<bool>("system.auto_finish_on_sensor_idle", true); }
 
     // ── 传感器（ROS2 话题默认从配置文件 sensor: 节读取）────────────────────────
     std::string lidarTopic()    const { return get<std::string>("sensor.lidar.topic", "/os1_cloud_node1/points"); }
@@ -33,19 +38,27 @@ public:
     std::string fastLivoCloudTopic() const { return get<std::string>("frontend.cloud_topic", "/cloud_registered"); }
     std::string fastLivoKFInfoTopic()const { return get<std::string>("frontend.kf_info_topic", "/fast_livo/keyframe_info"); }
     bool        useComposableNode()  const { return get<bool>("frontend.use_composable_node", true); }
+    /** 前端发布的点云坐标系：body=雷达/body 系，需用 T_w_b 变换到世界；world=camera_init/世界系（fast_livo 默认），需先转 body 再建图，否则会双重变换导致全局图错乱 */
+    std::string frontendCloudFrame() const { return get<std::string>("frontend.cloud_frame", "world"); }
 
     // ── 关键帧 ────────────────────────────────────────────
     double kfMinTranslation()   const { return get<double>("keyframe.min_translation", 1.0); }
     double kfMinRotationDeg()   const { return get<double>("keyframe.min_rotation_deg", 10.0); }
     double kfMaxInterval()      const { return get<double>("keyframe.max_interval", 2.0); }
     double kfMaxEsikfCovNorm()  const { return get<double>("keyframe.max_esikf_cov_norm", 1e3); }
+    /** P1 修复：是否保留关键帧点云（若 false 则定期删除以节省内存，但 buildGlobalMap 会回退） */
+    bool   retainCloudBody()    const { return get<bool>("keyframe.retain_cloud_body", true); }
+    /** 是否允许子图归档时删除关键帧点云（不推荐，会导致回退到 merged_cloud） */
+    bool   allowCloudArchival() const { return get<bool>("keyframe.allow_cloud_archival", false); }
+    /** 关键帧内存上限（MB，诊断参考） */
+    int    maxKeyframeMemoryMb()const { return get<int>("keyframe.max_memory_mb", 4096); }
 
     // ── 子图 ──────────────────────────────────────────────
     int    submapMaxKF()        const { return get<int>("submap.max_keyframes", 100); }
     double submapMaxSpatial()   const { return get<double>("submap.max_spatial_m", 100.0); }
     double submapMaxTemporal()  const { return get<double>("submap.max_temporal_s", 60.0); }
-    double submapMatchRes()     const { return get<double>("submap.match_resolution", 0.4); }
-    double submapMergeRes()     const { return get<double>("submap.merge_resolution", 0.1); }
+    double submapMatchRes()     const { return std::max(0.2, get<double>("submap.match_resolution", 0.4)); }
+    double submapMergeRes()     const { return std::max(0.2, get<double>("submap.merge_resolution", 0.2)); }
 
     // ── GPS 延迟对齐 ──────────────────────────────────────
     int    gpsAlignMinPoints()  const { return get<int>("gps.align_min_points", 50); }
@@ -90,7 +103,7 @@ public:
     // ── TEASER++ ──────────────────────────────────────────
     double teaserNoiseBound()   const { return get<double>("loop_closure.teaser.noise_bound", 0.1); }
     double teaserCbar2()        const { return get<double>("loop_closure.teaser.cbar2", 1.0); }
-    double teaserVoxelSize()    const { return get<double>("loop_closure.teaser.voxel_size", 0.4); }
+    double teaserVoxelSize()    const { return std::max(0.2, get<double>("loop_closure.teaser.voxel_size", 0.4)); }
     double teaserMinInlierRatio()const{ return get<double>("loop_closure.teaser.min_inlier_ratio", 0.30); }
     double teaserMaxRMSE()      const { return get<double>("loop_closure.teaser.max_rmse_m", 0.3); }
     bool   teaserICPRefine()    const { return get<bool>("loop_closure.teaser.icp_refine", true); }
@@ -108,8 +121,13 @@ public:
     bool   hbaOnFinish()        const { return get<bool>("backend.hba.trigger_on_finish", true); }
     std::string hbaDataPath()   const { return get<std::string>("backend.hba.data_path", "/tmp/hba_data"); }
 
-    // ── 地图 ──────────────────────────────────────────────
-    double mapVoxelSize()       const { return get<double>("map.voxel_size", 0.1); }
+    // ── 地图（东北天 ENU 统一坐标系）──────────────────────────────────────
+    double mapVoxelSize()       const { return std::max(0.2, get<double>("map.voxel_size", 0.2)); }
+    /** 地图坐标系原点经纬度配置文件路径（.cfg），先创建再写入；后端统一使用该 ENU 原点 */
+    std::string mapFrameConfigPath() const {
+        std::string p = get<std::string>("map.frame_config_path", "");
+        return p.empty() ? (outputDir() + "/map_frame.cfg") : p;
+    }
     bool   mapStatisticalFilter()const{ return get<bool>("map.statistical_filter", true); }
     bool   mapStatFilter()        const { return mapStatisticalFilter(); }  // 别名，map_filter 使用
     int    mapStatFilterMeanK() const { return get<int>("map.statistical_filter_mean_k", 50); }

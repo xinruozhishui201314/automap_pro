@@ -280,6 +280,8 @@ inline constexpr const char* SUBMAPS_CREATED = "submaps_created";
 inline constexpr const char* SUBMAPS_FROZEN = "submaps_frozen";
 inline constexpr const char* KEYFRAMES_CREATED = "keyframes_created";
 inline constexpr const char* GPS_MEASUREMENTS_VALID = "gps_measurements_valid";
+// P1 修复：回退路径检测
+inline constexpr const char* FALLBACK_TO_MERGED_CLOUD = "fallback_to_merged_cloud";
 
 inline constexpr const char* OPTIMIZATIONS_RUN = "optimizations_run";
 
@@ -312,6 +314,8 @@ inline constexpr const char* LOOP_INLIER_RATIO = "loop_inlier_ratio";
 inline constexpr const char* GPS_ALIGN_SCORE = "gps_align_score";
 inline constexpr const char* ODOMETRY_QUALITY = "odometry_quality";
 inline constexpr const char* TEASER_INLIER_RATIO = "teaser_inlier_ratio";
+// P2 修复：HBA↔iSAM2 同步诊断
+inline constexpr const char* HBA_ISAM2_SEPARATION_M = "hba_isam2_separation_m";
 
 } // namespace metrics
 
@@ -568,6 +572,7 @@ private:
         registerGauge(metrics::GPS_ALIGN_SCORE, "GPS alignment score");
         registerGauge(metrics::ODOMETRY_QUALITY, "Odometry quality");
         registerGauge(metrics::TEASER_INLIER_RATIO, "TEASER++ inlier ratio");
+        registerGauge(metrics::HBA_ISAM2_SEPARATION_M, "HBA vs iSAM2 pose separation (m)");
     }
 };
 

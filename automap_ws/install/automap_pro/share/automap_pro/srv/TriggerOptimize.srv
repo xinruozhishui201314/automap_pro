@@ -1,6 +1,0 @@
-bool full_optimization
-int32 max_iterations
----
-bool success
-float64 elapsed_seconds
-int32 nodes_updated

@@ -1,1 +1,0 @@
-bool wait_for_result

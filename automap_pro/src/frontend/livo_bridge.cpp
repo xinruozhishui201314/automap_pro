@@ -11,6 +11,9 @@ namespace automap_pro {
 LivoBridge::LivoBridge() = default;
 
 void LivoBridge::init(rclcpp::Node::SharedPtr node) {
+    if (!node) {
+        throw std::invalid_argument("LivoBridge::init: node is null");
+    }
     node_ = node;
     const auto& cfg = ConfigManager::instance();
 
@@ -24,9 +27,10 @@ void LivoBridge::init(rclcpp::Node::SharedPtr node) {
         cfg.fastLivoOdomTopic(), sensor_qos,
         std::bind(&LivoBridge::onOdometry, this, std::placeholders::_1));
 
-    // 点云（中频，RELIABLE 保证不丢帧）
+    // 点云：与 fast_livo 的 publish(..., 100) 一致，RELIABLE + KeepLast(100)，避免队列满丢帧
+    auto cloud_qos = rclcpp::QoS(rclcpp::KeepLast(100)).reliable();
     cloud_sub_ = node->create_subscription<sensor_msgs::msg::PointCloud2>(
-        cfg.fastLivoCloudTopic(), reliable_qos,
+        cfg.fastLivoCloudTopic(), cloud_qos,
         std::bind(&LivoBridge::onCloud, this, std::placeholders::_1));
 
     // ESIKF 扩展信息（与里程计同频）
@@ -43,11 +47,13 @@ void LivoBridge::init(rclcpp::Node::SharedPtr node) {
 
     connected_ = true;
     RCLCPP_INFO(node->get_logger(),
-        "[LivoBridge][TOPIC] subscribe: odom=%s cloud=%s kfinfo=%s gps=%s",
+        "[LivoBridge][TOPIC] subscribe: odom=%s (SensorData) cloud=%s (RELIABLE KeepLast(100), match frontend) kfinfo=%s gps=%s",
         cfg.fastLivoOdomTopic().c_str(),
         cfg.fastLivoCloudTopic().c_str(),
         cfg.fastLivoKFInfoTopic().c_str(),
         cfg.gpsEnabled() ? cfg.gpsTopic().c_str() : "disabled");
+    RCLCPP_INFO(node->get_logger(),
+        "[LivoBridge][FLOW] fast_livo publishes odom then cloud per frame; backend triggers KF on cloud (pose=last_odom)");
 }
 
 void LivoBridge::onOdometry(const nav_msgs::msg::Odometry::SharedPtr msg) {
@@ -62,24 +68,35 @@ void LivoBridge::onOdometry(const nav_msgs::msg::Odometry::SharedPtr msg) {
     Pose3d pose = poseFromOdom(*msg);
     Mat66d cov  = covFromOdom(*msg);
 
-    if (odom_count_ == 1) {
+    const int o = odom_count_.load();
+    if (o <= 5) {
         RCLCPP_INFO(node_->get_logger(),
-            "[LivoBridge][DATA] first odom ts=%.3f pos=[%.2f,%.2f,%.2f]",
-            ts, pose.translation().x(), pose.translation().y(), pose.translation().z());
-    } else if (odom_count_.load() % 500 == 0) {
+            "[LivoBridge][DATA] odom #%d ts=%.3f pos=[%.2f,%.2f,%.2f]",
+            o, ts, pose.translation().x(), pose.translation().y(), pose.translation().z());
+    } else if (o % 500 == 0) {
         RCLCPP_INFO(node_->get_logger(),
-            "[LivoBridge][DATA] odom count=%d ts=%.3f pos=[%.2f,%.2f,%.2f]",
-            odom_count_.load(), ts, pose.translation().x(), pose.translation().y(), pose.translation().z());
+            "[LivoBridge][DATA] odom #%d ts=%.3f pos=[%.2f,%.2f,%.2f]",
+            o, ts, pose.translation().x(), pose.translation().y(), pose.translation().z());
     }
     if (odom_count_ % 100 == 0) {
         ALOG_DEBUG(MOD, "Odom#{}: ts={:.3f} t=[{:.2f},{:.2f},{:.2f}]",
                    odom_count_, ts,
                    pose.translation().x(), pose.translation().y(), pose.translation().z());
     }
-    for (auto& cb : odom_cbs_) cb(ts, pose, cov);
+    for (auto& cb : odom_cbs_) {
+        try {
+            cb(ts, pose, cov);
+        } catch (const std::exception& e) {
+            RCLCPP_ERROR(node_->get_logger(), "[LivoBridge][EXCEPTION] odom callback ts=%.3f: %s (next odom will still be delivered)", ts, e.what());
+        } catch (...) {
+            RCLCPP_ERROR(node_->get_logger(), "[LivoBridge][EXCEPTION] odom callback ts=%.3f: unknown exception", ts);
+        }
+    }
 }
 
 void LivoBridge::onCloud(const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
+    using Clock = std::chrono::steady_clock;
+    const auto recv_wall = Clock::now();
     cloud_count_++;
     double ts = msg->header.stamp.sec + 1e-9 * msg->header.stamp.nanosec;
 
@@ -87,19 +104,46 @@ void LivoBridge::onCloud(const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
     pcl::fromROSMsg(*msg, *cloud);
 
     if (cloud->empty()) {
-        RCLCPP_WARN(node_->get_logger(), "[LivoBridge][DATA] empty cloud ts=%.3f count=%d", ts, cloud_count_.load());
-        ALOG_WARN(MOD, "Empty cloud at ts={:.3f}", ts);
+        empty_cloud_count_++;
+        const int ec = empty_cloud_count_.load();
+        if (ec <= 10 || ec % 50 == 0) {
+            RCLCPP_WARN(node_->get_logger(), "[LivoBridge][DATA] empty cloud discarded #%d total_cloud_msg=%d ts=%.3f (backend will not see this frame)",
+                ec, cloud_count_.load(), ts);
+        }
+        ALOG_WARN(MOD, "Empty cloud at ts={:.3f} count={}", ts, cloud_count_.load());
         return;
     }
-    if (cloud_count_ == 1) {
-        RCLCPP_INFO(node_->get_logger(), "[LivoBridge][DATA] first cloud ts=%.3f pts=%zu", ts, cloud->size());
-    } else if (cloud_count_.load() % 100 == 0) {
-        RCLCPP_INFO(node_->get_logger(), "[LivoBridge][DATA] cloud count=%d ts=%.3f pts=%zu", cloud_count_.load(), ts, cloud->size());
+    {
+        std::lock_guard<std::mutex> lk(mutex_);
+        last_cloud_ts_ = ts;
     }
+    const int c = cloud_count_.load();
+    // 每帧都打一条，便于与 fast_livo [PUB] 对照，排查「前端发了后端没收到」
+    static auto s_last_recv_wall = recv_wall;
+    double delta_ms = 1e-6 * std::chrono::duration_cast<std::chrono::microseconds>(recv_wall - s_last_recv_wall).count();
+    s_last_recv_wall = recv_wall;
+    RCLCPP_INFO(node_->get_logger(),
+        "[LivoBridge][RECV] cloud #%d ts=%.3f pts=%zu delta_recv_ms=%.0f (if delta_recv_ms>>200 and frontend published more, executor may be busy or QoS mismatch)",
+        c, ts, cloud->size(), c > 1 ? delta_ms : 0.0);
+    if (c <= 5) {
+        RCLCPP_INFO(node_->get_logger(), "[LivoBridge][DATA] cloud #%d ts=%.3f pts=%zu → trigger KF", c, ts, cloud->size());
+    } else if (c % 100 == 0) {
+        RCLCPP_INFO(node_->get_logger(), "[LivoBridge][DATA] cloud #%d ts=%.3f pts=%zu", c, ts, cloud->size());
+    }
+    RCLCPP_INFO(node_->get_logger(), "[LivoBridge][FRAME] #%d ts=%.3f pts=%zu → backend",
+                c, ts, cloud->size());
     if (cloud_count_ % 50 == 0) {
         ALOG_DEBUG(MOD, "Cloud#{}: pts={} ts={:.3f}", cloud_count_, cloud->size(), ts);
     }
-    for (auto& cb : cloud_cbs_) cb(ts, cloud);
+    for (auto& cb : cloud_cbs_) {
+        try {
+            cb(ts, cloud);
+        } catch (const std::exception& e) {
+            RCLCPP_ERROR(node_->get_logger(), "[LivoBridge][EXCEPTION] cloud callback #%d ts=%.3f: %s (next frames will still be delivered)", c, ts, e.what());
+        } catch (...) {
+            RCLCPP_ERROR(node_->get_logger(), "[LivoBridge][EXCEPTION] cloud callback #%d ts=%.3f: unknown exception", c, ts);
+        }
+    }
 }
 
 void LivoBridge::onKFInfo(const automap_pro::msg::KeyFrameInfoMsg::SharedPtr msg) {
@@ -120,7 +164,15 @@ void LivoBridge::onKFInfo(const automap_pro::msg::KeyFrameInfoMsg::SharedPtr msg
             "[LivoBridge][DATA] kfinfo count=%u ts=%.3f cov_norm=%.4f degen=%d",
             kfinfo_count.load(), info.timestamp, info.esikf_cov_norm, info.is_degenerate ? 1 : 0);
     }
-    for (auto& cb : kfinfo_cbs_) cb(info);
+    for (auto& cb : kfinfo_cbs_) {
+        try {
+            cb(info);
+        } catch (const std::exception& e) {
+            RCLCPP_ERROR(node_->get_logger(), "[LivoBridge][EXCEPTION] kfinfo callback ts=%.3f: %s", info.timestamp, e.what());
+        } catch (...) {
+            RCLCPP_ERROR(node_->get_logger(), "[LivoBridge][EXCEPTION] kfinfo callback ts=%.3f: unknown exception", info.timestamp);
+        }
+    }
 }
 
 void LivoBridge::onGPS(const sensor_msgs::msg::NavSatFix::SharedPtr msg) {
@@ -143,7 +195,15 @@ void LivoBridge::onGPS(const sensor_msgs::msg::NavSatFix::SharedPtr msg) {
             "[LivoBridge][DATA] gps count=%u ts=%.3f lat=%.6f lon=%.6f alt=%.1f hdop=%.2f",
             gps_count.load(), ts, lat, lon, alt, hdop);
     }
-    for (auto& cb : gps_cbs_) cb(ts, lat, lon, alt, hdop, sats);
+    for (auto& cb : gps_cbs_) {
+        try {
+            cb(ts, lat, lon, alt, hdop, sats);
+        } catch (const std::exception& e) {
+            RCLCPP_ERROR(node_->get_logger(), "[LivoBridge][EXCEPTION] gps callback ts=%.3f: %s", ts, e.what());
+        } catch (...) {
+            RCLCPP_ERROR(node_->get_logger(), "[LivoBridge][EXCEPTION] gps callback ts=%.3f: unknown exception", ts);
+        }
+    }
 }
 
 Pose3d LivoBridge::poseFromOdom(const nav_msgs::msg::Odometry& msg) {

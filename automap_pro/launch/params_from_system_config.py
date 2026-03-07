@@ -325,6 +325,14 @@ def _get_fast_livo2_params_impl(config):
         else:
             params[section] = val
 
+    # 前端 PCD 保存目录与 system.output_dir 统一，便于与后端地图同目录
+    system = config.get("system") if isinstance(config.get("system"), dict) else {}
+    out_dir = (system.get("output_dir") or "").strip() or "/data/automap_output"
+    if "pcd_save" not in params:
+        params["pcd_save"] = {}
+    if isinstance(params["pcd_save"], dict) and not (params["pcd_save"].get("output_dir") or "").strip():
+        params["pcd_save"]["output_dir"] = out_dir
+
     # 确保 evo.seq_name 等字符串参数非空（fast_livo 声明为 string，不能为 not set）
     if "evo" in params:
         evo = params["evo"]

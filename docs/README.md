@@ -1,6 +1,6 @@
 # AutoMap-Pro 文档索引
 
-> 以下路径均以**仓库根目录**为基准。重构后主入口为 **automap_start.sh**。
+> 以下路径均以**仓库根目录**为基准。主入口脚本：**run_automap.sh**（可选：automap_start.sh）。
 
 ---
 
@@ -9,8 +9,8 @@
 | 文档 | 说明 |
 |------|------|
 | [../README.md](../README.md) | 项目总览、特性、一键开始 |
-| [../QUICK_START.md](../QUICK_START.md) | 快速开始与常用命令 |
-| [BUILD_DEPLOY_RUN.md](BUILD_DEPLOY_RUN.md) | 编译/部署/运行（重构约定、路径、Docker） |
+| [../QUICK_START.md](../QUICK_START.md) | 快速开始、常用命令与错误排查速查 |
+| [BUILD_DEPLOY_RUN.md](BUILD_DEPLOY_RUN.md) | 编译/部署/运行（run_automap.sh、路径、Docker） |
 
 ---
 
@@ -56,6 +56,17 @@
 
 ---
 
+## 包内文档（automap_pro/docs）
+
+| 文档 | 说明 |
+|------|------|
+| [../automap_pro/docs/TROUBLESHOOTING.md](../automap_pro/docs/TROUBLESHOOTING.md) | 系统启动故障排查（Bag/HBA/级联故障） |
+| [../automap_pro/docs/MAP_FRAME_CONFIG.md](../automap_pro/docs/MAP_FRAME_CONFIG.md) | 地图坐标系与配置 |
+| [../automap_pro/docs/DEBUG_WITH_GDB.md](../automap_pro/docs/DEBUG_WITH_GDB.md) | GDB 调试与 core 分析 |
+| [../automap_pro/docs/CONFIG_PARAM_MAPPING.md](../automap_pro/docs/CONFIG_PARAM_MAPPING.md) | 配置参数映射 |
+| [../automap_pro/docs/GLOBAL_MAP_DIAGNOSIS.md](../automap_pro/docs/GLOBAL_MAP_DIAGNOSIS.md) | 全局地图诊断 |
+| [../automap_pro/docs/CRASH_ANALYSIS_AND_HARDENING.md](../automap_pro/docs/CRASH_ANALYSIS_AND_HARDENING.md) | 崩溃分析与加固 |
+
 ## 其他
 
 | 文档 | 说明 |
@@ -65,5 +76,5 @@
 
 ---
 
-**文档版本**：v2.0（重构后）  
-**更新日期**：2026-03-03
+**文档版本**：v2.1  
+**更新日期**：2026-03-07

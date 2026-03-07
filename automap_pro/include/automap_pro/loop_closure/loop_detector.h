@@ -93,8 +93,10 @@ private:
     std::condition_variable                desc_cv_;
 
     // 几何验证队列（Stage 2，子图已有描述子后提交）
+    // query_cloud：入队时深拷贝，避免 worker 读 SubMap::downsampled_cloud 与主线程并发导致 use-after-free
     struct MatchTask {
         SubMap::Ptr query;
+        CloudXYZIPtr query_cloud;  // 入队时拷贝，worker 仅用此指针
         std::vector<OverlapTransformerInfer::Candidate> candidates;
     };
     std::queue<MatchTask> match_queue_;

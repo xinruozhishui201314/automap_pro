@@ -6,6 +6,7 @@
 #include <condition_variable>
 #include <queue>
 #include <atomic>
+#include <chrono>
 
 #ifdef USE_HBA_API
 #include <hba_api/hba_api.h>
@@ -50,6 +51,9 @@ public:
     void triggerAsync(const std::vector<SubMap::Ptr>& all_submaps,
                       bool wait = false);
 
+    /** 等待队列清空且当前无 HBA 运行，最多等待 timeout_ms 毫秒（用于关闭时限时等待） */
+    void waitUntilIdleFor(std::chrono::milliseconds timeout_ms);
+
     /** GPS 对齐完成后，批量为已有关键帧添加 GPS 因子 */
     void onGPSAligned(const GPSAlignResult& align_result,
                       const std::vector<SubMap::Ptr>& all_submaps);
@@ -57,6 +61,8 @@ public:
     // ── 状态查询 ──────────────────────────────────────────────────────────
     bool isRunning() const { return hba_running_.load(); }
     int  triggerCount() const { return trigger_count_; }
+    /** 当前待处理任务数（含正在执行的一轮） */
+    size_t queueDepth() const;
 
     // ── 回调注册 ──────────────────────────────────────────────────────────
     void registerDoneCallback(HBADoneCallback cb) {
@@ -70,7 +76,7 @@ private:
     };
 
     std::queue<PendingTask>     pending_queue_;
-    std::mutex                  queue_mutex_;
+    mutable std::mutex          queue_mutex_;
     std::condition_variable     queue_cv_;
     std::thread                 worker_thread_;
     std::atomic<bool>           running_{false};
@@ -88,6 +94,8 @@ private:
     HBAResult runHBA(const PendingTask& task);
     std::vector<KeyFrame::Ptr> collectKeyFramesFromSubmaps(
         const std::vector<SubMap::Ptr>& submaps) const;
+    /** 在 queue_mutex_ 下检查是否空闲 */
+    bool isIdle() const;
 };
 
 } // namespace automap_pro

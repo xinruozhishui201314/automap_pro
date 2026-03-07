@@ -74,8 +74,15 @@ public:
     /** 发布关键帧位姿数组 */
     void publishKeyframePoses(const std::vector<KeyFrame::Ptr>& keyframes);
 
-    /** 发布GPS轨迹（原始 + 对齐后） */
+    /**
+     * 发布 GPS 轨迹 Path：/automap/gps_raw_path（原始）、/automap/gps_aligned_path（对齐后）。
+     * 若传入 gps_positions_map 非空，raw path 使用地图系坐标（与 RViz Fixed Frame 一致）；
+     * 否则 raw 使用子图 gps_center（ENU），可能与 map 系不一致。
+     */
     void publishGPSTrajectory(const std::vector<SubMap::Ptr>& submaps,
+                              bool show_aligned = true);
+    void publishGPSTrajectory(const std::vector<SubMap::Ptr>& submaps,
+                              const std::vector<Eigen::Vector3d>& gps_positions_map,
                               bool show_aligned = true);
 
     /** 发布轨迹对比（优化前后） */
@@ -135,6 +142,14 @@ public:
 
     /** 发布真实GPS位置（已转换到全局地图坐标系），供 RViz 显示 */
     void publishGPSPositionsInMap(const std::vector<Eigen::Vector3d>& positions_map);
+
+    /**
+     * 发布 GPS 约束标记与约束线（同 topic 一次发布，避免覆盖）。
+     * gps_positions_map 与有 has_valid_gps 的子图一一对应（顺序一致），表示各地图系下 GPS 位置。
+     */
+    void publishGPSMarkersWithConstraintLines(
+        const std::vector<SubMap::Ptr>& submaps,
+        const std::vector<Eigen::Vector3d>& gps_positions_map);
 
     // ═══════════════════════════════════════════════════════════════════════
     // 6. 后端优化可视化
@@ -290,6 +305,12 @@ private:
 
     /** 删除命名空间所有Marker */
     visualization_msgs::msg::MarkerArray makeDeleteAllMarkers(const std::string& ns) const;
+
+    /** 将文本转为 RViz 可正确显示的 ASCII（非 ASCII 替换为空格，避免显示为方框） */
+    static std::string toAsciiDisplayText(const std::string& text);
+
+    /** 模块名中文→英文，用于 RViz 状态文本 */
+    static std::string moduleDisplayName(const std::string& name);
 };
 
 }  // namespace automap_pro

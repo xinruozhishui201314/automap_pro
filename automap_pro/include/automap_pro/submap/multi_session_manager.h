@@ -249,7 +249,7 @@ public:
      */
     pcl::PointCloud<pcl::PointXYZI>::Ptr buildGlobalMap(
         const std::vector<uint64_t>& session_ids,
-        float voxel_size = 0.1f) const;
+        float voxel_size = 0.2f) const;
 
 private:
     /**

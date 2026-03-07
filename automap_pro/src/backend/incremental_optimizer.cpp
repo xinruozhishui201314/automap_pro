@@ -7,6 +7,7 @@
 #include "automap_pro/core/error_code.h"
 #define MOD "iSAM2"
 
+#include <rclcpp/rclcpp.hpp>
 #include <gtsam/base/Matrix.h>
 #include <Eigen/SVD>
 #include <chrono>
@@ -136,6 +137,8 @@ OptimizationResult IncrementalOptimizer::commitAndUpdate() {
         current_estimate_ = isam2_.calculateEstimate();
     } catch (const std::exception& e) {
         ALOG_ERROR(MOD, "iSAM2 update FAILED: {}", e.what());
+        RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+            "[IncrementalOptimizer][EXCEPTION] iSAM2 update FAILED: %s", e.what());
         pending_graph_.resize(0);
         pending_values_.clear();
         return OptimizationResult{false};
@@ -156,8 +159,12 @@ OptimizationResult IncrementalOptimizer::commitAndUpdate() {
             poses[id] = fromPose3(p);
         } catch (const std::exception& e) {
             ALOG_ERROR(MOD, "iSAM2 extract pose sm_id={} exception: {}", id, e.what());
+            RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+                "[IncrementalOptimizer][EXCEPTION] extract pose sm_id=%d: %s", id, e.what());
         } catch (...) {
             ALOG_ERROR(MOD, "iSAM2 extract pose sm_id={} unknown exception (not in estimate?)", id);
+            RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+                "[IncrementalOptimizer][EXCEPTION] extract pose sm_id=%d: unknown exception", id);
         }
     }
 
@@ -183,9 +190,13 @@ Pose3d IncrementalOptimizer::getPose(int sm_id) const {
         return fromPose3(p);
     } catch (const std::exception& e) {
         ALOG_ERROR(MOD, "getPose(sm_id={}) exception: {}", sm_id, e.what());
+        RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+            "[IncrementalOptimizer][EXCEPTION] getPose sm_id=%d: %s", sm_id, e.what());
         return Pose3d::Identity();
     } catch (...) {
         ALOG_ERROR(MOD, "getPose(sm_id={}) unknown exception", sm_id);
+        RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+            "[IncrementalOptimizer][EXCEPTION] getPose sm_id=%d: unknown exception", sm_id);
         return Pose3d::Identity();
     }
 }
@@ -199,8 +210,12 @@ std::unordered_map<int, Pose3d> IncrementalOptimizer::getAllPoses() const {
             out[kv.first] = fromPose3(p);
         } catch (const std::exception& e) {
             ALOG_ERROR(MOD, "getAllPoses sm_id={} exception: {}", kv.first, e.what());
+            RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+                "[IncrementalOptimizer][EXCEPTION] getAllPoses sm_id=%d: %s", kv.first, e.what());
         } catch (...) {
             ALOG_ERROR(MOD, "getAllPoses sm_id={} unknown exception", kv.first);
+            RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+                "[IncrementalOptimizer][EXCEPTION] getAllPoses sm_id=%d: unknown exception", kv.first);
         }
     }
     return out;
@@ -272,6 +287,8 @@ IncrementalOptimizer::infoToNoise(const Mat66d& info) const {
     // ✅ 修复：检查求逆结果是否有效
     if (!cov.allFinite()) {
         ALOG_ERROR(MOD, "Regularized inverse contains NaN/Inf, using fallback covariance");
+        RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+            "[IncrementalOptimizer][EXCEPTION] Regularized inverse contains NaN/Inf, using fallback covariance");
         cov = gtsam::Matrix66::Identity() * 1.0;
         return gtsam::noiseModel::Gaussian::Covariance(cov);
     }

@@ -26,8 +26,9 @@ void RvizPublisher::init(rclcpp::Node::SharedPtr node) {
     auto reliable_qos = rclcpp::QoS(rclcpp::KeepLast(10)).reliable();
     auto path_qos = rclcpp::QoS(rclcpp::KeepLast(100)).reliable();
 
-    // 点云
-    global_map_pub_     = node->create_publisher<sensor_msgs::msg::PointCloud2>("/automap/global_map", sensor_qos);
+    // 点云（全局地图用 Reliable，便于 RViz 完整显示）
+    auto map_qos = rclcpp::QoS(rclcpp::KeepLast(5)).reliable();
+    global_map_pub_     = node->create_publisher<sensor_msgs::msg::PointCloud2>("/automap/global_map", map_qos);
     current_cloud_pub_  = node->create_publisher<sensor_msgs::msg::PointCloud2>("/automap/current_cloud", sensor_qos);
     submap_cloud_pub_   = node->create_publisher<sensor_msgs::msg::PointCloud2>("/automap/submap_cloud", sensor_qos);
     colored_cloud_pub_  = node->create_publisher<sensor_msgs::msg::PointCloud2>("/automap/colored_cloud", sensor_qos);
@@ -76,16 +77,19 @@ void RvizPublisher::init(rclcpp::Node::SharedPtr node) {
 void RvizPublisher::publishGlobalMap(const CloudXYZIPtr& cloud) {
     if (!publish_global_map_ || !node_ || !cloud || cloud->empty()) return;
     try {
-        auto ds = global_map_ds_res_ > 0 ?
-                  utils::voxelDownsample(cloud, global_map_ds_res_) : cloud;
-        if (!ds || ds->empty()) return;
+        // 调用方（AutoMapSystem::publishGlobalMap）传入的已是 buildGlobalMap 下采样后的点云，
+        // 不再在此处二次体素滤波，避免 PCL VoxelGrid 在部分 leaf/范围组合下写越界导致析构时 SIGSEGV。
+        RCLCPP_DEBUG(node_->get_logger(), "[GLOBAL_MAP_DIAG] RvizPublisher publishGlobalMap frame_id=%s pts=%zu",
+            frame_id_.c_str(), cloud->size());
         sensor_msgs::msg::PointCloud2 msg;
-        pcl::toROSMsg(*ds, msg);
+        pcl::toROSMsg(*cloud, msg);
         msg.header.stamp    = node_->now();
         msg.header.frame_id = frame_id_;
         global_map_pub_->publish(msg);
     } catch (const std::exception& e) {
         RCLCPP_ERROR(node_->get_logger(), "[RvizPublisher] publishGlobalMap failed: %s", e.what());
+    } catch (...) {
+        RCLCPP_ERROR(node_->get_logger(), "[RvizPublisher] publishGlobalMap failed: unknown exception (SIGSEGV possible)");
     }
 }
 
@@ -257,16 +261,31 @@ void RvizPublisher::publishKeyframePoses(const std::vector<KeyFrame::Ptr>& keyfr
 }
 
 void RvizPublisher::publishGPSTrajectory(const std::vector<SubMap::Ptr>& submaps, bool show_aligned) {
-    if (!node_) return;
+    publishGPSTrajectory(submaps, std::vector<Eigen::Vector3d>{}, show_aligned);
+}
+
+void RvizPublisher::publishGPSTrajectory(const std::vector<SubMap::Ptr>& submaps,
+                                          const std::vector<Eigen::Vector3d>& gps_positions_map,
+                                          bool show_aligned) {
+    if (!node_ || !gps_raw_path_pub_) return;
     nav_msgs::msg::Path raw_path, aligned_path;
     raw_path.header.stamp = aligned_path.header.stamp = node_->now();
     raw_path.header.frame_id = aligned_path.header.frame_id = frame_id_;
+    size_t map_idx = 0;
+    const bool use_map_frame = !gps_positions_map.empty();
     for (const auto& sm : submaps) {
         if (!sm || !sm->has_valid_gps) continue;
         geometry_msgs::msg::PoseStamped ps;
         ps.header = raw_path.header;
-        ps.pose.position.x = sm->gps_center.x(); ps.pose.position.y = sm->gps_center.y(); ps.pose.position.z = sm->gps_center.z();
         ps.pose.orientation.w = 1.0;
+        if (use_map_frame && map_idx < gps_positions_map.size()) {
+            const auto& p = gps_positions_map[map_idx++];
+            ps.pose.position.x = p.x(); ps.pose.position.y = p.y(); ps.pose.position.z = p.z();
+        } else {
+            ps.pose.position.x = sm->gps_center.x();
+            ps.pose.position.y = sm->gps_center.y();
+            ps.pose.position.z = sm->gps_center.z();
+        }
         raw_path.poses.push_back(ps);
         ps.pose.position.x = sm->pose_w_anchor_optimized.translation().x();
         ps.pose.position.y = sm->pose_w_anchor_optimized.translation().y();
@@ -304,6 +323,8 @@ void RvizPublisher::publishLoopMarkers(
         const std::vector<LoopConstraint::Ptr>& loops,
         const std::vector<SubMap::Ptr>& submaps) {
 
+    if (!node_ || !loop_marker_pub_) return;
+
     std::map<int, Eigen::Vector3d> sm_pos;
     for (const auto& sm : submaps) {
         if (!sm) continue;
@@ -311,6 +332,10 @@ void RvizPublisher::publishLoopMarkers(
     }
 
     visualization_msgs::msg::MarkerArray markers;
+    // 先清除该命名空间下旧的回环线，避免数量减少时残留
+    auto delete_all = makeDeleteAllMarkers("loops");
+    markers.markers.push_back(delete_all.markers.front());
+
     int id = 0;
     for (const auto& lc : loops) {
         auto it_i = sm_pos.find(lc->submap_i);
@@ -324,11 +349,11 @@ void RvizPublisher::publishLoopMarkers(
         line.id    = id++;
         line.type  = visualization_msgs::msg::Marker::LINE_STRIP;
         line.action= visualization_msgs::msg::Marker::ADD;
-        line.scale.x = 0.12;
+        line.scale.x = 0.25;
         line.color.r = lc->is_inter_session ? 1.0f : 0.0f;
         line.color.g = lc->is_inter_session ? 0.5f : 1.0f;
         line.color.b = 0.0f;
-        line.color.a = 0.8f;
+        line.color.a = 0.9f;
 
         geometry_msgs::msg::Point p1, p2;
         p1.x = it_i->second.x(); p1.y = it_i->second.y(); p1.z = it_i->second.z();
@@ -443,18 +468,16 @@ void RvizPublisher::publishSubmapBoundingBoxes(const std::vector<SubMap::Ptr>& s
 
 void RvizPublisher::publishSubmapGraph(const std::vector<SubMap::Ptr>& submaps) {
     if (!node_ || !submap_graph_pub_) return;
-    // 按子图 ID 排序后连接相邻子图
-    std::vector<SubMap::Ptr> sorted = submaps;
+    // 按子图 ID 排序后连接相邻子图（过滤 null 避免 sort 比较器解引用空指针）
+    std::vector<SubMap::Ptr> sorted;
+    for (const auto& s : submaps) if (s) sorted.push_back(s);
     std::sort(sorted.begin(), sorted.end(),
-        [](const SubMap::Ptr& a, const SubMap::Ptr& b) {
-            return a->id < b->id;
-        });
-    
+        [](const SubMap::Ptr& a, const SubMap::Ptr& b) { return a->id < b->id; });
+
     visualization_msgs::msg::MarkerArray markers;
     int id = 0;
     std_msgs::msg::ColorRGBA gray = makeColor(0.5f, 0.5f, 0.5f, 0.6f);
     for (size_t i = 0; i + 1 < sorted.size(); ++i) {
-        if (!sorted[i] || !sorted[i+1]) continue;
         Eigen::Vector3d a = sorted[i]->pose_w_anchor_optimized.translation();
         Eigen::Vector3d b = sorted[i+1]->pose_w_anchor_optimized.translation();
         markers.markers.push_back(makeLineMarker("submap_graph", id++, a, b, gray, 0.03));
@@ -473,15 +496,44 @@ void RvizPublisher::publishSubmapDetail(const SubMap::Ptr& submap) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 void RvizPublisher::publishGPSMarkers(const std::vector<SubMap::Ptr>& submaps) {
-    if (!node_) return;
+    if (!node_ || !gps_marker_pub_) return;
     visualization_msgs::msg::MarkerArray markers;
+    // 先清除旧 GPS 约束标记，避免数量变化时残留
+    auto delete_all = makeDeleteAllMarkers("gps");
+    markers.markers.push_back(delete_all.markers.front());
+
     int id = 0;
     for (const auto& sm : submaps) {
         if (!sm || !sm->has_valid_gps) continue;
-        // 使用优化后位姿，与轨迹一致
+        // 使用优化后位姿，与轨迹一致（子图中心即 GPS 约束节点）
         Eigen::Vector3d pos = sm->pose_w_anchor_optimized.translation();
-        auto sphere = makeSphereMarker("gps", id++, pos, 2.0, makeColor(0.0f, 0.5f, 1.0f, 0.7f));
+        auto sphere = makeSphereMarker("gps", id++, pos, 2.5, makeColor(0.0f, 0.6f, 1.0f, 0.85f));
         markers.markers.push_back(sphere);
+    }
+    gps_marker_pub_->publish(markers);
+}
+
+void RvizPublisher::publishGPSMarkersWithConstraintLines(
+    const std::vector<SubMap::Ptr>& submaps,
+    const std::vector<Eigen::Vector3d>& gps_positions_map) {
+    if (!node_ || !gps_marker_pub_) return;
+    visualization_msgs::msg::MarkerArray markers;
+    markers.markers.push_back(makeDeleteAllMarkers("gps").markers.front());
+    markers.markers.push_back(makeDeleteAllMarkers("gps_constraint_lines").markers.front());
+
+    size_t gps_idx = 0;
+    int sphere_id = 0;
+    std_msgs::msg::ColorRGBA line_c = makeColor(0.2f, 0.8f, 0.4f, 0.9f);
+    for (const auto& sm : submaps) {
+        if (!sm || !sm->has_valid_gps) continue;
+        if (gps_idx >= gps_positions_map.size()) break;
+        Eigen::Vector3d pos = sm->pose_w_anchor_optimized.translation();
+        markers.markers.push_back(
+            makeSphereMarker("gps", sphere_id++, pos, 2.5, makeColor(0.0f, 0.6f, 1.0f, 0.85f)));
+        markers.markers.push_back(
+            makeLineMarker("gps_constraint_lines", static_cast<int>(gps_idx),
+                           pos, gps_positions_map[gps_idx], line_c, 0.15));
+        gps_idx++;
     }
     gps_marker_pub_->publish(markers);
 }
@@ -685,8 +737,10 @@ void RvizPublisher::publishModuleStatus(const std::map<std::string, int>& module
     int id = 0;
     double y = 0.0;
     for (const auto& [name, status] : module_status) {
+        std::string display_name = moduleDisplayName(name);
+        std::string label = display_name + (status ? ": OK" : ": FAIL");
         std_msgs::msg::ColorRGBA c = (status == 1) ? makeColor(0.0f, 1.0f, 0.0f, 1.0f) : makeColor(1.0f, 0.0f, 0.0f, 1.0f);
-        auto text = makeTextMarker("module_status", id++, Eigen::Vector3d(0.0, y, 0.0), name + (status ? ": OK" : ": FAIL"), 0.6, &c);
+        auto text = makeTextMarker("module_status", id++, Eigen::Vector3d(0.0, y, 0.0), label, 0.6, &c);
         markers.markers.push_back(text);
         y += 1.0;
     }
@@ -841,6 +895,27 @@ visualization_msgs::msg::Marker RvizPublisher::makeSphereMarker(
     return m;
 }
 
+std::string RvizPublisher::toAsciiDisplayText(const std::string& text) {
+    std::string out;
+    out.reserve(text.size());
+    for (unsigned char c : text) {
+        if (c >= 0x20 && c < 0x7F) out += c;
+        else if (c != 0) out += ' ';
+    }
+    return out.empty() ? " " : out;
+}
+
+std::string RvizPublisher::moduleDisplayName(const std::string& name) {
+    if (name == "前端" || name == "Frontend") return "Frontend";
+    if (name == "后端" || name == "Backend") return "Backend";
+    if (name == "回环" || name == "Loop") return "Loop";
+    if (name == "GPS") return "GPS";
+    if (name == "HBA" || name == "HBAOptimizer") return "HBA";
+    if (name == "子图" || name == "Submap") return "Submap";
+    if (name == "建图" || name == "Mapping") return "Mapping";
+    return toAsciiDisplayText(name);
+}
+
 visualization_msgs::msg::Marker RvizPublisher::makeTextMarker(
     const std::string& ns, int id, const Eigen::Vector3d& position,
     const std::string& text, double size, const std_msgs::msg::ColorRGBA* color) const {
@@ -854,7 +929,7 @@ visualization_msgs::msg::Marker RvizPublisher::makeTextMarker(
     m.pose.position.x = position.x(); m.pose.position.y = position.y(); m.pose.position.z = position.z();
     m.pose.orientation.w = 1.0;
     m.scale.z = size;
-    m.text = text;
+    m.text = toAsciiDisplayText(text);
     m.color = color ? *color : makeColor(1.0f, 1.0f, 0.0f, 1.0f);
     return m;
 }
