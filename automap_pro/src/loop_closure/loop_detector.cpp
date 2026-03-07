@@ -187,6 +187,8 @@ void LoopDetector::computeDescriptorAsync(const SubMap::Ptr& submap) {
 }
 
 void LoopDetector::onDescriptorReady(const SubMap::Ptr& submap) {
+    auto t_start = std::chrono::steady_clock::now();
+    
     // 先加入数据库
     addToDatabase(submap);
 
@@ -197,6 +199,7 @@ void LoopDetector::onDescriptorReady(const SubMap::Ptr& submap) {
         db_copy = db_submaps_;
     }
 
+    auto t_retrieve_start = std::chrono::steady_clock::now();
     auto candidates = overlap_infer_.retrieve(
         submap->overlap_descriptor,
         db_copy,
@@ -207,12 +210,14 @@ void LoopDetector::onDescriptorReady(const SubMap::Ptr& submap) {
         gps_search_radius_,
         submap->gps_center,
         submap->has_valid_gps);
+    auto t_retrieve_end = std::chrono::steady_clock::now();
+    double retrieve_ms = std::chrono::duration<double, std::milli>(t_retrieve_end - t_retrieve_start).count();
 
     // ✅ 详细诊断日志
     if (candidates.empty()) {
-        ALOG_INFO(MOD, "[METRIC] query_id={} db_size={} candidates=0 threshold={:.3f} (reason=no_match)",
-                  submap->id, db_copy.size(), overlap_threshold_);
-        ALOG_INFO(MOD, "[TRACE] step=loop_cand result=skip reason=no_overlap_candidates query_id={} db_size={} top_k={} threshold={:.3f} (精准定位: 描述子检索无候选，可尝试降低 overlap_threshold 或增大 top_k)",
+        ALOG_INFO(MOD, "[METRIC] query_id={} db_size={} candidates=0 threshold={:.3f} retrieve_time={:.1f}ms (reason=no_match)",
+                  submap->id, db_copy.size(), overlap_threshold_, retrieve_ms);
+        ALOG_INFO(MOD, "[TRACE] step=loop_cand result=skip reason=no_overlap_candidates query_id={} db_size={} top_k={} threshold={:.3f}",
                   submap->id, db_copy.size(), top_k_, overlap_threshold_);
         return;
     }
@@ -232,27 +237,30 @@ void LoopDetector::onDescriptorReady(const SubMap::Ptr& submap) {
     if (valid_candidates.empty()) {
         ALOG_INFO(MOD, "[METRIC] query_id={} candidates_before_gap_filter={} filtered_by_gap={} (reason=temporal_gap)",
                   submap->id, candidates.size(), filtered_by_gap);
-        ALOG_INFO(MOD, "[TRACE] step=loop_cand result=skip reason=all_filtered_by_submap_gap query_id={} candidates_before={} min_submap_gap={} (精准定位: 候选均被 min_submap_gap 过滤)",
+        ALOG_INFO(MOD, "[TRACE] step=loop_cand result=skip reason=all_filtered_by_submap_gap query_id={} candidates_before={} min_submap_gap={}",
                   submap->id, candidates.size(), min_submap_gap_);
         return;
     }
 
-    // ✅ 输出候选的相似度分布
+    // ✅ 输出候选的相似度分布 + 性能数据
     std::string score_str;
     for (size_t i = 0; i < valid_candidates.size(); ++i) {
         score_str += fmt::format("{:.3f}", valid_candidates[i].score);
         if (i < valid_candidates.size() - 1) score_str += ", ";
     }
-    ALOG_INFO(MOD, "[METRIC] query_id={} candidates={} scores=[{}] (entering TEASER++)",
-              submap->id, valid_candidates.size(), score_str);
+    auto t_end = std::chrono::steady_clock::now();
+    double total_stage1_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+    
+    ALOG_INFO(MOD, "[METRIC] query_id={} db_size={} candidates={} scores=[{}] retrieve_time={:.1f}ms total_time={:.1f}ms (entering TEASER++)",
+              submap->id, db_copy.size(), valid_candidates.size(), score_str, retrieve_ms, total_stage1_ms);
 
     // 入队时深拷贝 query 点云，避免 worker 处理时读 SubMap::downsampled_cloud 与 buildGlobalMap 等并发
     CloudXYZIPtr query_cloud_copy;
     if (submap->downsampled_cloud && !submap->downsampled_cloud->empty()) {
         query_cloud_copy = std::make_shared<CloudXYZI>();
         *query_cloud_copy = *submap->downsampled_cloud;
-        ALOG_INFO(MOD, "enqueue MatchTask query_id={} query_cloud_pts={} candidates={}",
-                  submap->id, query_cloud_copy->size(), valid_candidates.size());
+        ALOG_DEBUG(MOD, "enqueue MatchTask query_id={} query_cloud_pts={} candidates={}",
+                   submap->id, query_cloud_copy->size(), valid_candidates.size());
     }
 
     // 提交到 TEASER++ 匹配队列（Stage 2）

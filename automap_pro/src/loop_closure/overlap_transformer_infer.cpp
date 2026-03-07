@@ -109,28 +109,52 @@ std::vector<float> OverlapTransformerInfer::generateRangeImage(
         }
     }
 
-    // ✅ 第二遍：补齐稀疏像素（用相邻有效像素的最小值）
+    // ✅ 第二遍：快速补齐稀疏像素（行列扫描，O(H×W) 而非 O(H×W×9)）
+    // 水平传播（从左到右）
     for (int row = 0; row < proj_H_; ++row) {
-        for (int col = 0; col < proj_W_; ++col) {
+        for (int col = 1; col < proj_W_; ++col) {
             int idx = row * proj_W_ + col;
-            if (valid_pixel[idx]) continue;  // 已有深度值，跳过
-
-            float min_neighbor = max_range_;
-            // 检查 3×3 邻域
-            for (int dr = -1; dr <= 1; ++dr) {
-                for (int dc = -1; dc <= 1; ++dc) {
-                    int nr = row + dr;
-                    int nc = col + dc;
-                    if (nr >= 0 && nr < proj_H_ && nc >= 0 && nc < proj_W_) {
-                        int nidx = nr * proj_W_ + nc;
-                        if (valid_pixel[nidx]) {
-                            min_neighbor = std::min(min_neighbor, img[nidx]);
-                        }
-                    }
-                }
+            if (valid_pixel[idx]) continue;
+            int left_idx = idx - 1;
+            if (valid_pixel[left_idx] && img[left_idx] > 0.0f) {
+                img[idx] = img[left_idx];
+                valid_pixel[idx] = true;
             }
-            if (min_neighbor < max_range_) {
-                img[idx] = min_neighbor;
+        }
+    }
+    // 水平传播（从右到左，补齐右侧空洞）
+    for (int row = 0; row < proj_H_; ++row) {
+        for (int col = proj_W_ - 2; col >= 0; --col) {
+            int idx = row * proj_W_ + col;
+            if (valid_pixel[idx]) continue;
+            int right_idx = idx + 1;
+            if (valid_pixel[right_idx] && img[right_idx] > 0.0f) {
+                img[idx] = img[right_idx];
+                valid_pixel[idx] = true;
+            }
+        }
+    }
+    
+    // 垂直传播（从上到下）
+    for (int col = 0; col < proj_W_; ++col) {
+        for (int row = 1; row < proj_H_; ++row) {
+            int idx = row * proj_W_ + col;
+            if (valid_pixel[idx]) continue;
+            int up_idx = idx - proj_W_;
+            if (valid_pixel[up_idx] && img[up_idx] > 0.0f) {
+                img[idx] = img[up_idx];
+                valid_pixel[idx] = true;
+            }
+        }
+    }
+    // 垂直传播（从下到上，补齐下侧空洞）
+    for (int col = 0; col < proj_W_; ++col) {
+        for (int row = proj_H_ - 2; row >= 0; --row) {
+            int idx = row * proj_W_ + col;
+            if (valid_pixel[idx]) continue;
+            int down_idx = idx + proj_W_;
+            if (valid_pixel[down_idx] && img[down_idx] > 0.0f) {
+                img[idx] = img[down_idx];
                 valid_pixel[idx] = true;
             }
         }
@@ -209,14 +233,27 @@ Eigen::VectorXf OverlapTransformerInfer::computeFallbackDescriptor(
 Eigen::VectorXf OverlapTransformerInfer::computeDescriptor(
     const CloudXYZIPtr& cloud) const
 {
-    auto t0 = std::chrono::steady_clock::now();
+    auto t_start = std::chrono::steady_clock::now();
+    
+    auto t_phase = std::chrono::steady_clock::now();
+    
     Eigen::VectorXf desc;
 
 #ifdef USE_TORCH
     if (model_loaded_) {
         std::lock_guard<std::mutex> lk(mutex_);
         auto range_img = generateRangeImage(cloud);
+        auto t_range = std::chrono::steady_clock::now();
+        double range_ms = std::chrono::duration<double, std::milli>(t_range - t_phase).count();
+        
         desc = inferWithTorch(range_img);
+        auto t_infer = std::chrono::steady_clock::now();
+        double infer_ms = std::chrono::duration<double, std::milli>(t_infer - t_range).count();
+        
+        if (range_ms > 10.0 || infer_ms > 20.0) {
+            ALOG_WARN(MOD, "[PERF] Range generation: {:.1f}ms, Inference: {:.1f}ms", 
+                      range_ms, infer_ms);
+        }
     } else {
         desc = computeFallbackDescriptor(cloud);
     }
@@ -224,10 +261,7 @@ Eigen::VectorXf OverlapTransformerInfer::computeDescriptor(
     desc = computeFallbackDescriptor(cloud);
 #endif
 
-    auto t1 = std::chrono::steady_clock::now();
-    last_infer_ms_ = std::chrono::duration<double, std::milli>(t1 - t0).count();
-    total_inferences_++;
-    
+    auto t_norm = std::chrono::steady_clock::now();
     // ✅ 验证 L2 归一化
     float norm = desc.norm();
     if (norm > 1e-6f) {
@@ -236,13 +270,20 @@ Eigen::VectorXf OverlapTransformerInfer::computeDescriptor(
         ALOG_WARN(MOD, "Descriptor norm too small ({:.6f}), using uniform fallback", norm);
         desc = Eigen::VectorXf::Constant(256, 1.0f / std::sqrt(256.0f));
     }
+
+    auto t_end = std::chrono::steady_clock::now();
+    last_infer_ms_ = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+    total_inferences_++;
     
-    if (last_infer_ms_ > 50.0) {
-        ALOG_WARN(MOD, "Descriptor compute SLOW: {:.1f}ms (total_calls={})", last_infer_ms_, total_inferences_);
-    } else {
-        ALOG_DEBUG(MOD, "Descriptor computed in {:.1f}ms (mode={}, total={})",
-                   last_infer_ms_, model_loaded_ ? "LibTorch" : "fallback", total_inferences_);
+    if (last_infer_ms_ > 30.0) {
+        ALOG_WARN(MOD, "[PERF] Descriptor compute SLOW: {:.1f}ms (target: <20ms for 50Hz) pts={}", 
+                  last_infer_ms_, cloud ? cloud->size() : 0);
+    } else if (total_inferences_ % 50 == 0) {
+        // 每50次输出一次平均耗时
+        ALOG_DEBUG(MOD, "[PERF] Avg descriptor: {:.1f}ms (calls={})",
+                   last_infer_ms_, total_inferences_);
     }
+    
     return desc;
 }
 
