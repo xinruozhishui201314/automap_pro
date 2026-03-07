@@ -95,7 +95,14 @@ void SubMapManager::addKeyFrame(const KeyFrame::Ptr& kf) {
             submaps_.push_back(active_submap_);
             RCLCPP_INFO(rclcpp::get_logger("automap_system"),
                 "[SubMapMgr][ADD_KF_STEP] created new submap sm_id=%d (first KF)", active_submap_->id);
-            
+            // 建图精度分析：子图锚定帧位姿协方差(1σ)
+            const Mat66d& cov = kf->covariance;
+            double pos_std_x = std::sqrt(std::max(0.0, cov(3, 3)));
+            double pos_std_y = std::sqrt(std::max(0.0, cov(4, 4)));
+            double pos_std_z = std::sqrt(std::max(0.0, cov(5, 5)));
+            RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                "[PRECISION][SUBMAP] created sm_id=%d kf_id=%lu pos_std_xyz=[%.4f,%.4f,%.4f]m",
+                active_submap_->id, kf->id, pos_std_x, pos_std_y, pos_std_z);
             SLOG_INFO(MOD, "Created new submap: id={}, session_id={}", 
                       active_submap_->id, current_session_id_);
             
@@ -277,14 +284,14 @@ void SubMapManager::freezeActiveSubmap(const SubMap::Ptr& sm) {
         METRICS_INCREMENT(metrics::SUBMAPS_FROZEN);
         
         // 触发回调（→ onSubmapFrozen → getFrozenSubmaps；必须在未持 mutex_ 时调用，此处已满足）
-        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-            "[SubMapMgr][FREEZE_STEP] before frozen_cbs_ sm_id=%d", sm->id);
+        // RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+        //     "[SubMapMgr][FREEZE_STEP] before frozen_cbs_ sm_id=%d", sm->id);
         for (auto& cb : frozen_cbs_) {
             SLOG_DEBUG(MOD, "Calling frozen callback for SM#{}", sm->id);
             cb(sm);
         }
-        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-            "[SubMapMgr][FREEZE_STEP] after frozen_cbs_ sm_id=%d", sm->id);
+        // RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+        //     "[SubMapMgr][FREEZE_STEP] after frozen_cbs_ sm_id=%d", sm->id);
         
         // 更新健康检查：此处可安全调用 getFrozenSubmaps（当前未持 mutex_）
         HEALTH_UPDATE_QUEUE("submap", getFrozenSubmaps().size());
@@ -571,6 +578,7 @@ CloudXYZIPtr SubMapManager::buildGlobalMap(float voxel_size) const {
     // 使用优化后位姿从关键帧重算全局图，避免“位姿已优化、点云仍为旧世界系”导致的杂乱（见 docs/GLOBAL_MAP_MESSY_ANALYSIS.md）
     CloudXYZIPtr world_tmp = std::make_shared<CloudXYZI>();
     bool hit_limit = false;
+    bool used_fallback_path = false;  // 用于 [GLOBAL_MAP_BLUR] 精准定位
     size_t kf_used_total = 0;
     size_t kf_skipped_null = 0;
     size_t kf_skipped_empty = 0;
@@ -721,6 +729,7 @@ CloudXYZIPtr SubMapManager::buildGlobalMap(float voxel_size) const {
             METRICS_INCREMENT(metrics::FALLBACK_TO_MERGED_CLOUD);
         }
 
+        used_fallback_path = true;  // 供 [GLOBAL_MAP_BLUR] 汇总判断
         RCLCPP_WARN(log, "[GLOBAL_MAP_DIAG] ┌─ 回退路径: 拼接 merged_cloud (旧世界系，可能不准确)");
         RCLCPP_INFO(log, "[GLOBAL_MAP_DIAG] path=fallback_merged_cloud (⚠️  if shown, global_map may be misaligned with optimized trajectory)");
         
@@ -809,7 +818,21 @@ CloudXYZIPtr SubMapManager::buildGlobalMap(float voxel_size) const {
             RCLCPP_INFO(log, "[GLOBAL_MAP_DIAG] buildGlobalMap SUCCESS: %zu points → %zu after downsample", 
                 combined->size(), out->size());
             RCLCPP_INFO(log, "[GLOBAL_MAP_DIAG] ════════════════════════════════════════════════════════");
-            
+            // 精准定位模糊问题：单行汇总，grep GLOBAL_MAP_BLUR 即可
+            {
+                const double comp_pct = (combined->empty()) ? 0.0 : (100.0 * static_cast<double>(out->size()) / static_cast<double>(combined->size()));
+                const bool blur_risk = used_fallback_path || (kf_fallback_unopt > 0u) || (comp_pct < 5.0) || (vs > 0.3f);
+                RCLCPP_INFO(log, "[GLOBAL_MAP_BLUR] path=%s kf_unopt=%zu voxel=%.3f combined=%zu out=%zu comp_pct=%.1f%% blur_risk=%s",
+                    used_fallback_path ? "fallback" : "from_kf", kf_fallback_unopt, vs, combined->size(), out->size(), comp_pct, blur_risk ? "yes" : "no");
+                if (blur_risk) {
+                    RCLCPP_WARN(log,
+                        "[GLOBAL_MAP_BLUR] 存在模糊风险: %s%s%s%s → 见 docs/GLOBAL_MAP_BLUR_ANALYSIS.md",
+                        used_fallback_path ? "path=fallback " : "",
+                        (kf_fallback_unopt > 0u) ? "未优化位姿 " : "",
+                        (comp_pct < 5.0) ? "下采样过狠 " : "",
+                        (vs > 0.3f) ? "体素过大 " : "");
+                }
+            }
             return out;
         } else if (out && out->empty()) {
             SLOG_WARN(MOD, "buildGlobalMap: voxelDownsampleChunked returned empty, returning sanitized combined");

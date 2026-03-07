@@ -55,6 +55,7 @@ def _launch_nodes_offline(context, *args, **kwargs):
         from params_from_system_config import (
             load_system_config,
             get_overlap_transformer_params,
+            resolve_default_overlap_model_path,
             get_fast_livo2_params,
             get_hba_params,
             get_hba_cal_mme_params,
@@ -63,6 +64,12 @@ def _launch_nodes_offline(context, *args, **kwargs):
         )
         system_config = load_system_config(config_path)
         ot_params = get_overlap_transformer_params(system_config)
+        if not (ot_params.get("model_path") or "").strip():
+            default_ot = resolve_default_overlap_model_path(launch_dir)
+            if default_ot:
+                ot_params["model_path"] = default_ot
+                sys.stderr.write("{} [OVERLAP] model_path 为空，使用仓库内默认: {}\n".format(_LP, default_ot))
+                sys.stderr.flush()
         hba_params = get_hba_params(system_config)
         hba_cal_mme_params = get_hba_cal_mme_params(system_config)
         hba_visualize_params = get_hba_visualize_params(system_config)
@@ -74,7 +81,7 @@ def _launch_nodes_offline(context, *args, **kwargs):
 
     # 在 OpaqueFunction 内用 .perform(context) 读参数，按需添加节点，避免 IfCondition/PythonExpression 触发 Humble 的 TypeError
     use_external_frontend_val = LaunchConfiguration("use_external_frontend", default="false").perform(context).strip().lower() == "true"
-    use_external_overlap_val = LaunchConfiguration("use_external_overlap", default="false").perform(context).strip().lower() == "true"
+    use_external_overlap_val = LaunchConfiguration("use_external_overlap", default="true").perform(context).strip().lower() == "true"
     use_hba_val = LaunchConfiguration("use_hba", default="true").perform(context).strip().lower() == "true"
     use_hba_cal_mme_val = LaunchConfiguration("use_hba_cal_mme", default="false").perform(context).strip().lower() == "true"
     use_hba_visualize_val = LaunchConfiguration("use_hba_visualize", default="false").perform(context).strip().lower() == "true"
@@ -312,7 +319,7 @@ def generate_launch_description():
         DeclareLaunchArgument("rate", default_value="0.5", description="Playback rate (0.5=half speed, 1.0=realtime)"),
         DeclareLaunchArgument("use_rviz", default_value="true", description="Whether to start RViz"),
         DeclareLaunchArgument("use_external_frontend", default_value="true", description="true=use verified fast_livo node (modular); false=use internal FastLIVO2Wrapper (ESIKF)"),
-        DeclareLaunchArgument("use_external_overlap", default_value="false", description="Launch OverlapTransformer descriptor (params from system_config)"),
+        DeclareLaunchArgument("use_external_overlap", default_value="true", description="Launch OverlapTransformer descriptor; true=使用 pretrained_overlap_transformer.pth.tar 做回环粗匹配"),
         DeclareLaunchArgument("use_hba", default_value="false", description="Launch standalone HBA node (reads pose.json at startup; offline 时默认 false 避免零位姿崩溃，优化由 automap_system 内 HBAOptimizer 负责)"),
         DeclareLaunchArgument("use_hba_cal_mme", default_value="false", description="Launch HBA cal_MME node (params from system_config.backend.hba_cal_mme)"),
         DeclareLaunchArgument("use_hba_visualize", default_value="false", description="Launch HBA visualize node (params from system_config.backend.hba_visualize)"),

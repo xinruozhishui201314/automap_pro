@@ -307,6 +307,11 @@ add_library(automap_loop_closure SHARED
 target_include_directories(automap_loop_closure PUBLIC ${AUTOMAP_INCLUDE_DIRS})
 target_link_libraries(automap_loop_closure automap_core automap_submap ${AUTOMAP_LIBS})
 ament_target_dependencies(automap_loop_closure ${AUTOMAP_AMENT_DEPS})
+# 与 PCL 构建对齐，避免 FPFHEstimation 析构时 Eigen aligned_free 崩溃（PCL #4877）
+if(PCL_DEFINITIONS)
+  target_compile_definitions(automap_loop_closure PRIVATE ${PCL_DEFINITIONS})
+endif()
+target_compile_definitions(automap_loop_closure PRIVATE EIGEN_MAKE_ALIGNED_OPERATION_NEW)
 if(overlap_transformer_msgs_FOUND)
   ament_target_dependencies(automap_loop_closure overlap_transformer_msgs)
 endif()

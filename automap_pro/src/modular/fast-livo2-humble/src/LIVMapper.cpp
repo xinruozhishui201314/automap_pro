@@ -460,7 +460,7 @@ void LIVMapper::handleVIO()
     return;
   }
     
-  std::cout << "[ VIO ] Raw feature num: " << pcl_w_wait_pub->points.size() << std::endl;
+  // std::cout << "[ VIO ] Raw feature num: " << pcl_w_wait_pub->points.size() << std::endl;
 
   if (fabs((LidarMeasures.last_lio_update_time - _first_lidar_time) - plot_time) < (frame_cnt / 2 * 0.1)) 
   {
@@ -1002,7 +1002,7 @@ void LIVMapper::imu_cbk(const sensor_msgs::msg::Imu::ConstSharedPtr &msg_in)
 
   imu_buffer.push_back(msg);
   if (should_log) {
-    RCLCPP_INFO(this->node->get_logger(), "get imu at time: %.6f, imu size %zu %s", t, imu_buffer.size(), hostTimeString().c_str());
+    // RCLCPP_INFO(this->node->get_logger(), "get imu at time: %.6f, imu size %zu %s", t, imu_buffer.size(), hostTimeString().c_str());
   }
   mtx_buffer.unlock();
   if (imu_prop_enable)

@@ -15,6 +15,8 @@
 #include <filesystem>
 #include <chrono>
 #include <algorithm>
+#include <iomanip>
+#include <sstream>
 
 namespace fs = std::filesystem;
 namespace automap_pro {
@@ -76,7 +78,7 @@ AutoMapSystem::~AutoMapSystem() {
     // 工作线程已退出、队列无人消费而永久阻塞，进程被 SIGKILL，地图从未保存）
     if (submap_manager_.submapCount() > 0) {
         try {
-            std::string out_dir = ConfigManager::instance().outputDir();
+            std::string out_dir = getOutputDir();
             RCLCPP_INFO(get_logger(), "[AutoMapSystem][PIPELINE] event=shutdown_auto_save output_dir=%s submaps=%d", out_dir.c_str(), submap_manager_.submapCount());
             saveMapToFiles(out_dir);
             RCLCPP_INFO(get_logger(), "[AutoMapSystem] Auto-saved backend map to %s on shutdown", out_dir.c_str());
@@ -102,7 +104,15 @@ AutoMapSystem::~AutoMapSystem() {
 void AutoMapSystem::loadConfigAndInit() {
     RCLCPP_DEBUG(get_logger(), "[AutoMapSystem][CONFIG] Declaring parameter config_file");
     declare_parameter("config_file", "");
+    declare_parameter("output_dir", std::string(""));
+    declare_parameter("trajectory_log_enable", true);
+    declare_parameter("trajectory_log_dir", std::string(""));
     std::string config_path = get_parameter("config_file").as_string();
+    output_dir_override_ = get_parameter("output_dir").as_string();
+    while (!output_dir_override_.empty() && output_dir_override_.back() == '/') output_dir_override_.pop_back();
+    if (!output_dir_override_.empty()) {
+        RCLCPP_INFO(get_logger(), "[AutoMapSystem][CONFIG] output_dir from launch: %s (前后端地图将保存到此目录)", output_dir_override_.c_str());
+    }
     RCLCPP_INFO(get_logger(), "[AutoMapSystem][CONFIG] config_file param=%s", config_path.empty() ? "(empty)" : config_path.c_str());
     if (!config_path.empty()) {
         ConfigManager::instance().load(config_path);
@@ -110,6 +120,14 @@ void AutoMapSystem::loadConfigAndInit() {
     } else {
         RCLCPP_WARN(get_logger(), "[AutoMapSystem][CONFIG] No config file specified, using defaults");
     }
+    trajectory_log_enabled_ = get_parameter("trajectory_log_enable").as_bool();
+    trajectory_log_dir_    = get_parameter("trajectory_log_dir").as_string();
+    if (trajectory_log_dir_.empty()) {
+        const char* env_dir = std::getenv("AUTOMAP_LOG_DIR");
+        trajectory_log_dir_ = env_dir ? env_dir : "logs";
+    }
+    RCLCPP_INFO(get_logger(), "[AutoMapSystem][CONFIG] trajectory_log_enable=%d trajectory_log_dir=%s",
+                trajectory_log_enabled_ ? 1 : 0, trajectory_log_dir_.c_str());
 }
 
 void AutoMapSystem::setupModules() {
@@ -180,6 +198,8 @@ void AutoMapSystem::deferredSetupModules() {
     RCLCPP_INFO(get_logger(), "[AutoMapSystem][DEFERRED] Step 7: register GPSManager callbacks");
     gps_manager_.registerAlignCallback(
         [this](const GPSAlignResult& r) { onGPSAligned(r); });
+    gps_manager_.registerMeasurementLogCallback(
+        [this](double ts, const Eigen::Vector3d& pos_enu) { onGPSMeasurementForLog(ts, pos_enu); });
     gps_manager_.registerGpsFactorCallback(
         [this](double ts, const Eigen::Vector3d& pos, const Eigen::Matrix3d& cov) {
             if (!gps_aligned_) return;
@@ -283,6 +303,13 @@ void AutoMapSystem::onOdometry(double ts, const Pose3d& pose, const Mat66d& cov)
         RCLCPP_INFO(get_logger(),
             "[AutoMapSystem][BACKEND][RECV] odom #%d ts=%.3f pos=[%.2f,%.2f,%.2f] (backend entry)",
             seq, ts, pose.translation().x(), pose.translation().y(), pose.translation().z());
+        double pos_std_x = std::sqrt(std::max(0.0, cov(3, 3)));
+        double pos_std_y = std::sqrt(std::max(0.0, cov(4, 4)));
+        double pos_std_z = std::sqrt(std::max(0.0, cov(5, 5)));
+        RCLCPP_INFO(get_logger(),
+            "[PRECISION][ODOM] seq=%d ts=%.4f pos_std_xyz=[%.4f,%.4f,%.4f] pos=[%.3f,%.3f,%.3f]",
+            seq, ts, pos_std_x, pos_std_y, pos_std_z,
+            pose.translation().x(), pose.translation().y(), pose.translation().z());
     }
     if (!first_odom_logged_.exchange(true)) {
         RCLCPP_INFO(get_logger(), "[AutoMapSystem][DATA] First odometry received ts=%.3f pos=[%.2f,%.2f,%.2f]", ts, pose.translation().x(), pose.translation().y(), pose.translation().z());
@@ -318,17 +345,21 @@ void AutoMapSystem::onOdometry(double ts, const Pose3d& pose, const Mat66d& cov)
         pub_odom_path_count_++;
     }
 
+    // 轨迹对比记录：每帧位姿写入 CSV，便于与 GPS 曲线对比分析建图精度
+    if (trajectory_log_enabled_) writeTrajectoryOdom(ts, pose, cov);
+
     // 关键帧由 onCloud 触发，保证 pose 与 cloud 同帧（fast_livo 先发 odom 再发 cloud，收到 cloud 时 last_odom_pose_ 已是本帧）
 }
 
 void AutoMapSystem::onCloud(double ts, const CloudXYZIPtr& cloud) {
     const size_t pts = cloud ? cloud->size() : 0u;
-    RCLCPP_INFO(get_logger(),
-        "[AutoMapSystem][BACKEND][RECV] cloud entry ts=%.3f pts=%zu → queue (callback returns immediately)",
-        ts, pts);
+    (void)pts;  // for optional RCLCPP_INFO below
+    // RCLCPP_INFO(get_logger(),
+    //     "[AutoMapSystem][BACKEND][RECV] cloud entry ts=%.3f pts=%zu → queue (callback returns immediately)",
+    //     ts, pts);
     if (!first_cloud_logged_.exchange(true)) {
-        RCLCPP_INFO(get_logger(), "[AutoMapSystem][DATA] First cloud received ts=%.3f pts=%zu", ts, pts);
-        RCLCPP_INFO(get_logger(), "[AutoMapSystem][PIPELINE] event=first_cloud ts=%.3f pts=%zu", ts, pts);
+        // RCLCPP_INFO(get_logger(), "[AutoMapSystem][DATA] First cloud received ts=%.3f pts=%zu", ts, pts);
+        // RCLCPP_INFO(get_logger(), "[AutoMapSystem][PIPELINE] event=first_cloud ts=%.3f pts=%zu", ts, pts);
     }
     {
         std::lock_guard<std::mutex> lk(data_mutex_);
@@ -344,8 +375,8 @@ void AutoMapSystem::onCloud(double ts, const CloudXYZIPtr& cloud) {
         if (frame_queue_.size() >= kMaxFrameQueueSize) {
             frame_queue_.pop();
             frame_queue_dropped_++;
-            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
-                "[AutoMapSystem][BACKEND] frame queue full (%zu), drop oldest (total_dropped=%d)", kMaxFrameQueueSize, frame_queue_dropped_.load());
+            // RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+            //     "[AutoMapSystem][BACKEND] frame queue full (%zu), drop oldest (total_dropped=%d)", kMaxFrameQueueSize, frame_queue_dropped_.load());
         }
         frame_queue_.push(std::move(f));
     }
@@ -355,21 +386,21 @@ void AutoMapSystem::onCloud(double ts, const CloudXYZIPtr& cloud) {
     {
         static std::atomic<bool> first_frame_queued_logged{false};
         if (!first_frame_queued_logged.exchange(true)) {
-            RCLCPP_INFO(get_logger(), "[AutoMapSystem][BACKEND][DIAG] first frame in queue ts=%.3f pts=%zu, notify_one (worker should wake)", ts, pts);
+            // RCLCPP_INFO(get_logger(), "[AutoMapSystem][BACKEND][DIAG] first frame in queue ts=%.3f pts=%zu, notify_one (worker should wake)", ts, pts);
         }
     }
     if (qs <= 3 || qs % 50 == 0) {
-        RCLCPP_INFO(get_logger(), "[AutoMapSystem][BACKEND][RECV] cloud ts=%.3f pts=%zu queued, queue_size=%zu", ts, pts, qs);
+        // RCLCPP_INFO(get_logger(), "[AutoMapSystem][BACKEND][RECV] cloud ts=%.3f pts=%zu queued, queue_size=%zu", ts, pts, qs);
     }
 }
 
 void AutoMapSystem::onKFInfo(const LivoKeyFrameInfo& info) {
     static std::atomic<int> backend_kfinfo_recv_count{0};
     const int seq = backend_kfinfo_recv_count.fetch_add(1) + 1;
-    if (seq <= 5 || seq % 200 == 0) {
-        RCLCPP_INFO(get_logger(),
-            "[AutoMapSystem][BACKEND][RECV] kfinfo #%d ts=%.3f cov_norm=%.4f degen=%d (backend entry)",
-            seq, info.timestamp, info.esikf_cov_norm, info.is_degenerate ? 1 : 0);
+    if (seq <= 5 || seq % 20 == 0) {
+        // RCLCPP_INFO(get_logger(),
+        //     "[AutoMapSystem][BACKEND][RECV] kfinfo #%d ts=%.3f cov_norm=%.4f degen=%d (backend entry)",
+        //     seq, info.timestamp, info.esikf_cov_norm, info.is_degenerate ? 1 : 0);
     }
     { std::lock_guard<std::mutex> lk(data_mutex_); last_livo_info_ = info; }
     kfinfoCacheAdd(info.timestamp, info);
@@ -422,10 +453,10 @@ bool AutoMapSystem::kfinfoCacheGet(double ts, LivoKeyFrameInfo& out_info) {
 }
 
 void AutoMapSystem::backendWorkerLoop() {
-    RCLCPP_INFO(get_logger(), "[AutoMapSystem][BACKEND] worker thread running, entering wait for first frame (queue empty until LivoBridge feeds)");
+    // RCLCPP_INFO(get_logger(), "[AutoMapSystem][BACKEND] worker thread running, entering wait for first frame (queue empty until LivoBridge feeds)");
     const std::string cloud_frame = ConfigManager::instance().frontendCloudFrame();
-    RCLCPP_INFO(get_logger(), "[AutoMapSystem][BACKEND][CONFIG] frontend_cloud_frame=%s (fast_livo /cloud_registered is world; use world to avoid global map double-transform)",
-                cloud_frame.c_str());
+    // RCLCPP_INFO(get_logger(), "[AutoMapSystem][BACKEND][CONFIG] frontend_cloud_frame=%s (fast_livo /cloud_registered is world; use world to avoid global map double-transform)",
+    //             cloud_frame.c_str());
     static thread_local int no_odom_skip_count = 0;
     const auto wait_chunk = std::chrono::milliseconds(2000);
     const double idle_timeout_sec = ConfigManager::instance().sensorIdleTimeoutSec();
@@ -450,19 +481,19 @@ void AutoMapSystem::backendWorkerLoop() {
                     first_cloud_logged_.load(std::memory_order_acquire) && idle_sec >= idle_timeout_sec) {
                     sensor_idle_finish_triggered_.store(true, std::memory_order_release);
                     lock.unlock();
-                    RCLCPP_INFO(get_logger(), "[AutoMapSystem][PIPELINE] event=sensor_idle_timeout idle_sec=%.1f timeout=%.1f → final HBA + save + shutdown", idle_sec, idle_timeout_sec);
+                    // RCLCPP_INFO(get_logger(), "[AutoMapSystem][PIPELINE] event=sensor_idle_timeout idle_sec=%.1f timeout=%.1f → final HBA + save + shutdown", idle_sec, idle_timeout_sec);
                     try {
                         if (submap_manager_.submapCount() > 0) {
                             if (ConfigManager::instance().hbaOnFinish()) {
                                 auto all = submap_manager_.getAllSubmaps();
-                                RCLCPP_INFO(get_logger(), "[AutoMapSystem] Sensor idle: triggering final HBA (wait=true) submaps=%zu", all.size());
+                                // RCLCPP_INFO(get_logger(), "[AutoMapSystem] Sensor idle: triggering final HBA (wait=true) submaps=%zu", all.size());
                                 hba_optimizer_.triggerAsync(all, true);
-                                RCLCPP_INFO(get_logger(), "[AutoMapSystem][PIPELINE] event=final_hba_done");
+                                // RCLCPP_INFO(get_logger(), "[AutoMapSystem][PIPELINE] event=final_hba_done");
                             }
-                            std::string out_dir = ConfigManager::instance().outputDir();
-                            RCLCPP_INFO(get_logger(), "[AutoMapSystem] Sensor idle: saving map to %s", out_dir.c_str());
+                            std::string out_dir = getOutputDir();
+                            // RCLCPP_INFO(get_logger(), "[AutoMapSystem] Sensor idle: saving map to %s", out_dir.c_str());
                             saveMapToFiles(out_dir);
-                            RCLCPP_INFO(get_logger(), "[AutoMapSystem][PIPELINE] event=auto_finish_save_done output_dir=%s", out_dir.c_str());
+                            // RCLCPP_INFO(get_logger(), "[AutoMapSystem][PIPELINE] event=auto_finish_save_done output_dir=%s", out_dir.c_str());
                         }
                         RCLCPP_INFO(get_logger(), "[AutoMapSystem] Sensor idle: requesting context shutdown (end mapping)");
                         rclcpp::shutdown();
@@ -495,6 +526,7 @@ void AutoMapSystem::backendWorkerLoop() {
             no_odom_skip_count++;
             if (no_odom_skip_count <= 15) {
                 RCLCPP_WARN(get_logger(), "[AutoMapSystem][BACKEND][DIAG] no odom in cache for ts=%.3f frame_no=%d skip #%d (odom not yet arrived or ts mismatch)", f.ts, frame_no, no_odom_skip_count);
+                RCLCPP_INFO(get_logger(), "[TRACE] step=backend_worker result=skip reason=no_odom_in_cache frame_no=%d ts=%.3f pts=%zu (精准定位: 缓存无对应位姿)", frame_no, f.ts, f.cloud ? f.cloud->size() : 0u);
             } else {
                 RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
                     "[AutoMapSystem][BACKEND] no odom in cache for ts=%.3f frame_no=%d, skip (align by ts) total_skips=%d", f.ts, frame_no, no_odom_skip_count);
@@ -525,9 +557,13 @@ void AutoMapSystem::backendWorkerLoop() {
             tryCreateKeyFrame(f.ts, pose, cov, cloud_for_kf, &kfinfo_copy);
         } catch (const std::exception& e) {
             RCLCPP_ERROR(get_logger(), "[AutoMapSystem][BACKEND][EXCEPTION] worker frame_no=%d ts=%.3f: %s", frame_no, f.ts, e.what());
+            RCLCPP_INFO(get_logger(), "[TRACE] step=backend_worker result=fail reason=exception frame_no=%d ts=%.3f step_where=tryCreateKeyFrame what=%s",
+                       frame_no, f.ts, e.what());
             ErrorMonitor::instance().recordException(e, errors::LIVO_ODOMETRY_FAILED);
         } catch (...) {
             RCLCPP_ERROR(get_logger(), "[AutoMapSystem][BACKEND][EXCEPTION] worker frame_no=%d ts=%.3f: unknown", frame_no, f.ts);
+            RCLCPP_INFO(get_logger(), "[TRACE] step=backend_worker result=fail reason=unknown_exception frame_no=%d ts=%.3f step_where=tryCreateKeyFrame",
+                       frame_no, f.ts);
             ErrorMonitor::instance().recordError(ErrorDetail(errors::UNKNOWN_ERROR, "backend worker unknown exception"));
         }
         const double duration_ms = 1e-6 * std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - t0).count();
@@ -590,6 +626,7 @@ void AutoMapSystem::tryCreateKeyFrame(double ts, const Pose3d& pose, const Mat66
     // 空点云直接丢弃，不参与关键帧决策
     if (!cur_cloud || cur_cloud->empty()) {
         RCLCPP_INFO(get_logger(), "[AutoMapSystem][BACKEND][FRAME] ts=%.3f result=discard_empty (no KF decision)", ts);
+        RCLCPP_INFO(get_logger(), "[TRACE] step=kf_decision result=skip reason=cloud_empty ts=%.3f pts=0 (精准定位: 点云为空)", ts);
         static int empty_skip_count = 0;
         if (++empty_skip_count <= 3 || empty_skip_count % 100 == 0) {
             RCLCPP_DEBUG(get_logger(), "[AutoMapSystem][KF] cloud_ts=%.3f cloud empty, discard (no KF decision)", ts);
@@ -598,14 +635,15 @@ void AutoMapSystem::tryCreateKeyFrame(double ts, const Pose3d& pose, const Mat66
         return;
     }
 
-    RCLCPP_INFO(get_logger(), "[AutoMapSystem][BACKEND][FRAME] process ts=%.3f pts=%zu odom_ts=%.3f (KF decision)",
-                ts, cur_cloud->size(), odom_ts);
+    // RCLCPP_INFO(get_logger(), "[AutoMapSystem][BACKEND][FRAME] process ts=%.3f pts=%zu odom_ts=%.3f (KF decision)",
+    //             ts, cur_cloud->size(), odom_ts);
 
     using KfClock = std::chrono::steady_clock;
     const auto kf_t0 = KfClock::now();
 
     if (!kf_manager_.shouldCreateKeyFrame(cur_pose, ts)) {
         RCLCPP_INFO(get_logger(), "[AutoMapSystem][BACKEND][FRAME] ts=%.3f result=skip_no_kf (dist/rot/interval)", ts);
+        RCLCPP_INFO(get_logger(), "[TRACE] step=kf_decision result=skip reason=shouldCreateKeyFrame_false ts=%.3f pts=%zu (精准定位: 距离/旋转/间隔未达阈值)", ts, cur_cloud->size());
         static int reject_count = 0;
         if (++reject_count >= 60) {
             reject_count = 0;
@@ -639,6 +677,13 @@ void AutoMapSystem::tryCreateKeyFrame(double ts, const Pose3d& pose, const Mat66
     auto t_after_gps = KfClock::now();
     double ms_gps = 1e-6 * std::chrono::duration_cast<std::chrono::microseconds>(t_after_gps - t_after_voxel).count();
     RCLCPP_DEBUG(get_logger(), "[AutoMapSystem][BACKEND][KF_STEP] ts=%.3f step=gps_query done ms=%.1f", ts, ms_gps);
+
+    // 精准定位模糊：关键帧点云过少会导致全局图稀疏/糊
+    constexpr size_t kSparseKeyframeThreshold = 500;
+    if (cur_cloud->size() < kSparseKeyframeThreshold) {
+        RCLCPP_WARN(get_logger(), "[GLOBAL_MAP_BLUR] sparse_keyframe kf_pts=%zu (threshold=%zu) ts=%.3f → 全局图可能稀疏，检查前端 filter_size_surf/盲区",
+                    cur_cloud->size(), kSparseKeyframeThreshold, ts);
+    }
 
     auto kf = kf_manager_.createKeyFrame(
         cur_pose, cur_cov, ts,
@@ -674,6 +719,8 @@ void AutoMapSystem::tryCreateKeyFrame(double ts, const Pose3d& pose, const Mat66
         has_gps ? 1 : 0, livo_info.is_degenerate ? 1 : 0, ms_total);
     RCLCPP_INFO(get_logger(), "[AutoMapSystem][BACKEND][FRAME] ts=%.3f result=kf_created kf_id=%lu sm_id=%d pts=%zu (tryCreateKeyFrame total_ms=%.1f)",
                 ts, kf->id, kf->submap_id, cur_cloud->size(), ms_total);
+    RCLCPP_INFO(get_logger(), "[TRACE] step=kf_decision result=ok reason=kf_created kf_id=%lu sm_id=%d ts=%.3f pts=%zu total_ms=%.1f",
+                kf->id, kf->submap_id, ts, cur_cloud->size(), ms_total);
     RCLCPP_INFO(get_logger(), "[AutoMapSystem][PIPELINE] event=kf_created kf_id=%lu sm_id=%d cloud_ts=%.3f odom_ts=%.3f pts=%zu",
         kf->id, kf->submap_id, ts, odom_ts, cur_cloud->size());
     ALOG_DEBUG(MOD, "KF#{} created: pts={} ds_pts={} has_gps={} livo_degen={}",
@@ -693,19 +740,20 @@ void AutoMapSystem::onSubmapFrozen(const SubMap::Ptr& submap) {
     const double ax = submap->pose_w_anchor.translation().x();
     const double ay = submap->pose_w_anchor.translation().y();
     const double az = submap->pose_w_anchor.translation().z();
-    RCLCPP_INFO(get_logger(),
-        "[AutoMapSystem][SM] frozen sm_id=%d kf_count=%zu t=[%.3f,%.3f] dist=%.2fm anchor=[%.2f,%.2f,%.2f] total_frozen=%d",
-        submap->id, submap->keyframes.size(), submap->t_start, submap->t_end,
-        submap->spatial_extent_m, ax, ay, az, frozen_submap_count_);
-    RCLCPP_INFO(get_logger(), "[AutoMapSystem][PIPELINE] event=sm_frozen sm_id=%d kfs=%zu total_frozen=%d", submap->id, submap->keyframes.size(), frozen_submap_count_);
-    ALOG_INFO(MOD, "SM#{} FROZEN: kf={} dist={:.1f}m total_frozen={}",
-              submap->id, submap->keyframes.size(),
-              submap->spatial_extent_m, frozen_submap_count_);
+    (void)ax; (void)ay; (void)az;  // for optional RCLCPP_INFO below
+    // RCLCPP_INFO(get_logger(),
+    //     "[AutoMapSystem][SM] frozen sm_id=%d kf_count=%zu t=[%.3f,%.3f] dist=%.2fm anchor=[%.2f,%.2f,%.2f] total_frozen=%d",
+    //     submap->id, submap->keyframes.size(), submap->t_start, submap->t_end,
+    //     submap->spatial_extent_m, ax, ay, az, frozen_submap_count_);
+    // RCLCPP_INFO(get_logger(), "[AutoMapSystem][PIPELINE] event=sm_frozen sm_id=%d kfs=%zu total_frozen=%d", submap->id, submap->keyframes.size(), frozen_submap_count_);
+    // ALOG_INFO(MOD, "SM#{} FROZEN: kf={} dist={:.1f}m total_frozen={}",
+    //           submap->id, submap->keyframes.size(),
+    //           submap->spatial_extent_m, frozen_submap_count_);
 
     // 添加子图节点到 iSAM2
     bool is_first = (isam2_optimizer_.nodeCount() == 0);
     isam2_optimizer_.addSubMapNode(submap->id, submap->pose_w_anchor, is_first);
-    RCLCPP_INFO(get_logger(), "[AutoMapSystem][PIPELINE] event=isam2_node_added sm_id=%d is_first=%d node_count=%d", submap->id, is_first ? 1 : 0, isam2_optimizer_.nodeCount());
+    // RCLCPP_INFO(get_logger(), "[AutoMapSystem][PIPELINE] event=isam2_node_added sm_id=%d is_first=%d node_count=%d", submap->id, is_first ? 1 : 0, isam2_optimizer_.nodeCount());
 
     // 添加里程计因子（与前一个子图之间）
     auto all_sm = submap_manager_.getFrozenSubmaps();
@@ -717,9 +765,24 @@ void AutoMapSystem::onSubmapFrozen(const SubMap::Ptr& submap) {
         Mat66d info = computeOdomInfoMatrix(prev, submap, rel);
         
         isam2_optimizer_.addOdomFactor(prev->id, submap->id, rel, info);
-        RCLCPP_DEBUG(get_logger(), "[AutoMapSystem][SM] odom factor prev_sm=%d cur_sm=%d info_norm=%.2e",
-                     prev->id, submap->id, info.norm());
-        RCLCPP_INFO(get_logger(), "[AutoMapSystem][PIPELINE] event=odom_factor_added prev_sm=%d cur_sm=%d", prev->id, submap->id);
+        // RCLCPP_DEBUG(get_logger(), "[AutoMapSystem][SM] odom factor prev_sm=%d cur_sm=%d info_norm=%.2e",
+        //              prev->id, submap->id, info.norm());
+        // RCLCPP_INFO(get_logger(), "[AutoMapSystem][PIPELINE] event=odom_factor_added prev_sm=%d cur_sm=%d", prev->id, submap->id);
+    }
+
+    // 建图精度日志：子图冻结时的几何与锚定帧不确定性
+    if (!submap->keyframes.empty()) {
+        const Mat66d& anchor_cov = submap->keyframes.front()->covariance;
+        double a_px = std::sqrt(std::max(0.0, anchor_cov(3, 3)));
+        double a_py = std::sqrt(std::max(0.0, anchor_cov(4, 4)));
+        double a_pz = std::sqrt(std::max(0.0, anchor_cov(5, 5)));
+        RCLCPP_INFO(get_logger(),
+            "[PRECISION][SUBMAP] frozen sm_id=%d kf_count=%zu extent_m=%.2f anchor_pos_std_xyz=[%.4f,%.4f,%.4f] total_frozen=%d",
+            submap->id, submap->keyframes.size(), submap->spatial_extent_m, a_px, a_py, a_pz, frozen_submap_count_);
+    } else {
+        RCLCPP_INFO(get_logger(),
+            "[PRECISION][SUBMAP] frozen sm_id=%d kf_count=0 extent_m=%.2f total_frozen=%d",
+            submap->id, submap->spatial_extent_m, frozen_submap_count_);
     }
 
     // 提交到回环检测器
@@ -730,9 +793,9 @@ void AutoMapSystem::onSubmapFrozen(const SubMap::Ptr& submap) {
     if (frozen_submap_count_ % hba_trigger == 0) {
         auto all = submap_manager_.getAllSubmaps();
         hba_optimizer_.triggerAsync(all, false);
-        RCLCPP_INFO(get_logger(), "[AutoMapSystem][SM] HBA trigger (frozen_count=%d mod %d) submaps=%zu",
-                   frozen_submap_count_, hba_trigger, all.size());
-        RCLCPP_INFO(get_logger(), "[AutoMapSystem][PIPELINE] event=hba_trigger frozen=%d submaps=%zu", frozen_submap_count_, all.size());
+        // RCLCPP_INFO(get_logger(), "[AutoMapSystem][SM] HBA trigger (frozen_count=%d mod %d) submaps=%zu",
+        //            frozen_submap_count_, hba_trigger, all.size());
+        // RCLCPP_INFO(get_logger(), "[AutoMapSystem][PIPELINE] event=hba_trigger frozen=%d submaps=%zu", frozen_submap_count_, all.size());
     }
     // 数据触发：子图冻结后立即发布全局地图
     publishGlobalMap();
@@ -766,9 +829,13 @@ void AutoMapSystem::onLoopDetected(const LoopConstraint::Ptr& lc) {
         RCLCPP_INFO(get_logger(),
             "[AutoMapSystem][LOOP] optimized nodes_updated=%d elapsed=%.1fms final_rmse=%.4f",
             result.nodes_updated, result.elapsed_ms, result.final_rmse);
+        RCLCPP_INFO(get_logger(), "[TRACE] step=loop_factor_add result=ok sm_i=%d sm_j=%d nodes_updated=%d rmse=%.4f elapsed_ms=%.1f",
+                   lc->submap_i, lc->submap_j, result.nodes_updated, result.final_rmse, result.elapsed_ms);
         RCLCPP_INFO(get_logger(), "[AutoMapSystem][PIPELINE] event=loop_factor_added success=1 sm_i=%d sm_j=%d nodes_updated=%d rmse=%.4f", lc->submap_i, lc->submap_j, result.nodes_updated, result.final_rmse);
     } else {
         RCLCPP_ERROR(get_logger(), "[AutoMapSystem][LOOP][EXCEPTION] addLoopFactor failed sm_i=%d sm_j=%d", lc->submap_i, lc->submap_j);
+        RCLCPP_INFO(get_logger(), "[TRACE] step=loop_factor_add result=fail reason=isam2_node_missing_or_exception sm_i=%d sm_j=%d (精准定位: 见上文 [IncrementalOptimizer][EXCEPTION])",
+                   lc->submap_i, lc->submap_j);
         RCLCPP_INFO(get_logger(), "[AutoMapSystem][PIPELINE] event=loop_factor_added success=0 sm_i=%d sm_j=%d", lc->submap_i, lc->submap_j);
     }
 
@@ -837,6 +904,7 @@ void AutoMapSystem::onPoseUpdated(const std::unordered_map<int, Pose3d>& poses) 
 void AutoMapSystem::onHBADone(const HBAResult& result) {
     if (!result.success) {
         RCLCPP_ERROR(get_logger(), "[AutoMapSystem][HBA][EXCEPTION] optimization failed");
+        RCLCPP_INFO(get_logger(), "[TRACE] step=hba_done result=fail reason=optimization_failed (精准定位: 见 [HBA][BACKEND] 或 stderr 中 HBA failed 详情)");
         return;
     }
     const size_t pose_count = result.optimized_poses.size();
@@ -1389,8 +1457,89 @@ Mat66d AutoMapSystem::computeOdomInfoMatrix(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// 轨迹对比记录（每帧位姿 + GPS，便于脚本绘图分析建图精度）
+// ─────────────────────────────────────────────────────────────────────────────
+void AutoMapSystem::ensureTrajectoryLogDir() {
+    if (!trajectory_session_id_.empty()) return;
+    try {
+        fs::create_directories(trajectory_log_dir_);
+        auto now = std::chrono::system_clock::now();
+        auto t = std::chrono::system_clock::to_time_t(now);
+        std::tm buf;
+#if defined(_WIN32) || defined(_WIN64)
+        std::tm* ptm = std::localtime(&t);
+#else
+        std::tm* ptm = ::localtime_r(&t, &buf);
+#endif
+        if (ptm) {
+            std::ostringstream oss;
+            oss << std::put_time(ptm, "%Y%m%d_%H%M%S");
+            trajectory_session_id_ = oss.str();
+        } else {
+            trajectory_session_id_ = std::to_string(current_session_id_);
+        }
+        RCLCPP_INFO(get_logger(), "[AutoMapSystem][TRAJ_LOG] trajectory log dir=%s session_id=%s",
+                    trajectory_log_dir_.c_str(), trajectory_session_id_.c_str());
+    } catch (const std::exception& e) {
+        RCLCPP_WARN(get_logger(), "[AutoMapSystem][TRAJ_LOG] create dir failed: %s", e.what());
+        trajectory_session_id_ = "default";
+    }
+}
+
+void AutoMapSystem::writeTrajectoryOdom(double ts, const Pose3d& pose, const Mat66d& cov) {
+    std::lock_guard<std::mutex> lk(trajectory_log_mutex_);
+    ensureTrajectoryLogDir();
+    if (!trajectory_odom_file_.is_open()) {
+        std::string path = trajectory_log_dir_ + "/trajectory_odom_" + trajectory_session_id_ + ".csv";
+        trajectory_odom_file_.open(path, std::ios::out);
+        if (trajectory_odom_file_.is_open()) {
+            trajectory_odom_file_ << "timestamp,x,y,z,qx,qy,qz,qw,pos_std_x,pos_std_y,pos_std_z\n";
+            trajectory_odom_file_.flush();
+            RCLCPP_INFO(get_logger(), "[AutoMapSystem][TRAJ_LOG] opened %s", path.c_str());
+        }
+    }
+    if (!trajectory_odom_file_.is_open()) return;
+    Eigen::Quaterniond q(pose.rotation());
+    double px = std::sqrt(std::max(0.0, cov(3, 3)));
+    double py = std::sqrt(std::max(0.0, cov(4, 4)));
+    double pz = std::sqrt(std::max(0.0, cov(5, 5)));
+    trajectory_odom_file_ << std::fixed << std::setprecision(6)
+        << ts << ","
+        << pose.translation().x() << "," << pose.translation().y() << "," << pose.translation().z() << ","
+        << q.x() << "," << q.y() << "," << q.z() << "," << q.w() << ","
+        << px << "," << py << "," << pz << "\n";
+    trajectory_odom_file_.flush();
+}
+
+void AutoMapSystem::onGPSMeasurementForLog(double ts, const Eigen::Vector3d& pos_enu) {
+    if (!trajectory_log_enabled_) return;
+    std::lock_guard<std::mutex> lk(trajectory_log_mutex_);
+    ensureTrajectoryLogDir();
+    if (!trajectory_gps_file_.is_open()) {
+        std::string path = trajectory_log_dir_ + "/trajectory_gps_" + trajectory_session_id_ + ".csv";
+        trajectory_gps_file_.open(path, std::ios::out);
+        if (trajectory_gps_file_.is_open()) {
+            trajectory_gps_file_ << "timestamp,x,y,z,frame\n";
+            trajectory_gps_file_.flush();
+            RCLCPP_INFO(get_logger(), "[AutoMapSystem][TRAJ_LOG] opened %s", path.c_str());
+        }
+    }
+    if (!trajectory_gps_file_.is_open()) return;
+    Eigen::Vector3d pos = gps_manager_.isAligned() ? gps_manager_.enu_to_map(pos_enu) : pos_enu;
+    const char* frame = gps_manager_.isAligned() ? "map" : "enu";
+    trajectory_gps_file_ << std::fixed << std::setprecision(6)
+        << ts << "," << pos.x() << "," << pos.y() << "," << pos.z() << "," << frame << "\n";
+    trajectory_gps_file_.flush();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // 地图保存
 // ─────────────────────────────────────────────────────────────────────────────
+std::string AutoMapSystem::getOutputDir() const {
+    if (!output_dir_override_.empty()) return output_dir_override_;
+    return ConfigManager::instance().outputDir();
+}
+
 void AutoMapSystem::saveMapToFiles(const std::string& output_dir) {
     try {
         if (output_dir.empty()) {

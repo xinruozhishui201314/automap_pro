@@ -72,6 +72,10 @@ public:
                                                   const Eigen::Matrix3d& cov)>;
     void registerGpsFactorCallback(GpsFactorCallback cb) { gps_factor_cbs_.push_back(std::move(cb)); }
 
+    /** 每条 GPS 测量写入轨迹对比文件（ts, pos_enu），由 AutoMapSystem 转 map 系后落盘 */
+    using MeasurementLogCallback = std::function<void(double ts, const Eigen::Vector3d& pos_enu)>;
+    void registerMeasurementLogCallback(MeasurementLogCallback cb) { measurement_log_cbs_.push_back(std::move(cb)); }
+
     // ── 强制重新对齐（用于 GPS 信号恢复后） ──────────────────────────────
     void triggerRealign();
 
@@ -110,8 +114,9 @@ private:
 
     mutable std::mutex mutex_;
 
-    std::vector<AlignCallback>      align_cbs_;
-    std::vector<GpsFactorCallback>  gps_factor_cbs_;
+    std::vector<AlignCallback>         align_cbs_;
+    std::vector<GpsFactorCallback>     gps_factor_cbs_;
+    std::vector<MeasurementLogCallback> measurement_log_cbs_;
 
     // ── 私有方法 ──────────────────────────────────────────────────────────
     Eigen::Vector3d wgs84_to_enu(double lat, double lon, double alt) const;

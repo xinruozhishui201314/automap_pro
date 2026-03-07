@@ -1,5 +1,6 @@
 # ══════════════════════════════════════════════════════════════════════════════
 # AutoMap-Pro v2.0  统一配置文件（全工程唯一配置，所有模块均从此读取）
+# 点云模糊优化：见 docs/CONFIG_M2DGR_BLUR_OPTIMIZATION.md（map.voxel_size / filter_size_surf 等）
 #
 # 配置结构：
 #   一、总体参数     system（名称、输出目录、线程、日志）
@@ -109,7 +110,7 @@ fast_livo:
     lidar_type:       2         # 2=Velodyne
     scan_line:        32
     point_filter_num: 3
-    filter_size_surf: 0.25
+    filter_size_surf: 0.20      # 原 0.25，减小以改善点云密度、减轻模糊
     blind:            1.0       # 最小量程约 1.0 m
 
   vio:                                     # VIO（仅 img_en=1 生效）
@@ -192,7 +193,7 @@ submap:
   max_keyframes:    100
   max_spatial_m:    100.0
   max_temporal_s:    60.0
-  match_resolution:   0.4
+  match_resolution:   0.35     # 原 0.4，略细有利于回环位姿、减少重影
   merge_resolution:   0.2
 
 # ── 3.2 GPS 延迟对齐（M2DGR 含 /ublox/fix，可做 GPS 约束）────────────────────
@@ -207,24 +208,26 @@ gps:
 
 # ── 3.3 回环检测 ───────────────────────────────────────────────────────────
 loop_closure:
-  overlap_threshold:   0.30
-  top_k:               5
+  overlap_threshold:   0.25      # ⬇️ 降低阈值（从0.30→0.25），在保持准确的前提下检测更多回环
+  top_k:               8         # ⬆️ 增加候选数（从5→8），给几何验证更多机会
   min_temporal_gap_s:  30.0
   min_submap_gap:      3
   gps_search_radius_m: 200.0
   worker_threads:      2
   overlap_transformer:
+    # 空则 launch 自动解析为仓库内 src/modular/OverlapTransformer-master/model/pretrained_overlap_transformer.pth.tar（回环粗匹配必须使用该模型）
     model_path:     ""
     proj_H:         64
     proj_W:         900
-    fov_up:         3.0
-    fov_down:      -25.0
-    max_range:      50.0
+    fov_up:         3.0        # KITTI 标准参数，与模型训练一致
+    fov_down:      -25.0       # KITTI 标准参数，与模型训练一致（总视野28°）
+    max_range:      80.0       # ⚠️ 改为80m（模型训练值），确保远距离回环不被丢弃；M2DGR 实际最大深度需验证
     descriptor_dim: 256
   teaser:
     noise_bound:      0.1
     cbar2:            1.0
     voxel_size:       0.4
+    max_points:       8000   # 回环匹配前单侧点云最大点数（voxel 后 cap），增大可提高几何约束强度
     min_inlier_ratio: 0.30
     max_rmse_m:       0.3
     icp_refine:       true
@@ -257,7 +260,7 @@ backend:
 # ── 3.5 地图输出与保存 ─────────────────────────────────────────────────────
 # ConfigManager 还读 map.statistical_filter_mean_k / statistical_filter_std_mul（缺省 50、1.0）
 map:
-  voxel_size:        0.35
+  voxel_size:        0.2       # 原 0.35，减小以显著改善全局图清晰度（减轻块状模糊）
   statistical_filter: true
 
 # ── 3.6 多会话建图 ─────────────────────────────────────────────────────────

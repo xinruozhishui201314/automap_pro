@@ -8,6 +8,7 @@
 #include <pcl_conversions/pcl_conversions.h>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 
 namespace automap_pro {
 
@@ -96,10 +97,10 @@ void LoopDetector::addSubmap(const SubMap::Ptr& submap) {
         dbsize = dbSize();
     }
     desc_cv_.notify_one();
-    RCLCPP_INFO(node_->get_logger(),
-        "[LoopDetector][DATA] addSubmap sm_id=%d kf=%zu desc_pts=%zu queue=%zu db=%zu",
-        submap->id, submap->keyframes.size(),
-        submap->downsampled_cloud ? submap->downsampled_cloud->size() : 0u, qsize, dbsize);
+    // RCLCPP_INFO(node_->get_logger(),
+        // "[LoopDetector][DATA] addSubmap sm_id=%d kf=%zu desc_pts=%zu queue=%zu db=%zu",
+        // submap->id, submap->keyframes.size(),
+        // submap->downsampled_cloud ? submap->downsampled_cloud->size() : 0u, qsize, dbsize);
     ALOG_INFO(MOD, "SubMap#{} submitted for loop detection (queue_size={}, db_size={})",
               submap->id, qsize, dbsize);
 }
@@ -121,12 +122,12 @@ void LoopDetector::descWorkerLoop() {
         }
         if (!submap) continue;
 
-        // 计算描述子
-        if (!submap->has_descriptor) {
-            computeDescriptorAsync(submap);
-        } else {
-            onDescriptorReady(submap);
-        }
+    // ✅ 在存储描述子时更新 norm 缓存
+    submap->overlap_descriptor = overlap_infer_.computeDescriptor(
+        submap->downsampled_cloud);
+    submap->overlap_descriptor_norm = submap->overlap_descriptor.norm();
+    submap->has_descriptor = true;
+    onDescriptorReady(submap);
     }
 }
 
@@ -207,16 +208,43 @@ void LoopDetector::onDescriptorReady(const SubMap::Ptr& submap) {
         submap->gps_center,
         submap->has_valid_gps);
 
-    if (candidates.empty()) return;
+    // ✅ 详细诊断日志
+    if (candidates.empty()) {
+        ALOG_INFO(MOD, "[METRIC] query_id={} db_size={} candidates=0 threshold={:.3f} (reason=no_match)",
+                  submap->id, db_copy.size(), overlap_threshold_);
+        ALOG_INFO(MOD, "[TRACE] step=loop_cand result=skip reason=no_overlap_candidates query_id={} db_size={} top_k={} threshold={:.3f} (精准定位: 描述子检索无候选，可尝试降低 overlap_threshold 或增大 top_k)",
+                  submap->id, db_copy.size(), top_k_, overlap_threshold_);
+        return;
+    }
 
     // 过滤候选（时间/子图间隔）
     std::vector<OverlapTransformerInfer::Candidate> valid_candidates;
+    int filtered_by_gap = 0;
     for (const auto& cand : candidates) {
         if (cand.session_id == submap->session_id &&
-            std::abs(cand.submap_id - submap->id) < min_submap_gap_) continue;
+            std::abs(cand.submap_id - submap->id) < min_submap_gap_) {
+            filtered_by_gap++;
+            continue;
+        }
         valid_candidates.push_back(cand);
     }
-    if (valid_candidates.empty()) return;
+    
+    if (valid_candidates.empty()) {
+        ALOG_INFO(MOD, "[METRIC] query_id={} candidates_before_gap_filter={} filtered_by_gap={} (reason=temporal_gap)",
+                  submap->id, candidates.size(), filtered_by_gap);
+        ALOG_INFO(MOD, "[TRACE] step=loop_cand result=skip reason=all_filtered_by_submap_gap query_id={} candidates_before={} min_submap_gap={} (精准定位: 候选均被 min_submap_gap 过滤)",
+                  submap->id, candidates.size(), min_submap_gap_);
+        return;
+    }
+
+    // ✅ 输出候选的相似度分布
+    std::string score_str;
+    for (size_t i = 0; i < valid_candidates.size(); ++i) {
+        score_str += fmt::format("{:.3f}", valid_candidates[i].score);
+        if (i < valid_candidates.size() - 1) score_str += ", ";
+    }
+    ALOG_INFO(MOD, "[METRIC] query_id={} candidates={} scores=[{}] (entering TEASER++)",
+              submap->id, valid_candidates.size(), score_str);
 
     // 入队时深拷贝 query 点云，避免 worker 处理时读 SubMap::downsampled_cloud 与 buildGlobalMap 等并发
     CloudXYZIPtr query_cloud_copy;
@@ -239,6 +267,10 @@ void LoopDetector::onDescriptorReady(const SubMap::Ptr& submap) {
 // Worker: TEASER++ 匹配（单线程 Stage 2）
 // ─────────────────────────────────────────────────────────────────────────────
 void LoopDetector::matchWorkerLoop() {
+    // 限制本线程内 OpenMP/PMC 为单线程，缓解 TEASER++ 析构时 free() SIGSEGV（见 docs/TEASER_CRASH_ANALYSIS.md）
+#if defined(__unix__) || defined(__linux__)
+    setenv("OMP_NUM_THREADS", "1", 1);
+#endif
     IcpRefiner icp_refiner;
     while (running_) {
         MatchTask task;
@@ -276,6 +308,7 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
         CloudXYZIPtr query_ref = query ? query->downsampled_cloud : nullptr;
         if (!query_ref || query_ref->empty()) {
             ALOG_DEBUG(MOD, "[tid={}] step=task_skip query_id={} query_cloud null/empty", tid, query ? query->id : -1);
+            ALOG_INFO(MOD, "[TRACE] step=loop_match result=skip reason=query_cloud_empty tid={} query_id={} (精准定位: 无查询点云)", tid, query ? query->id : -1);
             return;
         }
         query_cloud = std::make_shared<CloudXYZI>();
@@ -301,7 +334,10 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
                 }
             }
         }
-        if (!target_ref || target_ref->empty()) continue;
+        if (!target_ref || target_ref->empty()) {
+            ALOG_DEBUG(MOD, "[tid={}] [TRACE] step=loop_cand result=skip reason=target_cloud_empty query_id={} target_id={}", tid, query->id, cand.submap_id);
+            continue;
+        }
 
         // 深拷贝 target 点云，避免 PCL/TEASER 与主线程竞争
         CloudXYZIPtr target_cloud = std::make_shared<CloudXYZI>();
@@ -325,13 +361,14 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
             ALOG_DEBUG(MOD, "[tid={}] step=match_returned query_id={} target_id={} success={}", 
                       tid, query->id, target->id, teaser_res.success);
         } catch (const std::exception& e) {
-            ALOG_ERROR(MOD, "[tid={}] step=match_exception query_id={} target_id={} exception={}", 
+            ALOG_ERROR(MOD, "[tid={}] step=match_exception query_id={} target_id={} exception={}",
                       tid, query->id, target->id, e.what());
-            // 不重新throw，继续处理下一个候选（loop closure是可选的）
+            ALOG_INFO(MOD, "[TRACE] step=loop_match result=fail reason=teaser_exception query_id={} target_id={} what={} (精准定位: TEASER/FPFH 异常)", tid, query->id, target->id, e.what());
             continue;
         } catch (...) {
-            ALOG_ERROR(MOD, "[tid={}] step=match_exception query_id={} target_id={} unknown_exception", 
+            ALOG_ERROR(MOD, "[tid={}] step=match_exception query_id={} target_id={} unknown_exception",
                       tid, query->id, target->id);
+            ALOG_INFO(MOD, "[TRACE] step=loop_match result=fail reason=teaser_unknown_exception query_id={} target_id={}", tid, query->id, target->id);
             continue;
         }
         double teaser_ms = std::chrono::duration<double, std::milli>(
@@ -340,7 +377,11 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
                    tid, query->id, target->id, teaser_res.success, teaser_res.inlier_ratio, teaser_res.num_correspondences, teaser_res.rmse, teaser_ms,
                    static_cast<const void*>(query_cloud.get()), static_cast<const void*>(target_cloud.get()));
 
-        if (!teaser_res.success || teaser_res.inlier_ratio < min_inlier_ratio_) continue;
+        if (!teaser_res.success || teaser_res.inlier_ratio < min_inlier_ratio_) {
+            ALOG_DEBUG(MOD, "[tid={}] [TRACE] step=loop_cand result=skip reason=teaser_fail_or_inlier_low query_id={} target_id={} success={} inlier={:.3f} min_ratio={:.3f}",
+                      tid, query->id, target->id, teaser_res.success, teaser_res.inlier_ratio, min_inlier_ratio_);
+            continue;
+        }
 
         // Stage 3: ICP 精配准（可选）
         Pose3d final_T = teaser_res.T_tgt_src;
@@ -355,7 +396,11 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
             }
         }
 
-        if (final_rmse > max_rmse_) continue;
+        if (final_rmse > max_rmse_) {
+            ALOG_DEBUG(MOD, "[tid={}] [TRACE] step=loop_cand result=skip reason=rmse_too_high query_id={} target_id={} rmse={:.4f} max_rmse={:.4f}",
+                      tid, query->id, target->id, final_rmse, max_rmse_);
+            continue;
+        }
 
         // 构建回环约束
         auto lc = std::make_shared<LoopConstraint>();
@@ -374,11 +419,17 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
         double info_scale = lc->inlier_ratio / (lc->rmse + 1e-3f);
         lc->information = Mat66d::Identity() * info_scale;
 
+        ALOG_INFO(MOD, "[TRACE] step=loop_match result=ok reason=loop_accepted query_id={} target_id={} inlier={:.3f} rmse={:.4f} score={:.3f} (精准定位: 回环约束已发布)",
+                  tid, query->id, target->id, lc->inlier_ratio, lc->rmse, lc->overlap_score);
         if (node_) {
             RCLCPP_INFO(node_->get_logger(),
                 "[LoopDetector] Loop %d↔%d | inlier=%.2f rmse=%.3f score=%.2f teaser=%.1fms",
                 lc->submap_i, lc->submap_j,
                 lc->inlier_ratio, lc->rmse, lc->overlap_score, teaser_ms);
+            RCLCPP_INFO(node_->get_logger(),
+                "[PRECISION][LOOP] detected sm_i=%d sm_j=%d score=%.3f inlier=%.3f rmse_m=%.4f info_scale=%.2f teaser_ms=%.1f",
+                lc->submap_i, lc->submap_j, lc->overlap_score, lc->inlier_ratio,
+                static_cast<double>(lc->rmse), info_scale, teaser_ms);
         }
 
         // 发布 ROS2 消息

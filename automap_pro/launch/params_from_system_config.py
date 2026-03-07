@@ -118,6 +118,23 @@ def _safe_bool(val, default=False):
     return default
 
 
+def resolve_default_overlap_model_path(launch_dir):
+    """
+    当 config 中 model_path 为空时，解析仓库内捆绑的 pretrained_overlap_transformer.pth.tar 路径。
+    launch_dir 通常为 automap_pro/launch 的绝对路径；返回的路径供 Python descriptor_server 加载 .pth.tar。
+    若文件不存在则返回空字符串。
+    """
+    if not launch_dir or not os.path.isdir(launch_dir):
+        return ""
+    # automap_pro/launch -> automap_pro/src/modular/OverlapTransformer-master/model/...
+    default_path = os.path.join(
+        launch_dir, "..", "src", "modular", "OverlapTransformer-master",
+        "model", "pretrained_overlap_transformer.pth.tar"
+    )
+    abs_path = os.path.abspath(default_path)
+    return abs_path if os.path.isfile(abs_path) else ""
+
+
 def get_overlap_transformer_params(config):
     """
     从 system_config 的 loop_closure.overlap_transformer 生成 descriptor_server 节点参数。
@@ -325,12 +342,12 @@ def _get_fast_livo2_params_impl(config):
         else:
             params[section] = val
 
-    # 前端 PCD 保存目录与 system.output_dir 统一，便于与后端地图同目录
+    # 前端 PCD 保存目录与 system.output_dir 统一，始终覆盖为 system.output_dir，保证与后端 automap_output 同目录
     system = config.get("system") if isinstance(config.get("system"), dict) else {}
     out_dir = (system.get("output_dir") or "").strip() or "/data/automap_output"
     if "pcd_save" not in params:
         params["pcd_save"] = {}
-    if isinstance(params["pcd_save"], dict) and not (params["pcd_save"].get("output_dir") or "").strip():
+    if isinstance(params["pcd_save"], dict):
         params["pcd_save"]["output_dir"] = out_dir
 
     # 确保 evo.seq_name 等字符串参数非空（fast_livo 声明为 string，不能为 not set）

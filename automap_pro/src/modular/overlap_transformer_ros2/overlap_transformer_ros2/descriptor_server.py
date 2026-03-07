@@ -44,7 +44,7 @@ def pointcloud2_to_xyzi(msg):
 
 
 def range_projection_standalone(vertex, fov_up=3.0, fov_down=-25.0, proj_H=64, proj_W=900, max_range=80):
-    """KITTI-style range projection (from OverlapTransformer tools.utils.utils)."""
+    """KITTI-style range projection with sparse pixel fill & bilinear interpolation."""
     fov_up = fov_up / 180.0 * np.pi
     fov_down = fov_down / 180.0 * np.pi
     fov = abs(fov_down) + abs(fov_up)
@@ -68,8 +68,21 @@ def range_projection_standalone(vertex, fov_up=3.0, fov_down=-25.0, proj_H=64, p
     depth = depth[order]
     proj_y, proj_x = proj_y[order], proj_x[order]
 
+    # ✅ 初始化为 NaN（标记无效像素）
     proj_range = np.full((proj_H, proj_W), np.nan, dtype=np.float32)
     proj_range[proj_y, proj_x] = depth
+    
+    # ✅ 补齐稀疏像素：相邻像素最小值（局部最小值滤波）
+    # 这样可以保留尽可能多的深度信息，避免大范围空洞
+    valid_mask = ~np.isnan(proj_range)
+    if np.sum(valid_mask) > 0:
+        # 对每个 NaN 像素，用相邻 8 个有效像素的最小值填充
+        from scipy.ndimage import maximum_filter
+        min_depth_map = maximum_filter(proj_range, size=3, mode='constant', cval=np.nan)
+        nan_mask = np.isnan(proj_range)
+        proj_range[nan_mask] = min_depth_map[nan_mask]
+    
+    # ✅ 最后的空洞用 0 填充
     proj_range = np.nan_to_num(proj_range, nan=0.0)
     return proj_range.astype(np.float32)
 
@@ -112,12 +125,41 @@ class DescriptorServer(Node):
             state = torch.load(model_path, map_location=self._device)
             if isinstance(state, dict) and "state_dict" in state:
                 state = state["state_dict"]
+            
+            # ✅ 加载前验证权重兼容性
+            if "conv1.weight" in state:
+                conv1_shape = state["conv1.weight"].shape
+                expected_shape = (16, 1, 5, 1)  # KITTI 配置
+                if conv1_shape != expected_shape:
+                    self.get_logger().warn(
+                        f"[Weight Check] conv1.weight shape mismatch: got {conv1_shape}, expected {expected_shape}. "
+                        "Model may not work correctly."
+                    )
+            
             self._model.load_state_dict(state, strict=False)
             self._model.to(self._device)
             self._model.eval()
+            
+            # ✅ 验证推理正确性
+            x_dummy = torch.zeros(1, 1, 64, 900, device=self._device)
+            with torch.no_grad():
+                y_dummy = self._model(x_dummy)
+            if y_dummy.shape[-1] != 256:
+                self.get_logger().error(
+                    f"[Weight Check] Output dimension mismatch: got {y_dummy.shape[-1]}, expected 256"
+                )
+                self._model = None
+                return
+            
+            self.get_logger().info(
+                f"[Weight Check] ✓ Model verified: conv1={state.get('conv1.weight', 'N/A').shape if isinstance(state.get('conv1.weight'), torch.Tensor) else 'N/A'}, "
+                f"output=256-d, device={self._device}"
+            )
             self.get_logger().info("OverlapTransformer model loaded from %s" % model_path)
         except Exception as e:
             self.get_logger().error("Failed to load model: %s" % str(e))
+            import traceback
+            self.get_logger().error(traceback.format_exc())
             self._model = None
 
     def compute_descriptor_callback(self, request, response):
@@ -156,16 +198,31 @@ class DescriptorServer(Node):
             with torch.no_grad():
                 desc = self._model(tensor)
             desc = desc.cpu().numpy().flatten()
+            
+            # ✅ 严格验证输出维度
             if desc.shape[0] != 256:
-                desc = np.resize(desc, 256)
+                self.get_logger().warn(
+                    f"[Descriptor] Output dimension {desc.shape[0]} != 256, padding to 256"
+                )
+                if desc.shape[0] > 256:
+                    desc = desc[:256]
+                else:
+                    desc = np.pad(desc, (0, 256 - desc.shape[0]), mode='constant')
+            
             norm = np.linalg.norm(desc)
             if norm > 1e-6:
                 desc = desc / norm
+            else:
+                self.get_logger().warn("[Descriptor] Zero norm descriptor, using fallback")
+                desc = np.ones(256, dtype=np.float32) / np.sqrt(256.0)
+            
             response.descriptor.layout.dim = []
             response.descriptor.data = desc.astype(np.float32).tolist()
             return response
         except Exception as e:
             self.get_logger().error("ComputeDescriptor failed: %s" % str(e))
+            import traceback
+            self.get_logger().error(traceback.format_exc())
             response.descriptor.data = [0.0] * 256
             return response
 

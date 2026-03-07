@@ -52,6 +52,9 @@ void GPSManager::addGPSMeasurement(
     gps_window_.push_back(rec);
     if (gps_window_.size() > 2000) gps_window_.pop_front();
 
+    // 轨迹对比：每条 GPS 测量通知外部落盘（用于与 odom 曲线对比分析建图精度）
+    for (auto& cb : measurement_log_cbs_) cb(timestamp, pos_enu);
+
     // 统计连续高质量帧
     if (quality >= GPSQuality::HIGH) {
         good_sample_count_++;

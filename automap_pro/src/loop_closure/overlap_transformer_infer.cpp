@@ -78,23 +78,22 @@ std::vector<float> OverlapTransformerInfer::generateRangeImage(
     const CloudXYZIPtr& cloud) const
 {
     const int len = proj_H_ * proj_W_;
-    std::vector<float> img(len, -1.0f);
+    std::vector<float> img(len, 0.0f);  // 初始化为0而非-1，便于后续补齐
 
     const float fov_up_rad   = fov_up_   * static_cast<float>(M_PI) / 180.0f;
     const float fov_down_rad = fov_down_ * static_cast<float>(M_PI) / 180.0f;
     const float fov_range    = std::abs(fov_down_rad) + std::abs(fov_up_rad);
 
+    // ✅ 第一遍：将点投影到范围图（取最近深度）
+    std::vector<bool> valid_pixel(len, false);  // 标记有效像素
     for (const auto& pt : cloud->points) {
         float depth = std::sqrt(pt.x*pt.x + pt.y*pt.y + pt.z*pt.z);
         if (depth >= max_range_ || depth <= 0.0f) continue;
 
-        // 水平角（负号使正前方在图像中间）
         float yaw   = -std::atan2(pt.y, pt.x);
-        // 垂直角
         float pitch = std::asin(pt.z / depth);
 
-        // 投影到像素坐标
-        float proj_x = 0.5f * (yaw / static_cast<float>(M_PI) + 1.0f);  // [0,1]
+        float proj_x = 0.5f * (yaw / static_cast<float>(M_PI) + 1.0f);
         float proj_y = 1.0f - (pitch + std::abs(fov_down_rad)) / fov_range;
 
         proj_x *= proj_W_;
@@ -104,12 +103,39 @@ std::vector<float> OverlapTransformerInfer::generateRangeImage(
         int row = std::max(0, std::min(proj_H_ - 1, static_cast<int>(std::floor(proj_y))));
 
         int idx = row * proj_W_ + col;
-        float old_depth = img[idx];
-        // 取最近深度（same as fast_ot.cpp: if depth < old_depth）
-        if (old_depth < 0.0f || depth < old_depth) {
+        if (img[idx] <= 0.0f || depth < img[idx]) {
             img[idx] = depth;
+            valid_pixel[idx] = true;
         }
     }
+
+    // ✅ 第二遍：补齐稀疏像素（用相邻有效像素的最小值）
+    for (int row = 0; row < proj_H_; ++row) {
+        for (int col = 0; col < proj_W_; ++col) {
+            int idx = row * proj_W_ + col;
+            if (valid_pixel[idx]) continue;  // 已有深度值，跳过
+
+            float min_neighbor = max_range_;
+            // 检查 3×3 邻域
+            for (int dr = -1; dr <= 1; ++dr) {
+                for (int dc = -1; dc <= 1; ++dc) {
+                    int nr = row + dr;
+                    int nc = col + dc;
+                    if (nr >= 0 && nr < proj_H_ && nc >= 0 && nc < proj_W_) {
+                        int nidx = nr * proj_W_ + nc;
+                        if (valid_pixel[nidx]) {
+                            min_neighbor = std::min(min_neighbor, img[nidx]);
+                        }
+                    }
+                }
+            }
+            if (min_neighbor < max_range_) {
+                img[idx] = min_neighbor;
+                valid_pixel[idx] = true;
+            }
+        }
+    }
+
     return img;
 }
 
@@ -201,6 +227,16 @@ Eigen::VectorXf OverlapTransformerInfer::computeDescriptor(
     auto t1 = std::chrono::steady_clock::now();
     last_infer_ms_ = std::chrono::duration<double, std::milli>(t1 - t0).count();
     total_inferences_++;
+    
+    // ✅ 验证 L2 归一化
+    float norm = desc.norm();
+    if (norm > 1e-6f) {
+        desc /= norm;
+    } else {
+        ALOG_WARN(MOD, "Descriptor norm too small ({:.6f}), using uniform fallback", norm);
+        desc = Eigen::VectorXf::Constant(256, 1.0f / std::sqrt(256.0f));
+    }
+    
     if (last_infer_ms_ > 50.0) {
         ALOG_WARN(MOD, "Descriptor compute SLOW: {:.1f}ms (total_calls={})", last_infer_ms_, total_inferences_);
     } else {
@@ -225,14 +261,20 @@ std::vector<OverlapTransformerInfer::Candidate> OverlapTransformerInfer::retriev
     bool   query_has_gps) const
 {
     std::vector<std::pair<float, int>> scored;
+    
+    // ✅ 预计算 query norm，避免重复计算
+    float query_norm_cache = query_desc.norm();
+    if (query_norm_cache < 1e-6f) {
+        query_norm_cache = 1.0f;  // 保底值
+    }
 
     for (int i = 0; i < (int)db_submaps.size(); ++i) {
         const auto& sm = db_submaps[i];
         if (!sm->has_descriptor) continue;
 
-        // ① 余弦相似度
+        // ① 余弦相似度（使用缓存的 norm 值）
         float score = query_desc.dot(sm->overlap_descriptor) /
-                      (query_desc.norm() * sm->overlap_descriptor.norm() + 1e-8f);
+                      (query_norm_cache * sm->overlap_descriptor_norm + 1e-8f);
         if (score < threshold) continue;
 
         // ② 子图间隔过滤（同 session 才检查）

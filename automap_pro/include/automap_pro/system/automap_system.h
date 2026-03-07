@@ -32,6 +32,7 @@
 #include <deque>
 #include <condition_variable>
 #include <chrono>
+#include <fstream>
 
 namespace automap_pro {
 
@@ -143,6 +144,8 @@ private:
 
     // 地图体素大小（init 时从 ConfigManager 缓存，避免 publishGlobalMap 回调中访问单例导致析构顺序 SIGSEGV）
     float map_voxel_size_ = 0.2f;
+    // launch 传入的 output_dir，非空时优先于 system.output_dir，使前后端保存到同一目录
+    std::string output_dir_override_;
 
     // 首次数据到达日志（各打一次，便于确认数据流）
     std::atomic<bool> first_odom_logged_{false};
@@ -234,7 +237,20 @@ private:
     void publishGlobalMap();
     void publishDataFlowSummary();  // 低频：各模块收发/发布汇总
 
+    // ── 轨迹对比记录（每帧位姿 + GPS，便于脚本绘图分析建图精度）────────────────
+    bool trajectory_log_enabled_ = true;
+    std::string trajectory_log_dir_;
+    std::ofstream trajectory_odom_file_;
+    std::ofstream trajectory_gps_file_;
+    std::mutex trajectory_log_mutex_;
+    std::string trajectory_session_id_;  // 本次会话文件名后缀
+    void ensureTrajectoryLogDir();
+    void writeTrajectoryOdom(double ts, const Pose3d& pose, const Mat66d& cov);
+    void onGPSMeasurementForLog(double ts, const Eigen::Vector3d& pos_enu);
+
     // ── 工具 ─────────────────────────────────────────────────────────────
+    /** 返回实际输出目录：launch 传入的 output_dir 优先，否则用 system.output_dir */
+    std::string getOutputDir() const;
     void saveMapToFiles(const std::string& output_dir);
     std::string stateToString(SystemState s) const;
     Mat66d computeOdomInfoMatrix(const SubMap::Ptr& prev,

@@ -39,13 +39,22 @@ def _launch_nodes_with_system_config(context, *args, **kwargs):
         from params_from_system_config import (
             load_system_config,
             get_overlap_transformer_params,
+            resolve_default_overlap_model_path,
             get_fast_livo2_params,
             get_hba_params,
             get_hba_cal_mme_params,
             get_hba_visualize_params,
         )
         system_config = load_system_config(config_path)
+        # 用 launch 的 output_dir 覆盖，使前端 PCD 与后端地图保存到同一目录（automap_output）
+        out_dir_launch = LaunchConfiguration("output_dir").perform(context)
+        if out_dir_launch and isinstance(system_config.get("system"), dict):
+            system_config["system"]["output_dir"] = out_dir_launch
         ot_params = get_overlap_transformer_params(system_config)
+        if not (ot_params.get("model_path") or "").strip():
+            default_ot = resolve_default_overlap_model_path(launch_dir)
+            if default_ot:
+                ot_params["model_path"] = default_ot
         fl2_params = get_fast_livo2_params(system_config)
         hba_params = get_hba_params(system_config)
         hba_cal_mme_params = get_hba_cal_mme_params(system_config)
@@ -64,7 +73,7 @@ def _launch_nodes_with_system_config(context, *args, **kwargs):
         print("[automap_pro launch] WARNING: Failed to load system_config from {}: {}. fast_livo/overlap_transformer may use fallback.".format(config_path, e), file=sys.stderr)
 
     use_external_frontend = LaunchConfiguration("use_external_frontend", default="false")
-    use_external_overlap = LaunchConfiguration("use_external_overlap", default="false")
+    use_external_overlap = LaunchConfiguration("use_external_overlap", default="true")
     use_hba = LaunchConfiguration("use_hba", default="true")
     use_hba_cal_mme = LaunchConfiguration("use_hba_cal_mme", default="false")
     use_hba_visualize = LaunchConfiguration("use_hba_visualize", default="false")
@@ -193,7 +202,7 @@ def generate_launch_description():
         description="true=use verified fast_livo node (modular); false=use internal FastLIVO2Wrapper (ESIKF)",
     )
     use_external_overlap_arg = DeclareLaunchArgument(
-        "use_external_overlap", default_value="false",
+        "use_external_overlap", default_value="true",
         description="If true, launch OverlapTransformer descriptor (params from system_config.loop_closure.overlap_transformer)",
     )
     use_hba_arg = DeclareLaunchArgument(

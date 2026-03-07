@@ -174,6 +174,7 @@ struct SubMap {
     // OverlapTransformer 256维描述子
     Eigen::VectorXf overlap_descriptor = Eigen::VectorXf::Zero(256);
     bool has_descriptor = false;
+    float overlap_descriptor_norm = 1.0f;  // ✅ 缓存 L2 norm，避免重复计算
 
     // GPS 中心（ENU，用于GPS范围过滤）
     Eigen::Vector3d gps_center = Eigen::Vector3d::Zero();

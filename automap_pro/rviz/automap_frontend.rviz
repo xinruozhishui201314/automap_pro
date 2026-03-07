@@ -42,6 +42,21 @@ Visualization Manager:
       Update Interval: 0
       Value: true
 
+    # 前端累积地图（fast_livo 发布 /Laser_map）
+    - Alpha: 0.9
+      Autocompute Value Bounds: true
+      Class: rviz_default_plugins/PointCloud2
+      Color: 135; 206; 250
+      Decay Time: 0
+      Enabled: true
+      Name: frontend map
+      Size (m): 0.02
+      Topic:
+        Depth: 5
+        Reliability Policy: Reliable
+        Value: /Laser_map
+      Use Fixed Frame: true
+
     # 前端 LIO 点云（fast_livo 输出）
     - Alpha: 1
       Autocompute Value Bounds: true

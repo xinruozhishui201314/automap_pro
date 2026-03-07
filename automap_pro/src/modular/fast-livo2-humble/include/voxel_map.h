@@ -212,6 +212,8 @@ public:
 
   int feats_down_size_;
   int effct_feat_num_;
+  /** 上一帧点面残差均值 (m)，用于建图精度分析 */
+  double last_mean_residual_ = 0.0;
   std::vector<M3D> cross_mat_list_;
   std::vector<M3D> body_cov_list_;
   std::vector<pointWithVar> pv_list_;

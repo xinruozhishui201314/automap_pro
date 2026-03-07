@@ -1,5 +1,8 @@
 #include "hba_api/hba_api.h"
 
+// 确保 PCL io 在 HBA 头文件之前可用（避免 mypcl.hpp 中 pcl::io 未声明）
+#include <pcl/io/pcd_io.h>
+
 // 直接包含 HBA 算法头文件（源码级复用）
 // HBA 算法核心位于 automap_ws/src/hba/include/
 #include "layer.hpp"
@@ -14,6 +17,7 @@
 #include <gtsam/nonlinear/ISAM2.h>
 #include <gtsam/nonlinear/NonlinearFactorGraph.h>
 #include <gtsam/nonlinear/Values.h>
+#include <gtsam/nonlinear/LevenbergMarquardtParams.h>
 #include <gtsam/nonlinear/LevenbergMarquardtOptimizer.h>
 #include <gtsam/inference/Symbol.h>
 
@@ -249,11 +253,11 @@ Result HBAOptimizer::optimize(ProgressCallback progress_cb) {
                 Eigen::Matrix3d Rij = Ri.transpose() * Rj;
                 Eigen::Vector3d tij = Ri.transpose() * (tj - ti);
 
-                gtsam::Pose3 rel{gtsam::Rot3(Rij), gtsam::Point3(tij)};
+                gtsam::Pose3 relative_pose(gtsam::Rot3(Rij), gtsam::Point3(tij));
                 auto noise = gtsam::noiseModel::Diagonal::Sigmas(
                     (gtsam::Vector6() << 0.01, 0.01, 0.01, 0.05, 0.05, 0.05).finished());
                 graph.add(gtsam::BetweenFactor<gtsam::Pose3>(
-                    gtsam::Symbol('x', i), gtsam::Symbol('x', i+1), rel, noise));
+                    gtsam::Symbol('x', i), gtsam::Symbol('x', i+1), relative_pose, noise));
             }
         }
 

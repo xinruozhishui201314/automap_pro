@@ -176,6 +176,9 @@ OptimizationResult IncrementalOptimizer::commitAndUpdate() {
 
     ALOG_INFO(MOD, "iSAM2 update done: nodes={} elapsed={:.1f}ms total_factors={}",
               res.nodes_updated, res.elapsed_ms, factor_count_);
+    RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+        "[PRECISION][OPT] iSAM2_update nodes_updated=%d elapsed_ms=%.1f factor_count=%d",
+        res.nodes_updated, res.elapsed_ms, factor_count_);
 
     notifyPoseUpdate(poses);
     return res;
