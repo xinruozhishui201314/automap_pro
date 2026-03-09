@@ -37,7 +37,7 @@ file:
   json_format: true  # 使用JSON格式便于解析
   pattern: "%v"
 
-# 组件特定配置
+# 组件特定配置（INFO 下回环关键日志：GAP_FILTER/NO_CAND/CAND/LOOP_OK）
 components:
   SensorManager:
     level: INFO
@@ -48,7 +48,7 @@ components:
   GPSProcessor:
     level: INFO
   LoopDetector:
-    level: INFO
+    level: INFO   # DEBUG=更多 TEASER/候选细节
   Optimizer:
     level: INFO
 

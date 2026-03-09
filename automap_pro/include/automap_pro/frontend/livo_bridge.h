@@ -38,7 +38,10 @@ public:
     LivoBridge();
     ~LivoBridge() = default;
 
+    /** 仅用 node 初始化，GPS 使能/话题从 ConfigManager 读取（可能与 loadConfigAndInit 时序不一致） */
     void init(rclcpp::Node::SharedPtr node);
+    /** 推荐：由 AutoMapSystem 传入已加载的 GPS 配置，避免与 ConfigManager 读值不一致导致 GPS 被误关 */
+    void init(rclcpp::Node::SharedPtr node, bool gps_enabled, const std::string& gps_topic);
 
     // ── 回调注册 ──────────────────────────────────────────────────────────
 
@@ -80,8 +83,11 @@ private:
     std::atomic<int>   odom_count_{0};
     std::atomic<int>   cloud_count_{0};
     std::atomic<int>   empty_cloud_count_{0};
+    std::atomic<int>   gps_msg_count_{0};   // 收到的 NavSatFix 消息总数（含无 fix），用于诊断“无 GPS 数据”
     double             last_odom_ts_ = 0.0;
     double             last_cloud_ts_ = 0.0;
+    std::string        gps_topic_;         // 当前订阅的 GPS 话题名（诊断用）
+    rclcpp::TimerBase::SharedPtr gps_diag_timer_;  // 延迟诊断：若超时仍 0 条则打 WARN
 
     std::vector<OdomCallback>   odom_cbs_;
     std::vector<CloudCallback>  cloud_cbs_;

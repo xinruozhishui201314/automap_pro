@@ -8,7 +8,9 @@ import subprocess
 import traceback
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, ExecuteProcess, OpaqueFunction
+from launch.actions import DeclareLaunchArgument, EmitEvent, ExecuteProcess, OpaqueFunction, RegisterEventHandler
+from launch.event_handlers import OnProcessExit
+from launch.events import Shutdown
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
@@ -28,13 +30,25 @@ def _log_launch_exception(step_name, e):
 
 
 def _launch_nodes_offline(context, *args, **kwargs):
-    config_path = LaunchConfiguration("config").perform(context)
+    config_path_raw = (LaunchConfiguration("config").perform(context) or "").strip()
     try:
         pkg_share = get_package_share_directory("automap_pro")
     except Exception as e:
         _log_launch_exception("get_package_share_directory(automap_pro)", e)
         pkg_share = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
         sys.stderr.write("{} [FALLBACK] 使用 launch 相对路径 pkg_share={}\n".format(_LP, pkg_share))
+        sys.stderr.flush()
+    # 全工程唯一配置：规范化为绝对路径，确保 load_system_config / fast_livo 临时 YAML / automap_system config_file 均用同一路径
+    if config_path_raw and not os.path.isabs(config_path_raw) and os.path.isfile(config_path_raw):
+        config_path = os.path.abspath(config_path_raw)
+    elif config_path_raw and not os.path.isabs(config_path_raw):
+        config_path = os.path.join(pkg_share, "config", os.path.basename(config_path_raw))
+        if not os.path.isfile(config_path):
+            config_path = config_path_raw
+    else:
+        config_path = config_path_raw
+    if config_path:
+        sys.stderr.write("{} [CONFIG] 全工程唯一配置文件: {}\n".format(_LP, os.path.abspath(config_path) if config_path and os.path.isfile(config_path) else config_path))
         sys.stderr.flush()
     # RViz 配置：前端 / 后端分两个窗口
     rviz_frontend_config = os.path.join(pkg_share, "rviz", "automap_frontend.rviz")
@@ -87,11 +101,9 @@ def _launch_nodes_offline(context, *args, **kwargs):
     use_hba_visualize_val = LaunchConfiguration("use_hba_visualize", default="false").perform(context).strip().lower() == "true"
     nodes = []
 
-    # Fast-LIVO2：参数写入临时 YAML 再以 parameters=[path] 传入，避免将含 bool 的 dict 交给 launch 序列化触发 "name 'true' is not defined"（launch_ros 已知问题）
+    # Fast-LIVO2：参数来自全工程唯一 config，写入临时 YAML 再以 parameters=[path] 传入
     if fl2_params and use_external_frontend_val:
-        config_abs = os.path.abspath(config_path) if config_path else None
-        sys.stderr.write("{} [CONFIG] 唯一配置文件(全工程): config_path={}\n".format(_LP, config_abs or config_path))
-        sys.stderr.write("{} [CONFIG] fast_livo 参数来源: 同上 config，写入临时 YAML 再加载\n".format(_LP))
+        sys.stderr.write("{} [CONFIG] fast_livo 参数来源: 同上唯一 config，写入临时 YAML 再加载\n".format(_LP))
         pb = fl2_params.get("parameter_blackboard") if isinstance(fl2_params.get("parameter_blackboard"), dict) else {}
         sys.stderr.write("{} [FAST_LIVO_PARAMS] fl2_params 顶层键: {}\n".format(_LP, sorted(fl2_params.keys())))
         sys.stderr.write("{} [FAST_LIVO_PARAMS] parameter_blackboard 键: {}, model={!r}\n".format(
@@ -119,12 +131,19 @@ def _launch_nodes_offline(context, *args, **kwargs):
             with open(fast_livo_params_file, "w", encoding="utf-8") as _f:
                 _yaml.dump(_data, _f, default_flow_style=False, allow_unicode=True, sort_keys=False)
             get_package_share_directory("fast_livo")
+            run_fast_livo_under_gdb = LaunchConfiguration("run_fast_livo_under_gdb", default="false").perform(context).lower() == "true"
+            fast_livo_prefix = []
+            if run_fast_livo_under_gdb and os.path.isfile(gdb_wrapper := os.path.join(launch_dir, "run_under_gdb.sh")):
+                fast_livo_prefix = [gdb_wrapper]
+                sys.stderr.write("{} [GDB] fastlivo_mapping 将以 GDB 启动，崩溃时自动打印 backtrace\n".format(_LP))
+                sys.stderr.flush()
             nodes.append(Node(
                 package="fast_livo",
                 executable="fastlivo_mapping",
                 name="laserMapping",
                 parameters=[fast_livo_params_file],
                 output="screen",
+                prefix=fast_livo_prefix,
             ))
         except Exception as e:
             _log_launch_exception("创建 fast_livo Node(get_package_share_directory 或 Node())", e)
@@ -186,13 +205,15 @@ def _launch_nodes_offline(context, *args, **kwargs):
         else:
             sys.stderr.write("{} [GDB] 未找到 {}，请安装 gdb 并确保 launch 目录存在 run_under_gdb.sh，跳过 GDB\n".format(_LP, gdb_wrapper))
         sys.stderr.flush()
+    automap_system_node = None
     try:
-        nodes.append(Node(
+        automap_system_node = Node(
             package="automap_pro", executable="automap_system_node", name="automap_system",
             output="screen",
             parameters=[{"config_file": config_path_str}, {"use_sim_time": True}],
             prefix=automap_prefix,
-        ))
+        )
+        nodes.append(automap_system_node)
     except Exception as e:
         _log_launch_exception("创建 automap_system Node", e)
         sys.stderr.write("{} [ERROR] automap_system 节点未添加，建图核心不可用\n".format(_LP))
@@ -225,6 +246,14 @@ def _launch_nodes_offline(context, *args, **kwargs):
         ))
     except Exception as e:
         _log_launch_exception("创建 map_camera_init_tf Node", e)
+    # 结束建图后全部进程关闭：automap_system 退出（finish_mapping → rclcpp::shutdown）时触发 launch Shutdown，终止 fast_livo / rviz / overlap 等所有进程
+    if automap_system_node is not None:
+        nodes.append(RegisterEventHandler(
+            OnProcessExit(
+                target_action=automap_system_node,
+                on_exit=[EmitEvent(event=Shutdown(reason="finish_mapping: automap_system exited"))],
+            )
+        ))
     return nodes
 
 
@@ -313,6 +342,15 @@ def _log_bag_path(context, *args, **kwargs):
 def generate_launch_description():
     pkg_share = get_package_share_directory("automap_pro")
     config_default = os.path.join(pkg_share, "config", "system_config.yaml")
+    # bag 播完后调用 finish_mapping，执行最终 HBA + 保存 + shutdown（离线“播完再结束”）
+    bag_play_action = ExecuteProcess(
+        cmd=["ros2", "bag", "play", LaunchConfiguration("bag_file"), "--rate", LaunchConfiguration("rate"), "--clock"],
+        output="screen",
+    )
+    finish_after_bag_action = ExecuteProcess(
+        cmd=["bash", "-c", "sleep 5 && ros2 service call /automap/finish_mapping std_srvs/srv/Trigger '{}'"],
+        output="screen",
+    )
     return LaunchDescription([
         DeclareLaunchArgument("config", default_value=config_default, description="Path to system_config.yaml"),
         DeclareLaunchArgument("bag_file", default_value=os.path.expanduser("~/data/mapping.db3"), description="Path to rosbag2"),
@@ -324,7 +362,14 @@ def generate_launch_description():
         DeclareLaunchArgument("use_hba_cal_mme", default_value="false", description="Launch HBA cal_MME node (params from system_config.backend.hba_cal_mme)"),
         DeclareLaunchArgument("use_hba_visualize", default_value="false", description="Launch HBA visualize node (params from system_config.backend.hba_visualize)"),
         DeclareLaunchArgument("run_automap_under_gdb", default_value="false", description="Run automap_system_node under GDB; on crash prints full backtrace (requires gdb in container)"),
+        DeclareLaunchArgument("run_fast_livo_under_gdb", default_value="false", description="Run fastlivo_mapping under GDB; use when frontend SIGSEGV to get backtrace (e.g. frame=10 crash)"),
         OpaqueFunction(function=_log_bag_path),
-        ExecuteProcess(cmd=["ros2", "bag", "play", LaunchConfiguration("bag_file"), "--rate", LaunchConfiguration("rate"), "--clock"], output="screen"),
+        bag_play_action,
         OpaqueFunction(function=_launch_nodes_offline),
+        RegisterEventHandler(
+            event_handler=OnProcessExit(
+                target_action=bag_play_action,
+                on_exit=[finish_after_bag_action],
+            )
+        ),
     ])

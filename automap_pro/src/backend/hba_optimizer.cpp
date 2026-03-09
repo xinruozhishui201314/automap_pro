@@ -44,14 +44,14 @@ void HBAOptimizer::onSubmapFrozen(const SubMap::Ptr& submap) {
         task.keyframes.push_back(kf);
     }
     task.enable_gps = gps_aligned_;
-        if (!task.keyframes.empty()) {
-            size_t kf_count = task.keyframes.size();
-            size_t qdepth = pending_queue_.size() + 1;
-            pending_queue_.push(std::move(task));
-            queue_cv_.notify_one();
-            trigger_count_++;
-            ALOG_INFO(MOD, "HBA triggered by frozen submap: kf_count={} queue_depth={}", kf_count, qdepth);
-        }
+    if (!task.keyframes.empty()) {
+        size_t kf_count = task.keyframes.size();
+        size_t qdepth = pending_queue_.size() + 1;
+        pending_queue_.push(std::move(task));
+        queue_cv_.notify_one();
+        trigger_count_++;
+        ALOG_INFO(MOD, "HBA triggered by frozen submap: kf_count={} queue_depth={}", kf_count, qdepth);
+    }
 }
 
 void HBAOptimizer::triggerAsync(
@@ -81,7 +81,14 @@ void HBAOptimizer::triggerAsync(
               sm_count, kf_count, gps_aligned_ ? 1 : 0, trigger_count_, queue_depth);
 
     if (wait) {
-        waitUntilIdleFor(std::chrono::milliseconds(0));  // 无超时：一直等
+        // 设置合理超时：最多等待5分钟，避免永久阻塞导致析构卡死
+        constexpr auto kMaxWaitTime = std::chrono::minutes(5);
+        waitUntilIdleFor(kMaxWaitTime);
+        if (!isIdle()) {
+            ALOG_WARN(MOD, "HBA wait timeout after 5 minutes, forcing stop to avoid deadlock");
+            RCLCPP_WARN(rclcpp::get_logger("automap_system"),
+                "[HBAOptimizer][TIMEOUT] HBA did not finish after 5 minutes, forcing stop");
+        }
     }
 }
 
@@ -132,9 +139,18 @@ void HBAOptimizer::workerLoop() {
             if (!running_ && pending_queue_.empty()) break;
 
             // 取最新任务（丢弃旧任务，避免堆积）
+            size_t old_size = pending_queue_.size();
             while (pending_queue_.size() > 1) pending_queue_.pop();
             task = std::move(pending_queue_.front());
             pending_queue_.pop();
+            
+            // 记录任务丢弃日志
+            if (old_size > 1) {
+                ALOG_WARN(MOD, "Dropped {} old HBA tasks to avoid backlog", old_size - 1);
+                RCLCPP_WARN(rclcpp::get_logger("automap_system"),
+                    "[HBAOptimizer][TASK_DROP] Dropped %zu old HBA tasks (queue size: %zu)",
+                    static_cast<size_t>(old_size - 1), old_size);
+            }
         }
 
         hba_running_ = true;

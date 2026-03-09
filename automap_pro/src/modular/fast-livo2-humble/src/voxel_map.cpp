@@ -11,6 +11,7 @@ which is included as part of this source code package.
 */
 
 #include "voxel_map.h"
+#include <cstdio>
 using namespace Eigen;
 void calcBodyCov(Eigen::Vector3d &pb, const float range_inc, const float degree_inc, Eigen::Matrix3d &cov)
 {
@@ -822,6 +823,11 @@ void VoxelMapManager::build_single_residual(pointWithVar &pv, const VoxelOctoTre
 
 void VoxelMapManager::pubVoxelMap()
 {
+  static int s_pub_voxel_call = 0;
+  s_pub_voxel_call++;
+  const bool diag = (s_pub_voxel_call <= 20 || s_pub_voxel_call % 200 == 0);
+  if (diag) std::fprintf(stderr, "[fast_livo][VoxelMap][DIAG] pubVoxelMap enter call=%d voxel_map_.size=%zu\n", s_pub_voxel_call, static_cast<size_t>(voxel_map_.size()));
+
   double max_trace = 0.25;
   double pow_num = 0.2;
   rclcpp::Rate loop(500);
@@ -833,6 +839,7 @@ void VoxelMapManager::pubVoxelMap()
   {
     GetUpdatePlane(iter->second, config_setting_.max_layer_, pub_plane_list);
   }
+  if (diag) std::fprintf(stderr, "[fast_livo][VoxelMap][DIAG] pubVoxelMap GetUpdatePlane done pub_plane_list.size=%zu\n", pub_plane_list.size());
   for (size_t i = 0; i < pub_plane_list.size(); i++)
   {
     V3D plane_cov = pub_plane_list[i].plane_var_.block<3, 3>(0, 0).diagonal();
@@ -850,10 +857,20 @@ void VoxelMapManager::pubVoxelMap()
   }
   voxel_map_pub_->publish(voxel_plane);
   loop.sleep();
+  if (diag) std::fprintf(stderr, "[fast_livo][VoxelMap][DIAG] pubVoxelMap exit call=%d\n", s_pub_voxel_call);
 }
 
 void VoxelMapManager::GetUpdatePlane(const VoxelOctoTree *current_octo, const int pub_max_voxel_layer, std::vector<VoxelPlane> &plane_list)
 {
+  if (current_octo == nullptr || current_octo->plane_ptr_ == nullptr) {
+    static int s_null_guard_hits = 0;
+    s_null_guard_hits++;
+    if (s_null_guard_hits <= 5 || s_null_guard_hits % 500 == 0) {
+      const void* pp = (current_octo != nullptr) ? static_cast<const void*>(current_octo->plane_ptr_) : nullptr;
+      std::fprintf(stderr, "[fast_livo][VoxelMap][DIAG] GetUpdatePlane null guard hit=%d (current_octo=%p plane_ptr_=%p)\n", s_null_guard_hits, static_cast<const void*>(current_octo), pp);
+    }
+    return;
+  }
   if (current_octo->layer_ > pub_max_voxel_layer) { return; }
   if (current_octo->plane_ptr_->is_update_) { plane_list.push_back(*current_octo->plane_ptr_); }
   if (current_octo->layer_ < current_octo->max_layer_)

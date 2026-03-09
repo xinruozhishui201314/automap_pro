@@ -71,7 +71,19 @@ system:
   # 传感器空闲结束建图：超过该秒数未收到点云且帧队列已空时，执行最终 HBA、导出地图并退出
   sensor_idle_timeout_sec: 10.0
   auto_finish_on_sensor_idle: true
+  # 离线“播完再结束”：true 时不依赖传感器空闲自动结束，仅由 /automap/finish_mapping 在 bag 播完后触发（launch 会调用）
+  offline_finish_after_bag: false
+  # 大幅度增加 buff，来一帧修一帧；后端帧队列与入口队列足够大，避免接收/处理不及时丢帧
+  frame_queue_max_size: 5000
+  ingress_queue_max_size: 2000
 
+# ── 性能优化开关（P0/P1：异步与并行，默认开启）────────────────────────────
+performance:
+  async_global_map_build: true    # 使用 buildGlobalMapAsync 异步构建全局图
+  async_isam2_update: true       # 回环/GPS 因子入队异步执行，不阻塞主线程
+  parallel_voxel_downsample: true # 体素下采样内部循环 OpenMP 并行（需 -fopenmp）
+  parallel_teaser_match: true    # 多候选 TEASER 匹配并行（std::async）
+  max_optimization_queue_size: 64 # iSAM2 异步队列上限，满则丢弃新任务
 
 # ┌─────────────────────────────────────────────────────────────────────────────
 # 二、前端参数
@@ -190,11 +202,13 @@ fast_livo:
     gravity_align_en: false
 
   publish:
-    dense_map_en:         true
-    pub_effect_point_en:  false
-    pub_plane_en:         false
-    pub_scan_num:         1
-    blind_rgb_points:     0.0
+    dense_map_en:           true
+    pub_effect_point_en:    false
+    pub_plane_en:           false
+    pub_scan_num:           1
+    blind_rgb_points:       0.0
+    laser_map_interval:     10   # 每 N 帧发布一次 /Laser_map
+    laser_map_voxel_size:   0.2  # 发布前体素下采样(m)，减轻前端累积图过稠/糊；0=关闭
 
   evo:
     seq_name:       "automap_pro"
@@ -232,19 +246,26 @@ submap:
 gps:
   align_min_points:       50
   align_min_distance_m:   30.0
+  keyframe_match_window_s: 0.5   # 关键帧匹配 GPS 的最大时间差(s)；1Hz GPS 时 0.1 易导致 has_gps=0，建议 0.5~1.0
+  max_interp_gap_s:        2.0   # 双样本线性插值最大间隔(s)，超过则退化为最近邻；位置线性插值，姿态由里程计提供
   quality_threshold_hdop:  2.0
   align_rmse_threshold_m:  1.5
   good_samples_needed:    30
   add_constraints_on_align: true
   factor_interval_m:       5.0
+  factor_weight:           1.0   # 全局缩放：>1 加强约束，<1 减弱
+  factor_quality_scale_excellent: 2.0   # 按质量自动调整：EXCELLENT 约束更强
+  factor_quality_scale_high:      1.0
+  factor_quality_scale_medium:    0.5
 
 # ── 3.3 回环检测 ───────────────────────────────────────────────────────────
 loop_closure:
   overlap_threshold:   0.25      # ⬇️ 降低阈值（从0.30→0.25），在保持准确的前提下检测更多回环
   top_k:               8         # ⬆️ 增加候选数（从5→8），给几何验证更多机会
   min_temporal_gap_s:  30.0
-  min_submap_gap:      3
+  min_submap_gap:      2      # 2=短轨迹时也能产生回环候选；3=更保守
   gps_search_radius_m: 200.0
+  geo_prefilter_max_distance_m: 0.0   # 几何距离预筛：0=关闭；>0 时过滤锚定距离超过该值的候选
   worker_threads:      2
   overlap_transformer:
     # 空则 launch 自动解析为仓库内 pretrained_overlap_transformer.pth.tar（回环粗匹配必须使用该模型）
@@ -267,10 +288,15 @@ loop_closure:
 # ── 3.4 后端优化（ISAM2、HBA）────────────────────────────────────────────────
 # HBA 键与 params_from_system_config.get_hba_params / get_hba_cal_mme_params / get_hba_visualize_params 一致
 backend:
+  # 每隔多少帧处理一帧（1=每帧都处理；5=默认跳过4帧处理1帧，减轻后端负载；前端仍每帧发，队列照常弹出）
+  process_every_n_frames: 5
+  # 每处理多少帧发布一次全局图（增大可减轻 publishGlobalMap 峰值耗时，见 docs/FULL_LOG_PERFORMANCE_ANALYSIS.md）
+  publish_global_map_every_n_processed: 100
   isam2:
     relinearize_threshold: 0.01
     relinearize_skip:       1
     enable_relinearization: true
+    prior_variance:         1e-8   # 先验方差(仅首节点)，过小易过约束影响清晰度，见 CONFIG_M2DGR_BLUR_OPTIMIZATION.md
   hba:
     total_layer_num:         3
     thread_num:              8

@@ -51,11 +51,19 @@ SubMapManager::SubMapManager() {
     }
 }
 
+SubMapManager::~SubMapManager() {
+    freeze_post_running_.store(false);
+    freeze_post_cv_.notify_all();
+    if (freeze_post_thread_.joinable())
+        freeze_post_thread_.join();
+}
+
 void SubMapManager::init(rclcpp::Node::SharedPtr node) {
     node_ = node;
     event_pub_ = node->create_publisher<automap_pro::msg::SubMapEventMsg>(
         "/automap/submap_event", 50);
     RCLCPP_INFO(node->get_logger(), "[SubMapMgr][TOPIC] publish: /automap/submap_event");
+    freeze_post_thread_ = std::thread(&SubMapManager::freezePostProcessLoop, this);
 }
 
 void SubMapManager::startNewSession(uint64_t session_id) {
@@ -92,6 +100,10 @@ void SubMapManager::addKeyFrame(const KeyFrame::Ptr& kf) {
         // 如果没有活跃子图，创建一个
         if (!active_submap_) {
             active_submap_ = createNewSubmap(kf);
+            if (!active_submap_) {
+                RCLCPP_ERROR(rclcpp::get_logger("automap_system"), "[SubMapMgr][ADD_KF_STEP] createNewSubmap returned null, skip addKeyFrame");
+                return;
+            }
             submaps_.push_back(active_submap_);
             RCLCPP_INFO(rclcpp::get_logger("automap_system"),
                 "[SubMapMgr][ADD_KF_STEP] created new submap sm_id=%d (first KF)", active_submap_->id);
@@ -241,87 +253,105 @@ void SubMapManager::freezeActiveSubmap(const SubMap::Ptr& sm) {
     }
 
     RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-        "[SubMapMgr][FREEZE_STEP] enter freeze sm_id=%d (caller must not hold mutex_)", sm->id);
+        "[SubMapMgr][FREEZE_STEP] enter freeze sm_id=%d (async post-process)", sm->id);
 
-    // 结构化日志：开始Span
     SLOG_START_SPAN(MOD, "freeze_submap");
-    
-    // 计时：冻结操作（警告阈值500ms）
-    SLOG_TIMED_SCOPE(MOD, fmt::format("freeze_submap#{}", sm->id), 500.0);
 
     try {
-        // 降采样点云（用于回环匹配，使用 utils::voxelDownsample 避免 PCL 整数溢出崩溃）
-        if (sm->merged_cloud && !sm->merged_cloud->empty()) {
-            SLOG_TIMED_SCOPE(MOD, "downsample_submap", 200.0);
-            
-            CloudXYZIPtr ds = utils::voxelDownsample(sm->merged_cloud, static_cast<float>(match_res_));
-            if (!ds || ds->empty()) {
-                SLOG_WARN(MOD, "SM#{} voxelDownsample returned empty, keeping merged_cloud as downsampled", sm->id);
-                ds = sm->merged_cloud;
-            }
-            sm->downsampled_cloud = ds;
-            // ALOG_INFO(MOD, "[tid={}] step=downsampled_cloud_set sm_id={} pts={} (merged_pts={})",
-            //           automap_pro::logThreadId(), sm->id, ds->size(), sm->merged_cloud->size());
-
-            SLOG_DEBUG(MOD, "SM#{} downsampled: {} -> {} pts",
-                         sm->id, sm->merged_cloud->size(), ds->size());
-            
-            // 记录指标
-            METRICS_HISTOGRAM_OBSERVE(metrics::POINTCLOUD_SIZE, 
-                                          static_cast<double>(sm->merged_cloud->size()));
-        }
-
-        // 更新状态
         sm->state = SubMapState::FROZEN;
         publishEvent(sm, "FROZEN");
-        
-        SLOG_EVENT(MOD, "submap_frozen", 
-                   "SubMap #{} frozen (kf_count={}, dist={:.1f}m, memory={}MB)",
-                   sm->id, sm->keyframes.size(), sm->spatial_extent_m,
-                   sm->merged_cloud ? sm->merged_cloud->size() * sizeof(pcl::PointXYZI) / (1024.0 * 1024.0) : 0.0);
-        
-        // 记录指标
         METRICS_INCREMENT(metrics::SUBMAPS_FROZEN);
-        
-        // 触发回调（→ onSubmapFrozen → getFrozenSubmaps；必须在未持 mutex_ 时调用，此处已满足）
-        // RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-        //     "[SubMapMgr][FREEZE_STEP] before frozen_cbs_ sm_id=%d", sm->id);
-        for (auto& cb : frozen_cbs_) {
-            SLOG_DEBUG(MOD, "Calling frozen callback for SM#{}", sm->id);
-            cb(sm);
+        SLOG_EVENT(MOD, "submap_frozen", "SubMap #{} state=FROZEN (post-process enqueue)", sm->id);
+
+        bool enqueued = false;
+        {
+            std::unique_lock<std::mutex> lk(freeze_post_mutex_);
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+            while (freeze_post_queue_.size() >= kMaxFreezePostQueueSize && freeze_post_running_.load()) {
+                if (freeze_post_cv_.wait_until(lk, deadline, [this] {
+                    return freeze_post_queue_.size() < kMaxFreezePostQueueSize || !freeze_post_running_.load();
+                }))
+                    break;
+                break;
+            }
+            if (freeze_post_queue_.size() < kMaxFreezePostQueueSize && freeze_post_running_.load()) {
+                freeze_post_queue_.push(sm);
+                enqueued = true;
+                freeze_post_cv_.notify_one();
+            }
         }
-        // RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-        //     "[SubMapMgr][FREEZE_STEP] after frozen_cbs_ sm_id=%d", sm->id);
-        
-        // 更新健康检查：此处可安全调用 getFrozenSubmaps（当前未持 mutex_）
+        if (enqueued) {
+            RCLCPP_INFO(rclcpp::get_logger("automap_system"), "[SubMapMgr][FREEZE_STEP] exit freeze sm_id=%d (enqueued)", sm->id);
+            SLOG_END_SPAN();
+            return;
+        }
+
+        // 队列满或超时：同步执行 voxel + 回调，避免阻塞/死锁
+        RCLCPP_WARN(rclcpp::get_logger("automap_system"), "[SubMapMgr][FREEZE_STEP] queue full or timeout, sync fallback sm_id=%d", sm->id);
+        if (sm->merged_cloud && !sm->merged_cloud->empty()) {
+            CloudXYZIPtr ds = utils::voxelDownsample(sm->merged_cloud, static_cast<float>(match_res_));
+            if (!ds || ds->empty()) ds = sm->merged_cloud;
+            sm->downsampled_cloud = ds;
+            METRICS_HISTOGRAM_OBSERVE(metrics::POINTCLOUD_SIZE, static_cast<double>(sm->merged_cloud->size()));
+        }
+        for (auto& cb : frozen_cbs_) cb(sm);
         HEALTH_UPDATE_QUEUE("submap", getFrozenSubmaps().size());
         HEALTH_UPDATE_QUEUE("loop", 0);
-
-        ALOG_INFO(MOD, "[STATE] SubMap #{} frozen", sm->id);
-        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-            "[SubMapMgr][FREEZE_STEP] exit freeze sm_id=%d", sm->id);
-        
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"), "[SubMapMgr][FREEZE_STEP] exit freeze sm_id=%d (sync)", sm->id);
     } catch (const std::exception& e) {
-        // 使用错误码系统
-        auto error = ErrorDetail(errors::SUBMAP_STATE_INVALID, 
-                                 fmt::format("Failed to freeze submap #{}: {}", sm->id, e.what()));
+        auto error = ErrorDetail(errors::SUBMAP_STATE_INVALID, fmt::format("Failed to freeze submap #{}: {}", sm->id, e.what()));
         error.context().operation = "freezeActiveSubmap";
         error.context().file = __FILE__;
         error.context().line = __LINE__;
         error.context().function = __func__;
-        
         SLOG_ERROR_CODE(MOD, static_cast<uint32_t>(error.code()), error.message());
-        RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
-            "[SubMapManager][EXCEPTION] freezeActiveSubmap: %s", error.message().c_str());
-        
+        RCLCPP_ERROR(rclcpp::get_logger("automap_system"), "[SubMapManager][EXCEPTION] freezeActiveSubmap: %s", error.message().c_str());
         METRICS_INCREMENT(metrics::ERRORS_TOTAL);
         publishErrorEvent(sm->id, error);
     }
-    
     SLOG_END_SPAN();
 }
 
+void SubMapManager::freezePostProcessLoop() {
+    while (freeze_post_running_.load()) {
+        SubMap::Ptr sm;
+        {
+            std::unique_lock<std::mutex> lk(freeze_post_mutex_);
+            freeze_post_cv_.wait(lk, [this] {
+                return !freeze_post_queue_.empty() || !freeze_post_running_.load();
+            });
+            if (!freeze_post_running_.load() && freeze_post_queue_.empty()) break;
+            if (freeze_post_queue_.empty()) continue;
+            sm = std::move(freeze_post_queue_.front());
+            freeze_post_queue_.pop();
+        }
+        if (!sm) continue;
+        try {
+            if (sm->merged_cloud && !sm->merged_cloud->empty()) {
+                CloudXYZIPtr ds = utils::voxelDownsample(sm->merged_cloud, static_cast<float>(match_res_));
+                if (!ds || ds->empty()) ds = sm->merged_cloud;
+                sm->downsampled_cloud = ds;
+                METRICS_HISTOGRAM_OBSERVE(metrics::POINTCLOUD_SIZE, static_cast<double>(sm->merged_cloud->size()));
+            }
+            for (auto& cb : frozen_cbs_) cb(sm);
+            HEALTH_UPDATE_QUEUE("submap", getFrozenSubmaps().size());
+            HEALTH_UPDATE_QUEUE("loop", 0);
+            RCLCPP_DEBUG(rclcpp::get_logger("automap_system"), "[SubMapMgr][FREEZE_POST] sm_id=%d downsampled_cloud done", sm->id);
+        } catch (const std::exception& e) {
+            RCLCPP_ERROR(rclcpp::get_logger("automap_system"), "[SubMapManager][FREEZE_POST] sm_id=%d exception: %s", sm ? sm->id : -1, e.what());
+            METRICS_INCREMENT(metrics::ERRORS_TOTAL);
+        } catch (...) {
+            RCLCPP_ERROR(rclcpp::get_logger("automap_system"), "[SubMapManager][FREEZE_POST] sm_id=%d unknown exception", sm ? sm->id : -1);
+            METRICS_INCREMENT(metrics::ERRORS_TOTAL);
+        }
+    }
+}
+
 SubMap::Ptr SubMapManager::createNewSubmap(const KeyFrame::Ptr& first_kf) {
+    if (!first_kf) {
+        RCLCPP_ERROR(rclcpp::get_logger("automap_system"), "[SubMapManager] createNewSubmap: first_kf is null");
+        return nullptr;
+    }
     auto sm = std::make_shared<SubMap>();
     sm->id          = submap_id_counter_++;
     sm->session_id  = current_session_id_;
@@ -404,10 +434,26 @@ void SubMapManager::mergeCloudToSubmap(SubMap::Ptr& sm, const KeyFrame::Ptr& kf)
         CloudXYZIPtr temp = utils::voxelDownsample(sm->merged_cloud, static_cast<float>(merge_res_));
         if (temp && !temp->empty()) {
             size_t after_downsample = temp->size();
-            sm->merged_cloud.swap(temp);
-            RCLCPP_DEBUG(rclcpp::get_logger("automap_system"),
-                "[GLOBAL_MAP_DIAG] SM#%d post-merge downsample: %zu → %zu pts (threshold=%.0f)",
-                sm->id, before_downsample, after_downsample, static_cast<float>(kDownsampleThreshold));
+            // ✅ 修复：检查降采样后点数，防止降采样失败或点数仍然过大
+            if (after_downsample > 10000000) {  // 超过1000万点则强制清空
+                RCLCPP_WARN(rclcpp::get_logger("automap_system"),
+                    "[GLOBAL_MAP_DIAG] SM#%d post-merge downsample result too large (%zu pts), clearing to avoid memory issue",
+                    sm->id, after_downsample);
+                sm->merged_cloud->clear();
+                sm->merged_cloud->points.shrink_to_fit();
+            } else {
+                sm->merged_cloud.swap(temp);
+                RCLCPP_DEBUG(rclcpp::get_logger("automap_system"),
+                    "[GLOBAL_MAP_DIAG] SM#%d post-merge downsample: %zu → %zu pts (threshold=%.0f)",
+                    sm->id, before_downsample, after_downsample, static_cast<float>(kDownsampleThreshold));
+            }
+        } else {
+            // ✅ 修复：降采样失败则清空，避免累积过多点
+            RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+                "[GLOBAL_MAP_DIAG] SM#%d post-merge downsample failed (returned empty), clearing merged cloud",
+                sm->id);
+            sm->merged_cloud->clear();
+            sm->merged_cloud->points.shrink_to_fit();
         }
     }
 }
@@ -855,6 +901,110 @@ CloudXYZIPtr SubMapManager::buildGlobalMap(float voxel_size) const {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// 持久化：archiveSubmap / loadArchivedSubmap（修复 undefined symbol）
+// ─────────────────────────────────────────────────────────────────────
+
+bool SubMapManager::archiveSubmap(const SubMap::Ptr& submap, const std::string& dir) {
+    if (!submap) return false;
+    std::string subdir = dir + "/submap_" + std::to_string(submap->id);
+    try {
+        fs::create_directories(subdir);
+
+        json meta;
+        meta["id"] = submap->id;
+        meta["session_id"] = submap->session_id;
+        meta["t_start"] = submap->t_start;
+        meta["t_end"] = submap->t_end;
+        meta["spatial_extent_m"] = submap->spatial_extent_m;
+        meta["has_descriptor"] = submap->has_descriptor;
+        meta["has_valid_gps"] = submap->has_valid_gps;
+
+        const Pose3d& T = submap->pose_w_anchor_optimized;
+        Eigen::Quaterniond q(T.rotation());
+        meta["anchor_pose"] = {
+            {"px", T.translation().x()}, {"py", T.translation().y()}, {"pz", T.translation().z()},
+            {"qx", q.x()}, {"qy", q.y()}, {"qz", q.z()}, {"qw", q.w()}
+        };
+        if (submap->has_valid_gps) {
+            meta["gps_center"] = {submap->gps_center.x(), submap->gps_center.y(), submap->gps_center.z()};
+        }
+        if (submap->has_descriptor && submap->overlap_descriptor.size() > 0) {
+            meta["descriptor"] = std::vector<float>(submap->overlap_descriptor.data(),
+                submap->overlap_descriptor.data() + submap->overlap_descriptor.size());
+        }
+
+        std::ofstream ofs(subdir + "/submap_meta.json");
+        ofs << meta.dump(2);
+
+        if (submap->downsampled_cloud && !submap->downsampled_cloud->empty()) {
+            pcl::io::savePCDFileBinary(subdir + "/downsampled_cloud.pcd", *submap->downsampled_cloud);
+        }
+        submap->state = SubMapState::ARCHIVED;
+        return true;
+    } catch (const std::exception& e) {
+        SLOG_ERROR(MOD, "archiveSubmap sm_id={} failed: {}", submap->id, e.what());
+        return false;
+    }
+}
+
+bool SubMapManager::loadArchivedSubmap(const std::string& dir, int submap_id, SubMap::Ptr& out) {
+    std::string subdir = dir + "/submap_" + std::to_string(submap_id);
+    std::string meta_path = subdir + "/submap_meta.json";
+    if (!fs::exists(meta_path)) return false;
+    try {
+        std::ifstream ifs(meta_path);
+        json meta;
+        ifs >> meta;
+
+        auto sm = std::make_shared<SubMap>();
+        sm->id = meta.value("id", -1);
+        sm->session_id = meta.value("session_id", 0ULL);
+        sm->t_start = meta.value("t_start", 0.0);
+        sm->t_end = meta.value("t_end", 0.0);
+        sm->spatial_extent_m = meta.value("spatial_extent_m", 0.0);
+        sm->has_descriptor = meta.value("has_descriptor", false);
+        sm->has_valid_gps = meta.value("has_valid_gps", false);
+        sm->state = SubMapState::ARCHIVED;
+
+        if (meta.contains("anchor_pose")) {
+            const auto& ap = meta["anchor_pose"];
+            Eigen::Quaterniond q(ap.value("qw", 1.0), ap.value("qx", 0.0), ap.value("qy", 0.0), ap.value("qz", 0.0));
+            sm->pose_w_anchor_optimized = sm->pose_w_anchor = Pose3d::Identity();
+            sm->pose_w_anchor_optimized.linear() = q.toRotationMatrix();
+            sm->pose_w_anchor_optimized.translation() << ap.value("px", 0.0), ap.value("py", 0.0), ap.value("pz", 0.0);
+            sm->pose_w_anchor = sm->pose_w_anchor_optimized;
+        }
+        if (meta.contains("gps_center") && meta["gps_center"].is_array() && meta["gps_center"].size() >= 3) {
+            sm->gps_center << meta["gps_center"][0], meta["gps_center"][1], meta["gps_center"][2];
+        }
+        if (meta.contains("descriptor") && meta["descriptor"].is_array()) {
+            std::vector<float> d = meta["descriptor"].get<std::vector<float>>();
+            if (d.size() == 256) {
+                sm->overlap_descriptor = Eigen::VectorXf::Map(d.data(), 256);
+                sm->overlap_descriptor_norm = sm->overlap_descriptor.norm();
+            }
+        }
+
+        std::string pcd_path = subdir + "/downsampled_cloud.pcd";
+        if (fs::exists(pcd_path)) {
+            sm->downsampled_cloud = std::make_shared<CloudXYZI>();
+            if (pcl::io::loadPCDFile(pcd_path, *sm->downsampled_cloud) == 0) {
+                /* loaded */
+            } else {
+                sm->downsampled_cloud->clear();
+            }
+        }
+        if (!sm->downsampled_cloud) sm->downsampled_cloud = std::make_shared<CloudXYZI>();
+
+        out = sm;
+        return true;
+    } catch (const std::exception& e) {
+        SLOG_ERROR(MOD, "loadArchivedSubmap sm_id={} failed: {}", submap_id, e.what());
+        return false;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // 工程化辅助函数实现
 // ─────────────────────────────────────────────────────────────────────
 
@@ -930,6 +1080,60 @@ void SubMapManager::publishErrorEvent(int submap_id, const ErrorDetail& error) {
     SLOG_EVENT(MOD, "submap_error", "sm_id={}, code=0x{:08X}, msg={}",
                submap_id, static_cast<uint32_t>(error.code()),
                error.message());
+}
+
+// ── 异步构建实现（P0 优化）──────────────────────────────────────────
+
+std::future<CloudXYZIPtr> SubMapManager::buildGlobalMapAsync(float voxel_size) const {
+    return std::async(std::launch::async, [this, voxel_size]() {
+        std::vector<SubMap::Ptr> submaps_copy;
+        {
+            std::lock_guard<std::mutex> lk(mutex_);
+            submaps_copy = submaps_;
+        }
+        return buildGlobalMapInternal(submaps_copy, voxel_size);
+    });
+}
+
+CloudXYZIPtr SubMapManager::buildGlobalMapInternal(
+    const std::vector<SubMap::Ptr>& submaps_copy, float voxel_size) const {
+    const unsigned tid = automap_pro::logThreadId();
+    const rclcpp::Logger log = rclcpp::get_logger("automap_system");
+    ALOG_INFO(MOD, "[tid={}] step=buildGlobalMapInternal_enter voxel_size={:.3f}", tid, voxel_size);
+
+    CloudXYZIPtr combined = std::make_shared<CloudXYZI>();
+    CloudXYZIPtr world_tmp = std::make_shared<CloudXYZI>();
+
+    for (const auto& sm : submaps_copy) {
+        if (!sm) continue;
+        for (const auto& kf : sm->keyframes) {
+            if (!kf || !kf->cloud_body || kf->cloud_body->empty()) continue;
+            Pose3d T_w_b = kf->T_w_b_optimized;
+            if (T_w_b.matrix().isApprox(Eigen::Matrix4d::Identity(), 1e-6) &&
+                !kf->T_w_b.matrix().isApprox(Eigen::Matrix4d::Identity(), 1e-6)) {
+                T_w_b = kf->T_w_b;
+            }
+            Eigen::Affine3f T_wf;
+            T_wf.matrix() = T_w_b.cast<float>().matrix();
+            world_tmp->clear();
+            try {
+                pcl::transformPointCloud(*kf->cloud_body, *world_tmp, T_wf);
+            } catch (...) { continue; }
+            if (world_tmp->empty()) continue;
+            if (combined->size() + world_tmp->size() > kMaxCombinedPoints) break;
+            combined->reserve(combined->size() + world_tmp->size());
+            for (const auto& pt : world_tmp->points)
+                combined->push_back(pt);
+        }
+    }
+
+    if (combined->empty()) return combined;
+    float vs = std::max(voxel_size, utils::kMinVoxelLeafSize);
+    if (voxel_size <= 0.0f) return combined;
+
+    CloudXYZIPtr out = utils::voxelDownsampleChunked(combined, vs, 50.0f);
+    ALOG_INFO(MOD, "[tid={}] step=buildGlobalMapInternal_exit out={}", tid, out ? out->size() : 0u);
+    return out ? out : combined;
 }
 
 }  // namespace automap_pro

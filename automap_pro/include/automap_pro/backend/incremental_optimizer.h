@@ -10,12 +10,18 @@
 #include <gtsam/nonlinear/Values.h>
 #include <gtsam/nonlinear/ISAM2.h>
 #include <gtsam/inference/Symbol.h>
+#include <gtsam/linear/NoiseModel.h>
 
 #include <mutex>
 #include <shared_mutex>
 #include <unordered_map>
 #include <vector>
 #include <functional>
+#include <thread>
+#include <queue>
+#include <condition_variable>
+#include <atomic>
+#include <future>
 
 namespace automap_pro {
 
@@ -37,7 +43,8 @@ namespace automap_pro {
 class IncrementalOptimizer {
 public:
     explicit IncrementalOptimizer();
-    ~IncrementalOptimizer() = default;
+    ~IncrementalOptimizer();
+
 
     // ── 因子图操作（线程安全） ────────────────────────────────────────────
 
@@ -74,6 +81,12 @@ public:
     /** 重置（新 session 开始） */
     void reset();
 
+    /**
+     * 关闭前清空因子图与 iSAM2 状态并释放 prior_noise_，保证可控析构顺序。
+     * 不调用 ConfigManager，可重复调用（析构时再次调用安全）；调用后 addSubMapNode 等将不再添加因子。
+     */
+    void clearForShutdown();
+
     int nodeCount() const;
     int factorCount() const;
 
@@ -82,12 +95,50 @@ public:
     void registerPoseUpdateCallback(PoseUpdateCallback cb) {
         pose_update_cbs_.push_back(std::move(cb));
     }
+    
+    // ── P0 异步优化接口 ───────────────────────────────────────────────
+    
+    /** 优化任务类型 */
+    enum class OptimTaskType {
+        LOOP_FACTOR,    // 回环因子
+        GPS_FACTOR,     // GPS 因子
+        BATCH_UPDATE     // 批量更新（强制提交）
+    };
+    
+    /** 优化任务数据 */
+    struct OptimTask {
+        OptimTaskType type;
+        int from_id;
+        int to_id;
+        Pose3d rel_pose;
+        Mat66d info_matrix;
+        Eigen::Vector3d gps_pos;
+        Eigen::Matrix3d gps_cov;
+        
+        // 用于批量更新
+        std::function<void()> action;
+    };
+    
+    /** 提交优化任务到队列（立即返回，异步执行） */
+    void enqueueOptTask(const OptimTask& task);
+    
+    /** 批量提交优化任务（用于多个 GPS 因子） */
+    void enqueueOptTasks(const std::vector<OptimTask>& tasks);
+    
+    /** 等待所有已入队任务完成 */
+    void waitForPendingTasks();
+    
+    /** 获取当前队列深度 */
+    size_t getQueueDepth() const;
 
 private:
     gtsam::ISAM2         isam2_;
     gtsam::NonlinearFactorGraph pending_graph_;
     gtsam::Values               pending_values_;
     gtsam::Values               current_estimate_;
+
+    /** 先验因子共用单一 noise model。使用 Diagonal 而非 Constrained，避免进程退出时 GTSAM 析构顺序导致 double-free (SIGSEGV) */
+    gtsam::noiseModel::Diagonal::shared_ptr prior_noise_;
 
     mutable std::shared_mutex rw_mutex_;
     std::unordered_map<int, bool> node_exists_;
@@ -97,6 +148,15 @@ private:
     bool   has_prior_    = false;
 
     std::vector<PoseUpdateCallback> pose_update_cbs_;
+
+    // ── P0 异步优化队列与工作线程 ─────────────────────────────────────────
+    static constexpr size_t kMaxQueueSize = 64;
+    std::queue<OptimTask>  opt_queue_;
+    mutable std::mutex     opt_queue_mutex_;
+    std::condition_variable opt_queue_cv_;
+    std::atomic<bool>      opt_running_{true};
+    std::thread            opt_thread_;
+    void optLoop();
 
     // ── 私有工具 ──────────────────────────────────────────────────────────
     gtsam::Pose3 toPose3(const Pose3d& T) const;

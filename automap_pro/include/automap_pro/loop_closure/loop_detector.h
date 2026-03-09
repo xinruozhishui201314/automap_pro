@@ -132,8 +132,10 @@ private:
     double overlap_threshold_  = 0.3;
     int    top_k_              = 5;
     double min_temporal_gap_   = 30.0;
-    int    min_submap_gap_     = 3;
+    int    min_submap_gap_     = 2;
     double gps_search_radius_  = 200.0;
+    /** 几何距离预筛：候选与 query 子图锚定位置距离 > 此值(米)则过滤。0=关闭 */
+    double geo_prefilter_max_distance_m_ = 0.0;
     double min_inlier_ratio_   = 0.30;
     double max_rmse_           = 0.3;
     bool   use_icp_refine_     = true;

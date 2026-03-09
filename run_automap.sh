@@ -16,6 +16,7 @@
 #   --offline          离线模式（回放 rosbag）
 #   --bag-file <path>  指定 rosbag 文件路径（离线模式使用）
 #   --gdb              以 GDB 启动 automap_system_node，崩溃时打印 backtrace
+#   --gdb-frontend     以 GDB 启动 fastlivo_mapping（前端），用于定位 frame=10 等 SIGSEGV
 #   --build-only       仅编译不运行
 #   --run-only         仅运行不编译（假设已编译）
 #   --no-rviz          不启动 RViz 可视化
@@ -66,6 +67,7 @@ CLEAN_BUILD=false
 USE_EXTERNAL_FRONTEND=true
 USE_EXTERNAL_OVERLAP=false
 RUN_AUTOMAP_UNDER_GDB=false
+RUN_FAST_LIVO_UNDER_GDB=false
 # 离线模式是否在启动前清空输出目录（默认 true=每次离线重新建图，避免沿用上次结果）
 CLEAN_OUTPUT_ON_OFFLINE=true
 # 宿主机日志目录：编译输出 → build.log，运行输出 → full.log；默认项目根下的 logs，可用 --log-dir 覆盖
@@ -86,6 +88,7 @@ AutoMap-Pro 一键编译和运行脚本
     --bag-rate <rate>  Bag 回放速率，0.1-1.0（默认 0.5=半速）。需实时可传 1.0
     --config <file>    指定配置文件（如 system_config_M2DGR.yaml，默认 system_config.yaml）
     --gdb              以 GDB 启动 automap_system_node，崩溃时自动打印完整 backtrace（容器内需已安装 gdb）
+    --gdb-frontend     以 GDB 启动 fastlivo_mapping（前端）；用于定位前端 SIGSEGV（如 frame=10 崩溃）时抓 backtrace
     --build-only       仅编译不运行
     --run-only         仅运行不编译（假设已编译）
     --no-rviz          不启动 RViz 可视化
@@ -111,6 +114,7 @@ AutoMap-Pro 一键编译和运行脚本
         automap.log  全程总日志  build.log  编译  full.log  运行  clean.log  清理  image.log  镜像加载/构建
 
 故障排查:
+    - 若编译报「CMakeCache.txt directory ... is different than ...」：脚本已自动检测并清理含 /workspace/ 的缓存；仍失败时请加 --clean 后重跑
     - 若 ros2 bag 报「yaml-cpp: bad conversion」：检查 bag 元数据或换 --storage-preset mcap 重录
     - 若 HBA 报 vector::_M_default_append：多为尚无 LIO 位姿，请确保 --config 与 bag 话题一致且 fast_livo 已正常输出
     - 若 automap_system 报 undefined symbol keyframeCount：需重新编译 automap_pro（已补全 SubMapManager 实现）
@@ -176,6 +180,10 @@ parse_args() {
                 ;;
             --gdb)
                 RUN_AUTOMAP_UNDER_GDB=true
+                shift
+                ;;
+            --gdb-frontend)
+                RUN_FAST_LIVO_UNDER_GDB=true
                 shift
                 ;;
             --help|-h)
@@ -447,6 +455,12 @@ build_project() {
             source /opt/ros/humble/setup.bash
             cd /root/automap_ws
 
+            # 若 CMake 缓存为其他路径（如 /workspace/automap_ws）创建，会导致「current directory different than where CMakeCache.txt was created」编译失败，先清理
+            if [ -d build ] && find build -name CMakeCache.txt -exec grep -l '/workspace/' {} \\; 2>/dev/null | grep -q .; then
+              echo '[WARN] 检测到 CMake 缓存路径与当前工作空间不一致（含 /workspace/），清理 build/install/log 后重新编译'
+              rm -rf build install log build_teaserpp build_sophus build_ceres
+            fi
+
             # 链入 overlap_transformer_msgs / overlap_transformer_ros2 / hba（若存在）
             [ -d /root/mapping/overlap_transformer_msgs ] && ln -sf /root/mapping/overlap_transformer_msgs src/ 2>/dev/null || true
             [ -d /root/mapping/overlap_transformer_ros2 ] && ln -sf /root/mapping/overlap_transformer_ros2 src/ 2>/dev/null || true
@@ -653,8 +667,19 @@ run_system() {
     if [ "$MODE" = "offline" ] && [ "$CLEAN_OUTPUT_ON_OFFLINE" = true ]; then
         if [ -d "${OUTPUT_DIR}" ]; then
             print_info "清空输出目录以重新建图: ${OUTPUT_DIR}"
-            rm -rf "${OUTPUT_DIR:?}"/*
-            print_success "✓ 输出目录已清空，本次为全新建图"
+            rm -rf "${OUTPUT_DIR:?}"/* 2>/dev/null || true
+            # 若目录内仍有文件（多为容器/root 创建），用 sudo 再删一次以彻底清空
+            if [ -n "$(ls -A "${OUTPUT_DIR}" 2>/dev/null)" ]; then
+                if sudo -n rm -rf "${OUTPUT_DIR:?}"/* 2>/dev/null; then
+                    print_success "✓ 输出目录已清空（已使用 sudo 删除无权限文件），本次为全新建图"
+                else
+                    print_warning "⚠ 部分文件无权限删除且 sudo 不可用或需密码。请手动执行后重试："
+                    echo "    sudo rm -rf ${OUTPUT_DIR}/*"
+                    print_warning "或使用 --no-clean-output 跳过清空（将沿用目录内已有数据）。建图将继续启动。"
+                fi
+            else
+                print_success "✓ 输出目录已清空，本次为全新建图"
+            fi
         fi
         mkdir -p "${OUTPUT_DIR}"
     fi
@@ -759,6 +784,11 @@ except Exception as e:
         LAUNCH_ARGS="${LAUNCH_ARGS} run_automap_under_gdb:=true"
         print_info "GDB 调试: automap_system_node 将在 GDB 下运行，崩溃时自动打印 bt full"
     fi
+    if [ "$RUN_FAST_LIVO_UNDER_GDB" = true ]; then
+        CONTAINER_LAUNCH_ARGS="${CONTAINER_LAUNCH_ARGS} run_fast_livo_under_gdb:=true"
+        LAUNCH_ARGS="${LAUNCH_ARGS} run_fast_livo_under_gdb:=true"
+        print_info "GDB 调试: fastlivo_mapping 将在 GDB 下运行，崩溃时自动打印 bt full（用于定位前端 SIGSEGV）"
+    fi
 
     print_info "启动命令: ros2 launch ${LAUNCH_SPEC} ${LAUNCH_ARGS}"
 
@@ -790,6 +820,7 @@ except Exception as e:
     echo "[DIAG] 若出现 Camera model not specified → 查看 [FAST_LIVO_PARAMS] parameter_blackboard.model 及 [fast_livo] [DIAG] parameter_blackboard.model"
     echo "[DIAG] 若出现 Exception on parsing info file / bad conversion → 脚本已尝试修复 metadata；未修复时请手动: python3 scripts/fix_ros2_bag_metadata.py <bag目录>"
     echo "[DIAG] 若出现 HBA vector::_M_default_append 或 pose_size=0 → 查看 [HBA] [DATA] lio_pose_orig.size 与 [HBA] [FATAL]；确保 bag 回放且 fast_livo 先输出位姿"
+    echo "[DIAG] 若无 GPS（轨迹 CSV 无 gps_x/gps_y/gps_z）：grep -E 'LivoBridge\\[GPS\\]|GPS_DIAG|TRAJ_LOG no GPS' 日志；M2DGR 使用 sensor.gps.topic=/ublox/fix，须与 bag 话题一致"
     echo ""
 
     # 运行容器并启动建图系统（挂载 automap_pro 以便容器内能访问 config 等路径）

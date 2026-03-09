@@ -5,6 +5,7 @@
 #include <pcl/features/fpfh.h>
 #include <limits>
 #include <thread>
+#include <chrono>
 #include <csignal>
 #include <cstring>
 #include <execinfo.h>
@@ -15,14 +16,17 @@
 
 #define MOD "FPFHExtractor"
 
-// 崩溃精准分析：关键步骤同时写 cerr 并 flush，确保崩溃瞬间前一行日志可见
+// 崩溃精准分析：关键步骤带 ts_ms/lwp，同时写 cerr，便于与系统日志和 GDB info threads 对应
+#define _FPFH_TS_MS() (std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count())
 #define FPFH_CRASH_LOG(step, msg) do { \
-    ALOG_INFO(MOD, "[CRASH_TRACE][tid={}] {} {}", automap_pro::logThreadId(), step, msg); \
-    std::cerr << "[FPFH_CRASH_TRACE] " << step << " " << msg << std::endl; \
+    auto _ts = _FPFH_TS_MS(); \
+    ALOG_INFO(MOD, "[CRASH_TRACE][tid={}][lwp={}][ts_ms={}] {} {}", automap_pro::logThreadId(), automap_pro::logLwp(), _ts, step, msg); \
+    std::cerr << "[FPFH_CRASH_TRACE] ts_ms=" << _ts << " lwp=" << automap_pro::logLwp() << " " << step << " " << msg << std::endl; \
 } while(0)
 #define FPFH_CRASH_LOG_PTR(step, msg, ptr, size) do { \
-    ALOG_INFO(MOD, "[CRASH_TRACE][tid={}] {} {} ptr={} size={}", automap_pro::logThreadId(), step, msg, static_cast<const void*>(ptr), (size)); \
-    std::cerr << "[FPFH_CRASH_TRACE] " << step << " " << msg << " ptr=" << static_cast<const void*>(ptr) << " size=" << (size) << std::endl; \
+    auto _ts = _FPFH_TS_MS(); \
+    ALOG_INFO(MOD, "[CRASH_TRACE][tid={}][lwp={}][ts_ms={}] {} {} ptr={} size={}", automap_pro::logThreadId(), automap_pro::logLwp(), _ts, step, msg, static_cast<const void*>(ptr), (size)); \
+    std::cerr << "[FPFH_CRASH_TRACE] ts_ms=" << _ts << " lwp=" << automap_pro::logLwp() << " " << step << " " << msg << " ptr=" << static_cast<const void*>(ptr) << " size=" << (size) << std::endl; \
 } while(0)
 
 // 在关键步骤可选打印 backtrace（环境变量 AUTOMAP_FPFH_BACKTRACE=1 时启用）
@@ -127,7 +131,8 @@ FpfhExtractor::FpfhExtractor() {
  * （与 PCL #4877 同类：Eigen::DenseStorage::~DenseStorage → aligned_free → free）。
  *
  * 策略：
- * 1. 使用 function-local static NormalEstimation / FPFHEstimation，永不析构，避免析构路径崩溃
+ * 1. 使用 heap 分配 NormalEstimation/FPFHEstimation 且永不 delete（仅进程退出时由 OS 回收），
+ *    避免 exit() 阶段静态析构顺序导致的 ~FPFHEstimation → free() SIGSEGV（function-local static 仍会在 exit 时析构）。
  * 2. 不在 compute 后用空 shared_ptr 清空 estimator（会致下次 setInputCloud(valid) 时 PCL 内部 SIGSEGV），下次 compute 直接覆盖即可
  * 3. 入口深拷贝点云，避免外部在计算过程中修改/释放
  * 4. 全局互斥锁保护，SIGSEGV 时 backtrace 后 _exit(139)
@@ -224,11 +229,13 @@ FPFHCloudPtr FpfhExtractor::compute(
         ALOG_INFO(MOD, "[tid={}] [STEP=1.0] LOCK ACQUIRED", tid);
         if (enableBacktraceLog()) logBacktraceToStderr("after_lock_acquired");
 
-        // === 阶段1：法向量（静态 estimator 避免析构时 free 崩溃，见 PCL #4877）===
+        // === 阶段1：法向量（heap 分配、永不 delete，避免 exit 时析构 free 崩溃，见 PCL #4877）===
         ALOG_INFO(MOD, "[tid={}] [STEP=1.1] NORMAL ESTIMATION START", tid);
         auto normals = std::make_shared<pcl::PointCloud<pcl::Normal>>();
 
-        static pcl::NormalEstimation<pcl::PointXYZI, pcl::Normal> ne;
+        static pcl::NormalEstimation<pcl::PointXYZI, pcl::Normal>* ne_ptr = nullptr;
+        if (!ne_ptr) ne_ptr = new pcl::NormalEstimation<pcl::PointXYZI, pcl::Normal>();
+        pcl::NormalEstimation<pcl::PointXYZI, pcl::Normal>& ne = *ne_ptr;
         pcl::search::KdTree<pcl::PointXYZI>::Ptr tree_n;
         try {
             tree_n = std::make_shared<pcl::search::KdTree<pcl::PointXYZI>>();
@@ -271,11 +278,13 @@ FPFHCloudPtr FpfhExtractor::compute(
         FPFH_CRASH_LOG_PTR("1.6", "ne_compute_success", normals.get(), normals ? normals->size() : 0u);
         ALOG_INFO(MOD, "[tid={}] [STEP=1.9] NORMAL ESTIMATION COMPLETE normals_size={}", tid, normals ? normals->size() : 0u);
 
-        // === 阶段2：FPFH（静态 estimator 避免析构时 Eigen aligned_free 崩溃）===
+        // === 阶段2：FPFH（heap 分配、永不 delete，避免 exit 时析构 Eigen aligned_free 崩溃）===
         ALOG_INFO(MOD, "[tid={}] [STEP=2.0] FPFH COMPUTATION START cloud_ptr={} normals_ptr={}",
                   tid, static_cast<const void*>(working_cloud.get()), static_cast<const void*>(normals.get()));
 
-        static pcl::FPFHEstimation<pcl::PointXYZI, pcl::Normal, pcl::FPFHSignature33> fpfh;
+        static pcl::FPFHEstimation<pcl::PointXYZI, pcl::Normal, pcl::FPFHSignature33>* fpfh_ptr = nullptr;
+        if (!fpfh_ptr) fpfh_ptr = new pcl::FPFHEstimation<pcl::PointXYZI, pcl::Normal, pcl::FPFHSignature33>();
+        pcl::FPFHEstimation<pcl::PointXYZI, pcl::Normal, pcl::FPFHSignature33>& fpfh = *fpfh_ptr;
         pcl::search::KdTree<pcl::PointXYZI>::Ptr tree_f;
         try {
             tree_f = std::make_shared<pcl::search::KdTree<pcl::PointXYZI>>();

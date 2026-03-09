@@ -518,10 +518,13 @@ def write_fast_livo_params_file(config, output_path, config_path=None):
     _diag("output_dir_exists={}".format(os.path.isdir(out_dir)), tag="PATHS")
     _diag("params_file_for_fast_livo(use_this_in_grep)={}".format(out_abs), tag="PATHS")
 
+    # 全工程唯一配置：支持 frontend.fast_livo2 或顶层 fast_livo（如 system_config_M2DGR.yaml），二者等价
     if not isinstance(config, dict) or not config:
         _diag("config 为空或非 dict，fast_livo 将使用默认参数", level="WARN", tag="CONFIG")
+    elif isinstance(config.get("fast_livo"), dict):
+        _diag("使用顶层 fast_livo 作为唯一配置来源（与 frontend.fast_livo2 等价）", tag="CONFIG")
     elif not (isinstance(config.get("frontend"), dict) and isinstance(config.get("frontend", {}).get("fast_livo2"), dict)):
-        _diag("config 缺少 frontend.fast_livo2，部分 fast_livo 参数将使用默认值", level="WARN", tag="CONFIG")
+        _diag("config 缺少 frontend.fast_livo2 与顶层 fast_livo，部分 fast_livo 参数将使用默认值", level="WARN", tag="CONFIG")
     try:
         params = get_fast_livo2_params(config)
     except Exception as e:

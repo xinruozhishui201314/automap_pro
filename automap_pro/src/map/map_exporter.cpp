@@ -1,5 +1,6 @@
 #include "automap_pro/map/map_exporter.h"
 #include "automap_pro/core/logger.h"
+#include "automap_pro/core/config_manager.h"
 #include <pcl/common/transforms.h>
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/surface/organized_fast_mesh.h>
@@ -10,6 +11,8 @@
 #include <iomanip>
 #include <ctime>
 #include <filesystem>
+#include <cstdint>
+#include <cstring>
 #include <nlohmann/json.hpp>
 
 namespace fs = std::filesystem;
@@ -97,6 +100,8 @@ bool MapExporter::exportMap(const CloudXYZIPtr& cloud, const std::string& filena
         success = exportPLY(export_cloud, full_path);
     } else if (extension == ".obj") {
         success = exportOBJ(export_cloud, full_path);
+    } else if (extension == ".las") {
+        success = exportLAS(export_cloud, full_path);
     } else {
         // 默认使用PCD
         success = exportPCD(export_cloud, full_path);
@@ -187,11 +192,12 @@ bool MapExporter::exportTrajectory(const std::vector<KeyFrame::Ptr>& keyframes,
     out << "# AutoMap-Pro Trajectory\n";
     out << "# timestamp x y z qx qy qz qw\n";
     
-    // 写入数据
+    // 写入数据（与 buildGlobalMap/saveMapToFiles 一致：优先优化位姿，未优化则用原始位姿）
     for (const auto& kf : keyframes) {
         if (!kf) continue;
-        
-        const auto& T = kf->T_w_b;
+        Pose3d T = kf->T_w_b_optimized;
+        if (T.matrix().isApprox(Eigen::Matrix4d::Identity(), 1e-6) && !kf->T_w_b.matrix().isApprox(Eigen::Matrix4d::Identity(), 1e-6))
+            T = kf->T_w_b;
         Eigen::Vector3d t = T.translation();
         Eigen::Quaterniond q(T.rotation());
         
@@ -237,8 +243,10 @@ bool MapExporter::exportTrajectoryKML(const std::vector<KeyFrame::Ptr>& keyframe
 
     for (const auto& kf : keyframes) {
         if (!kf) continue;
-
-        Eigen::Vector3d t_enu = kf->T_w_b.translation();
+        Pose3d T = kf->T_w_b_optimized;
+        if (T.matrix().isApprox(Eigen::Matrix4d::Identity(), 1e-6) && !kf->T_w_b.matrix().isApprox(Eigen::Matrix4d::Identity(), 1e-6))
+            T = kf->T_w_b;
+        Eigen::Vector3d t_enu = T.translation();
         Eigen::Vector3d wgs84;
 
         if (config_.origin_valid) {
@@ -283,11 +291,12 @@ bool MapExporter::exportTrajectoryCSV(const std::vector<KeyFrame::Ptr>& keyframe
     // 写入CSV头部
     out << "timestamp,x,y,z,qx,qy,qz,qw\n";
     
-    // 写入数据
+    // 写入数据（与轨迹 txt 一致：优先优化位姿）
     for (const auto& kf : keyframes) {
         if (!kf) continue;
-        
-        const auto& T = kf->T_w_b;
+        Pose3d T = kf->T_w_b_optimized;
+        if (T.matrix().isApprox(Eigen::Matrix4d::Identity(), 1e-6) && !kf->T_w_b.matrix().isApprox(Eigen::Matrix4d::Identity(), 1e-6))
+            T = kf->T_w_b;
         Eigen::Vector3d t = T.translation();
         Eigen::Quaterniond q(T.rotation());
         
@@ -465,13 +474,14 @@ void MapExporter::waitForExport() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 坐标转换
+// 坐标转换（地图坐标系统一为 ENU：x=East, y=North, z=Up，单位米）
 // ─────────────────────────────────────────────────────────────────────────────
 
 Eigen::Vector3d MapExporter::enuToWGS84(const Eigen::Vector3d& enu_pt,
                                          double origin_lat, double origin_lon,
                                          double origin_alt) const {
-    // WGS84椭球参数
+    // ENU 约定：enu_pt.x()=East, enu_pt.y()=North, enu_pt.z()=Up（米）
+    // WGS84 椭球参数
     constexpr double a = 6378137.0;           // 长半轴（米）
     constexpr double f = 1.0 / 298.257223563; // 扁率
     constexpr double e2 = 2 * f - f * f;      // 第一偏心率的平方
@@ -498,33 +508,6 @@ Eigen::Vector3d MapExporter::enuToWGS84(const Eigen::Vector3d& enu_pt,
     double alt = origin_alt + dalt;
 
     return Eigen::Vector3d(lat, lon, alt);
-}
-
-bool MapExporter::convertToUTM(const CloudXYZIPtr& cloud_enu,
-                                 double origin_lat, double origin_lon,
-                                 CloudXYZIPtr& cloud_utm) const {
-    // TODO: 实现ENU到UTM的精确转换
-    // 需要使用GeographicLib或Proj4库
-    if (!cloud_enu || cloud_enu->empty()) return false;
-    
-    cloud_utm = CloudXYZIPtr(new CloudXYZI);
-    cloud_utm->resize(cloud_enu->size());
-    
-    // 简化实现（近似）
-    double lat_per_m = 1.0 / 111319.0;
-    double lon_per_m = 1.0 / (111319.0 * std::cos(origin_lat * M_PI / 180.0));
-    
-    for (size_t i = 0; i < cloud_enu->size(); ++i) {
-        const auto& pt_src = cloud_enu->points[i];
-        auto& pt_dst = cloud_utm->points[i];
-        
-        pt_dst.x = origin_lon + pt_src.x * lon_per_m;
-        pt_dst.y = origin_lat + pt_src.y * lat_per_m;
-        pt_dst.z = pt_src.z;
-        pt_dst.intensity = pt_src.intensity;
-    }
-    
-    return true;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -626,10 +609,91 @@ bool MapExporter::exportOBJ(const CloudXYZIPtr& cloud, const std::string& path) 
 }
 
 bool MapExporter::exportLAS(const CloudXYZIPtr& cloud, const std::string& path) {
-    // TODO: 实现LAS格式导出
-    // 需要使用liblas或pdal库
-    ALOG_WARN(MOD, "LAS export not yet implemented");
-    return false;
+    // LAS 1.2 二进制格式，Point Data Record Format 0（X,Y,Z,Intensity 等），无外部依赖
+    if (!cloud || cloud->empty()) {
+        ALOG_WARN(MOD, "exportLAS: empty cloud");
+        return false;
+    }
+
+    const double scale = 0.0001;  // 0.1mm 精度
+    double min_x = 1e38, min_y = 1e38, min_z = 1e38;
+    double max_x = -1e38, max_y = -1e38, max_z = -1e38;
+    for (const auto& pt : cloud->points) {
+        min_x = std::min(min_x, static_cast<double>(pt.x));
+        min_y = std::min(min_y, static_cast<double>(pt.y));
+        min_z = std::min(min_z, static_cast<double>(pt.z));
+        max_x = std::max(max_x, static_cast<double>(pt.x));
+        max_y = std::max(max_y, static_cast<double>(pt.y));
+        max_z = std::max(max_z, static_cast<double>(pt.z));
+    }
+    const double off_x = min_x, off_y = min_y, off_z = min_z;
+
+    std::ofstream out(path, std::ios::binary);
+    if (!out.is_open()) {
+        ALOG_ERROR(MOD, "exportLAS: cannot open {}", path);
+        return false;
+    }
+
+    // Public Header Block (LAS 1.2, 227 bytes)
+    char header[227];
+    std::memset(header, 0, sizeof(header));
+    std::memcpy(header + 0, "LASF", 4);
+    header[24] = 1;
+    header[25] = 2;
+    std::memcpy(header + 26, "AutoMap-Pro ENU", 15);   // System Identifier (32 bytes)
+    std::memcpy(header + 58, "AutoMap-Pro LAS 1.2", 19); // Generating Software (32 bytes)
+    // creation day/year: 0 = unknown
+    const uint16_t header_size = 227;
+    std::memcpy(header + 94, &header_size, 2);
+    const uint32_t point_data_offset = 227;
+    std::memcpy(header + 96, &point_data_offset, 4);
+    const uint32_t num_vlrs = 0;
+    std::memcpy(header + 100, &num_vlrs, 4);
+    const uint8_t point_format = 0;
+    header[104] = point_format;
+    const uint16_t record_len = 20;
+    std::memcpy(header + 105, &record_len, 2);
+    const uint32_t npts = static_cast<uint32_t>(std::min(cloud->size(), static_cast<size_t>(UINT32_MAX)));
+    std::memcpy(header + 107, &npts, 4);
+    std::memcpy(header + 131, &scale, 8);
+    std::memcpy(header + 139, &scale, 8);
+    std::memcpy(header + 147, &scale, 8);
+    std::memcpy(header + 155, &off_x, 8);
+    std::memcpy(header + 163, &off_y, 8);
+    std::memcpy(header + 171, &off_z, 8);
+    out.write(header, sizeof(header));
+
+    // Point Data Records (Format 0: 20 bytes each)
+    for (uint32_t i = 0; i < npts; ++i) {
+        const auto& pt = cloud->points[i];
+        int32_t ix = static_cast<int32_t>(std::round((pt.x - off_x) / scale));
+        int32_t iy = static_cast<int32_t>(std::round((pt.y - off_y) / scale));
+        int32_t iz = static_cast<int32_t>(std::round((pt.z - off_z) / scale));
+        uint16_t intensity = static_cast<uint16_t>(std::min(65535.0f, std::max(0.0f, pt.intensity)));
+        uint8_t return_byte = 1;
+        uint8_t classification = 0;
+        int8_t scan_angle = 0;
+        uint8_t user_data = 0;
+        uint16_t point_source_id = 0;
+
+        out.write(reinterpret_cast<const char*>(&ix), 4);
+        out.write(reinterpret_cast<const char*>(&iy), 4);
+        out.write(reinterpret_cast<const char*>(&iz), 4);
+        out.write(reinterpret_cast<const char*>(&intensity), 2);
+        out.write(reinterpret_cast<const char*>(&return_byte), 1);
+        out.write(reinterpret_cast<const char*>(&classification), 1);
+        out.write(reinterpret_cast<const char*>(&scan_angle), 1);
+        out.write(reinterpret_cast<const char*>(&user_data), 1);
+        out.write(reinterpret_cast<const char*>(&point_source_id), 2);
+    }
+
+    out.close();
+    if (!out.good()) {
+        ALOG_ERROR(MOD, "exportLAS: write failed");
+        return false;
+    }
+    ALOG_INFO(MOD, "exportLAS: wrote {} points to {}", npts, path);
+    return true;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -694,8 +758,10 @@ MapExporter::ExportMetadata MapExporter::buildMetadata(const std::vector<SubMap:
     
     for (const auto& kf : keyframes) {
         if (!kf) continue;
-        
-        Eigen::Vector3d t = kf->T_w_b.translation();
+        Pose3d T = kf->T_w_b_optimized;
+        if (T.matrix().isApprox(Eigen::Matrix4d::Identity(), 1e-6) && !kf->T_w_b.matrix().isApprox(Eigen::Matrix4d::Identity(), 1e-6))
+            T = kf->T_w_b;
+        Eigen::Vector3d t = T.translation();
         min_pt = min_pt.cwiseMin(t);
         max_pt = max_pt.cwiseMax(t);
     }
@@ -707,13 +773,24 @@ MapExporter::ExportMetadata MapExporter::buildMetadata(const std::vector<SubMap:
     meta.map_center[1] = center.y();
     meta.map_center[2] = center.z();
     meta.map_radius = radius;
-    
-    // TODO: 填充传感器信息和优化信息
-    meta.lidar_type = "Unknown";
-    meta.imu_type = "Unknown";
-    meta.has_loop_closure = false;
-    meta.has_gps = false;
-    
+
+    // 传感器与优化信息：从 ConfigManager 读取，保持 ENU 坐标系语义
+    const auto& cfg = ConfigManager::instance();
+    int lidar_type_id = cfg.keyframePreprocessLidarType();
+    switch (lidar_type_id) {
+        case 1: meta.lidar_type = "Livox Avia";   break;
+        case 2: meta.lidar_type = "Velodyne";      break;
+        case 3: meta.lidar_type = "Ouster";        break;
+        case 4: meta.lidar_type = "RealSense L515"; break;
+        default: meta.lidar_type = "Unknown";      break;
+    }
+    meta.lidar_config = cfg.lidarTopic();
+    meta.imu_type = "IMU";
+    meta.has_gps = cfg.gpsEnabled();
+    meta.gps_constraints = 0;  // 需调用方传入可填；此处无统计来源
+    meta.has_loop_closure = false;  // 需调用方传入可填；此处无回环统计
+    meta.loop_closure_count = 0;
+
     return meta;
 }
 

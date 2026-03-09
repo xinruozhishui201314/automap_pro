@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <future>
 
 namespace automap_pro {
 
@@ -19,6 +20,7 @@ LoopDetector::LoopDetector() {
     min_temporal_gap_  = cfg.loopMinTemporalGap();
     min_submap_gap_    = cfg.loopMinSubmapGap();
     gps_search_radius_ = cfg.gpsSearchRadius();
+    geo_prefilter_max_distance_m_ = cfg.loopGeoPrefilterMaxDistanceM();
     min_inlier_ratio_  = cfg.teaserMinInlierRatio();
     max_rmse_          = cfg.teaserMaxRMSE();
     use_icp_refine_    = cfg.teaserICPRefine();
@@ -79,11 +81,13 @@ void LoopDetector::start() {
 }
 
 void LoopDetector::stop() {
+    ALOG_INFO(MOD, "[SHUTDOWN] LoopDetector::stop() entered (running_=false, joining desc_workers + match_worker)");
     running_ = false;
     desc_cv_.notify_all();
     match_cv_.notify_all();
     for (auto& t : desc_workers_) if (t.joinable()) t.join();
     if (match_worker_.joinable()) match_worker_.join();
+    ALOG_INFO(MOD, "[SHUTDOWN] LoopDetector::stop() done (all workers joined)");
 }
 
 void LoopDetector::addSubmap(const SubMap::Ptr& submap) {
@@ -101,8 +105,8 @@ void LoopDetector::addSubmap(const SubMap::Ptr& submap) {
         // "[LoopDetector][DATA] addSubmap sm_id=%d kf=%zu desc_pts=%zu queue=%zu db=%zu",
         // submap->id, submap->keyframes.size(),
         // submap->downsampled_cloud ? submap->downsampled_cloud->size() : 0u, qsize, dbsize);
-    ALOG_INFO(MOD, "SubMap#{} submitted for loop detection (queue_size={}, db_size={})",
-              submap->id, qsize, dbsize);
+    ALOG_DEBUG(MOD, "SubMap#{} submitted for loop detection (queue_size={}, db_size={})",
+               submap->id, qsize, dbsize);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -215,10 +219,9 @@ void LoopDetector::onDescriptorReady(const SubMap::Ptr& submap) {
 
     // ✅ 详细诊断日志
     if (candidates.empty()) {
-        ALOG_INFO(MOD, "[METRIC] query_id={} db_size={} candidates=0 threshold={:.3f} retrieve_time={:.1f}ms (reason=no_match)",
-                  submap->id, db_copy.size(), overlap_threshold_, retrieve_ms);
-        ALOG_INFO(MOD, "[TRACE] step=loop_cand result=skip reason=no_overlap_candidates query_id={} db_size={} top_k={} threshold={:.3f}",
-                  submap->id, db_copy.size(), top_k_, overlap_threshold_);
+        ALOG_INFO(MOD, "[LoopDetector][NO_CAND] query_id={} db_size={} 无重叠候选 (threshold={:.3f} top_k={})。"
+                  " 若轨迹有闭环可尝试降低 loop_closure.overlap_threshold",
+                  submap->id, db_copy.size(), overlap_threshold_, top_k_);
         return;
     }
 
@@ -235,24 +238,64 @@ void LoopDetector::onDescriptorReady(const SubMap::Ptr& submap) {
     }
     
     if (valid_candidates.empty()) {
-        ALOG_INFO(MOD, "[METRIC] query_id={} candidates_before_gap_filter={} filtered_by_gap={} (reason=temporal_gap)",
-                  submap->id, candidates.size(), filtered_by_gap);
-        ALOG_INFO(MOD, "[TRACE] step=loop_cand result=skip reason=all_filtered_by_submap_gap query_id={} candidates_before={} min_submap_gap={}",
+        ALOG_WARN(MOD, "[LoopDetector][GAP_FILTER] query_id={} 候选数={} 均因 min_submap_gap={} 被过滤 → 无回环候选。"
+                  " 可尝试将 loop_closure.min_submap_gap 设为 2，或确保轨迹有闭环",
                   submap->id, candidates.size(), min_submap_gap_);
         return;
     }
 
-    // ✅ 输出候选的相似度分布 + 性能数据
+    // 【几何距离预筛】按两子图锚定位姿距离过滤，抑制重复结构导致的误检（相似但远距离的候选）
+    Eigen::Vector3d query_pos = submap->pose_w_anchor.translation();
+    std::vector<OverlapTransformerInfer::Candidate> geo_filtered_candidates;
+    int filtered_by_geo = 0;
+    for (const auto& cand : valid_candidates) {
+        SubMap::Ptr target_submap;
+        for (const auto& sm : db_copy) {
+            if (sm && sm->id == cand.submap_id) {
+                target_submap = sm;
+                break;
+            }
+        }
+        double geo_dist_m = -1.0;
+        if (target_submap) {
+            geo_dist_m = (query_pos - target_submap->pose_w_anchor.translation()).norm();
+            ALOG_INFO(MOD, "[LOOP_CAND] query_id={} target_id={} score={:.3f} geo_dist={:.1f}m",
+                      submap->id, cand.submap_id, cand.score, geo_dist_m);
+        } else {
+            ALOG_INFO(MOD, "[LOOP_CAND] query_id={} target_id={} score={:.3f} geo_dist=N/A (target not in db_copy)",
+                      submap->id, cand.submap_id, cand.score);
+        }
+        if (geo_prefilter_max_distance_m_ > 0.0 && geo_dist_m >= 0.0 && geo_dist_m > geo_prefilter_max_distance_m_) {
+            filtered_by_geo++;
+            ALOG_DEBUG(MOD, "[LoopDetector][GEO_PREFILTER] query_id={} target_id={} geo_dist={:.1f}m > max={:.1f}m → 过滤",
+                       submap->id, cand.submap_id, geo_dist_m, geo_prefilter_max_distance_m_);
+            continue;
+        }
+        geo_filtered_candidates.push_back(cand);
+    }
+
+    if (geo_filtered_candidates.empty()) {
+        ALOG_WARN(MOD, "[LoopDetector][GEO_PREFILTER] query_id={} 候选数={} 均因几何距离 > {:.1f}m 被过滤 → 无回环候选。"
+                  " 可调大 loop_closure.geo_prefilter_max_distance_m 或设为 0 关闭",
+                  submap->id, valid_candidates.size(), geo_prefilter_max_distance_m_);
+        return;
+    }
+    if (filtered_by_geo > 0) {
+        ALOG_INFO(MOD, "[LoopDetector][GEO_PREFILTER] query_id={} 几何预筛过滤 {}/{} 个候选 (max_dist={:.1f}m)，剩余 {}",
+                  submap->id, filtered_by_geo, valid_candidates.size(), geo_prefilter_max_distance_m_, geo_filtered_candidates.size());
+    }
+
+    // ✅ 输出候选的相似度分布 + 性能数据（使用几何预筛后的列表）
     std::string score_str;
-    for (size_t i = 0; i < valid_candidates.size(); ++i) {
-        score_str += fmt::format("{:.3f}", valid_candidates[i].score);
-        if (i < valid_candidates.size() - 1) score_str += ", ";
+    for (size_t i = 0; i < geo_filtered_candidates.size(); ++i) {
+        score_str += fmt::format("{:.3f}", geo_filtered_candidates[i].score);
+        if (i < geo_filtered_candidates.size() - 1) score_str += ", ";
     }
     auto t_end = std::chrono::steady_clock::now();
     double total_stage1_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
     
-    ALOG_INFO(MOD, "[METRIC] query_id={} db_size={} candidates={} scores=[{}] retrieve_time={:.1f}ms total_time={:.1f}ms (entering TEASER++)",
-              submap->id, db_copy.size(), valid_candidates.size(), score_str, retrieve_ms, total_stage1_ms);
+    ALOG_INFO(MOD, "[LoopDetector][CAND] query_id={} db={} candidates={} scores=[{}] retrieve_ms={:.1f} → TEASER++",
+              submap->id, db_copy.size(), geo_filtered_candidates.size(), score_str, retrieve_ms);
 
     // 入队时深拷贝 query 点云，避免 worker 处理时读 SubMap::downsampled_cloud 与 buildGlobalMap 等并发
     CloudXYZIPtr query_cloud_copy;
@@ -260,13 +303,13 @@ void LoopDetector::onDescriptorReady(const SubMap::Ptr& submap) {
         query_cloud_copy = std::make_shared<CloudXYZI>();
         *query_cloud_copy = *submap->downsampled_cloud;
         ALOG_DEBUG(MOD, "enqueue MatchTask query_id={} query_cloud_pts={} candidates={}",
-                   submap->id, query_cloud_copy->size(), valid_candidates.size());
+                   submap->id, query_cloud_copy->size(), geo_filtered_candidates.size());
     }
 
     // 提交到 TEASER++ 匹配队列（Stage 2）
     {
         std::lock_guard<std::mutex> lk(match_mutex_);
-        match_queue_.push({submap, query_cloud_copy, valid_candidates});
+        match_queue_.push({submap, query_cloud_copy, geo_filtered_candidates});
     }
     match_cv_.notify_one();
 }
@@ -315,18 +358,111 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
     if (!query_cloud || query_cloud->empty()) {
         CloudXYZIPtr query_ref = query ? query->downsampled_cloud : nullptr;
         if (!query_ref || query_ref->empty()) {
-            ALOG_DEBUG(MOD, "[tid={}] step=task_skip query_id={} query_cloud null/empty", tid, query ? query->id : -1);
-            ALOG_INFO(MOD, "[TRACE] step=loop_match result=skip reason=query_cloud_empty tid={} query_id={} (精准定位: 无查询点云)", tid, query ? query->id : -1);
+            ALOG_DEBUG(MOD, "[tid={}] step=task_skip query_cloud_empty query_id={}", tid, query ? query->id : -1);
             return;
         }
         query_cloud = std::make_shared<CloudXYZI>();
         *query_cloud = *query_ref;
-        ALOG_INFO(MOD, "[tid={}] step=task_fallback_copy query_id={} query_pts={} (no enqueue copy)", tid, query->id, query_cloud->size());
+        ALOG_DEBUG(MOD, "[tid={}] step=task_fallback_copy query_id={} query_pts={}", tid, query->id, query_cloud->size());
     }
 
-    ALOG_INFO(MOD, "[tid={}] step=task_start query_id={} query_cloud_ptr={} query_cloud_use_count={} query_pts={} candidates={}",
-              tid, query ? query->id : -1, static_cast<const void*>(query_cloud.get()), query_cloud.use_count(), query_cloud->size(), task.candidates.size());
+    ALOG_DEBUG(MOD, "[tid={}] step=task_start query_id={} query_pts={} candidates={}",
+               tid, query ? query->id : -1, query_cloud->size(), task.candidates.size());
     AUTOMAP_TIMED_SCOPE(MOD, fmt::format("GeomVerify SM#{}", task.query->id), 3000.0);
+
+    // P1: 并行 TEASER 多候选匹配（performance.parallel_teaser_match=true）
+    if (ConfigManager::instance().parallelTeaserMatch() && !task.candidates.empty()) {
+        struct CandWork {
+            OverlapTransformerInfer::Candidate cand;
+            SubMap::Ptr target;
+            CloudXYZIPtr target_cloud;
+        };
+        std::vector<CandWork> works;
+        {
+            std::shared_lock<std::shared_mutex> lk(db_mutex_);
+            for (const auto& cand : task.candidates) {
+                SubMap::Ptr target;
+                CloudXYZIPtr target_ref;
+                for (const auto& sm : db_submaps_) {
+                    if (sm->id == cand.submap_id && sm->session_id == cand.session_id) {
+                        target = sm;
+                        target_ref = sm->downsampled_cloud;
+                        break;
+                    }
+                }
+                if (!target_ref || target_ref->empty()) continue;
+                CloudXYZIPtr target_cloud = std::make_shared<CloudXYZI>();
+                *target_cloud = *target_ref;
+                works.push_back({cand, target, target_cloud});
+            }
+        }
+        if (!works.empty()) {
+            std::vector<std::future<TeaserMatcher::Result>> futures;
+            for (CandWork& w : works) {
+                CloudXYZIPtr q = query_cloud;
+                CloudXYZIPtr t = w.target_cloud;
+                futures.push_back(std::async(std::launch::async, [this, q, t]() {
+                    return teaser_matcher_.match(q, t, Pose3d::Identity());
+                }));
+            }
+            IcpRefiner icp_par;
+            for (size_t i = 0; i < works.size(); ++i) {
+                TeaserMatcher::Result teaser_res;
+                try {
+                    teaser_res = futures[i].get();
+                } catch (const std::exception& e) {
+                    ALOG_ERROR(MOD, "[tid={}] parallel_teaser candidate {} exception: {}", tid, works[i].cand.submap_id, e.what());
+                    continue;
+                } catch (...) {
+                    continue;
+                }
+                if (!teaser_res.success || teaser_res.inlier_ratio < min_inlier_ratio_) {
+                    ALOG_INFO(MOD, "[LOOP_REJECTED] query_id={} target_id={} reason=teaser_fail_or_inlier_low success={} inlier_ratio={:.3f} min_ratio={:.3f} score={:.3f} (parallel)",
+                              query->id, works[i].cand.submap_id, teaser_res.success, teaser_res.inlier_ratio, min_inlier_ratio_, works[i].cand.score);
+                    continue;
+                }
+                const auto& cand = works[i].cand;
+                SubMap::Ptr target = works[i].target;
+                CloudXYZIPtr target_cloud = works[i].target_cloud;
+                Pose3d final_T = teaser_res.T_tgt_src;
+                double final_rmse = teaser_res.rmse;
+                if (use_icp_refine_) {
+                    auto icp_res = icp_par.refine(query_cloud, target_cloud, final_T);
+                    if (icp_res.converged && icp_res.rmse < final_rmse) {
+                        final_T = icp_res.T_refined;
+                        final_rmse = icp_res.rmse;
+                    }
+                }
+                if (final_rmse > max_rmse_) {
+                    ALOG_INFO(MOD, "[LOOP_REJECTED] query_id={} target_id={} reason=rmse_too_high rmse={:.4f} max_rmse={:.4f} (parallel)",
+                              query->id, target->id, final_rmse, max_rmse_);
+                    continue;
+                }
+                auto lc = std::make_shared<LoopConstraint>();
+                lc->submap_i = target->id;
+                lc->submap_j = query->id;
+                lc->session_i = target->session_id;
+                lc->session_j = query->session_id;
+                lc->delta_T = final_T;
+                lc->overlap_score = cand.score;
+                lc->inlier_ratio = teaser_res.inlier_ratio;
+                lc->rmse = static_cast<float>(final_rmse);
+                lc->is_inter_session = (query->session_id != target->session_id);
+                lc->status = LoopStatus::ACCEPTED;
+                double info_scale = lc->inlier_ratio / (lc->rmse + 1e-3f);
+                lc->information = Mat66d::Identity() * info_scale;
+                ALOG_INFO(MOD, "[LoopDetector][LOOP_OK] 回环约束已发布(parallel) query_id={} target_id={} inlier={:.3f} rmse={:.4f}m",
+                          query->id, target->id, lc->inlier_ratio, lc->rmse);
+                if (node_) {
+                    RCLCPP_INFO(node_->get_logger(), "[LoopDetector] Loop %d↔%d | inlier=%.2f rmse=%.3f", lc->submap_i, lc->submap_j, lc->inlier_ratio, lc->rmse);
+                }
+                publishLoopConstraint(lc);
+                loop_detected_count_++;
+                for (auto& cb : loop_cbs_) cb(lc);
+            }
+        }
+        return;
+    }
 
     for (const auto& cand : task.candidates) {
         ALOG_DEBUG(MOD, "  Checking candidate SM#{} score={:.3f}", cand.submap_id, cand.score);
@@ -343,7 +479,8 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
             }
         }
         if (!target_ref || target_ref->empty()) {
-            ALOG_DEBUG(MOD, "[tid={}] [TRACE] step=loop_cand result=skip reason=target_cloud_empty query_id={} target_id={}", tid, query->id, cand.submap_id);
+            ALOG_INFO(MOD, "[LOOP_REJECTED] query_id={} target_id={} reason=target_cloud_empty score={:.3f}",
+                      query->id, cand.submap_id, cand.score);
             continue;
         }
 
@@ -351,14 +488,11 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
         CloudXYZIPtr target_cloud = std::make_shared<CloudXYZI>();
         *target_cloud = *target_ref;
 
-        ALOG_INFO(MOD, "[tid={}] step=cand_geom query_id={} target_id={} target_ref_use_count={} target_cloud_ptr={} target_pts={} score={:.3f}",
-                   tid, query->id, target->id, target_ref.use_count(), static_cast<const void*>(target_cloud.get()), target_cloud->size(), cand.score);
+        ALOG_DEBUG(MOD, "[tid={}] step=cand_geom query_id={} target_id={} target_pts={} score={:.3f}",
+                   tid, query->id, target->id, target_cloud->size(), cand.score);
 
         // Stage 2: TEASER++ 粗配准
         auto t0 = std::chrono::steady_clock::now();
-        ALOG_INFO(MOD, "[tid={}] step=teaser_call_enter query_id={} target_id={} query_cloud_ptr={} query_use_count={} query_pts={} target_cloud_ptr={} target_use_count={} target_pts={}",
-                  tid, query->id, target->id, static_cast<const void*>(query_cloud.get()), query_cloud.use_count(), query_cloud->size(),
-                  static_cast<const void*>(target_cloud.get()), target_cloud.use_count(), target_cloud->size());
         TeaserMatcher::Result teaser_res;
         try {
             ALOG_DEBUG(MOD, "[tid={}] step=match_invoke query_id={} target_id={}", tid, query->id, target->id);
@@ -371,23 +505,24 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
         } catch (const std::exception& e) {
             ALOG_ERROR(MOD, "[tid={}] step=match_exception query_id={} target_id={} exception={}",
                       tid, query->id, target->id, e.what());
-            ALOG_INFO(MOD, "[TRACE] step=loop_match result=fail reason=teaser_exception query_id={} target_id={} what={} (精准定位: TEASER/FPFH 异常)", tid, query->id, target->id, e.what());
+            ALOG_INFO(MOD, "[LOOP_REJECTED] query_id={} target_id={} reason=teaser_exception what={} score={:.3f}",
+                      query->id, target->id, e.what(), cand.score);
             continue;
         } catch (...) {
             ALOG_ERROR(MOD, "[tid={}] step=match_exception query_id={} target_id={} unknown_exception",
                       tid, query->id, target->id);
-            ALOG_INFO(MOD, "[TRACE] step=loop_match result=fail reason=teaser_unknown_exception query_id={} target_id={}", tid, query->id, target->id);
+            ALOG_INFO(MOD, "[LOOP_REJECTED] query_id={} target_id={} reason=teaser_unknown_exception score={:.3f}",
+                      query->id, target->id, cand.score);
             continue;
         }
         double teaser_ms = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - t0).count();
-        ALOG_INFO(MOD, "[tid={}] step=teaser_result query_id={} target_id={} success={} inlier={:.2f} corrs={} rmse={:.3f}m ms={:.1f} ptr_src_after={} ptr_tgt_after={}",
-                   tid, query->id, target->id, teaser_res.success, teaser_res.inlier_ratio, teaser_res.num_correspondences, teaser_res.rmse, teaser_ms,
-                   static_cast<const void*>(query_cloud.get()), static_cast<const void*>(target_cloud.get()));
+        ALOG_DEBUG(MOD, "[tid={}] step=teaser_result query_id={} target_id={} success={} inlier={:.2f} rmse={:.3f}m ms={:.1f}",
+                   tid, query->id, target->id, teaser_res.success, teaser_res.inlier_ratio, teaser_res.rmse, teaser_ms);
 
         if (!teaser_res.success || teaser_res.inlier_ratio < min_inlier_ratio_) {
-            ALOG_DEBUG(MOD, "[tid={}] [TRACE] step=loop_cand result=skip reason=teaser_fail_or_inlier_low query_id={} target_id={} success={} inlier={:.3f} min_ratio={:.3f}",
-                      tid, query->id, target->id, teaser_res.success, teaser_res.inlier_ratio, min_inlier_ratio_);
+            ALOG_INFO(MOD, "[LOOP_REJECTED] query_id={} target_id={} reason=teaser_fail_or_inlier_low success={} inlier_ratio={:.3f} min_ratio={:.3f} rmse={:.4f} score={:.3f}",
+                      query->id, target->id, teaser_res.success, teaser_res.inlier_ratio, min_inlier_ratio_, teaser_res.rmse, cand.score);
             continue;
         }
 
@@ -405,8 +540,8 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
         }
 
         if (final_rmse > max_rmse_) {
-            ALOG_DEBUG(MOD, "[tid={}] [TRACE] step=loop_cand result=skip reason=rmse_too_high query_id={} target_id={} rmse={:.4f} max_rmse={:.4f}",
-                      tid, query->id, target->id, final_rmse, max_rmse_);
+            ALOG_INFO(MOD, "[LOOP_REJECTED] query_id={} target_id={} reason=rmse_too_high rmse={:.4f} max_rmse={:.4f} inlier_ratio={:.3f} score={:.3f}",
+                      query->id, target->id, final_rmse, max_rmse_, teaser_res.inlier_ratio, cand.score);
             continue;
         }
 
@@ -427,17 +562,12 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
         double info_scale = lc->inlier_ratio / (lc->rmse + 1e-3f);
         lc->information = Mat66d::Identity() * info_scale;
 
-        ALOG_INFO(MOD, "[TRACE] step=loop_match result=ok reason=loop_accepted query_id={} target_id={} inlier={:.3f} rmse={:.4f} score={:.3f} (精准定位: 回环约束已发布)",
-                  tid, query->id, target->id, lc->inlier_ratio, lc->rmse, lc->overlap_score);
+        ALOG_INFO(MOD, "[LoopDetector][LOOP_OK] 回环约束已发布 query_id={} target_id={} inlier={:.3f} rmse={:.4f}m score={:.3f}",
+                  query->id, target->id, lc->inlier_ratio, lc->rmse, lc->overlap_score);
         if (node_) {
             RCLCPP_INFO(node_->get_logger(),
-                "[LoopDetector] Loop %d↔%d | inlier=%.2f rmse=%.3f score=%.2f teaser=%.1fms",
-                lc->submap_i, lc->submap_j,
-                lc->inlier_ratio, lc->rmse, lc->overlap_score, teaser_ms);
-            RCLCPP_INFO(node_->get_logger(),
-                "[PRECISION][LOOP] detected sm_i=%d sm_j=%d score=%.3f inlier=%.3f rmse_m=%.4f info_scale=%.2f teaser_ms=%.1f",
-                lc->submap_i, lc->submap_j, lc->overlap_score, lc->inlier_ratio,
-                static_cast<double>(lc->rmse), info_scale, teaser_ms);
+                "[LoopDetector] Loop %d↔%d | inlier=%.2f rmse=%.3f score=%.2f",
+                lc->submap_i, lc->submap_j, lc->inlier_ratio, lc->rmse, lc->overlap_score);
         }
 
         // 发布 ROS2 消息

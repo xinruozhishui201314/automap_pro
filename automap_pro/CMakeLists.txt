@@ -17,6 +17,7 @@ find_package(rclcpp_components REQUIRED)   # Composable Node 支持
 find_package(rclcpp_action REQUIRED)
 find_package(ament_index_cpp REQUIRED)
 find_package(std_msgs REQUIRED)
+find_package(std_srvs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
@@ -225,7 +226,7 @@ endif()
 # ──────────────────────────────────────────────────────────
 set(AUTOMAP_AMENT_DEPS
   rclcpp rclcpp_components rclcpp_action
-  std_msgs sensor_msgs geometry_msgs nav_msgs visualization_msgs
+  std_msgs std_srvs sensor_msgs geometry_msgs nav_msgs visualization_msgs
   tf2 tf2_ros tf2_eigen
   pcl_ros pcl_conversions cv_bridge image_transport message_filters
 )

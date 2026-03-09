@@ -137,7 +137,7 @@ CloudXYZIPtr getFineMap() const;
 - ✅ 轨迹导出（TXT/KML/CSV）
 - ✅ 子图批量导出
 - ✅ 元数据导出（JSON/YAML）
-- ✅ 坐标系转换（ENU/UTM）
+- ✅ 坐标系转换（ENU↔WGS84，地图统一 ENU）
 - ✅ 后台异步导出
 - ✅ 压缩选项
 - ✅ 完整性验证
@@ -172,7 +172,7 @@ struct ExportMetadata {
     int         total_keyframes = 0;
     int         total_submaps = 0;
     size_t      total_points = 0;
-    std::string coordinate_system;  // ENU/UTM/WGS84
+    std::string coordinate_system;  // 地图统一 ENU
     double      map_center[3];
     double      map_radius;
     bool        has_loop_closure = false;
@@ -474,8 +474,8 @@ ros2 service call /automap/save_map automap_pro/srv/SaveMap \
 ### V1（1-2周）
 - [ ] 完善单元测试覆盖（> 80%）
 - [ ] 添加性能基准测试
-- [ ] 实现LAS格式导出
-- [ ] 完善UTM坐标系转换
+- [x] 实现LAS格式导出
+- UTM 已移除，地图仅用 ENU
 
 ### V2（1-2月）
 - [ ] 实现增量地图更新（仅变更部分）

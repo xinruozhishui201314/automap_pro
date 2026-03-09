@@ -22,6 +22,13 @@
 #include <mutex>
 #include <filesystem>
 #include <thread>
+#include <sstream>
+#include <iomanip>
+#include <ctime>
+#if defined(__linux__)
+#include <unistd.h>
+#include <sys/syscall.h>
+#endif
 
 namespace automap_pro {
 
@@ -29,6 +36,21 @@ namespace automap_pro {
 inline unsigned logThreadId() {
     return static_cast<unsigned>(std::hash<std::thread::id>{}(std::this_thread::get_id()) % 100000u);
 }
+
+/** 返回当前线程 LWP（Linux 下 gettid），便于与 GDB "info threads" 对应；非 Linux 返回 0 */
+inline long logLwp() {
+#if defined(__linux__)
+    return static_cast<long>(syscall(SYS_gettid));
+#else
+    return 0;
+#endif
+}
+
+/** 精准追踪日志：带 step/tid/lwp，便于 grep "[TRACE]" 定位问题阶段 */
+#define ALOG_TRACE_STEP(mod, step) \
+    ALOG_INFO(mod, "[TRACE] step={} tid={} lwp={}", step, automap_pro::logThreadId(), automap_pro::logLwp())
+
+/** 崩溃定位：关键路径打 [CRASH_CONTEXT] step=xxx 与 session_id/frame_no，grep CRASH_CONTEXT | tail 即故障前最后步骤；见 LOGGING_AND_DIAGNOSIS.md 5.1 */
 
 class Logger {
 public:
@@ -44,20 +66,37 @@ public:
 
         std::filesystem::create_directories(log_dir);
 
+        // 每次启动使用带时间戳的日志文件名，便于按次区分
+        auto now = std::chrono::system_clock::now();
+        auto t = std::chrono::system_clock::to_time_t(now);
+        std::tm buf;
+#if defined(_WIN32) || defined(_WIN64)
+        std::tm* ptm = std::localtime(&t);
+#else
+        std::tm* ptm = ::localtime_r(&t, &buf);
+#endif
+        std::string log_basename = "automap.log";
+        if (ptm) {
+            std::ostringstream oss;
+            oss << "automap_" << std::put_time(ptm, "%Y%m%d_%H%M%S") << ".log";
+            log_basename = oss.str();
+        }
+        std::string log_path = log_dir + "/" + log_basename;
+
         // 异步日志线程池（8192 队列 + 1 后台线程）
         spdlog::init_thread_pool(8192, 1);
 
         std::vector<spdlog::sink_ptr> sinks;
 
-        // Sink 1: 彩色 stdout
+        // Sink 1: 彩色 stdout（带时间戳）
         auto console_sink = std::make_shared<spdlog::sinks::stdout_color_sink_mt>();
         console_sink->set_pattern(
             "%^[%Y-%m-%d %H:%M:%S.%e][%L]%$ %v");
         sinks.push_back(console_sink);
 
-        // Sink 2: 滚动日志文件（50MB × 5 文件）
+        // Sink 2: 滚动日志文件，每次启动新文件（50MB × 5 个轮转文件）
         auto file_sink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(
-            log_dir + "/automap.log", 50 * 1024 * 1024, 5, true);
+            log_path, 50 * 1024 * 1024, 5, true);
         file_sink->set_pattern(
             "[%Y-%m-%d %H:%M:%S.%e][%L][tid=%t] %v");
         sinks.push_back(file_sink);
@@ -79,8 +118,8 @@ public:
 
         initialized_ = true;
         SPDLOG_LOGGER_INFO(logger_,
-            "=== AutoMap-Pro Logger initialized (level={}, log_dir={}) ===",
-            eff_level, log_dir);
+            "=== AutoMap-Pro Logger initialized (level={}, log_file={}) ===",
+            eff_level, log_path);
     }
 
     void setLevel(const std::string& level) {

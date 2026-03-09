@@ -145,6 +145,10 @@ public:
   PointCloudXYZI::Ptr pcl_wait_pub;
   PointCloudXYZRGB::Ptr pcl_wait_save;
   PointCloudXYZI::Ptr pcl_wait_save_intensity;
+  /** 前端累积地图（发布到 /Laser_map），供 RViz automap_frontend 显示 */
+  PointCloudXYZI::Ptr pcl_laser_map_accum_;
+  int laser_map_pub_interval_ = 10;   // 每 N 帧发布一次，避免过于频繁
+  double laser_map_voxel_size_ = 0.2; // 发布前体素下采样边长(m)，>0 时先下采样再发布，减轻稠密/糊；0=关闭保持原逻辑
 
   ofstream fout_pre, fout_out, fout_visual_pos, fout_lidar_pos, fout_points;
 

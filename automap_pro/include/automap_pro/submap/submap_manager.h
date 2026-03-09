@@ -8,6 +8,11 @@
 #include <atomic>
 #include <vector>
 #include <functional>
+#include <thread>
+#include <queue>
+#include <condition_variable>
+#include <chrono>
+#include <future>
 #include <rclcpp/rclcpp.hpp>
 
 namespace automap_pro {
@@ -27,6 +32,7 @@ namespace automap_pro {
 class SubMapManager {
 public:
     explicit SubMapManager();
+    ~SubMapManager();
 
     void init(rclcpp::Node::SharedPtr node);
 
@@ -79,6 +85,9 @@ public:
 
     /** 构建全局合并点云（使用优化后位姿） */
     CloudXYZIPtr buildGlobalMap(float voxel_size = 0.2f) const;
+    
+    /** 异步构建全局点云（返回 future，调用方可异步等待） */
+    std::future<CloudXYZIPtr> buildGlobalMapAsync(float voxel_size = 0.2f) const;
 
     /** 更新子图的 GPS 重力中心 */
     void updateGPSGravityCenter(const KeyFrame::Ptr& kf);
@@ -128,6 +137,7 @@ private:
     mutable std::mutex pool_mutex_;
     
     // 从对象池获取点云（const 版本供 mergeCloudToSubmap 使用）
+    // ✅ P0-2 修复：返回深拷贝，避免多线程竞争同一 pool 槽位导致的数据竞争与崩溃
     CloudXYZIPtr getCloudFromPool() const {
         std::lock_guard<std::mutex> lk(pool_mutex_);
         size_t idx = pool_index_.fetch_add(1) % CLOUD_POOL_SIZE;
@@ -136,7 +146,11 @@ private:
             cloud_pool_[idx] = std::make_shared<CloudXYZI>();
         }
         
-        return cloud_pool_[idx];
+        // 深拷贝点云内容到新对象，避免调用方并发修改同一 pool 槽位
+        // 有性能损失，但保证线程安全，运行中不出现崩溃
+        auto cloud_copy = std::make_shared<CloudXYZI>();
+        cloud_copy->points = cloud_pool_[idx]->points;
+        return cloud_copy;
     }
 
     // 参数
@@ -151,7 +165,19 @@ private:
 
     std::vector<SubMapFrozenCallback> frozen_cbs_;
 
+    // 子图冻结后处理异步：voxel(merged_cloud)→downsampled_cloud 与 frozen_cbs_ 在专用线程执行，避免阻塞 addKeyFrame（有界队列+超时防死锁）
+    static constexpr size_t   kMaxFreezePostQueueSize = 32;
+    std::queue<SubMap::Ptr>   freeze_post_queue_;
+    std::mutex                freeze_post_mutex_;
+    std::condition_variable   freeze_post_cv_;
+    std::thread               freeze_post_thread_;
+    std::atomic<bool>         freeze_post_running_{true};
+    void freezePostProcessLoop();
+
     // ── 私有方法 ──────────────────────────────────────────────────────────
+    /** 内部实现：不持锁的地图构建（供异步版本使用） */
+    CloudXYZIPtr buildGlobalMapInternal(const std::vector<SubMap::Ptr>& submaps_copy, float voxel_size) const;
+    
     SubMap::Ptr createNewSubmap(const KeyFrame::Ptr& first_kf);
     /** 无参版本仅用于兼容；实际冻结请用传入 submap 的版本，且须在未持 mutex_ 时调用，避免回调内 getFrozenSubmaps 死锁 */
     void        freezeActiveSubmap();

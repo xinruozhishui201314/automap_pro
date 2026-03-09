@@ -54,7 +54,7 @@ public:
         bool        export_incremental = false;   // 仅导出新增部分
         int         last_exported_kf = -1;     // 最后导出的关键帧ID
 
-        std::string coordinate_system = "ENU";    // ENU/UTM/WGS84
+        std::string coordinate_system = "ENU";    // 地图坐标系统一为 ENU
 
         // WGS84 原点坐标（用于 ENU→WGS84 转换）
         double      origin_latitude = 0.0;    // 纬度（度）
@@ -129,11 +129,7 @@ public:
                        const std::vector<KeyFrame::Ptr>& keyframes,
                        const std::string& output_name = "automap_export");
     
-    // 坐标转换
-    bool convertToUTM(const CloudXYZIPtr& cloud_enu, 
-                      double origin_lat, double origin_lon,
-                      CloudXYZIPtr& cloud_utm) const;
-
+    // 坐标转换（地图坐标系统一为 ENU）
     /**
      * ENU坐标转WGS84经纬度
      * @param enu_pt ENU坐标点 (east, north, up)

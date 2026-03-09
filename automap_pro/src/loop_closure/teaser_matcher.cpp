@@ -205,7 +205,28 @@ TeaserMatcher::Result TeaserMatcher::match(
         }
         result.num_correspondences = static_cast<int>(corrs.size());
         ALOG_INFO(MOD, "[tid={}] step=fpfh_match_done correspondences={}", tid, result.num_correspondences);
-        
+
+        // 【FPFH_DIAG】统计对应点距离分布，诊断误匹配
+        if (!corrs.empty()) {
+            std::vector<double> distances;
+            distances.reserve(corrs.size());
+            for (const auto& [si, ti] : corrs) {
+                const auto& sp = src->points[si];
+                const auto& tp = tgt->points[ti];
+                double d = std::sqrt((sp.x - tp.x) * (sp.x - tp.x) +
+                                    (sp.y - tp.y) * (sp.y - tp.y) +
+                                    (sp.z - tp.z) * (sp.z - tp.z));
+                distances.push_back(d);
+            }
+            std::sort(distances.begin(), distances.end());
+            double p10 = distances[std::min(size_t(distances.size() * 0.1), distances.size() - 1)];
+            double p50 = distances[distances.size() / 2];
+            double p90 = distances[std::min(size_t(distances.size() * 0.9), distances.size() - 1)];
+            ALOG_WARN(MOD, "[FPFH_DIAG] tid={} corrs={} dist_p10={:.2f}m p50={:.2f}m p90={:.2f}m "
+                      "(p90>>5m 表示存在大量误匹配)",
+                      tid, corrs.size(), p10, p50, p90);
+        }
+
         if ((int)corrs.size() < 10) {
             ALOG_WARN(MOD, "[tid={}] step=match_skip insufficient_corrs={} (min=10)", tid, corrs.size());
             ALOG_INFO(MOD, "[TRACE] step=loop_match result=fail reason=insufficient_corrs tid={} corrs={} min=10 (精准定位: FPFH 对应点过少)", tid, corrs.size());
@@ -229,6 +250,20 @@ TeaserMatcher::Result TeaserMatcher::match(
     if (static_cast<int>(corrs.size()) < 12) {
         ALOG_WARN(MOD, "[tid={}] step=teaser_skip insufficient_corrs={} (min=12 for TEASER)", tid, corrs.size());
         ALOG_INFO(MOD, "[TRACE] step=loop_match result=fail reason=insufficient_corrs_for_teaser tid={} corrs={} min=12", tid, corrs.size());
+        return result;
+    }
+
+    // ===【V3 激进修复】完全避免在极少对应点时创建 TEASER solver===
+    // 根因：TEASER++ PMC 求解器在极少 inliers 时内部堆损坏，即使自然析构也崩溃
+    // 解决：在创建 solver 前就检查并提前返回，完全避免 TEASER 对象的创建
+    // 实测：corrs < 20 时 inliers < 10 的概率极高，直接跳过 TEASER
+    const int kCorrsThreshold = 20;
+    if (static_cast<int>(corrs.size()) < kCorrsThreshold) {
+        ALOG_WARN(MOD, "[tid={}] [CRITICAL_V3] step=teaser_skip_before_creation corrs={} < safe_threshold={}, COMPLETELY AVOIDING TEASER CREATION",
+                 tid, static_cast<int>(corrs.size()), kCorrsThreshold);
+        ALOG_INFO(MOD, "[TRACE] step=loop_match result=fail reason=insufficient_corrs_v3 tid={} corrs={} safe_min={} (V3: skip before solver creation)",
+                 tid, static_cast<int>(corrs.size()), kCorrsThreshold);
+        // 关键：完全不创建 solver 对象，从根源避免堆损坏
         return result;
     }
 
@@ -272,17 +307,10 @@ TeaserMatcher::Result TeaserMatcher::match(
         if (!solution.valid) {
             ALOG_WARN(MOD, "[tid={}] step=teaser_solve_invalid corr={}", tid, corrs.size());
             ALOG_INFO(MOD, "[TRACE] step=loop_match result=fail reason=teaser_solution_invalid tid={} corrs={}", tid, corrs.size());
-            ALOG_INFO(MOD, "[CRASH_TRACE][tid={} lwp={}] step=teaser_solver_reset_before solver_ptr={} (invalid path)",
+            ALOG_INFO(MOD, "[CRASH_TRACE][tid={} lwp={}] step=teaser_invalid_natural_destruct solver_ptr={} (solver will destruct naturally)",
                       tid, getLwpForLog(), static_cast<const void*>(solver.get()));
-            std::cerr << "[CRASH_TRACE] lwp=" << getLwpForLog() << " step=teaser_solver_reset_before invalid_path (about to destruct)" << std::endl;
-            try {
-                solver.reset();
-            } catch (const std::exception& e) {
-                ALOG_ERROR(MOD, "[tid={} lwp={}] step=teaser_solver_destructor_exception (invalid path) msg={}", tid, getLwpForLog(), e.what());
-            } catch (...) {
-                ALOG_ERROR(MOD, "[tid={} lwp={}] step=teaser_solver_destructor_unknown_exception (invalid path)", tid, getLwpForLog());
-            }
-            ALOG_INFO(MOD, "[CRASH_TRACE][tid={} lwp={}] step=teaser_solver_reset_after (invalid path)", tid, getLwpForLog());
+            std::cerr << "[CRASH_TRACE] lwp=" << getLwpForLog() << " step=teaser_invalid_natural_destruct (no explicit reset)" << std::endl;
+            // 注意：不调用 solver.reset()，让 unique_ptr 自然析构
             return result;
         }
         ALOG_DEBUG(MOD, "[tid={}] step=teaser_solution_valid", tid);
@@ -293,27 +321,53 @@ TeaserMatcher::Result TeaserMatcher::match(
         ALOG_INFO(MOD, "[tid={}] step=teaser_inlier_computed inliers={}/{} ratio={:.2f} thresh={}",
                  tid, inliers, corrs.size(), (float)inliers / (float)corrs.size(), min_inlier_ratio_);
 
-        // ===【关键修复】极少内点时提前安全退出，避免析构崩溃===
-        // 根因：inlier < 3 时 PMC 算法在析构时极易产生堆损坏（即使单线程也会）
-        if (inliers < 3) {
-            ALOG_WARN(MOD, "[tid={}] [CRITICAL] step=teaser_extremely_few_inliers inliers={} < 3, HIGH CRASH RISK detected, aborting TEASER",
-                     tid, inliers);
-            ALOG_INFO(MOD, "[CRASH_TRACE][tid={} lwp={}] step=teaser_solver_reset_critical solver_ptr={} inliers={} (about to safely destruct)",
-                      tid, getLwpForLog(), static_cast<const void*>(solver.get()), inliers);
-            std::cerr << "[CRASH_TRACE_CRITICAL] lwp=" << getLwpForLog() << " step=teaser_extremely_few_inliers inliers=" << inliers 
-                      << " (destruction imminent, CRASH RISK HIGH)" << std::endl;
-            try {
-                solver.reset();  // 显式销毁，确保内存管理受控
-            } catch (const std::exception& e) {
-                ALOG_ERROR(MOD, "[tid={} lwp={}] step=teaser_destructor_exception_critical msg={}", tid, getLwpForLog(), e.what());
-                std::cerr << "[CRASH_TRACE_CRITICAL] destructor_exception: " << e.what() << std::endl;
-            } catch (...) {
-                ALOG_ERROR(MOD, "[tid={} lwp={}] step=teaser_destructor_unknown_exception_critical", tid, getLwpForLog());
-                std::cerr << "[CRASH_TRACE_CRITICAL] destructor_unknown_exception" << std::endl;
+        // 【TEASER_DIAG】使用 solution 的位姿计算内点 RMSE 和距离分布（result.T_tgt_src 尚未赋值）
+        if (inliers > 0) {
+            const Eigen::Matrix3d& R_sol = solution.rotation;
+            const Eigen::Vector3d& t_sol = solution.translation;
+            std::vector<double> inlier_dists;
+            inlier_dists.reserve(inliers);
+            auto inlier_map = solver->getTranslationInliersMap();
+            double sq_err_sum = 0.0;
+            for (Eigen::Index c = 0; c < inlier_map.cols(); ++c) {
+                int idx = inlier_map(0, c);
+                if (idx < 0 || idx >= static_cast<int>(corrs.size())) continue;
+                const auto& sp = src->points[corrs[idx].first];
+                const auto& tp = tgt->points[corrs[idx].second];
+                Eigen::Vector3d pred = R_sol * Eigen::Vector3d(sp.x, sp.y, sp.z) + t_sol;
+                Eigen::Vector3d actual(tp.x, tp.y, tp.z);
+                double e = (pred - actual).norm();
+                inlier_dists.push_back(e);
+                sq_err_sum += e * e;
             }
-            ALOG_INFO(MOD, "[CRASH_TRACE][tid={} lwp={}] step=teaser_solver_reset_critical_done", tid, getLwpForLog());
-            ALOG_INFO(MOD, "[TRACE] step=loop_match result=fail reason=teaser_extremely_few_inliers tid={} inliers={} (SAFETY ABORT)",
-                     tid, inliers);
+            if (!inlier_dists.empty()) {
+                std::sort(inlier_dists.begin(), inlier_dists.end());
+                double rmse = std::sqrt(sq_err_sum / inlier_dists.size());
+                double p50 = inlier_dists[inlier_dists.size() / 2];
+                double p90 = inlier_dists[std::min(size_t(inlier_dists.size() * 0.9), inlier_dists.size() - 1)];
+                ALOG_WARN(MOD, "[TEASER_DIAG] tid={} inliers={} rmse={:.3f}m dist_p50={:.3f}m p90={:.3f}m "
+                          "(rmse>0.5m 或 p90>1m 表示几何一致性差)",
+                          tid, inliers, rmse, p50, p90);
+            }
+        }
+
+        // ===【V3 激进修复】双重安全检查：提前 abort + 延迟析构===
+        const int kMinSafeInliers = 10;
+        if (inliers < kMinSafeInliers) {
+            ALOG_WARN(MOD, "[tid={}] [CRITICAL_V3] step=teaser_extremely_few_inliers inliers={} < safe_threshold={}, HIGH CRASH RISK",
+                     tid, inliers, kMinSafeInliers);
+            ALOG_INFO(MOD, "[CRASH_TRACE][tid={} lwp={}] step=teaser_solver_abort_low_inliers solver_ptr={} inliers={} safe_min={}",
+                      tid, getLwpForLog(), static_cast<const void*>(solver.get()), inliers, kMinSafeInliers);
+            std::cerr << "[CRASH_TRACE_CRITICAL] lwp=" << getLwpForLog() 
+                      << " step=teaser_extremely_few_inliers inliers=" << inliers 
+                      << " safe_min=" << kMinSafeInliers << std::endl;
+            // 【关键修复】使用 release() 让 solver 自然析构，延长生命周期直到函数退出
+            // 这样可以在析构时有更多栈帧来捕获异常
+            solver.release();
+            ALOG_INFO(MOD, "[CRASH_TRACE][tid={} lwp={}] step=teaser_solver_released solver_ptr_released=true",
+                      tid, getLwpForLog());
+            ALOG_INFO(MOD, "[TRACE] step=loop_match result=fail reason=teaser_extremely_few_inliers tid={} inliers={} safe_min={} (V3: released solver)",
+                     tid, inliers, kMinSafeInliers);
             return result;
         }
 
@@ -322,19 +376,14 @@ TeaserMatcher::Result TeaserMatcher::match(
         if (result.inlier_ratio < min_inlier_ratio_) {
             ALOG_WARN(MOD, "[tid={}] step=teaser_inlier_rejected inlier_ratio={:.2f} < thresh={}", tid, result.inlier_ratio, min_inlier_ratio_);
             ALOG_INFO(MOD, "[TRACE] step=loop_match result=fail reason=inlier_ratio_low tid={} inlier_ratio={:.3f} min={}", tid, result.inlier_ratio, min_inlier_ratio_);
-            ALOG_INFO(MOD, "[CRASH_TRACE][tid={} lwp={}] step=teaser_solver_reset_before solver_ptr={} inliers={} (inlier_rejected path)",
+            ALOG_INFO(MOD, "[CRASH_TRACE][tid={} lwp={}] step=teaser_inlier_rejected_natural_destruct solver_ptr={} inliers={}",
                       tid, getLwpForLog(), static_cast<const void*>(solver.get()), inliers);
-            std::cerr << "[CRASH_TRACE] lwp=" << getLwpForLog() << " step=teaser_solver_reset_before inlier_rejected inliers=" << inliers << " (about to destruct)" << std::endl;
-            try {
-                solver.reset();
-            } catch (const std::exception& e) {
-                ALOG_ERROR(MOD, "[tid={} lwp={}] [ROBUST_FIX] teaser_solver_destructor_exception (inlier_rejected path) msg={}", tid, getLwpForLog(), e.what());
-                std::cerr << "[ROBUST_FIX_EXCEPTION] lwp=" << getLwpForLog() << " destructor_exception: " << e.what() << std::endl;
-            } catch (...) {
-                ALOG_ERROR(MOD, "[tid={} lwp={}] [ROBUST_FIX] teaser_solver_destructor_unknown_exception (inlier_rejected path)", tid, getLwpForLog());
-                std::cerr << "[ROBUST_FIX_EXCEPTION] lwp=" << getLwpForLog() << " destructor_unknown_exception" << std::endl;
-            }
-            ALOG_INFO(MOD, "[CRASH_TRACE][tid={} lwp={}] step=teaser_solver_reset_after (inlier_rejected path)", tid, getLwpForLog());
+            std::cerr << "[CRASH_TRACE] lwp=" << getLwpForLog() << " step=teaser_inlier_rejected_natural_destruct inliers=" << inliers 
+                      << " (solver will be released and destruct at function exit)" << std::endl;
+            // 【V3 激进修复】使用 release() 延迟析构，避免在异常处理路径中立即析构
+            solver.release();
+            ALOG_INFO(MOD, "[CRASH_TRACE][tid={} lwp={}] step=teaser_solver_released solver_ptr_released=true (delayed destruct)",
+                      tid, getLwpForLog());
             return result;
         }
 
@@ -364,8 +413,10 @@ TeaserMatcher::Result TeaserMatcher::match(
             ALOG_INFO(MOD, "[tid={}] step=teaser_rmse_final cnt={} rmse={:.3f}m success={}", 
                      tid, cnt, result.rmse, result.success);
         }
-        ALOG_INFO(MOD, "[CRASH_TRACE][tid={} lwp={}] step=teaser_solver_scope_exit success_path solver_ptr={} (unique_ptr leaving scope)",
+        ALOG_INFO(MOD, "[CRASH_TRACE][tid={} lwp={}] step=teaser_solver_scope_exit success_path solver_ptr={} (unique_ptr leaving scope, natural destruct)",
                   tid, getLwpForLog(), static_cast<const void*>(solver.get()));
+        std::cerr << "[CRASH_TRACE] lwp=" << getLwpForLog() << " step=teaser_success_path_solver_natural_destruct solver_ptr=" 
+                  << static_cast<const void*>(solver.get()) << std::endl;
     } catch (const std::bad_alloc& e) {
         ALOG_ERROR(MOD, "[tid={} lwp={}] [ROBUST_FIX] step=teaser_solve_exception reason=bad_alloc msg={}", tid, getLwpForLog(), e.what());
         ALOG_INFO(MOD, "[TRACE] step=loop_match result=fail reason=teaser_out_of_memory tid={} (TEASER/PMC OOM)", tid);

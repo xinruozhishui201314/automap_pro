@@ -274,6 +274,7 @@ Result HBAOptimizer::optimize(ProgressCallback progress_cb) {
 
         // ── 提取结果 ─────────────────────────────────────────────────────
         result.optimized_poses.resize(N);
+        bool extract_ok = true;
         for (int i = 0; i < N; ++i) {
             try {
                 auto p = optimized.at<gtsam::Pose3>(gtsam::Symbol('x', i));
@@ -282,15 +283,21 @@ Result HBAOptimizer::optimize(ProgressCallback progress_cb) {
                 T.translation() = p.translation();
                 result.optimized_poses[i] = T;
             } catch (...) {
+                // 回退未优化位姿仅用于避免崩溃；必须标记失败，避免调用方误用为优化结果
                 result.optimized_poses[i] = Impl::from_mypcl_pose(final_poses[i]);
+                extract_ok = false;
             }
+        }
+        if (!extract_ok) {
+            result.error_msg = "HBA: optimized Values 中部分位姿提取失败，结果含未优化位姿，不可用";
+            result.success = false;
         }
 
         auto t1 = std::chrono::steady_clock::now();
         result.elapsed_ms     = std::chrono::duration<double, std::milli>(t1 - t0).count();
         result.total_keyframes = N;
         result.final_mme      = Impl::calc_mme(kfs, result.optimized_poses, vs);
-        result.success        = true;
+        if (extract_ok) result.success = true;
 
         if (progress_cb) progress_cb(total_layers, total_layers, 100.0f);
 

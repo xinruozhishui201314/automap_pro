@@ -12,16 +12,17 @@ namespace automap_pro {
 /**
  * GPS 延迟对齐管理器
  *
- * 设计原则（来自 MapSystem 架构文档）：
- *   "先建图后对齐" —— GPS信号差时先做局部LiDAR建图，
- *    当连续 N 帧 GPS 信号质量超过阈值时，用 SVD 轨迹匹配
- *    计算 GPS-LiDAR 外参，再将 GPS 约束添加到 GTSAM 因子图。
- *
+ * 设计原则：
+ *  - GPS 为可选：有质量好的 GPS 就使用，没有或质量差则不用；建图不依赖 GPS，时有时无均正常。
+ *  - "先建图后对齐"：GPS 信号差时先做局部 LiDAR 建图；当连续 N 帧高质量 GPS 时做 SVD 对齐并添加约束。
+*  - 质量门控：仅 HIGH/EXCELLENT 用于对齐与因子；轨迹日志中仅 MEDIUM 及以上记为有效。
+*
  * 状态机：
- *   NOT_ALIGNED → (收到足够高质量GPS) → ALIGNING → (SVD成功) → ALIGNED
- *                                                             → (GPS变差) → DEGRADED
- *   DEGRADED → (GPS恢复) → ALIGNED
+*   NOT_ALIGNED → (足够高质量GPS) → ALIGNING → (SVD成功) → ALIGNED
+*                         -> (GPS变差) → DEGRADED
+*   DEGRADED -> (GPS恢复) -> ALIGNED
  */
+
 class GPSManager {
 public:
     explicit GPSManager();
@@ -39,18 +40,31 @@ public:
 
     // ── 状态查询 ──────────────────────────────────────────────────────────
 
-    GPSAlignState state()    const;
-    bool          isAligned()const { return state_ == GPSAlignState::ALIGNED; }
+    GPSAlignState state() const;
+    bool          isAligned() const { return state_ == GPSAlignState::ALIGNED; }
     const GPSAlignResult& alignResult() const { return align_result_; }
 
-    /** 获取最近的有效 GPS ENU 坐标（如已对齐，则已转换到 LiDAR 坐标系） */
+    /** 获取最近的有效 GPS ENU 坐标（如已对齐则已转换到 LiDAR 坐标系） */
     std::optional<Eigen::Vector3d> getLatestPositionENU() const;
 
-    /** 查询给定时间戳的GPS测量（最近邻插值，时间差<0.1s） */
+    /**
+     * 查询给定时间戳的 GPS 测量，用于关键帧约束。
+     * - 位置：在夹住 ts 的两条 GPS 之间做线性插值（时间窗内）；否则在 keyframe_match_window_s 内取最近邻。
+     * - 姿态：由里程计/前端提供，GPS 仅约束位置；若未来接入双天线朝向，可对四元数做球面插值(slerp)。
+     */
     std::optional<GPSMeasurement> queryByTimestamp(double ts) const;
+
+    /** 轨迹日志用：放宽时间窗口的查询（1Hz GPS + 时间偏差时仍可匹配），max_dt_s 建议 0.5~1.0 */
+    std::optional<GPSMeasurement> queryByTimestampForLog(double ts, double max_dt_s = 0.5) const;
 
     /** 当前 GPS 质量 */
     GPSQuality currentQuality() const;
+
+    /** 诊断用：当前 GPS 滑动窗口条数（用于排查轨迹 CSV 无 GPS 时是"无数据"还是"时间不匹配"） */
+    size_t getGpsWindowSize() const;
+
+    /** 诊断用：当前 GPS 窗口时间范围 [min_ts, max_ts]，便于判断 odom 时间是否落在范围内。返回 true 表示有数据并已写入 out_min_ts、 out_max_ts */
+    bool getGpsWindowTimeRange(double* out_min_ts, double* out_max_ts) const;
 
     // ── GPS-LiDAR 外参 ────────────────────────────────────────────────────
 
@@ -96,11 +110,14 @@ private:
     std::deque<std::pair<double, Pose3d>> kf_window_;  // 最近 N 个KF位姿
 
     // 参数
-    int    min_align_points_    = 50;
-    double min_align_dist_m_    = 30.0;
-    double quality_hdop_thresh_ = 2.0;
-    double rmse_accept_thresh_  = 1.5;
-    int    good_samples_needed_ = 30;
+    int    min_align_points_        = 50;
+    double min_align_dist_m_        = 30.0;
+    double keyframe_match_window_s_ = 1.0;   // 关键帧匹配 GPS 的最大时间差(s)，1Hz GPS 建议 0.5~1.0
+    double keyframe_max_hdop_       = 15.0;  // 关键帧绑定 GPS 的 HDOP 上界，放宽弱 GPS 场景（M2DGR 等）
+    double max_interp_gap_s_        = 2.0;   // 双样本线性插值最大间隔(s)，超过则退化为最近邻
+    double quality_hdop_thresh_ = 12.0;  // 【修复】放宽：2.0→12.0 适配弱GPS
+    double rmse_accept_thresh_  = 5.0;   // 【修复】放宽：1.5→5.0 弱GPS噪声大
+    int    good_samples_needed_ = 20;    // 【修复】降低：30→20 弱GPS高质量帧少
     int    good_sample_count_   = 0;
 
     // 状态
@@ -124,6 +141,36 @@ private:
     void            try_align();
     void            on_aligned(const GPSAlignResult& result);
     GPSQuality      hdop_to_quality(double hdop) const;
+
+    // ── 精准对齐增强方法 ───────────────────────────────────────────────────────
+
+    /**
+     * @brief 使用里程计积分估计GPS初始位置
+     * 当GPS数据延迟到达时，使用里程计积分来估计GPS在里程计起始时刻的位置
+     * 这样可以消除GPS延迟导致的系统初始偏差
+     */
+    Eigen::Vector3d estimateGpsPositionByOdom(double gps_ts, double odom_start_ts,
+                                               const Pose3d& odom_start_pose);
+
+    /**
+     * @brief 在线校准：持续校准GPS-里程计偏差
+     * 用于处理GPS延迟、时钟漂移等问题
+     */
+    void onlineCalibrate(double gps_ts, const Eigen::Vector3d& gps_enu,
+                        double odom_ts, const Pose3d& odom_pose);
+
+    /**
+     * @brief 查找最近邻里程计位姿
+     */
+    std::optional<std::pair<double, Pose3d>> findNearestOdomPose(double ts) const;
+
+    // ── 精准对齐相关成员 ────────────────────────────────────────────────────
+    std::deque<std::pair<double, Pose3d>> all_odom_poses_;  // 缓存所有里程计位姿用于插值
+    Eigen::Vector3d accumulated_offset_{Eigen::Vector3d::Zero()};  // 累积的GPS-里程计偏差
+    std::atomic<int> calib_count_{0};  // 在线校准次数
+    double online_calib_min_dist_    = 5.0;   // 最小累积距离触发在线校正（米）
+    double online_calib_max_rmse_    = 2.0;   // 在线校正RMSE阈值（米）
+    int    online_calib_min_samples_ = 5;     // 在线校正最小样本数
 };
 
 } // namespace automap_pro

@@ -24,6 +24,7 @@
 #include <automap_pro/srv/trigger_optimize.hpp>
 #include <automap_pro/srv/trigger_gps_align.hpp>
 #include <automap_pro/srv/load_session.hpp>
+#include <std_srvs/srv/trigger.hpp>
 
 #include <mutex>
 #include <atomic>
@@ -36,10 +37,11 @@
 
 namespace automap_pro {
 
-/** 按时间戳对齐：帧队列只存 (ts, cloud)，pose/cov/kfinfo 由 worker 从缓存按 ts 查询 */
+/** 按时间戳对齐：帧队列只存 (ts, cloud)，pose/cov/kfinfo 由 worker 从缓存按 ts 查询；可选 cloud_ds 由 feeder 预计算以省去 worker 内体素 */
 struct FrameToProcess {
     double ts = 0.0;
     CloudXYZIPtr cloud;
+    CloudXYZIPtr cloud_ds;  // 可选：feeder 预计算体素降采样，worker 有则直接用
 };
 
 /** 里程计按时间戳缓存，worker 用 get(cloud_ts) 对齐 */
@@ -103,13 +105,24 @@ private:
     // 异步任务关闭请求标志
     std::atomic<bool> shutdown_requested_{false};
 
-    // 后端帧队列：只存 (ts, cloud)，worker 按 ts 从 odom/kfinfo 缓存对齐，不阻塞回调
-    static constexpr size_t kMaxFrameQueueSize = 500;
+    // 入口缓冲：订阅回调只写入 ingress，快速返回；feeder 线程将 ingress → frame_queue_，背压在 feeder 内，不阻塞 Executor
+    size_t max_ingress_queue_size_ = 16;
+    std::queue<FrameToProcess> ingress_queue_;
+    std::mutex                 ingress_mutex_;
+    std::condition_variable    ingress_not_full_cv_;   // feeder 取走一帧时唤醒回调
+    std::condition_variable    ingress_not_empty_cv_;  // 回调放入一帧时唤醒 feeder
+    std::thread                feeder_thread_;
+    void feederLoop();
+
+    // 后端帧队列：只存 (ts, cloud)，worker 按 ts 从 odom/kfinfo 缓存对齐；长度由配置 frame_queue_max_size 决定
+    // 队列满时背压在 feeder 线程内等待，不丢帧
+    size_t max_frame_queue_size_ = 500;
     std::queue<FrameToProcess> frame_queue_;
     std::mutex                frame_queue_mutex_;
-    std::condition_variable   frame_queue_cv_;
+    std::condition_variable   frame_queue_cv_;           // 有数据时唤醒 worker
+    std::condition_variable   frame_queue_not_full_cv_; // 有空间时唤醒 feeder（背压）
     std::thread               backend_worker_;
-    std::atomic<int>          frame_queue_dropped_{0};
+    std::atomic<int>          frame_queue_dropped_{0};  // 背压模式下恒为 0
     void backendWorkerLoop();
 
     // 按时间戳缓存的 odom / kfinfo，有界、非阻塞写，worker 按帧 ts 对齐读取
@@ -142,10 +155,43 @@ private:
     // 子图计数（用于 HBA 周期触发）
     int  frozen_submap_count_ = 0;
 
+    // 地图发布异步化：专用线程执行 buildGlobalMap + publish，不阻塞后端 worker；与 tryCreateKeyFrame 通过 map_build_mutex_ 串行化读写
+    std::thread               map_publish_thread_;
+    std::mutex                map_build_mutex_;
+    std::condition_variable   map_publish_cv_;
+    std::atomic<bool>         map_publish_pending_{false};
+    void mapPublishLoop();
+
+    // 回环 iSAM2 更新异步：match_worker 只入队，本线程取任务执行 addLoopFactor，避免阻塞回环检测（有界队列防堆积/死锁）
+    static constexpr size_t   kMaxLoopFactorQueueSize = 64;
+    std::queue<LoopConstraint::Ptr> loop_factor_queue_;
+    std::mutex                loop_opt_mutex_;
+    std::condition_variable   loop_opt_cv_;
+    std::thread               loop_opt_thread_;
+    void loopOptThreadLoop();
+
+    // 可视化与状态发布迁出后端：仅投递不阻塞
+    static constexpr size_t   kVizQueueMaxSize = 2;
+    std::queue<CloudXYZIPtr>  viz_cloud_queue_;
+    std::mutex                viz_mutex_;
+    std::condition_variable   viz_cv_;
+    std::thread               viz_thread_;
+    void vizThreadLoop();
+
+    std::atomic<bool>         status_publish_pending_{false};
+    std::atomic<bool>         data_flow_publish_pending_{false};
+    std::mutex                status_pub_mutex_;
+    std::condition_variable   status_pub_cv_;
+    std::thread               status_publisher_thread_;
+    void statusPublisherLoop();
+
     // 地图体素大小（init 时从 ConfigManager 缓存，避免 publishGlobalMap 回调中访问单例导致析构顺序 SIGSEGV）
     float map_voxel_size_ = 0.2f;
     // launch 传入的 output_dir，非空时优先于 system.output_dir，使前后端保存到同一目录
     std::string output_dir_override_;
+    // GPS 配置：在 loadConfigAndInit 中一次性读取并传入 LivoBridge，避免 LivoBridge 再读 ConfigManager 时不一致
+    bool        gps_enabled_from_config_ = false;
+    std::string gps_topic_from_config_   = "/gps/fix";
 
     // 首次数据到达日志（各打一次，便于确认数据流）
     std::atomic<bool> first_odom_logged_{false};
@@ -153,8 +199,10 @@ private:
     // 传感器空闲结束建图：上次收到点云的墙钟时间；超时后触发最终处理并退出
     std::chrono::steady_clock::time_point last_sensor_data_wall_time_{std::chrono::steady_clock::now()};
     std::atomic<bool> sensor_idle_finish_triggered_{false};
-    // 后端已处理的点云帧计数（用于每帧日志）
+    // 后端已从队列弹出的点云帧计数（用于 DATA_FLOW 与帧率控制）
     std::atomic<int> backend_cloud_frames_processed_{0};
+    // 后端实际参与 tryCreateKeyFrame 的帧计数（process_every_n_frames 跳帧时与上面不同，用于发布周期）
+    std::atomic<int> backend_frames_actually_processed_{0};
     // 周期性状态汇总（每 10 次 status 打一条，约 10s）
     int status_publish_count_ = 0;
     // 低频数据流日志：各模块收发/发布计数（每 15s 打一条）
@@ -177,6 +225,7 @@ private:
     rclcpp::Service<automap_pro::srv::TriggerOptimize>::SharedPtr trigger_opt_srv_;
     rclcpp::Service<automap_pro::srv::TriggerGpsAlign>::SharedPtr trigger_gps_srv_;
     rclcpp::Service<automap_pro::srv::LoadSession>::SharedPtr     load_session_srv_;
+    rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr           finish_mapping_srv_;
 
     // ── 定时器（仅保留一次性 deferred init）────────────────────────────────
     // status/map/data_flow 已改为数据触发：在 backendWorkerLoop 中按处理帧数触发，见 setupTimers 注释
@@ -200,9 +249,10 @@ private:
     // ── 内部处理 ──────────────────────────────────────────────────────────
     /** 从当前 last_* 读取并创建 KF（兼容旧调用） */
     void tryCreateKeyFrame(double ts);
-    /** 使用入参创建 KF；optional_livo_info 非空时用于日志（时间戳对齐），否则读 last_livo_info_ */
+    /** 使用入参创建 KF；optional_livo_info 非空时用于日志；optional_cloud_ds 非空且非空点云时跳过体素降采样（feeder 预计算） */
     void tryCreateKeyFrame(double ts, const Pose3d& pose, const Mat66d& cov, const CloudXYZIPtr& cloud,
-                           const LivoKeyFrameInfo* optional_livo_info = nullptr);
+                           const LivoKeyFrameInfo* optional_livo_info = nullptr,
+                           const CloudXYZIPtr* optional_cloud_ds = nullptr);
     /** 将世界系点云转为 body 系（T_b_w * cloud），用于 frontend.cloud_frame=world 时避免全局图双重变换 */
     CloudXYZIPtr transformWorldToBody(const CloudXYZIPtr& world_cloud, const Pose3d& T_w_b) const;
     void onSubmapFrozen(const SubMap::Ptr& submap);
@@ -231,6 +281,9 @@ private:
     void handleLoadSession(
         const std::shared_ptr<automap_pro::srv::LoadSession::Request>,
         std::shared_ptr<automap_pro::srv::LoadSession::Response>);
+    void handleFinishMapping(
+        const std::shared_ptr<std_srvs::srv::Trigger::Request>,
+        std::shared_ptr<std_srvs::srv::Trigger::Response>);
 
     // ── 定时任务 ──────────────────────────────────────────────────────────
     void publishStatus();

@@ -42,22 +42,23 @@ Visualization Manager:
       Update Interval: 0
       Value: true
 
-    # 前端累积地图（fast_livo 发布 /Laser_map）
-    - Alpha: 0.9
+    # 前端累积地图（fast_livo 发布 /Laser_map）- 体素下采样后发布，清晰可辨；RViz 适度点大小
+    - Alpha: 0.92
       Autocompute Value Bounds: true
       Class: rviz_default_plugins/PointCloud2
       Color: 135; 206; 250
       Decay Time: 0
       Enabled: true
       Name: frontend map
-      Size (m): 0.02
+      Size (m): 0.06
+      Style: Points
       Topic:
-        Depth: 5
+        Depth: 1
         Reliability Policy: Reliable
         Value: /Laser_map
       Use Fixed Frame: true
 
-    # 前端 LIO 点云（fast_livo 输出）
+    # 前端 LIO 点云（fast_livo 输出）- 降密度：Points 样式 + 大点 + 单帧缓冲
     - Alpha: 1
       Autocompute Value Bounds: true
       Class: rviz_default_plugins/PointCloud2
@@ -65,9 +66,10 @@ Visualization Manager:
       Decay Time: 0.2
       Enabled: true
       Name: front LIO cloud
-      Size (m): 0.015
+      Size (m): 0.03
+      Style: Points
       Topic:
-        Depth: 5
+        Depth: 1
         Reliability Policy: Reliable
         Value: /cloud_registered
       Use Fixed Frame: true
@@ -82,6 +84,22 @@ Visualization Manager:
         Depth: 5
         Reliability Policy: Reliable
         Value: /path
+      Use Fixed Frame: true
+
+    # 后端全局地图（可选：全栈运行时显示）- 体素下采样发布；RViz 点略大便于区分结构
+    - Alpha: 0.88
+      Autocompute Value Bounds: true
+      Class: rviz_default_plugins/PointCloud2
+      Color: 100; 200; 100
+      Decay Time: 0
+      Enabled: true
+      Name: backend global map
+      Size (m): 0.06
+      Style: Points
+      Topic:
+        Depth: 1
+        Reliability Policy: Reliable
+        Value: /automap/global_map
       Use Fixed Frame: true
   Global Options:
     Background Color: 48; 48; 48

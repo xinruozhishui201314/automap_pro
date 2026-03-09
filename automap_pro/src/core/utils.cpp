@@ -1,4 +1,5 @@
 #include "automap_pro/core/utils.h"
+#include "automap_pro/core/config_manager.h"
 #include "automap_pro/core/logger.h"
 #include <filesystem>
 #include <Eigen/Geometry>
@@ -7,7 +8,11 @@
 #include <algorithm>
 #include <unordered_map>
 #include <tuple>
+#include <vector>
 #include <cstdint>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 namespace automap_pro {
 
@@ -49,6 +54,45 @@ CloudXYZIPtr voxelDownsampleGridNoPCL(const CloudXYZIPtr& input, float leaf) {
             out->push_back(p);
     }
     return out;
+}
+
+/** P1: OpenMP 并行体素下采样（每线程独立 map，再合并，避免锁竞争） */
+CloudXYZIPtr voxelDownsampleGridNoPCLParallel(const CloudXYZIPtr& input, float leaf) {
+    if (!input || input->empty() || leaf <= 0.f) return input;
+#if defined(_OPENMP)
+    const size_t n = input->points.size();
+    const float inv_leaf = 1.f / leaf;
+    const int max_t = omp_get_max_threads();
+    std::vector<std::unordered_map<VoxelKey, size_t, VoxelKeyHash>> thread_maps(
+        static_cast<size_t>(max_t));
+#pragma omp parallel
+    {
+        int t = omp_get_thread_num();
+        auto& m = thread_maps[static_cast<size_t>(t)];
+        m.reserve(std::min(n / 4 + 1, size_t(500000)));
+#pragma omp for
+        for (size_t i = 0; i < n; ++i) {
+            const auto& p = input->points[i];
+            int64_t ix = static_cast<int64_t>(std::floor(p.x * inv_leaf));
+            int64_t iy = static_cast<int64_t>(std::floor(p.y * inv_leaf));
+            int64_t iz = static_cast<int64_t>(std::floor(p.z * inv_leaf));
+            VoxelKey key{ix, iy, iz};
+            m.emplace(key, i);
+        }
+    }
+    std::unordered_map<VoxelKey, size_t, VoxelKeyHash> voxel_to_index;
+    voxel_to_index.reserve(std::min(n / 4, size_t(500000)));
+    auto out = std::make_shared<CloudXYZI>();
+    for (const auto& m : thread_maps) {
+        for (const auto& [k, idx] : m) {
+            if (voxel_to_index.emplace(k, idx).second)
+                out->push_back(input->points[idx]);
+        }
+    }
+    return out;
+#else
+    return voxelDownsampleGridNoPCL(input, leaf);
+#endif
 }
 
 }  // namespace
@@ -119,8 +163,10 @@ CloudXYZIPtr voxelDownsample(const CloudXYZIPtr& cloud, float leaf_size) {
             ALOG_WARN("Utils", "voxelDownsample: still overflow risk after enlarging leaf, returning copy without voxel filter");
             return input;
         }
-        // 使用无 PCL 的体素下采样，避免 PCL VoxelGrid::filter 在部分 leaf/范围下写越界导致析构时 SIGSEGV。
-        CloudXYZIPtr out = voxelDownsampleGridNoPCL(input, leaf);
+        // 使用无 PCL 的体素下采样；performance.parallel_voxel_downsample 为 true 时走 OpenMP 并行路径。
+        CloudXYZIPtr out = ConfigManager::instance().parallelVoxelDownsample()
+            ? voxelDownsampleGridNoPCLParallel(input, leaf)
+            : voxelDownsampleGridNoPCL(input, leaf);
         if (out && out->empty()) {
             ALOG_WARN("Utils", "voxelDownsample: output cloud is empty after filtering");
         }
@@ -187,56 +233,53 @@ CloudXYZIPtr voxelDownsampleChunked(const CloudXYZIPtr& cloud, float leaf_size, 
         auto merged = std::make_shared<CloudXYZI>();
         merged->reserve(input->size() / 4);
 
-        // ALOG_INFO("Utils", "[MAP] voxelDownsampleChunked step=chunk_loop_enter nx={} ny={} nz={}", nx, ny, nz);
-        int chunk_index = 0;
-        for (int ix = 0; ix < nx; ++ix) {
-            float cx_min = min_x + ix * cs;
-            float cx_max = (ix + 1 == nx) ? max_x : (min_x + (ix + 1) * cs);
-            for (int iy = 0; iy < ny; ++iy) {
-                float cy_min = min_y + iy * cs;
-                float cy_max = (iy + 1 == ny) ? max_y : (min_y + (iy + 1) * cs);
-                for (int iz = 0; iz < nz; ++iz) {
-                    float cz_min = min_z + iz * cs;
-                    float cz_max = (iz + 1 == nz) ? max_z : (min_z + (iz + 1) * cs);
+        const int total_chunks = nx * ny * nz;
+        std::vector<CloudXYZIPtr> chunk_results(static_cast<size_t>(total_chunks));
+        const auto& pts_ref = input->points;
+        const size_t num_pts = pts_ref.size();
+        const float cs_f = cs;
 
-                    ALOG_INFO("Utils", "[MAP] voxelDownsampleChunked step=chunk ix={} iy={} iz={} idx={} fill_enter", ix, iy, iz, chunk_index);
-                    auto chunk = std::make_shared<CloudXYZI>();
-                    chunk->reserve(std::min(input->size() / (static_cast<size_t>(nx) * ny * nz + 1), input->size()));
-                    const auto& pts_ref = input->points;
-                    const size_t num_pts = pts_ref.size();
-                    for (size_t i = 0; i < num_pts; ++i) {
-                        const auto& p = pts_ref[i];
-                        if (p.x >= cx_min && p.x <= cx_max && p.y >= cy_min && p.y <= cy_max && p.z >= cz_min && p.z <= cz_max)
-                            chunk->push_back(p);
-                    }
-                    ALOG_INFO("Utils", "[MAP] voxelDownsampleChunked step=chunk ix={} iy={} iz={} idx={} fill_done pts={}", ix, iy, iz, chunk_index, chunk->size());
-                    if (chunk->empty()) {
-                        ++chunk_index;
-                        continue;
-                    }
-                    ALOG_INFO("Utils", "[MAP] voxelDownsampleChunked step=chunk ix={} iy={} iz={} idx={} voxel_enter", ix, iy, iz, chunk_index);
-                    CloudXYZIPtr ds;
-                    try {
-                        ds = voxelDownsample(chunk, leaf);
-                    } catch (const std::exception& e) {
-                        // ALOG_ERROR("Utils", "[MAP] voxelDownsampleChunked chunk idx={} voxelDownsample exception: {}, use chunk as-is", chunk_index, e.what());
-                        ds = chunk;
-                    } catch (...) {
-                        // ALOG_ERROR("Utils", "[MAP] voxelDownsampleChunked chunk idx={} voxelDownsample unknown exception, use chunk as-is", chunk_index);
-                        ds = chunk;
-                    }
-                    // ALOG_INFO("Utils", "[MAP] voxelDownsampleChunked step=chunk ix={} iy={} iz={} idx={} voxel_done out={}", ix, iy, iz, chunk_index, ds ? ds->size() : 0u);
-                    if (ds && !ds->empty()) {
-                        // ALOG_INFO("Utils", "[MAP] voxelDownsampleChunked step=chunk ix={} iy={} iz={} idx={} merge_enter", ix, iy, iz, chunk_index);
-                        const auto& ds_pts = ds->points;
-                        const size_t ds_n = ds_pts.size();
-                        merged->reserve(merged->size() + ds_n);
-                        for (size_t i = 0; i < ds_n; ++i)
-                            merged->push_back(ds_pts[i]);
-                        // ALOG_INFO("Utils", "[MAP] voxelDownsampleChunked step=chunk ix={} iy={} iz={} idx={} merge_done", ix, iy, iz, chunk_index);
-                    }
-                    ++chunk_index;
-                }
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic)
+#endif
+        for (int idx = 0; idx < total_chunks; ++idx) {
+            const int iz = idx % nz;
+            const int iy = (idx / nz) % ny;
+            const int ix = idx / (nz * ny);
+            const float cx_min = min_x + ix * cs_f;
+            const float cx_max = (ix + 1 == nx) ? max_x : (min_x + (ix + 1) * cs_f);
+            const float cy_min = min_y + iy * cs_f;
+            const float cy_max = (iy + 1 == ny) ? max_y : (min_y + (iy + 1) * cs_f);
+            const float cz_min = min_z + iz * cs_f;
+            const float cz_max = (iz + 1 == nz) ? max_z : (min_z + (iz + 1) * cs_f);
+
+            auto chunk = std::make_shared<CloudXYZI>();
+            chunk->reserve(std::min(num_pts / (static_cast<size_t>(total_chunks) + 1), num_pts));
+            for (size_t i = 0; i < num_pts; ++i) {
+                const auto& p = pts_ref[i];
+                if (p.x >= cx_min && p.x <= cx_max && p.y >= cy_min && p.y <= cy_max && p.z >= cz_min && p.z <= cz_max)
+                    chunk->push_back(p);
+            }
+            if (chunk->empty()) {
+                chunk_results[static_cast<size_t>(idx)] = nullptr;
+                continue;
+            }
+            CloudXYZIPtr ds;
+            try {
+                ds = voxelDownsample(chunk, leaf);
+            } catch (const std::exception&) {
+                ds = chunk;
+            } catch (...) {
+                ds = chunk;
+            }
+            chunk_results[static_cast<size_t>(idx)] = (ds && !ds->empty()) ? ds : nullptr;
+        }
+
+        for (const auto& c : chunk_results) {
+            if (c && !c->empty()) {
+                merged->reserve(merged->size() + c->size());
+                for (const auto& p : c->points)
+                    merged->push_back(p);
             }
         }
 
