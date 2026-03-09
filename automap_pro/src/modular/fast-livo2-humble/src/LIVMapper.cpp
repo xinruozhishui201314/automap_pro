@@ -857,7 +857,8 @@ void LIVMapper::imu_prop_callback()
 
 void LIVMapper::transformLidar(const Eigen::Matrix3d rot, const Eigen::Vector3d t, const PointCloudXYZI::Ptr &input_cloud, PointCloudXYZI::Ptr &trans_cloud)
 {
-  PointCloudXYZI().swap(*trans_cloud);
+  // [SIGSEGV FIX] 使用 clear() 替代危险的 swap() 模式清空点云
+  trans_cloud->clear();
   trans_cloud->reserve(input_cloud->size());
   for (size_t i = 0; i < input_cloud->size(); i++)
   {
@@ -1217,7 +1218,8 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
       sig_buffer.notify_all();
       // 将上次切割剩下一半的点云转移到当前的队列
       *(meas.pcl_proc_cur) = *(meas.pcl_proc_next);
-      PointCloudXYZI().swap(*meas.pcl_proc_next);
+      // [SIGSEGV FIX] 使用 clear() 替代危险的 swap() 模式清空点云
+      meas.pcl_proc_next->clear();
 
       // 这个限容是新加的，ros1代码里面没有
       int lid_frame_num = lid_raw_data_buffer.size();
@@ -1500,12 +1502,14 @@ void LIVMapper::publish_frame_world(const rclcpp::Publisher<sensor_msgs::msg::Po
       if (pcl_wait_save->points.size() > 0)
       {
         pcd_writer.writeBinary(all_points_dir, *pcl_wait_save); // pcl::io::savePCDFileASCII(all_points_dir, *pcl_wait_save);
-        PointCloudXYZRGB().swap(*pcl_wait_save);
+        // [SIGSEGV FIX] 使用 clear() 替代危险的 swap() 模式
+        pcl_wait_save->clear();
       }
       if(pcl_wait_save_intensity->points.size() > 0)
       {
         pcd_writer.writeBinary(all_points_dir, *pcl_wait_save_intensity);
-        PointCloudXYZI().swap(*pcl_wait_save_intensity);
+        // [SIGSEGV FIX] 使用 clear() 替代危险的 swap() 模式
+        pcl_wait_save_intensity->clear();
       }
       scan_wait_num = 0;
     }
@@ -1535,8 +1539,22 @@ void LIVMapper::publish_frame_world(const rclcpp::Publisher<sensor_msgs::msg::Po
     }
   }
 
-  if(laserCloudWorldRGB->size() > 0)  PointCloudXYZI().swap(*pcl_wait_pub); 
-  if(LidarMeasures.lio_vio_flg == VIO)  PointCloudXYZI().swap(*pcl_w_wait_pub);
+  // [SIGSEGV FIX] 使用 clear() 替代危险的 PointCloudXXXI().swap() 模式
+  // 原因：swap() 创建临时对象，交换后临时对象析构可能导致内部指针悬空
+    // 特别是在 LIO-only 模式下，io_vio_flg 绝不是 VIO，但仍调用了 swap(*pcl_w_wait_pub)
+    // 这导致 pcl_w_wait_pub 状态不一致，下次访问时崩溃
+    if (laserCloudWorldRGB->size() > 0 && pcl_wait_pub) {
+    pcl_wait_pub->clear();
+  }
+  // LIO-only 模式下不应该清空 pcl_w_wait_pub（由 handleLIO() 寏帧重新填充）
+    if (slam_mode_ == ONLY_LIO || slam_mode_ == ONLY_LO) {
+    // LIO-only 模式：不清空，保留点云用于下次发布
+  } else if (LidarMeasures.lio_vio_flg == VIO) {
+    // VIO 模式：清空点云
+    if (pcl_w_wait_pub) {
+      pcl_w_wait_pub->clear();
+    }
+  }
 }
 
 void LIVMapper::publish_visual_sub_map(const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr &pubSubVisualMap)
