@@ -89,6 +89,24 @@ void SubMapManager::addKeyFrame(const KeyFrame::Ptr& kf) {
         return;
     }
 
+    // 增强关键帧有效性检查
+    if (!kf->cloud_body || kf->cloud_body->empty()) {
+        RCLCPP_WARN(rclcpp::get_logger("automap_system"),
+            "[SubMapManager] addKeyFrame: empty cloud, rejected (kf_id=%lu)", kf->id);
+        METRICS_INCREMENT(metrics::ERRORS_TOTAL);
+        return;
+    }
+
+    // 检查位姿有效性
+    const auto& t = kf->T_w_b.translation();
+    const auto& R = kf->T_w_b.rotation();
+    if (!t.allFinite() || !R.allFinite()) {
+        RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+            "[SubMapManager] addKeyFrame: invalid pose (non-finite), rejected (kf_id=%lu)", kf->id);
+        METRICS_INCREMENT(metrics::ERRORS_TOTAL);
+        return;
+    }
+
     std::unique_lock<std::mutex> lk(mutex_);
 
     METRIC_TIMED_SCOPE(metrics::POINTCLOUD_PROCESS_TIME_MS);
@@ -294,7 +312,11 @@ void SubMapManager::freezeActiveSubmap(const SubMap::Ptr& sm) {
             sm->downsampled_cloud = ds;
             METRICS_HISTOGRAM_OBSERVE(metrics::POINTCLOUD_SIZE, static_cast<double>(sm->merged_cloud->size()));
         }
-        for (auto& cb : frozen_cbs_) cb(sm);
+        {
+            std::vector<SubMapFrozenCallback> cbs_copy;
+            { std::lock_guard<std::mutex> lk(frozen_cbs_mutex_); cbs_copy = frozen_cbs_; }
+            for (auto& cb : cbs_copy) cb(sm);  // 锁外执行回调，禁止回调内调用 getFrozenSubmaps 等会获取 mutex_ 的接口
+        }
         HEALTH_UPDATE_QUEUE("submap", getFrozenSubmaps().size());
         HEALTH_UPDATE_QUEUE("loop", 0);
         RCLCPP_INFO(rclcpp::get_logger("automap_system"), "[SubMapMgr][FREEZE_STEP] exit freeze sm_id=%d (sync)", sm->id);
@@ -333,7 +355,11 @@ void SubMapManager::freezePostProcessLoop() {
                 sm->downsampled_cloud = ds;
                 METRICS_HISTOGRAM_OBSERVE(metrics::POINTCLOUD_SIZE, static_cast<double>(sm->merged_cloud->size()));
             }
-            for (auto& cb : frozen_cbs_) cb(sm);
+            {
+                std::vector<SubMapFrozenCallback> cbs_copy;
+                { std::lock_guard<std::mutex> lk(frozen_cbs_mutex_); cbs_copy = frozen_cbs_; }
+                for (auto& cb : cbs_copy) cb(sm);  // 锁外执行回调，禁止回调内调用 getFrozenSubmaps 等会获取 mutex_ 的接口
+            }
             HEALTH_UPDATE_QUEUE("submap", getFrozenSubmaps().size());
             HEALTH_UPDATE_QUEUE("loop", 0);
             RCLCPP_DEBUG(rclcpp::get_logger("automap_system"), "[SubMapMgr][FREEZE_POST] sm_id=%d downsampled_cloud done", sm->id);

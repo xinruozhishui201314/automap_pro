@@ -164,6 +164,24 @@ Eigen::Vector3d ConfigManager::gpsCovLow() const {
     return readVector3d(cfg_, "gps.cov_low", 4.0, 4.0, 8.0);
 }
 
+bool ConfigManager::gpsEnuOriginConfigured() const {
+    try {
+        YAML::Node g = cfg_["gps"];
+        if (!g.IsMap()) return false;
+        YAML::Node o = g["enu_origin"];
+        return o.IsSequence() && o.size() >= 3;
+    } catch (...) {
+        return false;
+    }
+}
+
+Eigen::Vector3d ConfigManager::gpsEnuOrigin() const {
+    if (!gpsEnuOriginConfigured()) {
+        return Eigen::Vector3d::Zero();
+    }
+    return readVector3d(cfg_, "gps.enu_origin", 0.0, 0.0, 0.0);
+}
+
 std::vector<std::string> ConfigManager::previousSessionDirs() const {
     std::vector<std::string> dirs;
     try {

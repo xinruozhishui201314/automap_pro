@@ -77,7 +77,9 @@ public:
     bool loadArchivedSubmap(const std::string& dir, int submap_id, SubMap::Ptr& out);
 
     // ── 回调注册 ──────────────────────────────────────────────────────────
+    /** 注册子图冻结回调。回调在锁外执行；禁止在回调中调用本类任何会获取 mutex_ 的接口（如 getFrozenSubmaps、addKeyFrame 等），否则可能死锁。入参 sm 即为本次冻结的子图，足以完成逻辑。 */
     void registerSubmapFrozenCallback(SubMapFrozenCallback cb) {
+        std::lock_guard<std::mutex> lk(frozen_cbs_mutex_);
         frozen_cbs_.push_back(std::move(cb));
     }
 
@@ -164,6 +166,7 @@ private:
     rclcpp::Publisher<automap_pro::msg::SubMapEventMsg>::SharedPtr event_pub_;
 
     std::vector<SubMapFrozenCallback> frozen_cbs_;
+    mutable std::mutex frozen_cbs_mutex_;  // 保护 frozen_cbs_，回调前复制列表、锁外执行，避免重入死锁
 
     // 子图冻结后处理异步：voxel(merged_cloud)→downsampled_cloud 与 frozen_cbs_ 在专用线程执行，避免阻塞 addKeyFrame（有界队列+超时防死锁）
     static constexpr size_t   kMaxFreezePostQueueSize = 32;
@@ -181,7 +184,7 @@ private:
     SubMap::Ptr createNewSubmap(const KeyFrame::Ptr& first_kf);
     /** 无参版本仅用于兼容；实际冻结请用传入 submap 的版本，且须在未持 mutex_ 时调用，避免回调内 getFrozenSubmaps 死锁 */
     void        freezeActiveSubmap();
-    /** 对指定子图执行冻结并触发回调；调用方不得持有 mutex_（回调中会调用 getFrozenSubmaps） */
+    /** 对指定子图执行冻结并触发回调。调用方不得持有 mutex_。回调在锁外执行，且禁止在回调中调用本类会获取 mutex_ 的接口（如 getFrozenSubmaps），否则可能死锁。 */
     void        freezeActiveSubmap(const SubMap::Ptr& sm);
     bool        isFull(const SubMap::Ptr& sm) const;
     void        mergeCloudToSubmap(SubMap::Ptr& sm, const KeyFrame::Ptr& kf) const;

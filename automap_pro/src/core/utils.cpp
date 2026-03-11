@@ -10,6 +10,7 @@
 #include <tuple>
 #include <vector>
 #include <cstdint>
+#include <future>
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -178,6 +179,74 @@ CloudXYZIPtr voxelDownsample(const CloudXYZIPtr& cloud, float leaf_size) {
         ALOG_ERROR("Utils", "voxelDownsample unknown exception");
         return cloud;
     }
+}
+
+// ============================================================================
+// V1: 带超时保护的体素下采样
+// ============================================================================
+
+CloudXYZIPtr voxelDownsampleWithTimeout(const CloudXYZIPtr& cloud, float leaf_size,
+                                          int timeout_ms, bool* timed_out) {
+    const unsigned tid = automap_pro::logThreadId();
+    const auto t_start = std::chrono::steady_clock::now();
+    
+    if (timed_out) *timed_out = false;
+    
+    if (!cloud || cloud->empty()) {
+        return cloud;
+    }
+    
+    // 对于小点云，直接处理（通常很快）
+    if (cloud->size() < 50000) {
+        try {
+            return voxelDownsample(cloud, leaf_size);
+        } catch (const std::exception& e) {
+            ALOG_ERROR("Utils", "[tid={}] voxelDownsampleWithTimeout: small cloud exception: {}", tid, e.what());
+            return cloud;
+        } catch (...) {
+            ALOG_ERROR("Utils", "[tid={}] voxelDownsampleWithTimeout: small cloud unknown exception", tid);
+            return cloud;
+        }
+    }
+    
+    // 大点云使用异步 + 超时保护
+    ALOG_DEBUG("Utils", "[tid={}] voxelDownsampleWithTimeout: starting async voxel for {} pts, timeout={}ms",
+               tid, cloud->size(), timeout_ms);
+    
+    // 按值捕获 cloud（shared_ptr 副本），避免超时返回后异步任务悬空引用
+    std::future<CloudXYZIPtr> future = std::async(std::launch::async, [cloud, leaf_size, tid]() -> CloudXYZIPtr {
+        try {
+            return voxelDownsample(cloud, leaf_size);
+        } catch (const std::exception& e) {
+            ALOG_ERROR("Utils", "[tid={}] voxelDownsampleWithTimeout async exception: {}", tid, e.what());
+            return cloud;
+        } catch (...) {
+            ALOG_ERROR("Utils", "[tid={}] voxelDownsampleWithTimeout async unknown exception", tid);
+            return cloud;
+        }
+    });
+    
+    std::future_status status = future.wait_for(std::chrono::milliseconds(timeout_ms));
+    
+    if (status == std::future_status::ready) {
+        auto result = future.get();
+        const auto t_end = std::chrono::steady_clock::now();
+        double elapsed_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+        ALOG_DEBUG("Utils", "[tid={}] voxelDownsampleWithTimeout: completed in {:.1f}ms", tid, elapsed_ms);
+        return result;
+    }
+    
+    // 超时
+    const auto t_end = std::chrono::steady_clock::now();
+    double elapsed_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+    ALOG_WARN("Utils", "[tid={}] voxelDownsampleWithTimeout: TIMEOUT after {:.1f}ms (limit={}ms), returning raw copy for {} pts",
+              tid, elapsed_ms, timeout_ms, cloud->size());
+    
+    if (timed_out) *timed_out = true;
+    
+    // 返回原始点云的副本（经过 sanitize）
+    CloudXYZIPtr result = sanitizePointCloudForVoxel(cloud, kDefaultMaxAbsCoord);
+    return result ? result : cloud;
 }
 
 // 点云点数低于此值时直接单次体素滤波，不走分块循环，避免 PCL 在部分 chunk 上 SIGSEGV

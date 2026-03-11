@@ -24,13 +24,20 @@ enum class EdgeType {
     PRIOR       // 先验约束边
 };
 
+/** 节点类型（用于 HBAWrapper 层级图：子图级 / 关键帧级） */
+enum class NodeType {
+    SUBMAP,
+    KEYFRAME
+};
+
 struct GraphNode {
-    int      id        = -1;
-    Pose3d   pose      = Pose3d::Identity();
-    Pose3d   pose_opt  = Pose3d::Identity();
-    bool     fixed     = false;
-    double   timestamp = 0.0;
-    
+    int       id        = -1;
+    NodeType  type      = NodeType::SUBMAP;  // 用于 HBAWrapper 区分层级
+    Pose3d    pose      = Pose3d::Identity();
+    Pose3d    pose_opt  = Pose3d::Identity();
+    bool      fixed     = false;
+    double    timestamp = 0.0;
+
     using Ptr = std::shared_ptr<GraphNode>;
 };
 
@@ -54,6 +61,8 @@ public:
 
     // 节点管理
     int addNode(const GraphNode& node);
+    /** 便捷接口：按 id/type/pose/fixed 添加节点（HBAWrapper 等使用） */
+    int addNode(int id, NodeType type, const Pose3d& pose, bool fixed = false);
     bool updateNodePose(int id, const Pose3d& pose);
     bool updateNodePoseOpt(int id, const Pose3d& pose);
     GraphNode::Ptr getNode(int id) const;
@@ -62,12 +71,27 @@ public:
 
     // 边管理
     int addEdge(const GraphEdge& edge);
+    /** 便捷接口：添加里程计边（HBAWrapper 等使用） */
+    int addOdomEdge(int from, int to, const Pose3d& rel_pose, const Mat66d& information);
+    /** 便捷接口：添加回环边 */
+    int addLoopEdge(int from, int to, const Pose3d& rel_pose, const Mat66d& information);
+    /** 便捷接口：添加 GPS 一元边（to 用 -1 表示） */
+    int addGPSEdge(int node_id, const Eigen::Vector3d& gps_pos, const Eigen::Matrix3d& gps_cov);
     GraphEdge::Ptr getEdge(int id) const;
     std::vector<GraphEdge> allEdges() const;
     std::vector<GraphEdge> edgesBetween(int from, int to) const;
     std::vector<GraphEdge> odomEdgesFrom(int from) const;
     std::vector<GraphEdge> loopEdgesFrom(int from) const;
     int edgeCount() const;
+
+    /** 回环边数量（HBAWrapper 日志用） */
+    int numLoopEdges() const;
+    /** 与 nodeCount() 一致，别名（HBAWrapper 使用） */
+    int numNodes() const { return nodeCount(); }
+    /** 与 edgeCount() 一致，别名（HBAWrapper 使用） */
+    int numEdges() const { return edgeCount(); }
+    /** 优化后位姿映射 id -> pose（写回后为 pose，否则 pose_opt 若存在） */
+    std::map<int, Pose3d> getOptimizedPoses() const;
 
     // 图查询
     bool hasNode(int id) const;

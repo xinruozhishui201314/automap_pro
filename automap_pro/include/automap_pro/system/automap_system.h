@@ -4,9 +4,11 @@
 #include "automap_pro/frontend/livo_bridge.h"
 #include "automap_pro/frontend/keyframe_manager.h"
 #include "automap_pro/frontend/gps_manager.h"
+#include "automap_pro/sensor/attitude_estimator.h"
 #include "automap_pro/submap/submap_manager.h"
 #include "automap_pro/loop_closure/loop_detector.h"
 #include "automap_pro/backend/incremental_optimizer.h"
+#include "automap_pro/backend/delayed_gps_compensator.h"
 #include "automap_pro/backend/hba_optimizer.h"
 #include "automap_pro/visualization/rviz_publisher.h"
 
@@ -14,6 +16,7 @@
 #include <rclcpp_components/register_node_macro.hpp>
 #include <nav_msgs/msg/path.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
+#include <sensor_msgs/msg/imu.hpp>
 
 // 本包消息类型
 #include <automap_pro/msg/mapping_status_msg.hpp>
@@ -26,6 +29,7 @@
 #include <automap_pro/srv/load_session.hpp>
 #include <std_srvs/srv/trigger.hpp>
 
+#include <memory>
 #include <mutex>
 #include <atomic>
 #include <thread>
@@ -90,8 +94,13 @@ private:
     SubMapManager         submap_manager_;
     LoopDetector          loop_detector_;
     IncrementalOptimizer  isam2_optimizer_;
+    std::unique_ptr<DelayedGPSCompensator> gps_compensator_;
     HBAOptimizer          hba_optimizer_;
     RvizPublisher         rviz_publisher_;
+
+    // GPS 姿态估计（IMU pitch/roll + GPS 航迹角 yaw）
+    std::shared_ptr<AttitudeEstimator> attitude_estimator_;
+    rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_for_attitude_;
 
     // 回环约束缓存（用于可视化）
     std::vector<LoopConstraint::Ptr> loop_constraints_;
@@ -123,6 +132,7 @@ private:
     std::condition_variable   frame_queue_not_full_cv_; // 有空间时唤醒 feeder（背压）
     std::thread               backend_worker_;
     std::atomic<int>          frame_queue_dropped_{0};  // 背压模式下恒为 0
+    std::atomic<int>          backpressure_force_drop_count_{0};  // 背压超限强制丢帧次数（可观测）
     void backendWorkerLoop();
 
     // 按时间戳缓存的 odom / kfinfo，有界、非阻塞写，worker 按帧 ts 对齐读取
@@ -155,9 +165,12 @@ private:
     // 子图计数（用于 HBA 周期触发）
     int  frozen_submap_count_ = 0;
 
-    // 地图发布异步化：专用线程执行 buildGlobalMap + publish，不阻塞后端 worker；与 tryCreateKeyFrame 通过 map_build_mutex_ 串行化读写
+    // 地图发布异步化：专用线程执行 buildGlobalMap + publish。拆锁避免背压死锁：关键帧创建与地图发布分离。
+    // keyframe_mutex_：保护 tryCreateKeyFrame 内对 submap_manager_/kf_manager_/isam2 的写操作（backend 持锁）。
+    // map_publish_mutex_：仅保护 map_publish 线程的 cv 等待与 publishGlobalMap 调用（只读 submap 由 SubMapManager 自身锁保护）。
     std::thread               map_publish_thread_;
-    std::mutex                map_build_mutex_;
+    std::mutex                keyframe_mutex_;
+    std::mutex                map_publish_mutex_;
     std::condition_variable   map_publish_cv_;
     std::atomic<bool>         map_publish_pending_{false};
     void mapPublishLoop();
@@ -193,6 +206,9 @@ private:
     bool        gps_enabled_from_config_ = false;
     std::string gps_topic_from_config_   = "/gps/fix";
 
+    // 健康检查降级：>0 时 backend 使用此值替代 config 的 process_every_n_frames，减轻负载
+    std::atomic<int> process_every_n_override_{0};
+
     // 首次数据到达日志（各打一次，便于确认数据流）
     std::atomic<bool> first_odom_logged_{false};
     std::atomic<bool> first_cloud_logged_{false};
@@ -210,6 +226,23 @@ private:
     std::atomic<int> pub_opt_path_count_{0};
     std::atomic<int> pub_map_count_{0};
     std::atomic<int> pub_status_count_{0};
+
+    // ── V2: 线程心跳监控 ─────────────────────────────────────────────────────
+    // 各关键线程上次心跳时间戳（墙钟），用于检测线程是否卡住
+    std::atomic<int64_t> feeder_heartbeat_ts_ms_{0};       // feeder 线程心跳
+    std::atomic<int64_t> backend_heartbeat_ts_ms_{0};      // backend worker 线程心跳
+    std::atomic<int64_t> map_pub_heartbeat_ts_ms_{0};      // map publish 线程心跳
+    std::atomic<int64_t> loop_opt_heartbeat_ts_ms_{0};     // loop optimization 线程心跳
+    std::atomic<int64_t> viz_heartbeat_ts_ms_{0};          // visualization 线程心跳
+    std::atomic<int64_t> status_pub_heartbeat_ts_ms_{0};   // status publisher 线程心跳
+    
+    // 心跳阈值（毫秒）：超过此时间未更新视为异常
+    static constexpr int64_t kHeartbeatWarnThresholdMs = 10000;   // 10秒未心跳警告
+    static constexpr int64_t kHeartbeatErrorThresholdMs = 30000;  // 30秒未心跳报错
+    
+    // 心跳监控定时器
+    rclcpp::TimerBase::SharedPtr heartbeat_monitor_timer_;
+    void checkThreadHeartbeats();  // 检查各线程心跳状态
 
     // ── 发布者 ────────────────────────────────────────────────────────────
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr                odom_path_pub_;
@@ -292,6 +325,8 @@ private:
 
     // ── 轨迹对比记录（每帧位姿 + GPS，便于脚本绘图分析建图精度）────────────────
     bool trajectory_log_enabled_ = true;
+    /** true=仅建图完成后写 trajectory_odom CSV（关键帧+最终GPS）；false=边建图边写（调试用，轨迹与GPS可能不重合） */
+    bool trajectory_log_after_mapping_only_ = true;
     std::string trajectory_log_dir_;
     std::ofstream trajectory_odom_file_;
     std::ofstream trajectory_gps_file_;
@@ -299,9 +334,13 @@ private:
     std::string trajectory_session_id_;  // 本次会话文件名后缀
     void ensureTrajectoryLogDir();
     void writeTrajectoryOdom(double ts, const Pose3d& pose, const Mat66d& cov);
+    /** 建图完成后写：关键帧位姿 + 最终地图系下 GPS，保证轨迹与 GPS 在同一坐标系下可对比 */
+    void writeTrajectoryOdomAfterMapping(const std::string& output_dir);
     void onGPSMeasurementForLog(double ts, const Eigen::Vector3d& pos_enu);
 
     // ── 工具 ─────────────────────────────────────────────────────────────
+    /** 从子图列表收集所有关键帧（按时间戳排序），用于 RViz 关键帧位姿实时刷新 */
+    static std::vector<KeyFrame::Ptr> collectKeyframesFromSubmaps(const std::vector<SubMap::Ptr>& submaps);
     /** 返回实际输出目录：launch 传入的 output_dir 优先，否则用 system.output_dir */
     std::string getOutputDir() const;
     void saveMapToFiles(const std::string& output_dir);

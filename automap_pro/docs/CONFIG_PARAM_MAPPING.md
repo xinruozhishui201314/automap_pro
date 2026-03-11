@@ -69,6 +69,7 @@
 
 | 代码键 | 类型 | 默认值 | YAML 位置 | 备注 |
 |--------|------|--------|-----------|------|
+| `gps.has_attitude` | bool | false | `gps.has_attitude` | 接收机是否输出姿态角（双天线/INS）；true=直接使用注入的 GPS 姿态，false=使用估计姿态（IMU+航迹角/里程计） |
 | `gps.align_min_points` | int | 50 | `gps.align_min_points` | |
 | `gps.align_min_distance_m` | double | 30.0 | `gps.align_min_distance_m` | |
 | `gps.quality_threshold_hdop` | double | 2.0 | `gps.quality_threshold_hdop` | |

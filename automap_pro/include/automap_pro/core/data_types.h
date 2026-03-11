@@ -48,10 +48,45 @@ enum class GPSQuality : int {
 
 // GPS 对齐状态机
 enum class GPSAlignState : int {
+    WAITING_GPS = -1,    // 等待首帧GPS数据（GPS延迟到达场景）
     NOT_ALIGNED = 0,     // 尚未对齐（GPS信号不足）
     ALIGNING    = 1,     // 正在计算对齐（SVD求解中）
     ALIGNED     = 2,     // 已对齐，可添加GPS约束
     DEGRADED    = 3,     // 对齐后GPS信号再次变差，暂停约束
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// IMU 数据（与 ImuProcessor/TimeSync 共用）
+// ─────────────────────────────────────────────────────────────────────────────
+struct ImuData {
+    double timestamp = 0.0;
+    Eigen::Vector3d angular_velocity = Eigen::Vector3d::Zero();
+    Eigen::Vector3d linear_acceleration = Eigen::Vector3d::Zero();
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 姿态估计来源（用于日志与因子权重）
+// ─────────────────────────────────────────────────────────────────────────────
+enum class AttitudeSource : int {
+    NONE = 0,              // 无有效姿态
+    IMU_ONLY = 1,          // 仅 IMU（pitch/roll）
+    GPS_TRAJECTORY = 2,    // GPS 航迹角 yaw
+    GPS_DUAL_ANTENNA = 3,  // GPS 双天线完整姿态
+    ODOMETRY = 4,          // 里程计 yaw
+    FUSED = 5              // 融合估计（IMU + GPS yaw / odom yaw）
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 姿态估计结果（弧度，ENU）
+// ─────────────────────────────────────────────────────────────────────────────
+struct AttitudeEstimate {
+    double pitch = 0.0;
+    double roll = 0.0;
+    double yaw = 0.0;
+    Eigen::Vector3d variance = Eigen::Vector3d::Ones() * 0.1;  // [pitch, roll, yaw] 方差 rad²
+    AttitudeSource source = AttitudeSource::NONE;
+    bool is_valid = false;
+    double velocity_horizontal = 0.0;  // 水平速度 m/s，用于 yaw 质量评估
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -65,8 +100,16 @@ struct GPSMeasurement {
     int num_satellites        = 0;
     Eigen::Matrix3d covariance = Eigen::Matrix3d::Identity() * 1e6;
     bool is_valid             = false;
+    bool is_outlier            = false;  // 跳变/一致性检测异常
     // 原始GNSS
     double latitude = 0.0, longitude = 0.0, altitude = 0.0;
+
+    // 姿态估计（无 GPS 姿态时由 IMU + 航迹角/里程计 估计）
+    AttitudeEstimate attitude;
+    // 速度估计（由位置差分，用于航迹角与质量评估）
+    Eigen::Vector3d velocity_enu = Eigen::Vector3d::Zero();
+    double speed_horizontal = 0.0;
+    bool has_velocity = false;
 
     using Ptr = std::shared_ptr<GPSMeasurement>;
 };

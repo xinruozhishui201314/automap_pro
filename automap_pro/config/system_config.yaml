@@ -80,7 +80,7 @@ system:
 # ── 性能优化开关（P0/P1：异步与并行，默认开启）────────────────────────────
 performance:
   async_global_map_build: true    # 使用 buildGlobalMapAsync 异步构建全局图
-  async_isam2_update: true       # 回环/GPS 因子入队异步执行，不阻塞主线程
+  async_isam2_update: false       # 回环/GPS 因子入队异步执行，不阻塞主线程
   parallel_voxel_downsample: true # 体素下采样内部循环 OpenMP 并行（需 -fopenmp）
   parallel_teaser_match: true    # 多候选 TEASER 匹配并行（std::async）
   max_optimization_queue_size: 64 # iSAM2 异步队列上限，满则丢弃新任务
@@ -244,6 +244,8 @@ submap:
 
 # ── 3.2 GPS 延迟对齐 ───────────────────────────────────────────────────────
 gps:
+  # 接收机是否输出姿态角（双天线/INS）：true=直接使用注入的 GPS 姿态；false=使用估计姿态（IMU pitch/roll + 航迹角/里程计 yaw）
+  has_attitude:            false
   align_min_points:       50
   align_min_distance_m:   30.0
   keyframe_match_window_s: 0.5   # 关键帧匹配 GPS 的最大时间差(s)；1Hz GPS 时 0.1 易导致 has_gps=0，建议 0.5~1.0
@@ -257,6 +259,17 @@ gps:
   factor_quality_scale_excellent: 2.0   # 按质量自动调整：EXCELLENT 约束更强
   factor_quality_scale_high:      1.0
   factor_quality_scale_medium:    0.5
+  factor_quality_scale_low:       0.25
+
+  # 延迟补偿：GPS 对齐后为历史帧与回环帧补充 GPS 约束（与回环独立，不影响回环检测）
+  delayed_compensation:
+    enabled:                 true   # 是否启用延迟补偿
+    compensate_on_loop:      true   # 回环优化后是否触发补偿
+    compensate_on_align:     true   # 对齐成功后是否立即批量补偿历史子图
+    batch_size:             10     # 每次补偿最大子图数
+    max_pending_submaps:     1000   # 待补偿队列上限
+    base_sigma_h:           0.5    # 补偿时 GPS 水平标准差(米)
+    base_sigma_v:           1.0    # 补偿时 GPS 垂直标准差(米)
 
 # ── 3.3 回环检测 ───────────────────────────────────────────────────────────
 loop_closure:

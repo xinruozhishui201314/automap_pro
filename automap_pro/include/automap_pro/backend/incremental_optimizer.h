@@ -70,6 +70,10 @@ public:
     void addGPSFactor(int sm_id, const Eigen::Vector3d& pos_map,
                       const Eigen::Matrix3d& cov3x3);
 
+    /** 批量添加 GPS 因子并只做一次 commitAndUpdate（由 opt 线程调用，用于避免多次 update 触发 GTSAM 内部竞态） */
+    struct GPSFactorItem { int sm_id; Eigen::Vector3d pos; Eigen::Matrix3d cov; };
+    void addGPSFactorsBatch(const std::vector<GPSFactorItem>& factors);
+
     // ── 查询当前最优位姿 ─────────────────────────────────────────────────
 
     Pose3d getPose(int sm_id) const;
@@ -77,6 +81,9 @@ public:
 
     /** 强制触发完整 iSAM2 update（用于批量 GPS 因子添加后） */
     OptimizationResult forceUpdate();
+
+    /** 是否存在未提交的因子或 value（用于 GPS 批前先 flush，避免 Prior+GPS 同批 update） */
+    bool hasPendingFactorsOrValues() const;
 
     /** 重置（新 session 开始） */
     void reset();
@@ -131,13 +138,46 @@ public:
     /** 获取当前队列深度 */
     size_t getQueueDepth() const;
 
+    // ── 健康检查与恢复 ───────────────────────────────────────────────────
+
+    /** 优化器健康状态 */
+    struct HealthStatus {
+        bool is_healthy = true;
+        int consecutive_failures = 0;
+        int total_optimizations = 0;
+        int failed_optimizations = 0;
+        double last_success_time_ms = 0.0;
+        std::string last_error_message;
+    };
+
+    /** 获取当前健康状态 */
+    HealthStatus getHealthStatus() const;
+
+    /** 记录优化失败（用于健康监控） */
+    void recordOptimizationFailure(const std::string& error_msg);
+
+    /** 记录优化成功 */
+    void recordOptimizationSuccess(double elapsed_ms);
+
+    /** 重置优化器（用于崩溃恢复） */
+    void resetForRecovery();
+
 private:
+    // 健康状态数据
+    std::atomic<int> consecutive_failures_{0};
+    std::atomic<int> total_optimizations_{0};
+    std::atomic<int> failed_optimizations_{0};
+    std::atomic<double> last_success_time_ms_{0.0};
+    std::string last_error_message_;
+    mutable std::mutex health_mutex_;
     gtsam::ISAM2         isam2_;
     gtsam::NonlinearFactorGraph pending_graph_;
     gtsam::Values               pending_values_;
     gtsam::Values               current_estimate_;
 
-    /** 先验因子共用单一 noise model。使用 Diagonal 而非 Constrained，避免进程退出时 GTSAM 析构顺序导致 double-free (SIGSEGV) */
+    /** 先验方差（6 维），用于每次 addSubMapNode 时新建 Prior noise，避免共享 noise 在 linearize 时 double free */
+    gtsam::Vector prior_var6_;
+    /** 仅用于 shutdown 检查与 has_prior_ 语义；Prior 因子改用 prior_var6_ 新建 noise */
     gtsam::noiseModel::Diagonal::shared_ptr prior_noise_;
 
     mutable std::shared_mutex rw_mutex_;

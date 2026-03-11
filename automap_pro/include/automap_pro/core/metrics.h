@@ -285,6 +285,12 @@ inline constexpr const char* FALLBACK_TO_MERGED_CLOUD = "fallback_to_merged_clou
 
 inline constexpr const char* OPTIMIZATIONS_RUN = "optimizations_run";
 
+// iSAM2 优化队列与健康（V1）
+inline constexpr const char* ISAM2_QUEUE_DEPTH = "isam2_queue_depth";
+inline constexpr const char* ISAM2_TASK_DROPPED = "isam2_task_dropped";
+// 可观测性：上次优化是否成功 1=成功 0=失败（V2）
+inline constexpr const char* ISAM2_LAST_SUCCESS = "isam2_last_success";
+
 inline constexpr const char* MAP_EXPORTS = "map_exports";
 inline constexpr const char* ERRORS_TOTAL = "errors_total";
 inline constexpr const char* WARNINGS_TOTAL = "warnings_total";
@@ -544,6 +550,9 @@ private:
         registerCounter(metrics::KEYFRAMES_CREATED, "KeyFrames created");
         registerCounter(metrics::GPS_MEASUREMENTS_VALID, "Valid GPS measurements");
         registerCounter(metrics::OPTIMIZATIONS_RUN, "Optimizations run");
+        registerCounter(metrics::ISAM2_TASK_DROPPED, "iSAM2 optimization tasks dropped (queue full)");
+        registerGauge(metrics::ISAM2_QUEUE_DEPTH, "iSAM2 optimization queue depth");
+        registerGauge(metrics::ISAM2_LAST_SUCCESS, "iSAM2 last update success (1=ok 0=fail)");
         registerCounter(metrics::MAP_EXPORTS, "Map exports");
         registerCounter(metrics::ERRORS_TOTAL, "Total errors");
         registerCounter(metrics::WARNINGS_TOTAL, "Total warnings");

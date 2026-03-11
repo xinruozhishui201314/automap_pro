@@ -28,6 +28,7 @@ public:
 
     struct Result {
         bool   success    = false;
+        bool   converged  = false;  // 是否在阈值内收敛（与 success 一致，未收敛时不写回）
         double final_cost = 0.0;
         int    iterations = 0;
         double time_ms    = 0.0;

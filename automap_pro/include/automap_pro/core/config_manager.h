@@ -40,6 +40,26 @@ public:
         if (v > 256) return 256;
         return static_cast<size_t>(v);
     }
+    /** ROS2 订阅 depth：里程计/点云/KF 话题 KeepLast，过大会占内存；资源受限时可减小。默认 1000 */
+    int subscriptionOdomCloudDepth() const {
+        int v = get<int>("system.subscription_odom_cloud_depth", 1000);
+        return std::max(100, std::min(10000, v));
+    }
+    /** ROS2 订阅 depth：GPS 话题 KeepLast。默认 1000 */
+    int subscriptionGpsDepth() const {
+        int v = get<int>("system.subscription_gps_depth", 1000);
+        return std::max(100, std::min(20000, v));
+    }
+    /** 背压：frame_queue 满时每次等待秒数，资源受限时可缩短以更快丢帧保活。默认 60 */
+    int backpressureWaitSec() const {
+        int v = get<int>("system.backpressure_wait_sec", 60);
+        return std::max(1, std::min(120, v));
+    }
+    /** 背压：最多等待次数，超限后强制丢弃最旧帧。默认 3（即 60*3=180s 后丢帧） */
+    int backpressureMaxWaits() const {
+        int v = get<int>("system.backpressure_max_waits", 3);
+        return std::max(1, std::min(10, v));
+    }
 
     // ── 传感器（ROS2 话题默认从配置文件 sensor: 节读取）────────────────────────
     std::string lidarTopic()    const { return get<std::string>("sensor.lidar.topic", "/os1_cloud_node1/points"); }
@@ -96,12 +116,27 @@ public:
     }
     /** 双样本线性插值时允许的最大时间间隔(秒)，超过则退化为最近邻。默认 2.0 */
     double gpsMaxInterpGapS() const { return std::max(0.2, get<double>("gps.max_interp_gap_s", 2.0)); }
+    /** GPS 滑动窗口最大条数（gps_window_/kf_window_），超限 FIFO 淘汰，防长时间运行 OOM。默认 5000 */
+    size_t gpsMaxWindowSize() const {
+        int v = get<int>("gps.max_window_size", 5000);
+        return static_cast<size_t>(std::max(1000, std::min(50000, v)));
+    }
     /** GPS 因子权重：>1 加强约束（协方差缩小），<1 减弱约束；默认 1.0 */
     double gpsFactorWeight() const { return std::max(0.01, get<double>("gps.factor_weight", 1.0)); }
     /** 按质量自动缩放：EXCELLENT/HIGH/MEDIUM 对应因子强度倍数（>1 则该质量约束更强），与 factor_weight 相乘 */
     double gpsFactorQualityScaleExcellent() const { return std::max(0.1, get<double>("gps.factor_quality_scale_excellent", 2.0)); }
     double gpsFactorQualityScaleHigh()      const { return std::max(0.1, get<double>("gps.factor_quality_scale_high", 1.0)); }
     double gpsFactorQualityScaleMedium()    const { return std::max(0.1, get<double>("gps.factor_quality_scale_medium", 0.5)); }
+    double gpsFactorQualityScaleLow()       const { return std::max(0.1, get<double>("gps.factor_quality_scale_low", 0.25)); }
+    // ── GPS 延迟补偿（对齐后历史帧/回环帧补偿）────────────────────────────────────
+    bool   gpsDelayedCompensationEnabled() const { return get<bool>("gps.delayed_compensation.enabled", true); }
+    bool   gpsCompensateOnLoop()           const { return get<bool>("gps.delayed_compensation.compensate_on_loop", true); }
+    bool   gpsCompensateOnAlign()          const { return get<bool>("gps.delayed_compensation.compensate_on_align", true); }
+    int    gpsCompensationBatchSize()      const { return std::max(1, std::min(100, get<int>("gps.delayed_compensation.batch_size", 10))); }
+    int    gpsMaxPendingSubmaps()          const { return std::max(100, std::min(10000, get<int>("gps.delayed_compensation.max_pending_submaps", 1000))); }
+    /** 补偿时 GPS 协方差基础标准差（米），水平/垂直 */
+    double gpsBaseSigmaH()                 const { return std::max(0.01, get<double>("gps.delayed_compensation.base_sigma_h", 0.5)); }
+    double gpsBaseSigmaV()                 const { return std::max(0.01, get<double>("gps.delayed_compensation.base_sigma_v", 1.0)); }
     // GPS 质量/滤波（gps_processor / gps_fusion 使用；可选，缺省用默认值）
     double gpsExcellentHDOP()   const { return get<double>("gps.quality_excellent_hdop", 0.8); }
     double gpsHighHDOP()        const { return get<double>("gps.quality_high_hdop", 1.5); }
@@ -112,10 +147,31 @@ public:
     int    gpsConsecutiveValid()const { return get<int>("gps.consecutive_valid_required", 3); }
     bool   gpsJumpDetection()   const { return get<bool>("gps.jump_detection_enabled", true); }
     bool   gpsConsistencyCheck()const { return get<bool>("gps.consistency_check_enabled", true); }
+    /** IMU 重力加速度 (m/s²)，用于预积分与姿态估计。默认 9.81 */
+    double imuGravity() const {
+        double v = get<double>("fast_livo.imu.gravity", 9.81);
+        if (!std::isfinite(v) || v <= 0.0) return 9.81;
+        return std::max(8.0, std::min(11.0, v));
+    }
+    // ── GPS 姿态（是否使用接收机姿态）────────────────────────────────────────
+    /** 为 true 时：若通过 addGPSAttitude 注入了接收机姿态（双天线/INS），则直接使用；为 false 时：始终使用估计姿态（IMU pitch/roll + 航迹角/里程计 yaw） */
+    bool   gpsHasAttitude() const { return get<bool>("gps.has_attitude", false); }
+    // ── GPS 姿态估计（IMU pitch/roll + GPS 航迹角 yaw）────────────────────────
+    bool   gpsAttitudeEstimationEnable() const { return get<bool>("gps.attitude_estimation.enable", true); }
+    double gpsAttitudeImuLowpassHz() const { return std::max(0.1, get<double>("gps.attitude_estimation.imu_lowpass_cutoff_hz", 0.5)); }
+    double gpsAttitudeMinVelocityForYaw() const { return std::max(0.1, get<double>("gps.attitude_estimation.min_velocity_for_yaw", 1.0)); }
+    int    gpsAttitudeYawSmoothingWindow() const { return std::max(1, std::min(21, get<int>("gps.attitude_estimation.yaw_smoothing_window", 5))); }
+    double gpsAttitudeYawMaxChangeRad() const { return std::max(0.01, get<double>("gps.attitude_estimation.yaw_max_change_rad", 0.5)); }
+    double gpsAttitudePitchRollBaseVar() const { return std::max(1e-6, get<double>("gps.attitude_estimation.pitch_roll_base_var", 0.01)); }
+    double gpsAttitudeYawVarVelocityScale() const { return std::max(1e-6, get<double>("gps.attitude_estimation.yaw_var_velocity_scale", 0.1)); }
     Eigen::Vector3d gpsCovExcellent() const;
     Eigen::Vector3d gpsCovHigh()     const;
     Eigen::Vector3d gpsCovMedium()   const;
     Eigen::Vector3d gpsCovLow()      const;
+    /** 是否在配置中显式指定 ENU 原点 (lat, lon, alt)。存在则 GPSManager 不再用首条 GPS 覆盖原点。 */
+    bool gpsEnuOriginConfigured() const;
+    /** 若已配置 ENU 原点，返回 [lat, lon, alt]；否则返回 [0,0,0]。调用前可用 gpsEnuOriginConfigured() 判断。 */
+    Eigen::Vector3d gpsEnuOrigin() const;
 
     // ── 【优化】GPS动态协方差和异常值检测参数 ─────────────────────────────
     bool   gpsEnableDynamicCov() const { return get<bool>("gps.enable_dynamic_cov", true); }
@@ -141,6 +197,16 @@ public:
         return std::max(0.0, v);
     }
     int    loopWorkerThreads()  const { return get<int>("loop_closure.worker_threads", 2); }
+    /** 回环描述子队列最大长度，超限丢弃最低优先级，防无界堆积。默认 128 */
+    size_t loopMaxDescQueueSize() const {
+        int v = get<int>("loop_closure.max_desc_queue_size", 128);
+        return static_cast<size_t>(std::max(32, std::min(512, v)));
+    }
+    /** 回环匹配队列最大长度，超限丢弃最旧任务。默认 128 */
+    size_t loopMaxMatchQueueSize() const {
+        int v = get<int>("loop_closure.max_match_queue_size", 128);
+        return static_cast<size_t>(std::max(32, std::min(512, v)));
+    }
 
     // ── OverlapTransformer ────────────────────────────────
     std::string overlapModelPath()   const { return get<std::string>("loop_closure.overlap_transformer.model_path", ""); }
@@ -174,7 +240,7 @@ public:
 
     // ── 性能优化（performance.*）────────────────────────────────────────────
     bool asyncGlobalMapBuild() const { return get<bool>("performance.async_global_map_build", true); }
-    bool asyncIsam2Update() const { return get<bool>("performance.async_isam2_update", true); }
+    bool asyncIsam2Update() const { return get<bool>("performance.async_isam2_update", false); }
     bool parallelVoxelDownsample() const { return get<bool>("performance.parallel_voxel_downsample", true); }
     bool parallelTeaserMatch() const { return get<bool>("performance.parallel_teaser_match", true); }
     int maxOptimizationQueueSize() const {

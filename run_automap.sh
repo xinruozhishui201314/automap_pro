@@ -70,8 +70,11 @@ RUN_AUTOMAP_UNDER_GDB=false
 RUN_FAST_LIVO_UNDER_GDB=false
 # 离线模式是否在启动前清空输出目录（默认 true=每次离线重新建图，避免沿用上次结果）
 CLEAN_OUTPUT_ON_OFFLINE=true
-# 宿主机日志目录：编译输出 → build.log，运行输出 → full.log；默认项目根下的 logs，可用 --log-dir 覆盖
+# 宿主机日志目录：编译输出 → build.log，运行输出 → full.log
+# 默认使用带时间戳子目录 logs/run_YYYYMMDD_HHMMSS/，便于区分每次运行；可用 --log-dir 覆盖为固定目录
 LOG_DIR="${SCRIPT_DIR}/logs"
+LOG_USE_TIMESTAMP_SUBDIR=true
+LOG_DIR_USER_SET=false
 
 # ==================== 帮助信息 ====================
 show_help() {
@@ -96,7 +99,7 @@ AutoMap-Pro 一键编译和运行脚本
     --external-overlap  使用 OverlapTransformer 服务作为回环描述子（需 config 中 loop_closure.overlap_transformer.mode: external_service）
     --clean            清理编译产物后重新编译
     --no-clean-output  离线时不清空输出目录（默认离线会清空 data/automap_output，保证每次重新建图）
-    --log-dir <path>   覆盖默认日志目录（默认: 项目根/logs；编译→build.log，运行→full.log）
+            --log-dir <path>   覆盖默认日志目录（默认: 项目根/logs/run_YYYYMMDD_HHMMSS/；编译→build.log，运行→full.log）
     --help             显示帮助信息
 
 示例:
@@ -110,10 +113,11 @@ AutoMap-Pro 一键编译和运行脚本
     - 工作空间: ${WORKSPACE_DIR}
     - 数据目录: ${DATA_DIR}
     - 输出目录: ${OUTPUT_DIR}（离线模式默认启动前清空，保证每次重新建图；可用 --no-clean-output 保留上次结果）
-    - 日志目录: ${SCRIPT_DIR}/logs（宿主机，便于精准分析）
+    - 日志目录: 默认 ${SCRIPT_DIR}/logs/run_YYYYMMDD_HHMMSS/（宿主机，每次运行独立目录）；--log-dir 可指定固定目录
         automap.log  全程总日志  build.log  编译  full.log  运行  clean.log  清理  image.log  镜像加载/构建
 
 故障排查:
+    - 第三方库（GTSAM/TEASER++/vikit）安装在 automap_ws/install_deps，--clean 不会删除；需强制重编第三方时请手动: rm -rf automap_ws/install_deps
     - 若编译报「CMakeCache.txt directory ... is different than ...」：脚本已自动检测并清理含 /workspace/ 的缓存；仍失败时请加 --clean 后重跑
     - 若 ros2 bag 报「yaml-cpp: bad conversion」：检查 bag 元数据或换 --storage-preset mcap 重录
     - 若 HBA 报 vector::_M_default_append：多为尚无 LIO 位姿，请确保 --config 与 bag 话题一致且 fast_livo 已正常输出
@@ -176,6 +180,7 @@ parse_args() {
                 ;;
             --log-dir)
                 LOG_DIR="$2"
+                LOG_DIR_USER_SET=true
                 shift 2
                 ;;
             --gdb)
@@ -373,7 +378,7 @@ build_project() {
             ${TIME_VOLUMES} \
             -v "${WORKSPACE_DIR}:/root/automap_ws:rw" \
             "${IMAGE_NAME}" \
-            /bin/bash -c "rm -rf /root/automap_ws/build /root/automap_ws/build_teaserpp /root/automap_ws/build_sophus /root/automap_ws/build_ceres /root/automap_ws/install /root/automap_ws/log && echo 'cleaned'" 2>&1 | add_timestamp | tee "${LOG_DIR}/clean.log"
+            /bin/bash -c "rm -rf /root/automap_ws/build /root/automap_ws/build_teaserpp /root/automap_ws/build_sophus /root/automap_ws/build_ceres /root/automap_ws/install /root/automap_ws/log && echo 'cleaned (install_deps 保留，第三方库不重编)'" 2>&1 | add_timestamp | tee "${LOG_DIR}/clean.log"
         CLEAN_EXIT=${PIPESTATUS[0]}
         set -e
         if [ "$CLEAN_EXIT" -eq 0 ]; then
@@ -437,195 +442,25 @@ build_project() {
 
     # 编译输出同时写入宿主机日志目录，便于排查（管道后需用 PIPESTATUS 获取 docker 退出码）
     print_info "编译日志将保存到: ${LOG_DIR}/build.log"
+    [ -f "${SCRIPT_DIR}/scripts/build_inside_container.sh" ] && chmod +x "${SCRIPT_DIR}/scripts/build_inside_container.sh"
     set +e
     docker run --rm \
         ${TIME_VOLUMES} \
         --gpus all \
         --net=host \
         -e DISPLAY=$DISPLAY \
+        -e OMP_NUM_THREADS=1 \
+        -e EIGEN_NUM_THREADS=1 \
+        -e MKL_NUM_THREADS=1 \
         -v /tmp/.X11-unix:/tmp/.X11-unix:rw \
         -v "${WORKSPACE_DIR}:/root/automap_ws:rw" \
         -v "${PROJECT_DIR}:/root/automap_ws/src/automap_pro:ro" \
+        -v "${SCRIPT_DIR}/scripts:/root/scripts:ro" \
         ${THRID_PARTY_MOUNT} \
         ${MAPPING_MOUNT} \
         ${FAST_LIVO_MOUNT} \
         "${IMAGE_NAME}" \
-        /bin/bash -c "
-            set -e
-            source /opt/ros/humble/setup.bash
-            cd /root/automap_ws
-
-            # 若 CMake 缓存为其他路径（如 /workspace/automap_ws）创建，会导致「current directory different than where CMakeCache.txt was created」编译失败，先清理
-            if [ -d build ] && find build -name CMakeCache.txt -exec grep -l '/workspace/' {} \\; 2>/dev/null | grep -q .; then
-              echo '[WARN] 检测到 CMake 缓存路径与当前工作空间不一致（含 /workspace/），清理 build/install/log 后重新编译'
-              rm -rf build install log build_teaserpp build_sophus build_ceres
-            fi
-
-            # 链入 overlap_transformer_msgs / overlap_transformer_ros2 / hba（若存在）
-            [ -d /root/mapping/overlap_transformer_msgs ] && ln -sf /root/mapping/overlap_transformer_msgs src/ 2>/dev/null || true
-            [ -d /root/mapping/overlap_transformer_ros2 ] && ln -sf /root/mapping/overlap_transformer_ros2 src/ 2>/dev/null || true
-            [ -d /root/mapping/HBA-main/HBA_ROS2 ]        && ln -sf /root/mapping/HBA-main/HBA_ROS2 src/hba 2>/dev/null || true
-
-            if [ -d src/overlap_transformer_msgs ]; then
-              echo '========================================'
-              echo '编译 overlap_transformer_msgs'
-              echo '========================================'
-              colcon build --packages-select overlap_transformer_msgs --cmake-args -DCMAKE_BUILD_TYPE=Release
-            fi
-            if [ -d src/overlap_transformer_ros2 ]; then
-              echo '========================================'
-              echo '编译 overlap_transformer_ros2'
-              echo '========================================'
-              colcon build --packages-select overlap_transformer_ros2 --cmake-args -DCMAKE_BUILD_TYPE=Release
-            fi
-            if [ -d src/hba ]; then
-              echo '========================================'
-              echo '编译 hba (HBA-main)'
-              echo '========================================'
-              colcon build --packages-select hba --cmake-args -DCMAKE_BUILD_TYPE=Release
-            fi
-            # TEASER++ 源码：优先仓库根，否则 automap_pro/src/modular（本仓库实际路径）
-            TEASER_SRC=\"\"
-            [ -d /root/mapping/TEASER-plusplus-master ] && TEASER_SRC=/root/mapping/TEASER-plusplus-master
-            [ -z \"\${TEASER_SRC}\" ] && [ -d /root/mapping/automap_pro/src/modular/TEASER-plusplus-master ] && TEASER_SRC=/root/mapping/automap_pro/src/modular/TEASER-plusplus-master
-            if [ -n \"\${TEASER_SRC}\" ]; then
-              echo '========================================'
-              echo '编译 TEASER++ (上游源码，优先于系统版本）'
-              echo '========================================'
-              # 源码在只读挂载 /root/mapping 下，必须在可写的 automap_ws 内建 build 目录
-              TEASER_BUILD=/root/automap_ws/build_teaserpp
-              mkdir -p /root/automap_ws/install/teaserpp
-              mkdir -p \"\${TEASER_BUILD}\" && cd \"\${TEASER_BUILD}\"
-              # thrid_party：优先使用含 pmc-master 的路径（本仓库为 automap_pro/thrid_party）
-              MAP_THRID=/root/mapping/automap_pro/thrid_party
-              [ ! -d \"\${MAP_THRID}/pmc-master\" ] && MAP_THRID=/root/mapping/thrid_party
-              PMC_SRC=\"\${MAP_THRID}/pmc-master\"
-              TINYPLY_SRC=\"\${MAP_THRID}/tinyply\"
-              SPECTRA_SRC=\"\${MAP_THRID}/spectra\"
-              GOOGLETEST_SRC=\"\${MAP_THRID}/googletest\"
-              if [ ! -d \"\${PMC_SRC}\" ]; then
-                echo \"✗ 错误: PMC 源码不存在于 \${PMC_SRC}\"
-                exit 1
-              fi
-              if [ ! -d \"\${TINYPLY_SRC}\" ]; then
-                echo \"✗ 错误: tinyply 源码不存在于 \${TINYPLY_SRC}\"
-                exit 1
-              fi
-              if [ ! -d \"\${SPECTRA_SRC}\" ]; then
-                echo \"✗ 错误: spectra 源码不存在于 \${SPECTRA_SRC}\"
-                exit 1
-              fi
-              if [ ! -d \"\${GOOGLETEST_SRC}\" ]; then
-                echo \"✗ 错误: googletest 源码不存在于 \${GOOGLETEST_SRC}\"
-                exit 1
-              fi
-              echo \"使用本地 PMC 源码: \${PMC_SRC}\"
-              echo \"使用本地 tinyply 源码: \${TINYPLY_SRC}\"
-              echo \"使用本地 spectra 源码: \${SPECTRA_SRC}\"
-              echo \"使用本地 googletest 源码: \${GOOGLETEST_SRC}\"
-              cmake -DCMAKE_BUILD_TYPE=Release \
-                    -DCMAKE_INSTALL_PREFIX=/root/automap_ws/install/teaserpp \
-                    -DBUILD_TEASER_FPFH=ON \
-                    -DBUILD_TESTS=OFF \
-                    -DBUILD_PYTHON_BINDINGS=OFF \
-                    -DFETCHCONTENT_SOURCE_DIR_PMC=\"\${PMC_SRC}\" \
-                    -DFETCHCONTENT_SOURCE_DIR_TINYPLY=\"\${TINYPLY_SRC}\" \
-                    -DFETCHCONTENT_SOURCE_DIR_SPECTRA=\"\${SPECTRA_SRC}\" \
-                    -DFETCHCONTENT_SOURCE_DIR_GOOGLETEST=\"\${GOOGLETEST_SRC}\" \
-                    -DCMAKE_PREFIX_PATH=\"\" \
-                    \"\${TEASER_SRC}\"
-              make -j\$(nproc) && make install
-              cd /root/automap_ws
-              # 设置 CMAKE_PREFIX_PATH，确保工作空间版本优先
-              export CMAKE_PREFIX_PATH=/root/automap_ws/install/teaserpp:\$CMAKE_PREFIX_PATH
-              echo \"✓ TEASER++ 源码编译完成，安装到工作空间\"
-            else
-              echo \"========================================\"
-              echo \"TEASER-plusplus-master 未找到，将使用系统安装的 TEASER++（如果存在）\"
-              echo \"========================================\"
-            fi
-            # 确保 src/fast_livo 存在：优先使用挂载；若无则从 mapping 链入（automap_pro/src/modular/fast-livo2-humble）
-            if [ ! -f src/fast_livo/package.xml ] && [ -d /root/mapping/automap_pro/src/modular/fast-livo2-humble ]; then
-              rm -f src/fast_livo 2>/dev/null || true
-              ln -sfn /root/mapping/automap_pro/src/modular/fast-livo2-humble src/fast_livo
-              echo \"[INFO] 已从 mapping 链入 fast-livo2-humble → src/fast_livo\"
-            fi
-            if [ -f src/fast_livo/package.xml ]; then
-              echo '========================================'
-              echo '编译 vikit_common / vikit_ros (rpg_vikit_ros2 本地)'
-              echo '========================================'
-              colcon build --paths src/thrid_party/rpg_vikit_ros2/vikit_common src/thrid_party/rpg_vikit_ros2/vikit_ros --cmake-args -DCMAKE_BUILD_TYPE=Release
-              source install/setup.bash
-              echo '========================================'
-              echo '编译 Sophus (fast_livo 依赖)'
-              echo '========================================'
-              # Sophus 的 test/ceres 需要 Ceres（ceres/manifold.h）。若使用本地 ceres-solver 则先编译并安装，再让 Sophus 链接；否则关闭 Sophus 测试。
-              CERES_SRC=/root/automap_ws/src/thrid_party/ceres-solver
-              CERES_INSTALL=/root/automap_ws/install/ceres
-              SOPHUS_CMAKE_EXTRA=\"-DBUILD_SOPHUS_TESTS=OFF\"
-              if [ -d \"\${CERES_SRC}\" ]; then
-                echo '使用本地 ceres-solver，先编译并安装到 install/ceres'
-                mkdir -p /root/automap_ws/build_ceres \"\${CERES_INSTALL}\"
-                (cd /root/automap_ws/build_ceres && cmake -DCMAKE_BUILD_TYPE=Release \
-                  -DCMAKE_INSTALL_PREFIX=\"\${CERES_INSTALL}\" \
-                  -DBUILD_TESTING=OFF \
-                  -DBUILD_EXAMPLES=OFF \
-                  -DBUILD_BENCHMARKS=OFF \
-                  -DMINIGLOG=ON \
-                  -DCERES_ADD_GERRIT_COMMIT_HOOK=OFF \
-                  \"\${CERES_SRC}\" && make -j\$(nproc) && make install)
-                if [ -f \"\${CERES_INSTALL}/lib/cmake/Ceres/CeresConfig.cmake\" ] || [ -f \"\${CERES_INSTALL}/lib64/cmake/Ceres/CeresConfig.cmake\" ]; then
-                  CERES_CMAKE_DIR=\"\${CERES_INSTALL}/lib/cmake/Ceres\"
-                  [ -f \"\${CERES_INSTALL}/lib64/cmake/Ceres/CeresConfig.cmake\" ] && CERES_CMAKE_DIR=\"\${CERES_INSTALL}/lib64/cmake/Ceres\"
-                  SOPHUS_CMAKE_EXTRA=\"-DCeres_DIR=\${CERES_CMAKE_DIR}\"
-                  echo \"✓ 本地 Ceres 已安装，Sophus 将使用 Ceres_DIR=\${CERES_CMAKE_DIR}\"
-                else
-                  echo \"⚠ Ceres 安装未找到 CeresConfig.cmake，Sophus 将关闭测试编译\"
-                fi
-              fi
-              # Sophus 无 package.xml，不能用 colcon；用 cmake 单独编译并安装到 install/sophus
-              SOPHUS_SRC=/root/automap_ws/src/thrid_party/Sophus
-              SOPHUS_BUILD=/root/automap_ws/build_sophus
-              SOPHUS_INSTALL=/root/automap_ws/install/sophus
-              mkdir -p \"\${SOPHUS_BUILD}\" \"\${SOPHUS_INSTALL}\"
-              (cd \"\${SOPHUS_BUILD}\" && cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=\"\${SOPHUS_INSTALL}\" -DSOPHUS_INSTALL=ON \${SOPHUS_CMAKE_EXTRA} \"\${SOPHUS_SRC}\" && make -j\$(nproc) && make install)
-              export CMAKE_PREFIX_PATH=\"\${SOPHUS_INSTALL}:\$CMAKE_PREFIX_PATH\"
-              source install/setup.bash
-              echo '========================================'
-              echo '编译 fast_livo (fast-livo2-humble)'
-              echo '========================================'
-              colcon build --paths src/fast_livo --cmake-args -DCMAKE_BUILD_TYPE=Release -DSophus_DIR=\"\${SOPHUS_INSTALL}/share/sophus/cmake\"
-            fi
-            echo '========================================'
-            echo '编译 automap_pro'
-            echo '========================================'
-            echo '[INFO] automap_pro 包较大，将实时输出编译进度（可能需 3～8 分钟）...'
-            if [ -d /root/automap_ws/install/teaserpp ]; then
-              export CMAKE_PREFIX_PATH=/root/automap_ws/install/teaserpp:\$CMAKE_PREFIX_PATH
-            fi
-            colcon build --packages-select automap_pro --cmake-args -DCMAKE_BUILD_TYPE=Release -DNLOHMANN_JSON_LOCAL=/root/automap_ws/src/thrid_party/nlohmann-json3 --event-handlers console_direct+
-
-            echo ''
-            echo '========================================'
-            echo '验证编译产物'
-            echo '========================================'
-            if [ -d src/fast_livo ]; then
-              if [ -f install/fast_livo/share/fast_livo/package.xml ]; then
-                echo '✓ fast_livo (fast-livo2-humble) 已安装'
-                source install/setup.bash && (ros2 pkg list | grep -q '^fast_livo\$') && echo '✓ fast_livo 已进入工作空间 overlay' || echo '⚠ fast_livo 未在 ros2 pkg list 中可见（请检查 install/setup.bash）'
-              else
-                echo '✗ fast_livo 未找到安装产物 (install/fast_livo/share/fast_livo/package.xml)'
-                exit 1
-              fi
-            fi
-            if [ ! -f install/automap_pro/share/automap_pro/package.xml ]; then
-              echo '✗ automap_pro 未找到安装产物'
-              exit 1
-            fi
-            echo '✓ automap_pro 已安装'
-            echo '✓ 验证通过'
-            echo '✓ 编译完成'
-        " 2>&1 | add_timestamp | tee "${LOG_DIR}/build.log"
+        /bin/bash /root/scripts/build_inside_container.sh 2>&1 | add_timestamp | tee "${LOG_DIR}/build.log"
     BUILD_EXIT=${PIPESTATUS[0]}
     set -e
 
@@ -792,6 +627,21 @@ except Exception as e:
 
     print_info "启动命令: ros2 launch ${LAUNCH_SPEC} ${LAUNCH_ARGS}"
 
+    # 使用外部前端时必须有 fast_livo 已编译，否则 launch 会跳过该节点、后端无数据
+    if [ "$USE_EXTERNAL_FRONTEND" = true ]; then
+        if [ ! -d "${WORKSPACE_DIR}/install/fast_livo" ] && [ ! -f "${WORKSPACE_DIR}/install/fast_livo/share/fast_livo/package.xml" ]; then
+            print_error "未找到 fast_livo 安装（install/fast_livo），无法启动前端节点，后端将一直等待数据。"
+            echo ""
+            echo "  若源码已在 automap_pro/src/modular/fast-livo2-humble 下，请执行完整编译（会编译 fast_livo 并安装）："
+            echo "    bash run_automap.sh --offline --bag-file \"\$(pwd)/data/automap_input/M2DGR/street_03_ros2\" --config system_config_M2DGR.yaml --clean"
+            echo "  编译时请查看 build.log 中 \"[INFO] fast_livo 源码检查\" 和 \"编译 fast_livo\" 是否出现；若无则容器内未找到该路径。"
+            echo ""
+            echo "  或使用内部前端：加参数 --no-external-frontend 再运行（若支持）。"
+            echo "  当前检查路径: ${WORKSPACE_DIR}/install/fast_livo"
+            exit 1
+        fi
+    fi
+
     # 配置 X11 转发
     xhost +local:docker &> /dev/null || true
 
@@ -834,6 +684,9 @@ except Exception as e:
         --ipc=host \
         -e DISPLAY=$DISPLAY \
         -e NVIDIA_DRIVER_CAPABILITIES=all \
+        -e OMP_NUM_THREADS=1 \
+        -e EIGEN_NUM_THREADS=1 \
+        -e MKL_NUM_THREADS=1 \
         -v /tmp/.X11-unix:/tmp/.X11-unix:rw \
         -v /dev:/dev \
         -v "${WORKSPACE_DIR}:/root/automap_ws:rw" \
@@ -843,7 +696,15 @@ except Exception as e:
         -w /root/automap_ws \
         "${IMAGE_NAME}" \
         /bin/bash -c "
+            # ✅ 修复：限制线程数以避免 GTSAM TBB 并行导致 SIGSEGV
+            export OMP_NUM_THREADS=1
+            export EIGEN_NUM_THREADS=1
+            export MKL_NUM_THREADS=1
+
             source /opt/ros/humble/setup.bash
+            # 先加载 install_deps（GTSAM/TEASER++/vikit），再加载主工作空间
+            if [ -f install_deps/setup.bash ]; then source install_deps/setup.bash; fi
+            for d in install_deps/gtsam/lib install_deps/teaserpp/lib; do [ -d \"\$d\" ] && export LD_LIBRARY_PATH=\"\$d:\$LD_LIBRARY_PATH\"; done
             source install/setup.bash
             ${CONTAINER_LAUNCH_CMD}
         "
@@ -869,6 +730,11 @@ main() {
 
     # 解析参数
     parse_args "$@"
+
+    # 未指定 --log-dir 时使用带时间戳子目录，便于区分每次运行
+    if [ "${LOG_DIR_USER_SET}" != "true" ] && [ "${LOG_USE_TIMESTAMP_SUBDIR}" = "true" ]; then
+        LOG_DIR="${SCRIPT_DIR}/logs/run_$(date +%Y%m%d_%H%M%S)"
+    fi
 
     # 确保日志目录存在，并将本次运行的全部输出带时间戳写入 logs/automap.log，便于精准分析
     mkdir -p "${LOG_DIR}"

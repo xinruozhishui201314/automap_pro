@@ -1,7 +1,9 @@
 #pragma once
 
 #include "automap_pro/core/data_types.h"
+#include "automap_pro/sensor/attitude_estimator.h"
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <vector>
 #include <functional>
@@ -66,6 +68,25 @@ public:
     /** 诊断用：当前 GPS 窗口时间范围 [min_ts, max_ts]，便于判断 odom 时间是否落在范围内。返回 true 表示有数据并已写入 out_min_ts、 out_max_ts */
     bool getGpsWindowTimeRange(double* out_min_ts, double* out_max_ts) const;
 
+    /** 诊断用：获取首个 GPS 时间戳（用于计算 GPS 到达延迟） */
+    double getFirstGpsTimestamp() const;
+
+    /** 诊断用：获取最后一个 GPS 时间戳 */
+    double getLastGpsTimestamp() const;
+
+    /** 
+     * @brief 为对齐后的历史关键帧补充 GPS 绑定
+     * @param kf_timestamps 关键帧时间戳和子图ID列表 [(timestamp, submap_id), ...]
+     * @param max_dt 最大时间差（秒），默认 0.5s
+     * @return 成功绑定的 [(submap_id, GPSMeasurement), ...]
+     * 
+     * 使用场景：GPS 数据延迟到达时，对齐前已创建的关键帧无法绑定 GPS。
+     * 对齐成功后调用此方法，为历史关键帧补充 GPS 约束。
+     */
+    std::vector<std::pair<int, GPSMeasurement>> getHistoricalGPSBindings(
+        const std::vector<std::pair<double, int>>& kf_timestamps,
+        double max_dt = 0.5) const;
+
     // ── GPS-LiDAR 外参 ────────────────────────────────────────────────────
 
     /** 获取旋转矩阵 R_lidar_gps（将GPS ENU坐标变换到LiDAR轨迹坐标系） */
@@ -74,6 +95,13 @@ public:
 
     /** 将 GPS ENU 坐标转换为 LiDAR 地图坐标系下的位置 */
     Eigen::Vector3d enu_to_map(const Eigen::Vector3d& enu) const;
+
+    /**
+     * 获取当前滑动窗口内所有 GPS 点在地图坐标系下的位置（建图结束时导出 PCD 用）。
+     * 仅当已对齐（ALIGNED/DEGRADED）时返回非空；未对齐时返回空向量。
+     * 返回 [(timestamp, pos_map), ...]，按时间顺序。
+     */
+    std::vector<std::pair<double, Eigen::Vector3d>> getGpsPositionsInMapFrame() const;
 
     // ── 回调注册 ──────────────────────────────────────────────────────────
 
@@ -92,6 +120,30 @@ public:
 
     // ── 强制重新对齐（用于 GPS 信号恢复后） ──────────────────────────────
     void triggerRealign();
+
+    /**
+     * 设置对齐调度器（可选）。若设置，达到对齐条件时不在此线程执行 try_align()，而是调用调度器；
+     * 由调用方在后台线程中执行 runScheduledAlignment()，避免阻塞 ROS 回调。
+     * 不设置则保持同步行为（当前逻辑）。
+     */
+    using AlignScheduler = std::function<void()>;
+    void setAlignScheduler(AlignScheduler f) { align_scheduler_ = std::move(f); }
+
+    /**
+     * 执行已调度的对齐。由后台线程（如 backend worker）在适当时机调用；
+     * 若此前 addGPSMeasurement 已触发调度（pending_align_），则执行 try_align() 并清除标志。
+     */
+    void runScheduledAlignment();
+
+    /** 设置姿态估计器（可选）。设置后 queryByTimestamp/queryByTimestampForLog 会填充 attitude/velocity */
+    void setAttitudeEstimator(std::shared_ptr<AttitudeEstimator> estimator) { attitude_estimator_ = std::move(estimator); }
+
+    /**
+     * 从 ConfigManager 重新加载 GPS 相关参数并写回成员。
+     * 用于修复「GPSManager 在 config 加载前构造导致 YAML 配置未生效」的问题；
+     * 应在 config 已加载后调用（如 AutoMapSystem::deferredSetupModules 中、注册 GPS 回调前）。
+     */
+    void applyConfig();
 
 private:
     // ENU 原点（第一个有效GPS点确定，call_once 避免多线程竞态）
@@ -134,6 +186,12 @@ private:
     std::vector<AlignCallback>         align_cbs_;
     std::vector<GpsFactorCallback>     gps_factor_cbs_;
     std::vector<MeasurementLogCallback> measurement_log_cbs_;
+
+    /** 异步对齐：达到条件时调用此调度器，由后台线程执行 runScheduledAlignment() */
+    AlignScheduler align_scheduler_;
+    std::atomic<bool> pending_align_{false};
+
+    std::shared_ptr<AttitudeEstimator> attitude_estimator_;
 
     // ── 私有方法 ──────────────────────────────────────────────────────────
     Eigen::Vector3d wgs84_to_enu(double lat, double lon, double alt) const;

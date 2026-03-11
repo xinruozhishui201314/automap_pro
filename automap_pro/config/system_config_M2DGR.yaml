@@ -31,6 +31,12 @@ system:
   # 计算效率优化：大幅度增加 buff，来一帧修一帧，避免接收/处理不及时丢帧（见 docs/FULL_LOG_MAPPING_END_AND_FRAME_ANALYSIS.md）
   frame_queue_max_size: 5000
   ingress_queue_max_size: 2000
+  # ROS2 订阅 depth（点云/里程计/KF/GPS），资源受限时可减小以降低内存
+  subscription_odom_cloud_depth: 1000
+  subscription_gps_depth: 1000
+  # 背压：frame_queue 满时等待秒数与最大等待次数，超限后强制丢帧（资源受限可缩短）
+  backpressure_wait_sec: 60
+  backpressure_max_waits: 3
 
 # 运行模式与传感器空闲超时（EARLY_SHUTDOWN_QUICK_FIX：离线用 7200s 避免 bag 未播完就结束）
 mode:
@@ -43,7 +49,7 @@ mode:
 # 性能优化开关（默认开启，与 system_config.yaml 一致）
 performance:
   async_global_map_build: true
-  async_isam2_update: true
+  async_isam2_update: false
   parallel_voxel_downsample: true
   parallel_teaser_match: true
   max_optimization_queue_size: 64
@@ -133,7 +139,7 @@ fast_livo:
     lidar_type:       2         # 2=Velodyne
     scan_line:        32
     point_filter_num: 3
-    filter_size_surf: 0.20      # 原 0.25，减小以改善点云密度、减轻模糊
+    filter_size_surf: 0.25      # 原 0.25，减小以改善点云密度、减轻模糊
     blind:            1.0       # 最小量程约 1.0 m
 
   vio:                                     # VIO（仅 img_en=1 生效）
@@ -150,11 +156,11 @@ fast_livo:
 
   imu:                                     # IMU 噪声与积分（M2DGR Xsens）
     imu_en:         true
-    imu_int_frame:  10
-    acc_cov:        0.05
-    gyr_cov:        0.005
-    b_acc_cov:      0.00001
-    b_gyr_cov:      0.000001
+    imu_int_frame:  30
+    acc_cov:        2.0
+    gyr_cov:        0.1
+    b_acc_cov:      0.0001
+    b_gyr_cov:      0.0001
     gravity_est_en: true
     ba_bg_est_en:   true
 
@@ -163,7 +169,7 @@ fast_livo:
     dept_err:        0.02
     beam_err:        0.05
     min_eigen_value: 0.0025
-    voxel_size:      0.25
+    voxel_size:      2.0
     max_layer:       2
     max_points_num:  50
     sigma_num:       3.0
@@ -224,9 +230,14 @@ submap:
 
 # ── 3.2 GPS 延迟对齐（M2DGR 含 /ublox/fix，可做 GPS 约束）────────────────────
 gps:
-  align_min_points:       30      # ⬇️ 降低（50→30），弱GPS场景高质量点少
-  align_min_distance_m:   30.0
-  keyframe_match_window_s: 0.5   # 关键帧匹配 GPS 的最大时间差(s)；1Hz GPS 时 0.1 易导致 has_gps=0，建议 0.5~1.0
+  # 接收机是否输出姿态角（双天线/INS）：true=直接使用注入的 GPS 姿态；false=使用估计姿态（IMU pitch/roll + 航迹角/里程计 yaw）
+  has_attitude:            false
+  # 可选：若指定 enu_origin，则系统使用该经纬高作为 ENU 原点，首条 GPS 不再改写原点。
+  # 典型用法：室外固定测试场地/生产地图，保持统一原点，便于多次回放与多车复用。
+  # enu_origin: [31.026058, 121.436795, 26.8]   # 示例：lat, lon, alt（WGS84）
+  align_min_points:       20      # ⬇️ 降低（50→30），弱GPS场景高质量点少
+  align_min_distance_m:   15.0
+  keyframe_match_window_s: 1.0   # 关键帧匹配 GPS 的最大时间差(s)；1Hz GPS 时 0.5 易导致 queryByTimestamp not_found，建议 1.0~1.5
   max_interp_gap_s:        2.0   # 双样本线性插值最大间隔(s)，超过则退化为最近邻；位置线性插值，姿态由里程计提供
   # 【修复】M2DGR弱GPS场景参数调整： HDOP通常8-12，需要放宽阈值
   # 原因：M2DGR是城市峡谷场景，GPS多路径效应严重，HDOP约8-12
@@ -244,6 +255,30 @@ gps:
   factor_quality_scale_excellent: 2.0   # EXCELLENT(HDOP≤1) 约束更强
   factor_quality_scale_high:      1.0   # HIGH(HDOP≤2) 基准
   factor_quality_scale_medium:    0.3   # MEDIUM(HDOP≤10) 约束较弱
+  factor_quality_scale_low:       0.25
+
+  # 延迟补偿：GPS 对齐后为历史帧与回环帧补充 GPS 约束（与回环独立）
+  delayed_compensation:
+    enabled:                 true
+    compensate_on_loop:      true
+    compensate_on_align:     true
+    batch_size:             10
+    max_pending_submaps:     1000
+    base_sigma_h:           0.5
+    base_sigma_v:           1.0
+
+  # 滑动窗口上界：gps_window_/kf_window_ 超过此条数 FIFO 淘汰，防长时间运行 OOM（默认 5000）
+  max_window_size: 5000
+
+  # 姿态估计（GPS 无姿态时：IMU 估计 pitch/roll，GPS 航迹角估计 yaw，运动中修正；兼容 GPS 有姿态）
+  attitude_estimation:
+    enable:                    true
+    imu_lowpass_cutoff_hz:      0.5    # IMU 加速度低通截止频率
+    min_velocity_for_yaw:       1.0    # 航迹角有效最小速度 (m/s)
+    yaw_smoothing_window:       5      # yaw 平滑窗口
+    yaw_max_change_rad:         0.5    # 单步 yaw 最大变化 (rad)
+    pitch_roll_base_var:        0.01   # pitch/roll 基础方差
+    yaw_var_velocity_scale:     0.1    # yaw 方差 = scale / velocity²
 
 # ── 3.3 回环检测 ───────────────────────────────────────────────────────────
 loop_closure:
@@ -255,6 +290,9 @@ loop_closure:
   # 几何距离预筛：两子图锚定位姿距离超过此值(米)的候选将被过滤，抑制重复结构误检。0=关闭
   geo_prefilter_max_distance_m: 0.0   # 0=关闭；可设为 150~200 抑制远距离相似场景误检
   worker_threads:      2
+  # 描述子/匹配队列上界，超限丢弃最低优先级或最旧任务，防无界堆积（默认 128）
+  max_desc_queue_size:  128
+  max_match_queue_size: 128
   overlap_transformer:
     # 空则 launch 自动解析为仓库内 src/modular/OverlapTransformer-master/model/pretrained_overlap_transformer.pth.tar（回环粗匹配必须使用该模型）
     model_path:     ""

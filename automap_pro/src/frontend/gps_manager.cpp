@@ -5,6 +5,7 @@
 
 #include <GeographicLib/LocalCartesian.hpp>
 #include <Eigen/SVD>
+#include <chrono>
 #include <numeric>
 #include <cmath>
 
@@ -27,6 +28,35 @@ GPSManager::GPSManager() {
     online_calib_min_dist_    = 5.0;   // 最小累积距离触发在线校正（米）
     online_calib_max_rmse_    = 2.0;   // 在线校正RMSE阈值（米）
     online_calib_min_samples_ = 5;     // 在线校正最小样本数
+
+    // 若配置中显式给出了 ENU 原点，经纬高以配置为准，避免首条 GPS 改写原点
+    if (cfg.gpsEnuOriginConfigured()) {
+        Eigen::Vector3d origin = cfg.gpsEnuOrigin();  // [lat, lon, alt]
+        enu_origin_lat_ = origin.x();
+        enu_origin_lon_ = origin.y();
+        enu_origin_alt_ = origin.z();
+        enu_origin_set_.store(true, std::memory_order_release);
+        ALOG_INFO(MOD,
+                  "[ENU_ORIGIN] Using configured ENU origin: lat={:.6f} lon={:.6f} alt={:.2f} "
+                  "(gps.enu_origin from YAML, will be written to map_frame.cfg)",
+                  enu_origin_lat_, enu_origin_lon_, enu_origin_alt_);
+        std::string cfg_path = cfg.mapFrameConfigPath();
+        MapFrameConfig::write(cfg_path, enu_origin_lat_, enu_origin_lon_, enu_origin_alt_);
+    }
+}
+
+void GPSManager::applyConfig() {
+    const auto& cfg = ConfigManager::instance();
+    min_align_points_       = cfg.gpsAlignMinPoints();
+    min_align_dist_m_      = cfg.gpsAlignMinDist();
+    keyframe_match_window_s_ = cfg.gpsKeyframeMatchWindowS();
+    keyframe_max_hdop_     = cfg.gpsKeyframeMaxHdop();
+    max_interp_gap_s_      = cfg.gpsMaxInterpGapS();
+    quality_hdop_thresh_   = cfg.gpsQualityThreshold();
+    rmse_accept_thresh_   = cfg.gpsAlignRmseThresh();
+    good_samples_needed_  = cfg.gpsGoodSamplesNeeded();
+    ALOG_INFO(MOD, "[applyConfig] min_align_points={} min_align_dist_m={:.1f} keyframe_match_window_s={:.2f}",
+              min_align_points_, min_align_dist_m_, keyframe_match_window_s_);
 }
 
 void GPSManager::addGPSMeasurement(
@@ -35,44 +65,83 @@ void GPSManager::addGPSMeasurement(
     double hdop, int num_sats)
 {
     // ENU 原点仅设置一次，避免多线程竞态；并写入 map_frame.cfg 供后端统一使用
+    // 若已通过配置指定 ENU 原点，则此处仅负责写回配置文件，不再用首条 GPS 覆盖。
     std::call_once(enu_origin_once_, [this, latitude, longitude, altitude]() {
-        enu_origin_lat_ = latitude;
-        enu_origin_lon_ = longitude;
-        enu_origin_alt_ = altitude;
-        enu_origin_set_.store(true);
-        ALOG_INFO(MOD, "ENU origin set: lat={:.6f} lon={:.6f} alt={:.2f}",
-                  latitude, longitude, altitude);
+        if (!enu_origin_set_.load(std::memory_order_acquire)) {
+            enu_origin_lat_ = latitude;
+            enu_origin_lon_ = longitude;
+            enu_origin_alt_ = altitude;
+            enu_origin_set_.store(true, std::memory_order_release);
+            ALOG_INFO(MOD, "ENU origin set from first GPS fix: lat={:.6f} lon={:.6f} alt={:.2f}",
+                      latitude, longitude, altitude);
+        } else {
+            ALOG_INFO(MOD,
+                      "ENU origin already configured (e.g., from YAML). "
+                      "Skipping GPS-based override and writing existing origin to map_frame.cfg");
+        }
         std::string cfg_path = ConfigManager::instance().mapFrameConfigPath();
-        MapFrameConfig::write(cfg_path, latitude, longitude, altitude);
+        MapFrameConfig::write(cfg_path, enu_origin_lat_, enu_origin_lon_, enu_origin_alt_);
     });
 
-    std::lock_guard<std::mutex> lk(mutex_);
+    Eigen::Vector3d pos_enu;
+    GPSQuality quality;
+    double log_ts = 0.0;
+    Eigen::Vector3d log_pos;
+    std::vector<MeasurementLogCallback> log_cbs;
 
-    Eigen::Vector3d pos_enu = wgs84_to_enu(latitude, longitude, altitude);
-    GPSQuality quality = hdop_to_quality(hdop);
+    {
+        std::lock_guard<std::mutex> lk(mutex_);
 
-    // 填入滑动窗口
-    GPSRecord rec;
-    rec.timestamp = timestamp;
-    rec.pos_enu   = pos_enu;
-    rec.quality   = quality;
-    rec.hdop      = hdop;
-    gps_window_.push_back(rec);
-    if (gps_window_.size() > 2000) gps_window_.pop_front();
+        pos_enu = wgs84_to_enu(latitude, longitude, altitude);
+        quality = hdop_to_quality(hdop);
 
-    // 诊断：首次与每 100 条打印，便于确认 GPS 是否进入系统（若轨迹 CSV 无 GPS 且从未见本日志，则 LivoBridge 未收到有效 fix）
-    static std::atomic<uint32_t> add_count{0};
-    uint32_t n = add_count++;
-    size_t w = gps_window_.size();
-    if (n == 0) {
-        ALOG_INFO(MOD, "[GPS_DIAG] First GPS measurement added: ts={:.3f} lat={:.6f} lon={:.6f} hdop={:.2f} quality={} window_size={}",
-                  timestamp, latitude, longitude, hdop, static_cast<int>(quality), w);
-    } else if (n % 100 == 0) {
-        ALOG_INFO(MOD, "[GPS_DIAG] GPS measurement #{} ts={:.3f} window_size={}", n + 1, timestamp, w);
+        // 填入滑动窗口
+        GPSRecord rec;
+        rec.timestamp = timestamp;
+        rec.pos_enu   = pos_enu;
+        rec.quality   = quality;
+        rec.hdop      = hdop;
+        gps_window_.push_back(rec);
+        const size_t max_gps_window = ConfigManager::instance().gpsMaxWindowSize();
+        while (gps_window_.size() > max_gps_window) gps_window_.pop_front();
+
+        // 诊断：首次与每 100 条打印，便于确认 GPS 是否进入系统（若轨迹 CSV 无 GPS 且从未见本日志，则 LivoBridge 未收到有效 fix）
+        static std::atomic<uint32_t> add_count{0};
+        uint32_t n = add_count++;
+        size_t w = gps_window_.size();
+        if (n == 0) {
+            ALOG_INFO(MOD, "[GPS_DIAG] First GPS measurement added: ts={:.3f} lat={:.6f} lon={:.6f} hdop={:.2f} quality={} window_size={}",
+                      timestamp, latitude, longitude, hdop, static_cast<int>(quality), w);
+        } else if (n % 100 == 0) {
+            ALOG_INFO(MOD, "[GPS_DIAG] GPS measurement #{} ts={:.3f} window_size={}", n + 1, timestamp, w);
+        }
+
+        // 【修复】复制回调列表与数据，在锁外执行，避免阻塞 Executor（死锁/长时间持锁）
+        log_ts = timestamp;
+        log_pos = pos_enu;
+        log_cbs = measurement_log_cbs_;
     }
 
-    // 轨迹对比：每条 GPS 测量通知外部落盘（用于与 odom 曲线对比分析建图精度）
-    for (auto& cb : measurement_log_cbs_) cb(timestamp, pos_enu);
+    // 轨迹对比：在锁外执行，避免 onGPSMeasurementForLog 等回调内锁与 mutex_ 形成死锁
+    for (auto& cb : log_cbs) {
+        try {
+            cb(log_ts, log_pos);
+        } catch (const std::exception& e) {
+            ALOG_ERROR(MOD, "[GPS_CALLBACK] measurement_log callback exception: {}", e.what());
+        } catch (...) {
+            ALOG_ERROR(MOD, "[GPS_CALLBACK] measurement_log callback unknown exception");
+        }
+    }
+
+    bool need_sync_align = false;
+    bool have_factor = false;
+    double factor_ts = 0.0;
+    Eigen::Vector3d factor_pos;
+    Eigen::Matrix3d factor_cov;
+    std::vector<GpsFactorCallback> factor_cbs;
+
+    {
+        std::lock_guard<std::mutex> lk(mutex_);
 
     // 统计连续高质量帧
     // 【修复】放宽质量要求：MEDIUM+ (HDOP≤5.0) 也计入good_sample，而非仅HIGH+ (HDOP≤2.0)
@@ -100,23 +169,26 @@ void GPSManager::addGPSMeasurement(
         state_ = GPSAlignState::ALIGNED;
     }
 
-    // 触发对齐判断
+    // 触发对齐判断：若设置了 align_scheduler_ 则异步调度，否则在锁外同步执行 try_align()，避免持锁执行回调导致死锁
     if (state_ == GPSAlignState::NOT_ALIGNED &&
         good_sample_count_ >= good_samples_needed_) {
         ALOG_INFO(MOD, "Sufficient good GPS samples ({}), triggering alignment...",
                   good_sample_count_);
-        try_align();
+        pending_align_.store(true);
+        if (align_scheduler_) {
+            align_scheduler_();
+        } else {
+            need_sync_align = true;
+        }
     }
 
     // 已对齐：发布 GPS 因子（协方差 = base_cov / (factor_weight * quality_scale)，质量越好约束越强）
-    // 【修复】降低质量阈值：MEDIUM+ (HDOP≤5.0) 也发布GPS因子，    // 原因：M2DGR弱GPS场景HDOP≈10 (质量LOW)，仅要求HIGH会完全禁用GPS约束
+    // 【修复】降低质量阈值：MEDIUM+ (HDOP≤5.0) 也发布GPS因子
     if (state_ == GPSAlignState::ALIGNED && quality >= GPSQuality::MEDIUM) {
         Eigen::Vector3d pos_map = enu_to_map(pos_enu);
         double hdop_safe = std::max(hdop, 0.1);
-        // 【修复】增大协方差基础值以反映弱GPS的实际精度
-        // 原sigma_h = hdop * 0.3 对HDOP=10来说只有3m，实际误差可能更大
-        double sigma_h = hdop_safe * 0.5;  // 水平精度估算（增大系数）
-        double sigma_v = hdop_safe * 1.0;  // 垂直精度估算（增大系数）
+        double sigma_h = hdop_safe * 0.5;
+        double sigma_v = hdop_safe * 1.0;
         Eigen::Matrix3d cov = Eigen::Matrix3d::Zero();
         cov(0,0) = sigma_h * sigma_h;
         cov(1,1) = sigma_h * sigma_h;
@@ -130,15 +202,37 @@ void GPSManager::addGPSMeasurement(
             case GPSQuality::MEDIUM:    quality_scale = cfg.gpsFactorQualityScaleMedium();     break;
             default: break;
         }
-        cov /= (weight * quality_scale);  // 质量越好 quality_scale 越大 -> 协方差越小 -> 约束越强
+        cov /= (weight * quality_scale);
 
-        // 距离控制（每 factor_interval_m 添加一个GPS因子）
         double dist = pos_map.norm();
         double interval = ConfigManager::instance().gpsFactorIntervalM();
         if (dist - last_gps_factor_dist_ >= interval) {
             last_gps_factor_dist_ = dist;
             aligned_gps_buffer_.push_back({timestamp, pos_map, cov});
-            for (auto& cb : gps_factor_cbs_) cb(timestamp, pos_map, cov);
+            have_factor = true;
+            factor_ts = timestamp;
+            factor_pos = pos_map;
+            factor_cov = cov;
+            factor_cbs = gps_factor_cbs_;
+        }
+    }
+    }  // end second lock scope
+
+    if (need_sync_align) {
+        pending_align_.store(false);
+        try_align();
+    }
+
+    // 【异步友好】在锁外执行 gps_factor_cbs_，避免长时间持锁阻塞 ROS 回调
+    if (have_factor) {
+        for (auto& cb : factor_cbs) {
+            try {
+                cb(factor_ts, factor_pos, factor_cov);
+            } catch (const std::exception& e) {
+                ALOG_ERROR(MOD, "[GPS_CALLBACK] gps_factor callback exception: {}", e.what());
+            } catch (...) {
+                ALOG_ERROR(MOD, "[GPS_CALLBACK] gps_factor callback unknown exception");
+            }
         }
     }
 }
@@ -146,32 +240,52 @@ void GPSManager::addGPSMeasurement(
 void GPSManager::addKeyFramePose(double timestamp, const Pose3d& T_w_b) {
     std::lock_guard<std::mutex> lk(mutex_);
     kf_window_.push_back({timestamp, T_w_b});
-    if (kf_window_.size() > 2000) kf_window_.pop_front();
+    const size_t max_kf_window = ConfigManager::instance().gpsMaxWindowSize();
+    while (kf_window_.size() > max_kf_window) kf_window_.pop_front();
     
     // 【修复】同时缓存所有里程计位姿用于精準插值
     all_odom_poses_.push_back({timestamp, T_w_b});
     if (all_odom_poses_.size() > 5000) all_odom_poses_.pop_front();
 }
 
-void GPSManager::try_align() {
-    // 检查轨迹长度
-    if (kf_window_.empty() || gps_window_.empty()) return;
+void GPSManager::runScheduledAlignment() {
+    // 不持锁调用 try_align，避免 try_align -> on_aligned -> align_cbs_ -> getHistoricalGPSBindings 重入锁死锁
+    if (!pending_align_.exchange(false)) return;
+    ALOG_INFO(MOD, "[GPS_ALIGN] runScheduledAlignment enter (pending_align was true, calling try_align)");
+    auto t0 = std::chrono::steady_clock::now();
+    try_align();
+    double ms = 1e-3 * std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+    ALOG_INFO(MOD, "[GPS_ALIGN] runScheduledAlignment exit duration_ms={:.1f}", ms);
+}
 
-    // 计算轨迹总长度
+void GPSManager::try_align() {
+    std::unique_lock<std::mutex> lk(mutex_);
+
+    const size_t kf_sz = kf_window_.size();
+    const size_t gps_sz = gps_window_.size();
+    if (kf_window_.empty() || gps_window_.empty()) {
+        ALOG_DEBUG(MOD, "[GPS_ALIGN] try_align skip reason=empty kf_window={} gps_window={}", kf_sz, gps_sz);
+        return;
+    }
+
     double total_dist = 0.0;
     for (size_t i = 1; i < kf_window_.size(); ++i) {
         total_dist += (kf_window_[i].second.translation() -
                        kf_window_[i-1].second.translation()).norm();
     }
-    if (total_dist < min_align_dist_m_) return;
+    if (total_dist < min_align_dist_m_) {
+        ALOG_DEBUG(MOD, "[GPS_ALIGN] try_align skip reason=dist_too_short dist={:.1f}m min={:.1f}m", total_dist, min_align_dist_m_);
+        return;
+    }
 
-    // 检查GPS点数量
-    // 【修复】放宽质量要求：MEDIUM+ (HDOP≤5.0) 也计入，而非仅HIGH+
     size_t good_gps_count = 0;
     for (const auto& g : gps_window_) {
         if (g.quality >= GPSQuality::MEDIUM) good_gps_count++;
     }
-    if ((int)good_gps_count < min_align_points_) return;
+    if ((int)good_gps_count < min_align_points_) {
+        ALOG_DEBUG(MOD, "[GPS_ALIGN] try_align skip reason=insufficient_points good_gps={} min={}", good_gps_count, min_align_points_);
+        return;
+    }
 
     ALOG_INFO(MOD, "[GPS_STATE] NOT_ALIGNED→ALIGNING reason=sufficient_samples good_gps={} dist={:.1f}m",
               good_gps_count, total_dist);
@@ -182,7 +296,22 @@ void GPSManager::try_align() {
         ALOG_INFO(MOD, "GPS alignment SUCCESS: rmse={:.3f}m matched={} pts",
                   result.rmse_m, result.matched_points);
         align_result_ = result;
-        on_aligned(result);
+        state_ = GPSAlignState::ALIGNED;
+        std::vector<AlignCallback> cbs = align_cbs_;
+        GPSAlignResult res_copy = result;
+        const size_t num_cbs = cbs.size();
+        lk.unlock();
+        ALOG_INFO(MOD, "[GPS_ALIGN] try_align callbacks_enter num_callbacks={} (lock released)", num_cbs);
+        for (auto& cb : cbs) {
+            try {
+                cb(res_copy);
+            } catch (const std::exception& e) {
+                ALOG_ERROR(MOD, "[GPS_CALLBACK] align callback exception: {}", e.what());
+            } catch (...) {
+                ALOG_ERROR(MOD, "[GPS_CALLBACK] align callback unknown exception");
+            }
+        }
+        ALOG_INFO(MOD, "[GPS_ALIGN] try_align callbacks_done");
     } else {
         ALOG_WARN(MOD, "GPS alignment FAILED: success={} rmse={:.3f}m > thresh={:.3f}m matched={}",
                   result.success, result.rmse_m, rmse_accept_thresh_, result.matched_points);
@@ -286,37 +415,34 @@ GPSAlignResult GPSManager::compute_svd_alignment() {
     gps_centroid /= pairs.size();
     lio_centroid /= pairs.size();
 
-    // 协方差矩阵（仅XY平面，GPS高度不可靠）
-    Eigen::Matrix3d cov = Eigen::Matrix3d::Zero();
+    // 2D 协方差（仅 XY），避免 3x3 时 z 恒为 0 导致第三奇异值=0、cond=inf
+    Eigen::Matrix2d cov_xy = Eigen::Matrix2d::Zero();
     for (const auto& p : pairs) {
-        Eigen::Vector3d gd = p.gps_enu   - gps_centroid;
-        Eigen::Vector3d ld = p.lidar_pos - lio_centroid;
-        gd.z() = 0.0;  // 忽略高度
-        ld.z() = 0.0;
-        cov += ld * gd.transpose();  // LiDAR←GPS
+        Eigen::Vector2d gd(p.gps_enu.x() - gps_centroid.x(), p.gps_enu.y() - gps_centroid.y());
+        Eigen::Vector2d ld(p.lidar_pos.x() - lio_centroid.x(), p.lidar_pos.y() - lio_centroid.y());
+        cov_xy += ld * gd.transpose();  // LiDAR←GPS
     }
 
-    // SVD 求旋转（仅XY平面旋转，绕Z轴）
-    Eigen::JacobiSVD<Eigen::Matrix3d> svd(cov, Eigen::ComputeFullU | Eigen::ComputeFullV);
-
-    // ✅ 退化场景检查
-    Eigen::Vector3d singular_vals = svd.singularValues();
+    Eigen::JacobiSVD<Eigen::Matrix2d> svd_xy(cov_xy, Eigen::ComputeFullU | Eigen::ComputeFullV);
+    Eigen::Vector2d singular_vals = svd_xy.singularValues();
     const double min_sv = singular_vals.minCoeff();
     const double max_sv = singular_vals.maxCoeff();
     const double cond = (max_sv > 1e-12) ? (max_sv / min_sv) : 1e12;
     if (min_sv < 1e-6 || cond > 1e8) {
-        ALOG_WARN(MOD, "GPS alignment: degenerate covariance (cond={:.2e}), rejecting", cond);
-        return result;  // 返回失败
+        ALOG_WARN(MOD, "GPS alignment: degenerate XY covariance (cond={:.2e}), rejecting", cond);
+        return result;
     }
 
-    Eigen::Matrix3d R = svd.matrixU() * svd.matrixV().transpose();
-
-    // 反射修正
-    if (R.determinant() < 0) {
-        Eigen::Matrix3d diag = Eigen::Matrix3d::Identity();
-        diag(2,2) = -1;
-        R = svd.matrixU() * diag * svd.matrixV().transpose();
+    Eigen::Matrix2d R_xy = svd_xy.matrixU() * svd_xy.matrixV().transpose();
+    if (R_xy.determinant() < 0) {
+        Eigen::Matrix2d diag = Eigen::Matrix2d::Identity();
+        diag(1, 1) = -1;
+        R_xy = svd_xy.matrixU() * diag * svd_xy.matrixV().transpose();
     }
+
+    // 扩展为 3x3：绕 Z 轴旋转，R(2,2)=1
+    Eigen::Matrix3d R = Eigen::Matrix3d::Identity();
+    R.block<2,2>(0,0) = R_xy;
 
     Eigen::Vector3d t = lio_centroid - R * gps_centroid;
 
@@ -372,6 +498,17 @@ Eigen::Vector3d GPSManager::enu_to_map(const Eigen::Vector3d& enu) const {
     if (state_ != GPSAlignState::ALIGNED && state_ != GPSAlignState::DEGRADED)
         return enu;
     return align_result_.R_gps_lidar * enu + align_result_.t_gps_lidar;
+}
+
+std::vector<std::pair<double, Eigen::Vector3d>> GPSManager::getGpsPositionsInMapFrame() const {
+    std::lock_guard<std::mutex> lk(mutex_);
+    std::vector<std::pair<double, Eigen::Vector3d>> out;
+    if (state_ != GPSAlignState::ALIGNED && state_ != GPSAlignState::DEGRADED)
+        return out;
+    out.reserve(gps_window_.size());
+    for (const auto& r : gps_window_)
+        out.emplace_back(r.timestamp, enu_to_map(r.pos_enu));
+    return out;
 }
 
 GPSQuality GPSManager::hdop_to_quality(double hdop) const {
@@ -527,6 +664,18 @@ bool GPSManager::getGpsWindowTimeRange(double* out_min_ts, double* out_max_ts) c
     *out_min_ts = min_t;
     *out_max_ts = max_t;
     return true;
+}
+
+double GPSManager::getFirstGpsTimestamp() const {
+    std::lock_guard<std::mutex> lk(mutex_);
+    if (gps_window_.empty()) return 0.0;
+    return gps_window_.front().timestamp;
+}
+
+double GPSManager::getLastGpsTimestamp() const {
+    std::lock_guard<std::mutex> lk(mutex_);
+    if (gps_window_.empty()) return 0.0;
+    return gps_window_.back().timestamp;
 }
 
 void GPSManager::triggerRealign() {

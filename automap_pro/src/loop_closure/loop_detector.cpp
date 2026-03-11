@@ -91,11 +91,27 @@ void LoopDetector::stop() {
 }
 
 void LoopDetector::addSubmap(const SubMap::Ptr& submap) {
+    // 添加数据有效性检查
+    if (!submap) {
+        ALOG_WARN(MOD, "addSubmap: null submap ignored");
+        return;
+    }
+    if (!submap->downsampled_cloud || submap->downsampled_cloud->empty()) {
+        ALOG_WARN(MOD, "addSubmap: submap #%d has empty cloud, skipped for loop detection", submap->id);
+        return;
+    }
+    if (submap->keyframes.empty()) {
+        ALOG_WARN(MOD, "addSubmap: submap #%d has no keyframes, skipped for loop detection", submap->id);
+        return;
+    }
+
     float priority = static_cast<float>(submap->id);
     size_t qsize;
     size_t dbsize;
     {
         std::lock_guard<std::mutex> lk(desc_mutex_);
+        const size_t max_desc = ConfigManager::instance().loopMaxDescQueueSize();
+        while (desc_queue_.size() >= max_desc) desc_queue_.pop();  // 丢弃最低优先级，防无界堆积
         desc_queue_.push({submap, priority});
         qsize = desc_queue_.size();
         dbsize = dbSize();
@@ -309,6 +325,8 @@ void LoopDetector::onDescriptorReady(const SubMap::Ptr& submap) {
     // 提交到 TEASER++ 匹配队列（Stage 2）
     {
         std::lock_guard<std::mutex> lk(match_mutex_);
+        const size_t max_match = ConfigManager::instance().loopMaxMatchQueueSize();
+        while (match_queue_.size() >= max_match) match_queue_.pop();  // 丢弃最旧任务，防无界堆积
         match_queue_.push({submap, query_cloud_copy, geo_filtered_candidates});
     }
     match_cv_.notify_one();
@@ -351,6 +369,19 @@ void LoopDetector::matchWorkerLoop() {
 
 void LoopDetector::processMatchTask(const MatchTask& task) {
     const unsigned tid = automap_pro::logThreadId();
+
+    // 添加任务有效性检查
+    if (!task.query) {
+        ALOG_WARN(MOD, "[tid=%u] processMatchTask: null query submap, skipping", tid);
+        return;
+    }
+
+    if (task.candidates.empty()) {
+        ALOG_DEBUG(MOD, "[tid=%u] processMatchTask: no candidates for SM#%d, skipping",
+                   tid, task.query->id);
+        return;
+    }
+
     IcpRefiner icp;
     const auto& query = task.query;
     // 优先使用入队时拷贝的 query_cloud，避免读 SubMap::downsampled_cloud 与主线程并发
@@ -358,20 +389,39 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
     if (!query_cloud || query_cloud->empty()) {
         CloudXYZIPtr query_ref = query ? query->downsampled_cloud : nullptr;
         if (!query_ref || query_ref->empty()) {
-            ALOG_DEBUG(MOD, "[tid={}] step=task_skip query_cloud_empty query_id={}", tid, query ? query->id : -1);
+            ALOG_DEBUG(MOD, "[tid=%u] step=task_skip query_cloud_empty query_id=%d", tid, query ? query->id : -1);
             return;
         }
         query_cloud = std::make_shared<CloudXYZI>();
         *query_cloud = *query_ref;
-        ALOG_DEBUG(MOD, "[tid={}] step=task_fallback_copy query_id={} query_pts={}", tid, query->id, query_cloud->size());
+        ALOG_DEBUG(MOD, "[tid=%u] step=task_fallback_copy query_id=%d query_pts=%zu", tid, query->id, query_cloud->size());
     }
 
-    ALOG_DEBUG(MOD, "[tid={}] step=task_start query_id={} query_pts={} candidates={}",
+    ALOG_DEBUG(MOD, "[tid=%u] step=task_start query_id=%d query_pts=%zu candidates=%zu",
                tid, query ? query->id : -1, query_cloud->size(), task.candidates.size());
     AUTOMAP_TIMED_SCOPE(MOD, fmt::format("GeomVerify SM#{}", task.query->id), 3000.0);
 
+    // 过滤掉无效候选
+    std::vector<OverlapTransformerInfer::Candidate> valid_candidates;
+    for (const auto& cand : task.candidates) {
+        if (cand.score < overlap_threshold_) {
+            continue;
+        }
+        // 检查候选子图ID有效性
+        if (cand.submap_id < 0) {
+            continue;
+        }
+        valid_candidates.push_back(cand);
+    }
+
+    if (valid_candidates.empty()) {
+        ALOG_DEBUG(MOD, "[tid=%u] No valid candidates after filtering for SM#%d",
+                   tid, query->id);
+        return;
+    }
+
     // P1: 并行 TEASER 多候选匹配（performance.parallel_teaser_match=true）
-    if (ConfigManager::instance().parallelTeaserMatch() && !task.candidates.empty()) {
+    if (ConfigManager::instance().parallelTeaserMatch() && !valid_candidates.empty()) {
         struct CandWork {
             OverlapTransformerInfer::Candidate cand;
             SubMap::Ptr target;
@@ -380,7 +430,7 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
         std::vector<CandWork> works;
         {
             std::shared_lock<std::shared_mutex> lk(db_mutex_);
-            for (const auto& cand : task.candidates) {
+            for (const auto& cand : valid_candidates) {
                 SubMap::Ptr target;
                 CloudXYZIPtr target_ref;
                 for (const auto& sm : db_submaps_) {
@@ -464,8 +514,8 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
         return;
     }
 
-    for (const auto& cand : task.candidates) {
-        ALOG_DEBUG(MOD, "  Checking candidate SM#{} score={:.3f}", cand.submap_id, cand.score);
+    for (const auto& cand : valid_candidates) {
+        ALOG_DEBUG(MOD, "  Checking candidate SM#%d score=%.3f", cand.submap_id, cand.score);
         SubMap::Ptr target;
         CloudXYZIPtr target_ref;  // 在持锁下取得强引用，避免读 submap 与主线程并发
         {

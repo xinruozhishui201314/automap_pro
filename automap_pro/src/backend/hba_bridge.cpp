@@ -7,6 +7,11 @@
 #include <iomanip>
 #include <algorithm>
 #include <cstdlib>
+#include <spawn.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <vector>
+#include <cstring>
 
 namespace automap_pro {
 
@@ -89,10 +94,52 @@ bool HBABridge::loadHBAResultAndApply(
 bool HBABridge::runHBAProcess(
     const std::string& data_path,
     const std::string& command_template) {
+    // 白名单：仅允许路径安全字符，避免命令注入
+    for (char c : data_path) {
+        if (!(std::isalnum(static_cast<unsigned char>(c)) ||
+              c == '/' || c == '_' || c == '-' || c == '.')) {
+            fprintf(stderr,
+                    "[HBABridge] runHBAProcess: unsafe character '%c' in data_path, abort\n",
+                    c);
+            return false;
+        }
+    }
+
     char path_buf[4096];
-    snprintf(path_buf, sizeof(path_buf), command_template.c_str(), data_path.c_str());
-    int ret = std::system(path_buf);
-    return (ret == 0);
+    std::snprintf(path_buf, sizeof(path_buf), command_template.c_str(), data_path.c_str());
+
+    // 将命令行拆成 argv[]（按空格），不经过 shell，完全消除注入面
+    std::vector<std::string> tokens;
+    for (const char* p = path_buf; *p;) {
+        while (*p == ' ' || *p == '\t') ++p;
+        if (!*p) break;
+        const char* start = p;
+        while (*p && *p != ' ' && *p != '\t') ++p;
+        tokens.emplace_back(start, static_cast<size_t>(p - start));
+    }
+    if (tokens.empty()) {
+        fprintf(stderr, "[HBABridge] runHBAProcess: empty command after substitute\n");
+        return false;
+    }
+
+    std::vector<char*> argv;
+    for (std::string& t : tokens)
+        argv.push_back(&t[0]);
+    argv.push_back(nullptr);
+
+    pid_t pid = 0;
+    int err = posix_spawnp(&pid, argv[0], nullptr, nullptr, argv.data(), environ);
+    if (err != 0) {
+        fprintf(stderr, "[HBABridge] runHBAProcess: posix_spawnp failed err=%d\n", err);
+        return false;
+    }
+
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) {
+        fprintf(stderr, "[HBABridge] runHBAProcess: waitpid failed\n");
+        return false;
+    }
+    return WIFEXITED(status) && (WEXITSTATUS(status) == 0);
 }
 
 }  // namespace automap_pro

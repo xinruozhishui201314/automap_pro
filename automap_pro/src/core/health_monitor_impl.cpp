@@ -497,6 +497,10 @@ void HealthMonitor::stop() {
     ALOG_INFO(MOD, "HealthMonitor stopped");
 }
 
+bool HealthMonitor::isRunning() const {
+    return running_.load();
+}
+
 void HealthMonitor::setConfig(const HealthMonitorConfig& config) {
     std::lock_guard<std::mutex> lk(mutex_);
     config_ = config;

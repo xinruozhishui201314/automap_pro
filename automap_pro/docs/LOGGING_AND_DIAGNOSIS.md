@@ -161,6 +161,7 @@ grep -E 'sensor.gps.topic|gps_topic=|Subscribed to' automap.log
 | **卡住无输出** | `grep -E 'BACKEND.*popped|BACKEND.*processed|MAP.*step=' <log> \| tail -5` → 看最后处理的 frame_no / step |
 | **无 GPS / 无轨迹** | `grep -E 'LivoBridge\\[GPS\\]|GPS_DIAG|TRAJ_LOG' <log>` |
 | **无关键帧/无建图** | `grep -E 'kf_created|tryCreateKeyFrame|no_odom_in_cache' <log> \| tail -20` |
+| **GPS 对齐后 iSAM2 崩溃** | `grep -E '\[GPS_BATCH\]\[DIAG\]|\[ISAM2_DIAG\]|\[ISAM2_QUEUE\]' <log> \| tail -40` → 见 §10 |
 
 ---
 
@@ -194,7 +195,107 @@ grep -E '\[MAP\]|publishGlobalMap|buildGlobalMap|voxelDownsample|SHUTDOWN|PIPELI
 
 ---
 
-## 8. 修改阈值或日志量
+## 8. 卡滞/阻塞与队列诊断（新增标签）
+
+出现「计数不涨、HEARTBEAT 停在同一帧、无新日志」时，用下列标签精确定位卡在哪个环节。
+
+### 8.1 标签与含义
+
+| 标签 / 关键字 | 含义 | 排查方向 |
+|---------------|------|----------|
+| `[INGRESS] wait_start` | Executor 线程因 ingress 队列满开始等待 feeder | 若持续出现→feeder 或 backend 未消费，见 FEEDER/BACKEND |
+| `[INGRESS] wait_timeout` | 单次 500ms 等待超时，consecutive_timeouts 递增 | 连续 3 次会丢弃最旧帧并 push 本帧；若反复出现→下游卡滞 |
+| `[INGRESS] dropped oldest frame` | 已丢弃队首帧以解除 Executor 阻塞 | 正常保护；若频繁出现需查 feeder/backend 为何慢 |
+| `[FEEDER] backpressure` | feeder 因 frame_queue 满在等待 backend | 若长期存在→backend 处理慢或卡在 runScheduledAlignment/waitForPendingTasks |
+| `[FEEDER][HEARTBEAT]` | feeder 每 100 帧打一次，含 queue/ingress 大小 | 确认 feeder 是否存活、ingress 是否堆积 |
+| `[BACKEND][HEARTBEAT]` | backend 每 30s 打一次（等数据时），含 livo_cloud/livo_odom/ingress | livo 不涨→回调未交付；ingress>0→feeder 可能卡住 |
+| `[BACKEND] wait_done reason=timeout` | backend 每 2s 被唤醒但队列仍空 | 仅 DEBUG 级；若只有 HEARTBEAT 无 frame 处理→上游未入队 |
+| `[GPS_ALIGN] runScheduledAlignment enter/exit` | 后台执行 try_align 的入口与耗时 | exit 后无 callbacks_done→可能卡在 align 回调（如 getHistoricalGPSBindings） |
+| `[GPS_ALIGN] try_align callbacks_enter/callbacks_done` | 对齐成功后在锁外执行 onGPSAligned 等 | 若 enter 后无 done→回调内卡住（如 waitForPendingTasks） |
+| `[GPS_BATCH] enter` | 开始批量添加 GPS 因子 | 随后会有 waitForPendingTasks；若长期无后续→卡在 Isam2 队列 |
+| `[ISAM2_QUEUE] waitForPendingTasks enter/done/timeout` | 等待优化任务队列清空 | timeout 表示 5s 内未清空，backend 会继续；若频繁 timeout→opt 线程慢或任务堆积 |
+
+### 8.2 卡滞时推荐 grep 顺序
+
+```bash
+# 1）最后几条 INGRESS/FEEDER/BACKEND，看卡在「等入队」还是「等消费」
+grep -E '\[INGRESS\]|\[FEEDER\] backpressure|\[BACKEND\]\[HEARTBEAT\]' automap.log | tail -20
+
+# 2）GPS 对齐与批量因子是否卡在回调或 Isam2
+grep -E '\[GPS_ALIGN\]|\[GPS_BATCH\]|\[ISAM2_QUEUE\]' automap.log | tail -15
+
+# 3）MAP_PUB / LOOP_OPT 是否在等（仅 DEBUG 级有 timeout 日志）
+grep -E '\[MAP_PUB\]|\[LOOP_OPT\]' automap.log | tail -10
+```
+
+### 8.3 现象 → 可能原因速查
+
+| 现象 | 可能原因 | 建议 grep |
+|------|----------|-----------|
+| livo_cloud/livo_odom 不涨 | ROS 回调未执行（Executor 阻塞或单线程卡在 onCloud 等） | `INGRESS wait_start`、`INGRESS wait_timeout` |
+| HEARTBEAT 中 ingress>0 且持续增长 | feeder 未消费（feeder 卡在体素或 frame_queue 满） | `FEEDER backpressure`、`FEEDER voxel` |
+| HEARTBEAT 中 queue=0 且 livo 涨 | backend 在等 frame_queue，feeder 未 push（或 push 极慢） | `FEEDER pushed`、`FEEDER HEARTBEAT` |
+| 有 runScheduledAlignment enter 无 exit | try_align 内死锁或长时间持锁（已修复：回调在锁外） | `GPS_ALIGN` |
+| 有 callbacks_enter 无 callbacks_done | onGPSAligned/addBatchGPSFactors 内卡住（如 waitForPendingTasks） | `GPS_BATCH`、`ISAM2_QUEUE` |
+
+---
+
+## 9. 修改阈值或日志量
 
 - **放宽小点云绕过阈值**：在 `automap_pro/src/core/utils.cpp` 中修改 `kVoxelChunkedSizeThreshold`（当前 250000）。调大则更多场景走单次体素。
 - **减少 chunk 步进日志**：将 `voxelDownsampleChunked` 内 `ALOG_INFO("Utils", "[MAP] voxelDownsampleChunked step=chunk ...")` 改为 `ALOG_DEBUG`，可减少刷屏，需要时再开 DEBUG 级别。
+- **卡滞诊断日志**：`[INGRESS] wait_start`、`[FEEDER] backpressure`、`[GPS_ALIGN] runScheduledAlignment`、`[ISAM2_QUEUE] waitForPendingTasks` 等为 INFO；backend/map_pub/loop_opt 的 wait_done timeout 为 DEBUG，需要时可将对应 RCLCPP_DEBUG 改为 RCLCPP_INFO。
+
+---
+
+## 10. iSAM2 / GPS 批量与崩溃根因分析
+
+当崩溃发生在 **GPS 对齐成功之后**、或与 **iSAM2 优化线程** 相关时，用下列标签精确定位根因（参见 [FIX_GPS_BATCH_SIGSEGV_20260310.md](FIX_GPS_BATCH_SIGSEGV_20260310.md)）。
+
+### 10.1 诊断标签与含义
+
+| 标签 / 关键字 | 含义 | 用于根因分析 |
+|---------------|------|----------------|
+| `[GPS_BATCH][DIAG] phase=existing_async enqueue_batch` | 异步：已入队「已有 GPS 子图」批量任务，count= 本批因子数 | 随后应为 wait_enter → opt 线程处理 → wait_done |
+| `[GPS_BATCH][DIAG] phase=existing_async wait_enter queue_depth=` | 回调线程开始等待优化队列，当前队列深度 | 若崩溃在 wait_enter 与 wait_done 之间，崩溃在 **opt 线程** |
+| `[GPS_BATCH][DIAG] phase=existing_async wait_done` | 回调线程等到队列清空 | 若先出现 wait_done 再崩溃，可能是后续逻辑或另一线程 |
+| `[GPS_BATCH][DIAG] phase=historical_async ...` | 同上，针对「历史绑定」批量 | 同样用 wait_enter / wait_done 界定 opt 线程是否在执行 |
+| `[ISAM2_DIAG] optLoop pop type=LOOP_FACTOR|GPS_FACTOR|BATCH_UPDATE` | opt 线程刚取出任务类型与剩余队列深度 | **崩溃在 commitAndUpdate 时，最后一条 pop type= 即当时执行的任务类型** |
+| `[ISAM2_DIAG] addGPSFactorsBatch enter count=` | opt 线程开始执行批量 GPS（BATCH_UPDATE 任务） | 随后会有 commitAndUpdate enter → 若崩溃则多在 isam2_.update 内部 |
+| `[ISAM2_DIAG] addGPSFactorsBatch done added=` | 批量 GPS 添加并完成一次 commitAndUpdate | 有 enter 无 done → 崩溃在 commitAndUpdate / isam2_.update |
+| `[ISAM2_DIAG] commitAndUpdate enter pending_factors= pending_values=` | 即将调用 isam2_.update(graph, values) | **若崩溃在此后且无 commitAndUpdate done → 崩溃在 GTSAM isam2_.update() 内部（如 addVariables/TBB internal_clear）** |
+| `[ISAM2_DIAG] commitAndUpdate done elapsed_ms= success=1` | 单次 update 成功返回 | 有 enter 无 done → 崩溃在 update 或 calculateEstimate |
+| `[ISAM2_DIAG] commitAndUpdate done success=0 exception=` | 单次 update 抛异常 | 根因为 GTSAM 异常，看 exception 内容 |
+| `[ISAM2_QUEUE] waitForPendingTasks enter/done/timeout` | 等待队列清空 | timeout 表示 5s 内未清空，可能 opt 线程卡在 commitAndUpdate 或任务过多 |
+
+### 10.2 GPS 对齐后崩溃：推荐 grep 与顺序
+
+```bash
+# 1）时间线：GPS 对齐 → 批量入队 → 等待 → opt 执行（用于确认崩溃发生在哪一阶段）
+grep -E '\[GPS_ALIGN\]|\[GPS_BATCH\]|\[GPS_BATCH\]\[DIAG\]|\[ISAM2_DIAG\]|\[ISAM2_QUEUE\]' full.log | tail -60
+
+# 2）仅 iSAM2 与队列（精确定位 commitAndUpdate 前后）
+grep -E '\[ISAM2_DIAG\]|\[ISAM2_QUEUE\]' full.log | tail -30
+
+# 3）最后一条 ISAM2_DIAG：若为 commitAndUpdate enter 且无后续 done → 崩溃在 isam2_.update 内部
+grep '\[ISAM2_DIAG\]' full.log | tail -5
+```
+
+### 10.3 如何解读「最后一条日志」
+
+| 最后一条（或最后几条） | 推断 |
+|------------------------|------|
+| `commitAndUpdate enter` 且无 `commitAndUpdate done` | 崩溃在 **isam2_.update(pending_graph_, pending_values_)** 内部（如 GTSAM addVariables、TBB internal_clear/free）。配合 GDB 栈：`free` ← `tbb::...::internal_clear` ← `gtsam::ISAM2::addVariables`。 |
+| `optLoop pop type=BATCH_UPDATE` 后紧跟 `commitAndUpdate enter`，无 done | 同上，且可确认是 **批量 GPS 任务** 触发的单次 update。 |
+| `addGPSFactorsBatch enter count=N` 后无 `addGPSFactorsBatch done` | 崩溃在 addGPSFactorsBatch 内，即 opt 线程在本次 batch 的 commitAndUpdate 中崩溃。 |
+| `wait_enter` 有，`wait_done` 无，且中间有 `commitAndUpdate enter` 无 done | 回调线程在等待；opt 线程在 commitAndUpdate 内崩溃（典型 GPS 批量 SIGSEGV 场景）。 |
+| `wait_done` 已有，随后崩溃 | 崩溃不在本次 GPS 批量路径，可能是后续 HBA、地图发布或其它线程。 |
+
+### 10.4 速查：现象 → grep
+
+| 现象 | 建议 grep |
+|------|------------|
+| **GPS 对齐后立即 SIGSEGV** | `grep -E '\[GPS_BATCH\]\[DIAG\]|\[ISAM2_DIAG\]|\[ISAM2_QUEUE\]' full.log \| tail -40` → 看最后是 commitAndUpdate enter 还是 wait_enter/wait_done |
+| **opt 线程崩溃（GDB 显示 optLoop/commitAndUpdate）** | `grep '\[ISAM2_DIAG\]' full.log \| tail -10` → 确认 pop type= 与 commitAndUpdate enter/done |
+| **队列长期不空 / 卡滞** | `grep -E '\[ISAM2_QUEUE\]|\[ISAM2_DIAG\] optLoop pop' full.log \| tail -20` |
+| **多路 GTSAM 崩溃（iSAM2 / Optimizer / HBA 任一）** | `grep -E 'GTSAM_ENTRY|GTSAM_EXIT' full.log \| tail -30` → 最后一条 ENTRY 无 EXIT 即出事调用点，详见 [GTSAM_MULTI_USE_AND_LOGGING.md](GTSAM_MULTI_USE_AND_LOGGING.md) |

@@ -83,6 +83,8 @@ private:
     std::atomic<int>   odom_count_{0};
     std::atomic<int>   cloud_count_{0};
     std::atomic<int>   empty_cloud_count_{0};
+    std::atomic<int>   pcl_conversion_error_count_{0};
+    std::atomic<int>   invalid_point_cloud_count_{0};
     std::atomic<int>   gps_msg_count_{0};   // 收到的 NavSatFix 消息总数（含无 fix），用于诊断“无 GPS 数据”
     double             last_odom_ts_ = 0.0;
     double             last_cloud_ts_ = 0.0;

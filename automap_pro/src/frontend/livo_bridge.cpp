@@ -5,6 +5,7 @@
 
 #include <pcl_conversions/pcl_conversions.h>
 #include <chrono>
+#include <cmath>
 
 namespace automap_pro {
 
@@ -17,13 +18,12 @@ void LivoBridge::init(rclcpp::Node::SharedPtr node) {
     node_ = node;
     const auto& cfg = ConfigManager::instance();
 
-    // 订阅端缓存足够大：接收到即放入 buffer，避免 executor 繁忙时 DDS 丢包（SensorDataQoS 默认 depth=5 易丢）
-    constexpr int kOdomKfinfoDepth = 200000;  // 里程计/关键帧信息与点云同频，缓冲与 frame_queue 量级一致
-    constexpr int kCloudDepth = 200000;       // 点云：与 frame_queue_max_size(1500) 对齐并留余量
-    constexpr int kGpsDepth = 50000;          // GPS 低频，适度缓冲即可
-    auto odom_kfinfo_qos = rclcpp::QoS(rclcpp::KeepLast(kOdomKfinfoDepth)).best_effort();
-    auto cloud_qos = rclcpp::QoS(rclcpp::KeepLast(kCloudDepth)).reliable();
-    auto gps_qos = rclcpp::QoS(rclcpp::KeepLast(kGpsDepth)).reliable();
+    // 订阅端 depth 由配置控制，资源受限时可减小（system.subscription_odom_cloud_depth / subscription_gps_depth）
+    const int odom_cloud_depth = cfg.subscriptionOdomCloudDepth();
+    const int gps_depth = cfg.subscriptionGpsDepth();
+    auto odom_kfinfo_qos = rclcpp::QoS(rclcpp::KeepLast(odom_cloud_depth)).best_effort();
+    auto cloud_qos = rclcpp::QoS(rclcpp::KeepLast(odom_cloud_depth)).reliable();
+    auto gps_qos = rclcpp::QoS(rclcpp::KeepLast(gps_depth)).reliable();
 
     odom_sub_ = node->create_subscription<nav_msgs::msg::Odometry>(
         cfg.fastLivoOdomTopic(), odom_kfinfo_qos,
@@ -45,7 +45,7 @@ void LivoBridge::init(rclcpp::Node::SharedPtr node) {
             std::bind(&LivoBridge::onGPS, this, std::placeholders::_1));
         RCLCPP_INFO(node->get_logger(),
             "[LivoBridge][GPS] Subscription created: topic=%s QoS=RELIABLE KeepLast(%d)",
-            cfg.gpsTopic().c_str(), kGpsDepth);
+            cfg.gpsTopic().c_str(), gps_depth);
         gps_diag_timer_ = node->create_wall_timer(
             std::chrono::seconds(45),
             [this]() {
@@ -63,8 +63,8 @@ void LivoBridge::init(rclcpp::Node::SharedPtr node) {
     connected_ = true;
     RCLCPP_INFO(node->get_logger(),
         "[LivoBridge][TOPIC] subscribe: odom=%s (KeepLast(%d) best_effort) cloud=%s (KeepLast(%d) reliable) kfinfo=%s gps=%s",
-        cfg.fastLivoOdomTopic().c_str(), kOdomKfinfoDepth,
-        cfg.fastLivoCloudTopic().c_str(), kCloudDepth,
+        cfg.fastLivoOdomTopic().c_str(), odom_cloud_depth,
+        cfg.fastLivoCloudTopic().c_str(), odom_cloud_depth,
         cfg.fastLivoKFInfoTopic().c_str(),
         cfg.gpsEnabled() ? cfg.gpsTopic().c_str() : "disabled");
     RCLCPP_INFO(node->get_logger(),
@@ -78,13 +78,12 @@ void LivoBridge::init(rclcpp::Node::SharedPtr node, bool gps_enabled, const std:
     node_ = node;
     const auto& cfg = ConfigManager::instance();
 
-    // 与 init(node) 一致：前端接收传感器数据大幅度增加 buff，来一帧进一帧
-    constexpr int kOdomKfinfoDepth = 200000;
-    constexpr int kCloudDepth = 200000;
-    constexpr int kGpsDepth = 50000;
-    auto odom_kfinfo_qos = rclcpp::QoS(rclcpp::KeepLast(kOdomKfinfoDepth)).best_effort();
-    auto cloud_qos = rclcpp::QoS(rclcpp::KeepLast(kCloudDepth)).reliable();
-    auto gps_qos = rclcpp::QoS(rclcpp::KeepLast(kGpsDepth)).reliable();
+    // 与 init(node) 一致：订阅 depth 由配置 system.subscription_odom_cloud_depth / subscription_gps_depth 控制
+    const int odom_cloud_depth = cfg.subscriptionOdomCloudDepth();
+    const int gps_depth = cfg.subscriptionGpsDepth();
+    auto odom_kfinfo_qos = rclcpp::QoS(rclcpp::KeepLast(odom_cloud_depth)).best_effort();
+    auto cloud_qos = rclcpp::QoS(rclcpp::KeepLast(odom_cloud_depth)).reliable();
+    auto gps_qos = rclcpp::QoS(rclcpp::KeepLast(gps_depth)).reliable();
 
     odom_sub_ = node->create_subscription<nav_msgs::msg::Odometry>(
         cfg.fastLivoOdomTopic(), odom_kfinfo_qos,
@@ -110,7 +109,7 @@ void LivoBridge::init(rclcpp::Node::SharedPtr node, bool gps_enabled, const std:
             std::bind(&LivoBridge::onGPS, this, std::placeholders::_1));
         RCLCPP_INFO(node->get_logger(),
             "[LivoBridge][GPS] Subscription created: topic=%s QoS=RELIABLE KeepLast(%d) (config passed from AutoMapSystem)",
-            topic.c_str(), kGpsDepth);
+            topic.c_str(), gps_depth);
         RCLCPP_INFO(node->get_logger(),
             "[LivoBridge][GPS_DIAG] Subscribed to %s (NavSatFix). If no \"[LivoBridge][GPS] First GPS message\" within ~60s, check: ros2 bag info <bag_dir> has this topic with type sensor_msgs/msg/NavSatFix; M2DGR bag uses /ublox/fix.",
             topic.c_str());
@@ -132,8 +131,8 @@ void LivoBridge::init(rclcpp::Node::SharedPtr node, bool gps_enabled, const std:
     connected_ = true;
     RCLCPP_INFO(node->get_logger(),
         "[LivoBridge][TOPIC] subscribe: odom=%s (KeepLast(%d) best_effort) cloud=%s (KeepLast(%d) reliable) kfinfo=%s gps=%s",
-        cfg.fastLivoOdomTopic().c_str(), kOdomKfinfoDepth,
-        cfg.fastLivoCloudTopic().c_str(), kCloudDepth,
+        cfg.fastLivoOdomTopic().c_str(), odom_cloud_depth,
+        cfg.fastLivoCloudTopic().c_str(), odom_cloud_depth,
         cfg.fastLivoKFInfoTopic().c_str(),
         gps_enabled ? topic.c_str() : "disabled");
     RCLCPP_INFO(node->get_logger(),
@@ -153,13 +152,9 @@ void LivoBridge::onOdometry(const nav_msgs::msg::Odometry::SharedPtr msg) {
     Mat66d cov  = covFromOdom(*msg);
 
     const int o = odom_count_.load();
-    if (o <= 5) {
+    if (o <= 10 || o % 100 == 0) {
         RCLCPP_INFO(node_->get_logger(),
-            "[LivoBridge][DATA] odom #%d ts=%.3f pos=[%.2f,%.2f,%.2f]",
-            o, ts, pose.translation().x(), pose.translation().y(), pose.translation().z());
-    } else if (o % 500 == 0) {
-        RCLCPP_INFO(node_->get_logger(),
-            "[LivoBridge][DATA] odom #%d ts=%.3f pos=[%.2f,%.2f,%.2f]",
+            "[LivoBridge][DATA] odom #%d ts=%.3f pos=[%.2f,%.2f,%.2f] (grep LivoBridge DATA 可对照后端 RECV)",
             o, ts, pose.translation().x(), pose.translation().y(), pose.translation().z());
     }
     if (odom_count_ % 100 == 0) {
@@ -182,10 +177,26 @@ void LivoBridge::onCloud(const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
     using Clock = std::chrono::steady_clock;
     const auto recv_wall = Clock::now();
     cloud_count_++;
+    const int c_enter = cloud_count_.load();
     double ts = msg->header.stamp.sec + 1e-9 * msg->header.stamp.nanosec;
 
+    // 诊断：前 20 帧打 ENTER/EXIT，便于确认「回调是否被调度」（若 cloud #5 无 EXIT 则卡在回调内）
+    if (c_enter <= 20) {
+        RCLCPP_INFO(node_->get_logger(), "[LivoBridge][CALLBACK] onCloud ENTER #%d ts=%.3f (grep CALLBACK 可确认 Executor 是否交付)", c_enter, ts);
+    }
+
     CloudXYZIPtr cloud(new CloudXYZI);
-    pcl::fromROSMsg(*msg, *cloud);
+    try {
+        pcl::fromROSMsg(*msg, *cloud);
+    } catch (const std::exception& e) {
+        pcl_conversion_error_count_++;
+        RCLCPP_ERROR(node_->get_logger(), "[LivoBridge][DATA] PCL conversion failed #%d ts=%.3f: %s",
+            pcl_conversion_error_count_.load(), ts, e.what());
+        if (c_enter <= 20) {
+            RCLCPP_INFO(node_->get_logger(), "[LivoBridge][CALLBACK] onCloud EXIT #%d (pcl conversion failed)", c_enter);
+        }
+        return;
+    }
 
     if (cloud->empty()) {
         empty_cloud_count_++;
@@ -194,9 +205,46 @@ void LivoBridge::onCloud(const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
             RCLCPP_WARN(node_->get_logger(), "[LivoBridge][DATA] empty cloud discarded #%d total_cloud_msg=%d ts=%.3f (backend will not see this frame)",
                 ec, cloud_count_.load(), ts);
         }
+        if (c_enter <= 20) {
+            RCLCPP_INFO(node_->get_logger(), "[LivoBridge][CALLBACK] onCloud EXIT #%d (empty, discarded)", c_enter);
+        }
         ALOG_WARN(MOD, "Empty cloud at ts={:.3f} count={}", ts, cloud_count_.load());
         return;
     }
+
+    // 检查点云数据有效性：是否有NaN或Inf
+    bool has_invalid_points = false;
+    size_t nan_count = 0;
+    for (const auto& pt : cloud->points) {
+        if (!std::isfinite(pt.x) || !std::isfinite(pt.y) || !std::isfinite(pt.z)) {
+            nan_count++;
+            if (nan_count > 100) {  // 统计过多则跳过
+                has_invalid_points = true;
+                break;
+            }
+        }
+    }
+    if (has_invalid_points || nan_count > 0) {
+        invalid_point_cloud_count_++;
+        RCLCPP_WARN(node_->get_logger(), "[LivoBridge][DATA] cloud #%d ts=%.3f has %zu NaN/Inf points, filtering...",
+            cloud_count_.load(), ts, nan_count);
+        // 过滤掉无效点
+        CloudXYZIPtr filtered(new CloudXYZI);
+        filtered->reserve(cloud->size());
+        for (const auto& pt : cloud->points) {
+            if (std::isfinite(pt.x) && std::isfinite(pt.y) && std::isfinite(pt.z)) {
+                filtered->push_back(pt);
+            }
+        }
+        if (filtered->empty()) {
+            RCLCPP_ERROR(node_->get_logger(), "[LivoBridge][DATA] cloud #%d: all points invalid after filtering", cloud_count_.load());
+            return;
+        }
+        RCLCPP_INFO(node_->get_logger(), "[LivoBridge][DATA] cloud #%d filtered: %zu -> %zu points",
+            cloud_count_.load(), cloud->size(), filtered->size());
+        cloud = filtered;
+    }
+
     {
         std::lock_guard<std::mutex> lk(mutex_);
         last_cloud_ts_ = ts;
@@ -209,8 +257,15 @@ void LivoBridge::onCloud(const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
     RCLCPP_DEBUG(node_->get_logger(),
         "[LivoBridge][RECV] cloud #%d ts=%.3f pts=%zu delta_recv_ms=%.0f",
         c, ts, cloud->size(), c > 1 ? delta_ms : 0.0);
-    if (c <= 3 || c % 500 == 0) {
-        RCLCPP_INFO(node_->get_logger(), "[LivoBridge][DATA] cloud #%d ts=%.3f pts=%zu", c, ts, cloud->size());
+    if (c <= 10 || c % 100 == 0) {
+        RCLCPP_INFO(node_->get_logger(), "[LivoBridge][DATA] cloud #%d ts=%.3f pts=%zu (grep LivoBridge DATA 可对照 fast_livo PUB)", c, ts, cloud->size());
+    }
+    if (c <= 20) {
+        RCLCPP_INFO(node_->get_logger(), "[LivoBridge][CALLBACK] onCloud EXIT #%d ts=%.3f pts=%zu (grep CALLBACK 可确认回调返回)", c, ts, cloud->size());
+    }
+    if (c % 100 == 0) {
+        RCLCPP_INFO(node_->get_logger(), "[LivoBridge][HEARTBEAT] cloud_count=%d odom_count=%d last_cloud_ts=%.3f (grep LivoBridge HEARTBEAT 可确认收包存活)",
+                    c, odom_count_.load(), ts);
     }
     RCLCPP_DEBUG(node_->get_logger(), "[LivoBridge][FRAME] #%d ts=%.3f pts=%zu → backend", c, ts, cloud->size());
     if (cloud_count_ % 50 == 0) {
@@ -296,6 +351,9 @@ void LivoBridge::onGPS(const sensor_msgs::msg::NavSatFix::SharedPtr msg) {
 
     if (c == 0) {
         RCLCPP_INFO(node_->get_logger(),
+            "[LivoBridge][CALLBACK] onGPS ENTER first valid fix ts=%.3f (grep CALLBACK 可确认首条 GPS 回调是否阻塞)",
+            ts);
+        RCLCPP_INFO(node_->get_logger(),
             "[LivoBridge][GPS] First valid GPS received: ts=%.3f lat=%.6f lon=%.6f alt=%.1f hdop=%.2f → forwarding to GPSManager (trajectory_gps_*.csv will be created)",
             ts, lat, lon, alt, hdop);
     } else if (c % 50 == 0) {
@@ -311,6 +369,10 @@ void LivoBridge::onGPS(const sensor_msgs::msg::NavSatFix::SharedPtr msg) {
         } catch (...) {
             RCLCPP_ERROR(node_->get_logger(), "[LivoBridge][EXCEPTION] gps callback ts=%.3f: unknown exception", ts);
         }
+    }
+    if (c == 0) {
+        RCLCPP_INFO(node_->get_logger(),
+            "[LivoBridge][CALLBACK] onGPS EXIT first valid fix ts=%.3f (若此后无 cloud #5 等，疑 Executor 未再调度)", ts);
     }
 }
 

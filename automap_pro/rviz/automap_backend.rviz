@@ -42,7 +42,7 @@ Visualization Manager:
       Update Interval: 0
       Value: true
 
-    # 全局地图点云
+    # 全局地图点云（后端位姿/点云更新后会重新发布，Decay Time 0 表示仅显示最新一帧）
     - Alpha: 0.95
       Autocompute Value Bounds: true
       Axis: Z
@@ -85,21 +85,23 @@ Visualization Manager:
         Reliability Policy: Reliable
         Value: /automap/odom_path
       Use Fixed Frame: true
+    # 优化后轨迹（回环/iSAM2/HBA/GPS 对齐后后端会刷新）
     - Alpha: 1
       Class: rviz_default_plugins/Path
       Color: 0; 255; 100
       Enabled: true
       Name: optimized odom path
       Topic:
-        Depth: 5
+        Depth: 10
         Reliability Policy: Reliable
         Value: /automap/optimized_path
       Use Fixed Frame: true
+    # 关键帧位姿（iSAM2/HBA/GPS 对齐后后端会刷新，RViz 显示最新一次发布的全部位姿）
     - Class: rviz_default_plugins/PoseArray
       Enabled: true
       Name: keyframe_poses
       Topic:
-        Depth: 5
+        Depth: 10
         Reliability Policy: Reliable
         Value: /automap/keyframe_poses
       Use Fixed Frame: true

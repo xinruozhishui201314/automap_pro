@@ -278,6 +278,7 @@ add_library(automap_frontend SHARED
   src/frontend/keyframe_manager.cpp
   src/frontend/gps_manager.cpp
   src/frontend/livo_bridge.cpp
+  src/sensor/attitude_estimator.cpp
 )
 target_include_directories(automap_frontend PUBLIC ${AUTOMAP_INCLUDE_DIRS})
 target_link_libraries(automap_frontend automap_core ${AUTOMAP_LIBS})
@@ -321,7 +322,9 @@ endif()
 # 库：automap_backend（iSAM2 + HBA API 封装）
 # ──────────────────────────────────────────────────────────
 add_library(automap_backend SHARED
+  src/backend/gtsam_guard.cpp
   src/backend/incremental_optimizer.cpp
+  src/backend/delayed_gps_compensator.cpp
   src/backend/hba_optimizer.cpp
   src/backend/pose_graph.cpp
   src/backend/optimizer.cpp

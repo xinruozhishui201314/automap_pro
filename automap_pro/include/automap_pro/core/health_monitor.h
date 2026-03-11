@@ -173,6 +173,7 @@ public:
     PerformanceHealthChecker(const HealthMonitorConfig& config);
 
     void recordOptimizationTime(const std::string& optimizer_name, double time_ms);
+    void recordOptimizationFailure(const std::string& optimizer_name);
     void recordProcessingTime(const std::string& stage_name, double time_ms);
 
     std::string name() const override { return "Performance"; }
@@ -183,6 +184,7 @@ private:
     std::mutex mutex_;
     std::map<std::string, std::vector<double>> optimization_times_;
     std::map<std::string, std::vector<double>> processing_times_;
+    std::map<std::string, int> optimization_failure_count_;  // 最近窗口内失败次数（用于收敛/失败纳入健康）
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -196,6 +198,8 @@ public:
     void init(rclcpp::Node::SharedPtr node, const HealthMonitorConfig& config = HealthMonitorConfig());
     void start();
     void stop();
+    /** @return true 若监控线程已通过 start() 启动且未 stop() */
+    bool isRunning() const;
     void setConfig(const HealthMonitorConfig& config);
 
     // 注册检查器
@@ -209,6 +213,7 @@ public:
     void updateSensorGPS(int hdop, bool has_fix);
     void updateSensorCamera(double last_time_ms, bool is_receiving);
     void recordOptimizationTime(const std::string& optimizer_name, double time_ms);
+    void recordOptimizationFailure(const std::string& optimizer_name);
     void recordProcessingTime(const std::string& stage_name, double time_ms);
 
     // 检查和报告
@@ -288,6 +293,8 @@ private:
 
 #define HEALTH_RECORD_OPT_TIME(name, ms) \
     HealthMonitor::instance().recordOptimizationTime(name, ms)
+#define HEALTH_RECORD_OPT_FAILURE(name) \
+    HealthMonitor::instance().recordOptimizationFailure(name)
 #define HEALTH_RECORD_PROC_TIME(name, ms) \
     HealthMonitor::instance().recordProcessingTime(name, ms)
 

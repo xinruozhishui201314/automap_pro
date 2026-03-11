@@ -23,6 +23,16 @@ bool voxelGridWouldOverflow(float min_x, float max_x, float min_y, float max_y, 
 /** Voxel downsample point cloud. leaf_size 会 clamp 至至少 kMinVoxelLeafSize；输入内部会 sanitize；溢出风险时放大 leaf 或返回副本。 */
 CloudXYZIPtr voxelDownsample(const CloudXYZIPtr& cloud, float leaf_size);
 
+/** 带超时保护的体素下采样。
+ *  @param cloud 输入点云
+ *  @param leaf_size 体素大小
+ *  @param timeout_ms 超时时间（毫秒），默认 5000ms (5秒)
+ *  @param timed_out 如果非空，超时时会被设置为 true
+ *  @return 降采样后的点云；超时或异常时返回原始点云的副本
+ */
+CloudXYZIPtr voxelDownsampleWithTimeout(const CloudXYZIPtr& cloud, float leaf_size, 
+                                         int timeout_ms = 5000, bool* timed_out = nullptr);
+
 /** 分块体素滤波：按空间网格分块，每块单独滤波再合并，避免大范围点云单次滤波导致 PCL 溢出/崩溃。
  *  chunk_size_m 为每块边长（米），建议 40～80；若 <=0 则退化为单次 voxelDownsample。 */
 CloudXYZIPtr voxelDownsampleChunked(const CloudXYZIPtr& cloud, float leaf_size, float chunk_size_m = 50.0f);

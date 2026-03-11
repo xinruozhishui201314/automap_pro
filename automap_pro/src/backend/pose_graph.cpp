@@ -23,6 +23,17 @@ int PoseGraph::addNode(const GraphNode& node) {
     return new_node.id;
 }
 
+int PoseGraph::addNode(int id, NodeType type, const Pose3d& pose, bool fixed) {
+    GraphNode node;
+    node.id = id;
+    node.type = type;
+    node.pose = pose;
+    node.pose_opt = pose;
+    node.fixed = fixed;
+    node.timestamp = 0.0;
+    return addNode(node);
+}
+
 bool PoseGraph::updateNodePose(int id, const Pose3d& pose) {
     // 复制回调列表（在锁外调用，避免死锁）
     std::vector<NodeUpdateCallback> callbacks_copy;
@@ -112,6 +123,41 @@ int PoseGraph::addEdge(const GraphEdge& edge) {
     return new_edge.id;
 }
 
+int PoseGraph::addOdomEdge(int from, int to, const Pose3d& rel_pose, const Mat66d& information) {
+    GraphEdge e;
+    e.from = from;
+    e.to = to;
+    e.type = EdgeType::ODOM;
+    e.measurement = rel_pose;
+    e.information = information;
+    return addEdge(e);
+}
+
+int PoseGraph::addLoopEdge(int from, int to, const Pose3d& rel_pose, const Mat66d& information) {
+    GraphEdge e;
+    e.from = from;
+    e.to = to;
+    e.type = EdgeType::LOOP;
+    e.measurement = rel_pose;
+    e.information = information;
+    return addEdge(e);
+}
+
+int PoseGraph::addGPSEdge(int node_id, const Eigen::Vector3d& gps_pos, const Eigen::Matrix3d& gps_cov) {
+    GraphEdge e;
+    e.from = node_id;
+    e.to = -1;  // unary
+    e.type = EdgeType::GPS;
+    e.measurement = Pose3d::Identity();
+    e.measurement.translation() = gps_pos;
+    e.information = Mat66d::Identity();
+    Eigen::Matrix3d pos_info = gps_cov.inverse();
+    if (!pos_info.allFinite()) pos_info = Eigen::Matrix3d::Identity() * 1e-3;
+    e.information.block<3,3>(0,0) = pos_info;
+    e.information.block<3,3>(3,3) = Eigen::Matrix3d::Identity() * 1e-6;  // 旋转弱约束
+    return addEdge(e);
+}
+
 GraphEdge::Ptr PoseGraph::getEdge(int id) const {
     std::lock_guard<std::mutex> lk(mutex_);
     
@@ -172,6 +218,24 @@ std::vector<GraphEdge> PoseGraph::loopEdgesFrom(int from) const {
 int PoseGraph::edgeCount() const {
     std::lock_guard<std::mutex> lk(mutex_);
     return static_cast<int>(edges_.size());
+}
+
+int PoseGraph::numLoopEdges() const {
+    std::lock_guard<std::mutex> lk(mutex_);
+    int n = 0;
+    for (const auto& [id, edge] : edges_) {
+        if (edge.type == EdgeType::LOOP) n++;
+    }
+    return n;
+}
+
+std::map<int, Pose3d> PoseGraph::getOptimizedPoses() const {
+    std::lock_guard<std::mutex> lk(mutex_);
+    std::map<int, Pose3d> out;
+    for (const auto& [id, node] : nodes_) {
+        out[id] = node.pose;  // 优化器写回后 pose 即为优化结果
+    }
+    return out;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -403,13 +467,20 @@ void PoseGraph::removeEdge(int id) {
         auto adj_it = adjacency_list_.find(from);
         if (adj_it != adjacency_list_.end()) {
             auto& neighbors = adj_it->second;
-            neighbors.erase(std::remove(neighbors.begin(), neighbors.end(), to), neighbors.end());
+            // 仅删除一条 (from,to) 邻接关系，保持“多边”与邻接表的一致性
+            auto pos = std::find(neighbors.begin(), neighbors.end(), to);
+            if (pos != neighbors.end()) {
+                neighbors.erase(pos);
+            }
         }
         
         auto rev_it = reverse_adjacency_list_.find(to);
         if (rev_it != reverse_adjacency_list_.end()) {
             auto& rev_neighbors = rev_it->second;
-            rev_neighbors.erase(std::remove(rev_neighbors.begin(), rev_neighbors.end(), from), rev_neighbors.end());
+            auto pos = std::find(rev_neighbors.begin(), rev_neighbors.end(), from);
+            if (pos != rev_neighbors.end()) {
+                rev_neighbors.erase(pos);
+            }
         }
         
         edges_.erase(it);
@@ -417,6 +488,7 @@ void PoseGraph::removeEdge(int id) {
 }
 
 void PoseGraph::registerNodeUpdateCallback(NodeUpdateCallback cb) {
+    std::lock_guard<std::mutex> lk(mutex_);
     node_update_cbs_.push_back(std::move(cb));
 }
 

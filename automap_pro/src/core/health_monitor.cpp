@@ -330,6 +330,11 @@ void PerformanceHealthChecker::recordOptimizationTime(const std::string& optimiz
     }
 }
 
+void PerformanceHealthChecker::recordOptimizationFailure(const std::string& optimizer_name) {
+    std::lock_guard<std::mutex> lk(mutex_);
+    optimization_failure_count_[optimizer_name]++;
+}
+
 void PerformanceHealthChecker::recordProcessingTime(const std::string& stage_name, double time_ms) {
     std::lock_guard<std::mutex> lk(mutex_);
     processing_times_[stage_name].push_back(time_ms);
@@ -378,6 +383,24 @@ HealthCheckResult PerformanceHealthChecker::check() {
             if (result.state < HealthState::DEGRADED) result.state = HealthState::DEGRADED;
         }
     }
+
+    // 收敛/失败条件纳入健康：优化失败时标记 DEGRADED，避免静默退化
+    for (const auto& [name, fail_count] : optimization_failure_count_) {
+        if (fail_count <= 0) continue;
+        std::string item_name = name + "_failures";
+        result.items[item_name].name = item_name;
+        result.items[item_name].unit = "count";
+        result.items[item_name].current_value = static_cast<double>(fail_count);
+        result.items[item_name].threshold_warning = 1.0;
+        result.items[item_name].threshold_critical = 5.0;
+        result.items[item_name].is_ok = false;
+        result.items[item_name].state = HealthState::DEGRADED;
+        result.items[item_name].message = fmt::format("{} optimization failed {} time(s) since last check", name, fail_count);
+        result.items[item_name].fail_count = fail_count;
+        if (result.state < HealthState::DEGRADED) result.state = HealthState::DEGRADED;
+    }
+    // 上报后清零，下一周期重新统计
+    optimization_failure_count_.clear();
 
     // Check processing times
     for (const auto& [name, times] : processing_times_) {
@@ -576,6 +599,16 @@ void HealthMonitor::recordOptimizationTime(const std::string& optimizer_name, do
         perf_checker->recordOptimizationTime(optimizer_name, time_ms);
         METRICS_HISTOGRAM_OBSERVE(metrics::ISAM2_OPTIMIZE_TIME_MS, time_ms);
         METRICS_HISTOGRAM_OBSERVE(metrics::HBA_OPTIMIZE_TIME_MS, time_ms);
+    }
+}
+
+void HealthMonitor::recordOptimizationFailure(const std::string& optimizer_name) {
+    for (const auto& checker : checkers_) {
+        auto perf_checker = std::dynamic_pointer_cast<PerformanceHealthChecker>(checker);
+        if (perf_checker) {
+            perf_checker->recordOptimizationFailure(optimizer_name);
+            break;
+        }
     }
 }
 

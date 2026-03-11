@@ -84,6 +84,7 @@ htmlcov/
 
 # ========== ROS2 工作空间构建产物（不提交）==========
 automap_ws/install/
+automap_ws/install_deps/
 automap_ws/build/
 automap_ws/build_*/
 automap_ws/log/
