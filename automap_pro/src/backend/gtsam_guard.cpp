@@ -36,11 +36,12 @@ static void applyTbbSerialized() {
     // ✅ P0 修复：限制所有并行库的线程数为 1
     // 这是解决 SIGSEGV 崩溃的关键！
 
-    // 方法1: 设置环境变量（对某些库有效）
+    // 方法1: 设置环境变量（对某些库有效，包括子进程）
     #ifdef __linux__
     setenv("OMP_NUM_THREADS", "1", 1);  // 限制 OpenMP
     setenv("EIGEN_NUM_THREADS", "1", 1);  // 限制 Eigen
     setenv("MKL_NUM_THREADS", "1", 1);  // 限制 Intel MKL
+    setenv("TBB_NUM_THREADS", "1", 1);  // 限制 TBB（新增，更直接）
     #endif
 
     // 方法2: 运行时限制 Eigen

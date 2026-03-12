@@ -198,10 +198,15 @@ private:
     std::thread            opt_thread_;
     void optLoop();
 
+    /** 是否有线程正在执行 commitAndUpdate（用于 ensureBackendCompletedAndFlushBeforeHBA 等待「后端真正空闲」再触发 HBA） */
+    std::atomic<bool>      optimization_in_progress_{false};
+
     // ── 私有工具 ──────────────────────────────────────────────────────────
     gtsam::Pose3 toPose3(const Pose3d& T) const;
     Pose3d       fromPose3(const gtsam::Pose3& p) const;
     gtsam::noiseModel::Gaussian::shared_ptr infoToNoise(const Mat66d& info) const;
+    /** 从信息矩阵对角线构造 Diagonal 噪声，避免 Gaussian::Covariance 在 linearize 路径 double free */
+    gtsam::noiseModel::Diagonal::shared_ptr infoToNoiseDiagonal(const Mat66d& info) const;
     OptimizationResult commitAndUpdate();
     void notifyPoseUpdate(const std::unordered_map<int, Pose3d>& poses);
 };

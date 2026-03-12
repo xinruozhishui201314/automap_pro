@@ -64,6 +64,37 @@
 
 ---
 
+## 7.1. HBA GTSAM fallback：共享 between_noise 导致 double free（2026-03-11）
+
+- **现象**：使用 GTSAM fallback 时，`LevenbergMarquardtOptimizer` 构造阶段报 `double free or corruption (out)`，栈在 `free` ← `gtsam::NoiseModelFactor::error` ← `NonlinearFactorGraph::error` ← `LevenbergMarquardtOptimizer` 构造。
+- **根因**：HBA fallback 中所有 Between 因子共用同一个 `between_noise` shared_ptr，与「单节点 Prior + 共享 prior_noise_」同类（borglab/gtsam#1189）；LM 构造时对 graph 求 error 触发因子求值/析构路径上的 double free。
+- **修复**（`automap_pro/src/backend/hba_optimizer.cpp`）：
+  1. **Prior/Between 每因子独立噪声**：在循环内每次 `graph.add(PriorFactor/BetweenFactor(...))` 时新建 `noiseModel::Diagonal::Variances(...)`，不再在循环外创建单一 prior_noise/between_noise 复用。
+  2. **GPS 安全**：对 `position_enu` 与 `covariance` 做 `allFinite()` 校验；方差对角线 clamp 到 `[1e-6, 1e6]`，避免异常协方差导致 GTSAM 内部异常。
+  3. **日志**：图构建完成后打 `[HBA][GTSAM] graph built: factors=... values=... gps_factors=...`，失败时用 ALOG_ERROR 记录异常信息。
+
+## 7.2. HBA GTSAM fallback 与后端 ISAM2 双路 GTSAM 崩溃（2026-03-11）
+
+- **现象**：即使每因子独立噪声，LM 构造阶段仍报 `double free or corruption (out)`，栈同上（NoiseModelFactor::error → free）。
+- **可能根因**：① 同一进程内 **IncrementalOptimizer（ISAM2）** 与 **HBA GTSAM fallback（LevenbergMarquardtOptimizer）** 共用 libgtsam，ISAM2 与 LM 交替使用可能触发 GTSAM 内部/静态状态问题（与 borglab/gtsam#1189 同类）；② 某类因子（Prior/Between/GPS）在 LM 的 `graph.error(initial)` 路径存在库内 bug。
+- **增强日志与诊断**（`hba_optimizer.cpp`）：
+  1. 建图时记录每个因子的类型：`[HBA][GTSAM] factor[idx] type=Prior(k0)|Between(k0-k1)|GPS(k2)`，崩溃时可根据 factor 数量对应到类型。
+  2. LM 构造前打 `[HBA][GTSAM] LevenbergMarquardtOptimizer constructor enter (若崩溃在此后...)`，构造后打 `constructor exit`，便于确认崩溃在 LM 构造内。
+  3. **可选逐因子 error 诊断**：设置环境变量 `AUTOMAP_HBA_FACTOR_ERROR_DIAG=1` 后，在构造 LM 前对每个因子调用 `graph[i]->error(initial)` 并打 `factor_error idx=N type=...`；若崩溃发生在该循环，最后一条 `idx=N` 即肇事因子索引。
+- **隔离验证**：临时关闭 HBA 触发或关闭 HBA 的 GPS，仅用 ISAM2+GPS，或反之仅用 HBA fallback，观察崩溃是否消失，以区分「双路共用导致」与「单路 LM 内某因子导致」。详见 `GTSAM_MULTI_USE_AND_LOGGING.md` 第 5 节。
+
+## 7.3. HBA GTSAM fallback：Eigen 临时量 + 未传副本导致 LM 构造 double free（2026-03-11）
+
+- **现象**：与 7.2 相同，LM 构造阶段 `double free or corruption (out)`，栈在 `free` ← `NoiseModelFactor::error` ← `NonlinearFactorGraph::error` ← `LevenbergMarquardtOptimizer` 构造。
+- **根因**：① **Eigen 临时量**：Prior/Between 使用 `(gtsam::Vector(6) << ...).finished()` 作为临时传入 `noiseModel::Diagonal::Variances()`，若 GTSAM 内部某路径保存对传入向量的引用而非拷贝，则临时析构后悬垂引用，在 LM 构造内 `graph.error(initial)` 时触发未定义行为（表现为 double free）；② **LM 持引用**：直接传 `graph`/`initial` 给 LM 构造，与 ISAM2 双路共用 libgtsam 时，LM 内部若持有对栈上 graph/initial 的引用，生命周期与析构顺序易触发问题。
+- **修复**（`automap_pro/src/backend/hba_optimizer.cpp`）：
+  1. **命名方差向量**：用 `gtsam::Vector6 prior_var6` / `between_var6` 在栈上构造并填入数值，再 `Variances(prior_var6)` / `Variances(between_var6)`，避免将 Eigen 临时量传入 GTSAM。
+  2. **传副本给 LM**：构造 `graph_copy(graph)`、`initial_copy(initial)`，用 `LevenbergMarquardtOptimizer opt(graph_copy, initial_copy)`，与 `commitAndUpdate` 中 ISAM2 的 graph_copy/values_copy 策略一致，避免 LM 内部持对原对象的引用。
+  3. **key 一致性检查**：LM 构造前检查所有因子的 key 均在 `initial_copy` 中，若缺失则跳过优化并打 WARN，避免 key 缺失导致未定义行为。
+  4. **日志增强**：pre-LM 打 `graph_copy.size`、`initial_copy.size`、`initial_keys_sample=[...]`；unknown 异常时提示查阅 7.1/7.2 与 pre-LM 日志。
+
+---
+
 ## 8. 根因：单节点 Prior-only 与共享 prior_noise_ 导致 linearize double free（2026-03-11）
 
 - **现象**：flush 时崩溃，日志为 `pending_factors=1 pending_values=1`、`factor_0 type=Prior`，即 **仅 1 个 Prior 因子 + 1 个 value** 时在 `NoiseModelFactor::linearize` 内 double free。

@@ -15,8 +15,37 @@
 #ifdef USE_HBA_API
 #include <hba_api/hba_api.h>
 #endif
+#ifdef USE_GTSAM_FALLBACK
+#include <gtsam/base/Vector.h>
+#include <gtsam/geometry/Pose3.h>
+#include <gtsam/slam/PriorFactor.h>
+#include <gtsam/slam/BetweenFactor.h>
+#include <gtsam/navigation/GPSFactor.h>
+#include <gtsam/nonlinear/NonlinearFactorGraph.h>
+#include <gtsam/nonlinear/LevenbergMarquardtOptimizer.h>
+#include <gtsam/inference/Symbol.h>
+#include <gtsam/linear/NoiseModel.h>
+#endif
 
 namespace automap_pro {
+#ifdef USE_GTSAM_FALLBACK
+namespace {
+static gtsam::Pose3 toGtsamPose3(const Pose3d& T) {
+    Eigen::Quaterniond q(T.rotation());
+    gtsam::Rot3 rot = gtsam::Rot3::Quaternion(q.w(), q.x(), q.y(), q.z());
+    gtsam::Point3 t(T.translation().x(), T.translation().y(), T.translation().z());
+    return gtsam::Pose3(rot, t);
+}
+static Pose3d fromGtsamPose3(const gtsam::Pose3& p) {
+    Pose3d T = Pose3d::Identity();
+    T.translation() = Eigen::Vector3d(p.x(), p.y(), p.z());
+    const auto& q = p.rotation().toQuaternion();
+    T.linear() = Eigen::Quaterniond(q.w(), q.x(), q.y(), q.z()).toRotationMatrix();
+    return T;
+}
+static gtsam::Symbol KF(size_t i) { return gtsam::Symbol('x', static_cast<gtsam::Key>(i)); }
+} // namespace
+#endif
 
 HBAOptimizer::HBAOptimizer() = default;
 
@@ -129,8 +158,9 @@ void HBAOptimizer::onGPSAligned(
     gps_aligned_     = true;
     gps_align_result_ = align_result;
 
-    // GPS 对齐后立即触发一次全局优化
-    triggerAsync(all_submaps, false);
+    // GPS 对齐后立即触发一次全局优化（backend.hba.enabled=false 时跳过，仅 ISAM2+GPS）
+    if (ConfigManager::instance().hbaEnabled())
+        triggerAsync(all_submaps, false);
 }
 
 void HBAOptimizer::workerLoop() {
@@ -327,8 +357,16 @@ HBAResult HBAOptimizer::runHBA(const PendingTask& task) {
                 api_result.error_msg.c_str());
     }
 
+#elif defined(USE_GTSAM_FALLBACK)
+    if (!ConfigManager::instance().hbaGtsamFallbackEnabled()) {
+        RCLCPP_WARN(rclcpp::get_logger("automap_system"),
+            "[HBA][BACKEND] GTSAM fallback disabled (backend.hba.enable_gtsam_fallback=false), skipping HBA");
+        ALOG_WARN(MOD, "HBA: GTSAM fallback disabled by config, skip");
+        result.success = false;
+    } else {
+        result = runGTSAMFallback(task);
+    }
 #else
-    // fallback：无 HBA API，明确标记为失败，避免误以为已优化
     result.success = false;
     RCLCPP_WARN(rclcpp::get_logger("automap_system"),
         "[HBA][BACKEND] hba_api not available, skipping optimization (no changes applied)");
@@ -337,6 +375,199 @@ HBAResult HBAOptimizer::runHBA(const PendingTask& task) {
 
     return result;
 }
+
+#ifdef USE_GTSAM_FALLBACK
+HBAResult HBAOptimizer::runGTSAMFallback(const PendingTask& task) {
+    HBAResult result;
+    result.success = false;
+    if (task.keyframes.empty()) return result;
+
+    std::vector<KeyFrame::Ptr> sorted_kfs = task.keyframes;
+    std::sort(sorted_kfs.begin(), sorted_kfs.end(),
+              [](const KeyFrame::Ptr& a, const KeyFrame::Ptr& b) {
+                  return a->timestamp < b->timestamp;
+              });
+
+    ensureGtsamTbbSerialized();
+    GtsamCallScope scope(GtsamCaller::HBA, "GTSAM_fallback",
+                        "keyframes=" + std::to_string(sorted_kfs.size()) +
+                        " gps=" + (task.enable_gps ? "1" : "0"), true);
+
+    try {
+        gtsam::NonlinearFactorGraph graph;
+        gtsam::Values initial;
+        // 记录每个因子的类型，用于崩溃时定位（与 ISAM2 双路 GTSAM 时 double free 诊断）
+        std::vector<std::string> factor_type_log;
+
+        // 每个因子使用独立噪声模型，避免多因子共享同一 shared_ptr 在 GTSAM 内触发 double free
+        //（与 incremental_optimizer 及 FIX_GPS_BATCH_SIGSEGV 文档中 borglab/gtsam#1189 同类问题一致）
+        const double prior_var = 1e-8;
+        const double between_var = 0.01;
+
+        // 后端优化后再 HBA：优先用 T_w_b_optimized 做初始值（当与 T_w_b 不同时表示已被后端/上一轮 HBA 更新）
+        auto poseForInitial = [](const KeyFrame::Ptr& kf) -> Pose3d {
+            const Pose3d& o = kf->T_w_b_optimized;
+            const Pose3d& t = kf->T_w_b;
+            if ((o.translation() - t.translation()).norm() > 1e-9 || !o.rotation().isApprox(t.rotation()))
+                return o;
+            return t;
+        };
+
+        // 使用命名变量作为方差向量，避免将 Eigen 临时量传入 Variances() 导致 GTSAM 内部悬垂引用
+        //（LM 构造时 graph.error(initial) 会触发 NoiseModelFactor::error → double free，见 borglab/gtsam#1189 同类）
+        gtsam::Vector6 prior_var6;
+        prior_var6 << prior_var, prior_var, prior_var, prior_var, prior_var, prior_var;
+        gtsam::Vector6 between_var6;
+        between_var6 << between_var, between_var, between_var, between_var, between_var, between_var;
+
+        for (size_t i = 0; i < sorted_kfs.size(); ++i) {
+            Pose3d pose_i = poseForInitial(sorted_kfs[i]);
+            initial.insert(KF(i), toGtsamPose3(pose_i));
+            if (i == 0) {
+                auto prior_noise = gtsam::noiseModel::Diagonal::Variances(prior_var6);
+                graph.add(gtsam::PriorFactor<gtsam::Pose3>(KF(0), toGtsamPose3(pose_i), prior_noise));
+                factor_type_log.push_back("Prior(k0)");
+            } else {
+                Pose3d pose_prev = poseForInitial(sorted_kfs[i - 1]);
+                Pose3d rel = pose_prev.inverse() * pose_i;
+                auto between_noise = gtsam::noiseModel::Diagonal::Variances(between_var6);
+                graph.add(gtsam::BetweenFactor<gtsam::Pose3>(KF(i - 1), KF(i), toGtsamPose3(rel), between_noise));
+                factor_type_log.push_back("Between(k" + std::to_string(i - 1) + "-k" + std::to_string(i) + ")");
+            }
+        }
+
+        size_t gps_factors_added = 0;
+        if (task.enable_gps && gps_aligned_) {
+            for (size_t i = 0; i < sorted_kfs.size(); ++i) {
+                const auto& kf = sorted_kfs[i];
+                if (!kf->has_valid_gps || kf->gps.quality == GPSQuality::INVALID || kf->gps.quality == GPSQuality::LOW)
+                    continue;
+                // 校验 position_enu 有限
+                const auto& pos = kf->gps.position_enu;
+                if (!pos.allFinite()) {
+                    RCLCPP_WARN(rclcpp::get_logger("automap_system"),
+                        "[HBA][GTSAM] skip GPS factor kf=%zu: non-finite position_enu", i);
+                    ALOG_WARN(MOD, "HBA GTSAM: skip GPS kf={} non-finite position_enu", i);
+                    continue;
+                }
+                gtsam::Point3 pt(pos.x(), pos.y(), pos.z());
+                Eigen::Matrix3d c = kf->gps.covariance;
+                if (!c.allFinite()) {
+                    RCLCPP_WARN(rclcpp::get_logger("automap_system"),
+                        "[HBA][GTSAM] skip GPS factor kf=%zu: non-finite covariance", i);
+                    ALOG_WARN(MOD, "HBA GTSAM: skip GPS kf={} non-finite covariance", i);
+                    continue;
+                }
+                double v0 = std::max(1e-6, std::min(1e6, c(0, 0)));
+                double v1 = std::max(1e-6, std::min(1e6, c(1, 1)));
+                double v2 = std::max(1e-6, std::min(1e6, c(2, 2)));
+                gtsam::Vector3 vars(v0, v1, v2);
+                auto noise = gtsam::noiseModel::Diagonal::Variances(vars);
+                graph.add(gtsam::GPSFactor(KF(i), pt, noise));
+                factor_type_log.push_back("GPS(k" + std::to_string(i) + ")");
+                gps_factors_added++;
+            }
+        }
+
+        size_t n_factors = graph.size();
+        size_t n_values = initial.size();
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[HBA][GTSAM] graph built: factors=%zu values=%zu gps_factors=%zu (building LM optimizer...)",
+            n_factors, n_values, gps_factors_added);
+        ALOG_INFO(MOD, "HBA GTSAM: factors={} values={} gps_factors={}", n_factors, n_values, gps_factors_added);
+
+        // 诊断：逐因子打印类型，便于崩溃时定位是哪一个 factor 在 error() 路径触发 double free
+        for (size_t idx = 0; idx < graph.size(); ++idx) {
+            const char* type_str = idx < factor_type_log.size() ? factor_type_log[idx].c_str() : "?";
+            RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                "[HBA][GTSAM] factor[%zu] type=%s", idx, type_str);
+        }
+
+        // 可选：在 LM 构造前逐因子计算 error，若崩溃则最后一条 factor_error 即肇事因子（与 LM 构造内 graph.error() 同路径）
+        const char* diag_env = std::getenv("AUTOMAP_HBA_FACTOR_ERROR_DIAG");
+        bool run_factor_error_diag = (diag_env && (std::string(diag_env) == "1" || std::string(diag_env) == "true"));
+        if (run_factor_error_diag) {
+            double total_err = 0;
+            for (size_t idx = 0; idx < graph.size(); ++idx) {
+                const char* type_str = idx < factor_type_log.size() ? factor_type_log[idx].c_str() : "?";
+                RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                    "[HBA][GTSAM] factor_error idx=%zu type=%s (pre-call)", idx, type_str);
+                fflush(stdout);
+                double e = graph[idx]->error(initial);
+                total_err += e * e;
+                RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                    "[HBA][GTSAM] factor_error idx=%zu type=%s err_sq=%.6g", idx, type_str, e * e);
+            }
+            RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                "[HBA][GTSAM] factor_error total_sq=%.6g (LM constructor next)", total_err);
+        }
+
+        // 传入 graph/initial 的副本，避免 LM 内部持有对栈上对象的引用导致与 ISAM2 双路共用时的 double free（与 commitAndUpdate 中 graph_copy/values_copy 一致）
+        gtsam::NonlinearFactorGraph graph_copy(graph);
+        gtsam::Values initial_copy(initial);
+        std::string key_sample;
+        { size_t n = 0; for (gtsam::Key k : initial_copy.keys()) { if (n++) key_sample += ","; key_sample += std::to_string(k); if (n >= 5) { key_sample += ",..."; break; } } }
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[HBA][GTSAM] pre-LM: graph_copy.size=%zu initial_copy.size=%zu initial_keys_sample=[%s]",
+            graph_copy.size(), initial_copy.size(), key_sample.c_str());
+
+        // 可选：检查所有因子的 key 均在 initial 中，避免 key 缺失导致未定义行为
+        bool key_ok = true;
+        for (size_t idx = 0; idx < graph_copy.size() && key_ok; ++idx) {
+            for (gtsam::Key k : graph_copy[idx]->keys()) {
+                if (!initial_copy.exists(k)) {
+                    RCLCPP_WARN(rclcpp::get_logger("automap_system"),
+                        "[HBA][GTSAM] key mismatch: factor[%zu] key %zu not in initial", idx, static_cast<size_t>(k));
+                    key_ok = false;
+                    break;
+                }
+            }
+        }
+        if (!key_ok) {
+            RCLCPP_WARN(rclcpp::get_logger("automap_system"),
+                "[HBA][GTSAM] key consistency check failed, skipping LM optimization");
+            ALOG_WARN(MOD, "HBA GTSAM: factor key not in initial, skip");
+            return result;
+        }
+
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[HBA][GTSAM] LevenbergMarquardtOptimizer constructor enter (若崩溃在此后、无 exit→崩溃在 LM 构造/error 内)");
+        fflush(stdout);
+
+        gtsam::LevenbergMarquardtOptimizer opt(graph_copy, initial_copy);
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[HBA][GTSAM] LevenbergMarquardtOptimizer constructor exit (LM built ok)");
+
+        gtsam::Values optimized = opt.optimize();
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[HBA][GTSAM] LM optimize() exit iterations done");
+
+        for (size_t i = 0; i < sorted_kfs.size(); ++i) {
+            if (optimized.exists(KF(i))) {
+                sorted_kfs[i]->T_w_b_optimized = fromGtsamPose3(optimized.at<gtsam::Pose3>(KF(i)));
+                result.optimized_poses.push_back(sorted_kfs[i]->T_w_b_optimized);
+            }
+        }
+        result.success = true;
+        result.elapsed_ms = 0.0;
+        result.final_mme = 0.0;
+        scope.setSuccess(true);
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[HBA][BACKEND] GTSAM fallback done: poses=%zu", result.optimized_poses.size());
+        ALOG_INFO(MOD, "HBA GTSAM fallback done: optimized_poses={}", result.optimized_poses.size());
+    } catch (const std::exception& e) {
+        RCLCPP_WARN(rclcpp::get_logger("automap_system"),
+            "[HBA][BACKEND] GTSAM fallback failed: %s", e.what());
+        ALOG_ERROR(MOD, "HBA GTSAM fallback exception: {}", e.what());
+        fprintf(stderr, "[HBAOptimizer] GTSAM fallback: %s\n", e.what());
+    } catch (...) {
+        RCLCPP_WARN(rclcpp::get_logger("automap_system"),
+            "[HBA][BACKEND] GTSAM fallback unknown exception (若为 double free，检查 FIX_GPS_BATCH_SIGSEGV 7.1/7.2 与 pre-LM 日志)");
+        ALOG_ERROR(MOD, "HBA GTSAM fallback: unknown exception");
+    }
+    return result;
+}
+#endif
 
 std::vector<KeyFrame::Ptr> HBAOptimizer::collectKeyFramesFromSubmaps(
     const std::vector<SubMap::Ptr>& submaps) const

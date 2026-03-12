@@ -158,6 +158,7 @@ endif()
 
 # HBA API 库（直接 C++ 调用，无文件IO）
 # ament_export_libraries 可能导出 hba_api 或未创建 namespace 目标，需兼容
+# 未找到时启用 GTSAM ISAM2 fallback，保证全局优化仍可执行
 set(HBA_API_LINK_TARGET "")
 find_package(hba_api QUIET)
 if(hba_api_FOUND)
@@ -172,6 +173,10 @@ if(hba_api_FOUND)
   else()
     message(WARNING "[automap_pro] hba_api package found but no CMake target (build hba_api first: colcon build --packages-select hba_api)")
   endif()
+endif()
+if(NOT HBA_API_LINK_TARGET)
+  add_definitions(-DUSE_GTSAM_FALLBACK)
+  message(STATUS "[automap_pro] hba_api not found, using GTSAM ISAM2 fallback for global optimization")
 endif()
 
 # overlap_transformer_msgs（可选，用于降级 Python Service）
@@ -265,6 +270,7 @@ add_library(automap_core SHARED
   src/core/error_code.cpp
   src/core/error_monitor.cpp
   src/core/health_monitor_impl.cpp
+  src/core/crash_report.cpp
 )
 target_include_directories(automap_core PUBLIC ${AUTOMAP_INCLUDE_DIRS})
 # 必须与 ament_target_dependencies 一致：全部用普通形式（无 PUBLIC/PRIVATE），否则 CMake 报 keyword/plain 混用

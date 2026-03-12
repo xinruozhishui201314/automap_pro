@@ -299,3 +299,15 @@ grep '\[ISAM2_DIAG\]' full.log | tail -5
 | **opt 线程崩溃（GDB 显示 optLoop/commitAndUpdate）** | `grep '\[ISAM2_DIAG\]' full.log \| tail -10` → 确认 pop type= 与 commitAndUpdate enter/done |
 | **队列长期不空 / 卡滞** | `grep -E '\[ISAM2_QUEUE\]|\[ISAM2_DIAG\] optLoop pop' full.log \| tail -20` |
 | **多路 GTSAM 崩溃（iSAM2 / Optimizer / HBA 任一）** | `grep -E 'GTSAM_ENTRY|GTSAM_EXIT' full.log \| tail -30` → 最后一条 ENTRY 无 EXIT 即出事调用点，详见 [GTSAM_MULTI_USE_AND_LOGGING.md](GTSAM_MULTI_USE_AND_LOGGING.md) |
+
+### 10.5 崩溃时 stderr 的 [CRASH_REPORT]（2026-03-12 强化）
+
+进程在 SIGABRT/SIGSEGV 时会通过信号处理器向 **stderr** 写一行：
+
+```text
+[CRASH_REPORT] signal=SIGABRT last_step=first_update_phase3_add_factors
+```
+
+- **last_step** 为崩溃前最后一次设置的步骤标识（如 `first_update_lm_optimize`、`first_update_isam2_init`、`first_update_phase3_add_factors`、`incremental_isam2_update`）。
+- 即使日志缓冲未刷新，该行也会在终止前写入，便于与 `[CRASH_CONTEXT]` 对照定位。
+- 建议同时：`ulimit -c unlimited` 后复现，用 `gdb -c core.<pid> $(which automap_system_node)` 执行 `bt full` 获取完整栈。

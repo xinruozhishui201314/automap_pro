@@ -100,9 +100,13 @@ TeaserMatcher::Result TeaserMatcher::match(
     const Pose3d& /*initial_guess*/) const
 {
     const unsigned tid = automap_pro::logThreadId();
+    const size_t src_pts = src_cloud ? src_cloud->size() : 0u;
+    const size_t tgt_pts = tgt_cloud ? tgt_cloud->size() : 0u;
+    ALOG_INFO(MOD, "[LOOP_COMPUTE][TEASER] match_enter src_pts={} tgt_pts={} (精准优化: 后续见 fpfh_done/teaser_solve_enter/teaser_done)",
+              src_pts, tgt_pts);
     ALOG_INFO(MOD, "[tid={}] step=match_enter src_ptr={} src_use_count={} src_pts={} tgt_ptr={} tgt_use_count={} tgt_pts={}",
-              tid, static_cast<const void*>(src_cloud.get()), src_cloud ? src_cloud.use_count() : 0, src_cloud ? src_cloud->size() : 0u,
-              static_cast<const void*>(tgt_cloud.get()), tgt_cloud ? tgt_cloud.use_count() : 0, tgt_cloud ? tgt_cloud->size() : 0u);
+              tid, static_cast<const void*>(src_cloud.get()), src_cloud ? src_cloud.use_count() : 0, src_pts,
+              static_cast<const void*>(tgt_cloud.get()), tgt_cloud ? tgt_cloud.use_count() : 0, tgt_pts);
     Result result;
     
     try {
@@ -128,6 +132,7 @@ TeaserMatcher::Result TeaserMatcher::match(
 
         // === 检查最少点数要求 ===
         if (src->size() < 30 || tgt->size() < 30) {
+            ALOG_INFO(MOD, "[LOOP_COMPUTE][TEASER] teaser_fail reason=insufficient_pts src_pts={} tgt_pts={} min=30", src->size(), tgt->size());
             ALOG_WARN(MOD, "[tid={}] step=match_skip insufficient_pts src={} tgt={} (min=30)", tid, src->size(), tgt->size());
             ALOG_INFO(MOD, "[TRACE] step=loop_match result=fail reason=insufficient_pts tid={} src_pts={} tgt_pts={} min=30 (精准定位: 预处理后点数不足，可增大 teaser.max_points 或减小 voxel_size)", tid, src->size(), tgt->size());
             return result;
@@ -204,6 +209,8 @@ TeaserMatcher::Result TeaserMatcher::match(
             return result;
         }
         result.num_correspondences = static_cast<int>(corrs.size());
+        ALOG_INFO(MOD, "[LOOP_COMPUTE][TEASER] fpfh_done corrs={} (精准优化: corrs<20 会跳过 TEASER，可调 FPFH 或 voxel 增加对应点)",
+                  result.num_correspondences);
         ALOG_INFO(MOD, "[tid={}] step=fpfh_match_done correspondences={}", tid, result.num_correspondences);
 
         // 【FPFH_DIAG】统计对应点距离分布，诊断误匹配
@@ -228,6 +235,7 @@ TeaserMatcher::Result TeaserMatcher::match(
         }
 
         if ((int)corrs.size() < 10) {
+            ALOG_INFO(MOD, "[LOOP_COMPUTE][TEASER] teaser_fail reason=insufficient_corrs corrs={} min=10", static_cast<int>(corrs.size()));
             ALOG_WARN(MOD, "[tid={}] step=match_skip insufficient_corrs={} (min=10)", tid, corrs.size());
             ALOG_INFO(MOD, "[TRACE] step=loop_match result=fail reason=insufficient_corrs tid={} corrs={} min=10 (精准定位: FPFH 对应点过少)", tid, corrs.size());
             return result;
@@ -239,6 +247,7 @@ TeaserMatcher::Result TeaserMatcher::match(
     // 策略：对应点 < 20 时提前返回，避免进入 TEASER 不稳定路径
     const int corr_count = static_cast<int>(corrs.size());
     if (corr_count < 20) {
+        ALOG_INFO(MOD, "[LOOP_COMPUTE][TEASER] teaser_fail reason=teaser_precheck_insufficient_corrs corrs={} safe_min=20", corr_count);
         ALOG_WARN(MOD, "[tid={}] step=teaser_precheck_skip corr_count={} < safe_threshold=20, too risky for TEASER PMC",
                  tid, corr_count);
         ALOG_INFO(MOD, "[TRACE] step=loop_match result=fail reason=teaser_precheck_insufficient_corrs tid={} corrs={} safe_min=20",
@@ -259,6 +268,7 @@ TeaserMatcher::Result TeaserMatcher::match(
     // 实测：corrs < 20 时 inliers < 10 的概率极高，直接跳过 TEASER
     const int kCorrsThreshold = 20;
     if (static_cast<int>(corrs.size()) < kCorrsThreshold) {
+        ALOG_INFO(MOD, "[LOOP_COMPUTE][TEASER] teaser_fail reason=insufficient_corrs_v3 corrs={} safe_min={}", static_cast<int>(corrs.size()), kCorrsThreshold);
         ALOG_WARN(MOD, "[tid={}] [CRITICAL_V3] step=teaser_skip_before_creation corrs={} < safe_threshold={}, COMPLETELY AVOIDING TEASER CREATION",
                  tid, static_cast<int>(corrs.size()), kCorrsThreshold);
         ALOG_INFO(MOD, "[TRACE] step=loop_match result=fail reason=insufficient_corrs_v3 tid={} corrs={} safe_min={} (V3: skip before solver creation)",
@@ -295,6 +305,8 @@ TeaserMatcher::Result TeaserMatcher::match(
     params.max_clique_num_threads   = 1;
 
     try {
+        ALOG_INFO(MOD, "[LOOP_COMPUTE][TEASER] teaser_solve_enter corrs={} noise_bound={} (精准优化: 求解后见 teaser_done inliers/ratio)",
+                  static_cast<int>(corrs.size()), params.noise_bound);
         ALOG_DEBUG(MOD, "[tid={}] step=teaser_solve_enter corrs={} noise_bound={}", tid, corrs.size(), params.noise_bound);
         AUTOMAP_TIMED_SCOPE(MOD, fmt::format("TEASER solve corr={}", corrs.size()), 3000.0);
         // 使用 unique_ptr 便于在低 inlier 提前 return 前显式 reset，避免栈展开时 TEASER 析构触发已知的 SIGSEGV（极少 inlier 时）
@@ -305,6 +317,7 @@ TeaserMatcher::Result TeaserMatcher::match(
 
         auto solution = solver->getSolution();
         if (!solution.valid) {
+            ALOG_INFO(MOD, "[LOOP_COMPUTE][TEASER] teaser_fail reason=teaser_solution_invalid corrs={}", static_cast<int>(corrs.size()));
             ALOG_WARN(MOD, "[tid={}] step=teaser_solve_invalid corr={}", tid, corrs.size());
             ALOG_INFO(MOD, "[TRACE] step=loop_match result=fail reason=teaser_solution_invalid tid={} corrs={}", tid, corrs.size());
             ALOG_INFO(MOD, "[CRASH_TRACE][tid={} lwp={}] step=teaser_invalid_natural_destruct solver_ptr={} (solver will destruct naturally)",
@@ -318,8 +331,11 @@ TeaserMatcher::Result TeaserMatcher::match(
         // 计算内点率（getInlierMaxClique 返回 vector<int>，为索引个数即 inlier 数）
         const auto max_clique = solver->getInlierMaxClique();
         const int inliers = static_cast<int>(max_clique.size());
+        const float ratio = corrs.empty() ? 0.f : static_cast<float>(inliers) / static_cast<float>(corrs.size());
+        ALOG_INFO(MOD, "[LOOP_COMPUTE][TEASER] teaser_done inliers={} corrs={} ratio={:.3f} valid={} (精准优化: inliers<10 会拒绝，可调 safe_min 或改进初值)",
+                  inliers, static_cast<int>(corrs.size()), ratio, (inliers >= 10 && ratio >= min_inlier_ratio_) ? 1 : 0);
         ALOG_INFO(MOD, "[tid={}] step=teaser_inlier_computed inliers={}/{} ratio={:.2f} thresh={}",
-                 tid, inliers, corrs.size(), (float)inliers / (float)corrs.size(), min_inlier_ratio_);
+                 tid, inliers, corrs.size(), ratio, min_inlier_ratio_);
 
         // 【TEASER_DIAG】使用 solution 的位姿计算内点 RMSE 和距离分布（result.T_tgt_src 尚未赋值）
         if (inliers > 0) {
@@ -354,6 +370,8 @@ TeaserMatcher::Result TeaserMatcher::match(
         // ===【V3 激进修复】双重安全检查：提前 abort + 延迟析构===
         const int kMinSafeInliers = 10;
         if (inliers < kMinSafeInliers) {
+            ALOG_INFO(MOD, "[LOOP_COMPUTE][TEASER] teaser_fail reason=teaser_extremely_few_inliers inliers={} safe_min={} (精准优化: 可放宽 safe_min 或改进 FPFH/重叠)",
+                      inliers, kMinSafeInliers);
             ALOG_WARN(MOD, "[tid={}] [CRITICAL_V3] step=teaser_extremely_few_inliers inliers={} < safe_threshold={}, HIGH CRASH RISK",
                      tid, inliers, kMinSafeInliers);
             ALOG_INFO(MOD, "[CRASH_TRACE][tid={} lwp={}] step=teaser_solver_abort_low_inliers solver_ptr={} inliers={} safe_min={}",
@@ -374,6 +392,7 @@ TeaserMatcher::Result TeaserMatcher::match(
         result.inlier_ratio = (float)inliers / (float)corrs.size();
 
         if (result.inlier_ratio < min_inlier_ratio_) {
+            ALOG_INFO(MOD, "[LOOP_COMPUTE][TEASER] teaser_fail reason=inlier_ratio_low inliers={} ratio={:.3f} min_ratio={}", inliers, result.inlier_ratio, min_inlier_ratio_);
             ALOG_WARN(MOD, "[tid={}] step=teaser_inlier_rejected inlier_ratio={:.2f} < thresh={}", tid, result.inlier_ratio, min_inlier_ratio_);
             ALOG_INFO(MOD, "[TRACE] step=loop_match result=fail reason=inlier_ratio_low tid={} inlier_ratio={:.3f} min={}", tid, result.inlier_ratio, min_inlier_ratio_);
             ALOG_INFO(MOD, "[CRASH_TRACE][tid={} lwp={}] step=teaser_inlier_rejected_natural_destruct solver_ptr={} inliers={}",

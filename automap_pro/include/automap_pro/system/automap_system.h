@@ -295,6 +295,9 @@ private:
     void onGPSAligned(const GPSAlignResult& result);
     void addBatchGPSFactors();
 
+    /** 后端优化完成后再触发 HBA：等待 ISAM2 队列空并 flush pending，释放 GTSAM 相关变量，避免与 HBA 的 GTSAM 竞争崩溃。调用方在 triggerAsync 前必须调用。 */
+    void ensureBackendCompletedAndFlushBeforeHBA();
+
     // ── 服务处理 ──────────────────────────────────────────────────────────
     void handleSaveMap(
         const std::shared_ptr<automap_pro::srv::SaveMap::Request>,

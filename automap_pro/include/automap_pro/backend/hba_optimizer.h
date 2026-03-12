@@ -92,6 +92,10 @@ private:
 
     void workerLoop();
     HBAResult runHBA(const PendingTask& task);
+#ifdef USE_GTSAM_FALLBACK
+    /** 无 HBA API 时使用 GTSAM 批量优化作为 fallback */
+    HBAResult runGTSAMFallback(const PendingTask& task);
+#endif
     std::vector<KeyFrame::Ptr> collectKeyFramesFromSubmaps(
         const std::vector<SubMap::Ptr>& submaps) const;
     /** 在 queue_mutex_ 下检查是否空闲 */

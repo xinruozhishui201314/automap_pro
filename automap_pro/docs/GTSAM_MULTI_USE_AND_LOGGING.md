@@ -29,7 +29,7 @@
 |--------|------|-----------|
 | ISAM2 | IncrementalOptimizer（iSAM2） | `commitAndUpdate`, `addGPSFactorsBatch` |
 | Optimizer | Optimizer::optimizeGTSAM（位姿图批量） | `optimize` |
-| HBA | HBA 位姿图优化（hba_api） | `PGO` |
+| HBA | HBA 位姿图优化（hba_api 或 **GTSAM_fallback**） | `PGO`, `GTSAM_fallback` |
 
 ---
 
@@ -51,6 +51,7 @@ grep -E 'GTSAM_ENTRY|GTSAM_EXIT|\[ISAM2_DIAG\]|\[GPS_BATCH\]' full.log | tail -5
 |----------|------|
 | 最后一条为 `[GTSAM_ENTRY] caller=ISAM2 op=commitAndUpdate ...`，且**无**后续 `[GTSAM_EXIT]` | 崩溃发生在 **iSAM2 的 commitAndUpdate** 内部（如 `isam2_.update()` → GTSAM addVariables / TBB internal_clear）。 |
 | 最后一条为 `[GTSAM_ENTRY] caller=HBA op=PGO ...`，无 EXIT | 崩溃在 **HBA PGO**（hba_api 内 LevenbergMarquardtOptimizer）内部。 |
+| 最后一条为 `[GTSAM_ENTRY] caller=HBA op=GTSAM_fallback ...`，无 EXIT | 崩溃在 **HBA GTSAM fallback**（无 hba_api 时用 LM 批量优化）内部；结合 `[HBA][GTSAM] factor[n]` / `factor_error idx=` 可定位肇事因子。 |
 | 最后一条为 `[GTSAM_ENTRY] caller=Optimizer op=optimize ...`，无 EXIT | 崩溃在 **Optimizer::optimizeGTSAM** 内部。 |
 | ENTRY 与 EXIT 成对出现，崩溃在之后 | 崩溃不在本次 GTSAM 调用内，需结合 GDB 栈或后续日志（如地图发布、其他节点）排查。 |
 
@@ -62,26 +63,49 @@ grep -E 'GTSAM_ENTRY|GTSAM_EXIT|\[ISAM2_DIAG\]|\[GPS_BATCH\]' full.log | tail -5
 
 ---
 
-## 5. 配置与环境变量
+## 5. 双路 GTSAM 与冲突假设
+
+同一进程内存在两路 GTSAM 使用：
+
+1. **IncrementalOptimizer（ISAM2）**：子图节点 + 里程计边 + GPS 因子，增量 `isam2_.update()`。
+2. **HBA GTSAM fallback**：无 hba_api 时，HBA 用 `LevenbergMarquardtOptimizer(graph, initial)` 做批量 PGO。
+
+两者通过 **GtsamCallScope 全局互斥** 串行化，理论上不会并发进入 GTSAM；若仍出现 `double free or corruption`（栈在 `NoiseModelFactor::error` / `free`），可能原因包括：
+
+- **GTSAM 库内 bug**（如 borglab/gtsam#1189）：同一进程内 ISAM2 与 LM 交替使用，静态/内部状态被污染。
+- **某类因子或噪声模型** 在 LM 构造阶段 `graph.error(initial)` 时触发 double free。
+
+**隔离验证建议**：
+
+- **仅 ISAM2 + GPS（关闭 HBA）**：配置 `backend.hba.enabled: false`，则周期触发、GPS 对齐触发、结束建图触发均不执行 HBA，只跑增量 iSAM2 + GPS。
+- **仅 HBA 用 GPS（ISAM2 不加 GPS）**：配置 `gps.add_constraints_on_align: false`，则对齐后不向 iSAM2 批量添加 GPS 因子，仅 HBA 在触发时带 GPS 约束。
+- 启用逐因子 error 诊断：`AUTOMAP_HBA_FACTOR_ERROR_DIAG=1`，崩溃时最后一条 `factor_error idx=N` 即肇事因子索引，结合 `factor[N] type=Prior|Between|GPS` 定位类型。
+
+---
+
+## 6. 配置与环境变量
 
 | 项 | 说明 |
 |----|------|
 | `AUTOMAP_GTSAM_SERIAL` | 设为 `1`、`true`、`yes` 时启用全局 GTSAM 互斥（默认启用）；设为 `0` 关闭互斥（仅保留日志，不串行化）。 |
+| `AUTOMAP_HBA_FACTOR_ERROR_DIAG` | 设为 `1` 或 `true` 时，HBA GTSAM fallback 在构造 LM 前逐因子调用 `factor->error(initial)` 并打日志；若 double free 发生在该路径，最后一条 `factor_error idx=N` 即肇事因子，便于与 `factor[N] type=...` 对应。 |
+| **配置** `backend.hba.enabled` | 设为 `false` 时关闭所有 HBA 触发（仅跑 ISAM2+GPS），用于隔离。详见 `docs/ISOLATE_ISAM2_AND_HBA.md`。 |
+| **配置** `gps.add_constraints_on_align` | 设为 `false` 时对齐后不向 ISAM2 批量添加 GPS 因子（仅 HBA 用 GPS），用于隔离。 |
 
 ---
 
-## 6. 代码位置速查
+## 7. 代码位置速查
 
 | 功能 | 文件 | 说明 |
 |------|------|------|
 | GtsamCallScope / TBB 控制 | `include/automap_pro/backend/gtsam_guard.h`, `src/backend/gtsam_guard.cpp` | 全局互斥、ENTRY/EXIT 日志、`ensureGtsamTbbSerialized()` |
 | ISAM2 使用处 | `src/backend/incremental_optimizer.cpp` | 构造时 `ensureGtsamTbbSerialized()`；`commitAndUpdate()`、`addGPSFactorsBatch()` 内 `GtsamCallScope` |
 | Optimizer GTSAM | `src/backend/optimizer.cpp` | `optimizeGTSAM()` 内 `GtsamCallScope` |
-| HBA GTSAM | `src/backend/hba_optimizer.cpp` | `runHBA()` 内 `optimizer.optimize()` 外包裹 `GtsamCallScope` |
+| HBA GTSAM | `src/backend/hba_optimizer.cpp` | `runHBA()` / `runGTSAMFallback()` 内 `GtsamCallScope`；fallback 时逐因子类型日志与可选 `factor_error` 诊断 |
 
 ---
 
-## 7. 验证与回滚
+## 8. 验证与回滚
 
 - **验证**：同场景回放（如 M2DGR + GPS 对齐），确认日志中 `[GTSAM_ENTRY]` 与 `[GTSAM_EXIT]` 成对、无 SIGSEGV。
 - **关闭互斥**：`AUTOMAP_GTSAM_SERIAL=0` 仅关闭全局锁，ENTRY/EXIT 日志仍保留，便于定位。

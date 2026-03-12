@@ -9,9 +9,20 @@
 
 ## 2. 输出文件
 
+### 2.0 推荐：使用建图保存目录下的 trajectory_odom_*.csv
+
+当 **`trajectory_log_after_mapping_only=true`**（默认）时：
+
+- **用于轨迹-GPS 对比的 trajectory_odom** 仅在建图完成（调用 save_map / saveMapToFiles）时写入。
+- **首选使用保存目录**（与 `keyframe_poses.pcd`、`gps_positions_map.pcd`、`global_map.pcd` 同目录）下的 `trajectory_odom_<session_id>.csv`。
+- 该文件与 keyframe_poses.pcd、gps_positions_map.pcd **同坐标系（map）**，轨迹与 GPS 在同一地图系下可重合对比。
+- 若配置了 `trajectory_log_dir` 且与保存目录不同，系统会**同时**写一份副本到 `trajectory_log_dir`；做对比与绘图时仍请以**保存目录**下的文件为准。
+
+**推荐步骤**：1）保持 `trajectory_log_after_mapping_only: true`；2）建图结束后执行保存（save_map 或自动保存）；3）使用保存目录下的 `trajectory_odom_*.csv` 做对比与 `plot_trajectory_compare.py` 绘图。
+
 | 文件 | 含义 | 表头 |
 |------|------|------|
-| `trajectory_odom_<session_id>.csv` | 建图轨迹（每帧）+ 对应GPS信息（便于对比分析） | timestamp,x,y,z,qx,qy,qz,qw,pos_std_x,pos_std_y,pos_std_z,gps_x,gps_y,gps_z,gps_frame,gps_valid,gps_hdop,gps_quality |
+| `trajectory_odom_<session_id>.csv` | **（默认）建图完成时**写入**保存目录**，关键帧位姿 + 按时间匹配的 GPS（地图系）；与 keyframe_poses.pcd 同目录、同坐标系。用于轨迹-GPS 对比请用此文件。 | timestamp,x,y,z,qx,qy,qz,qw,pos_std_x,pos_std_y,pos_std_z,gps_x,gps_y,gps_z,gps_frame,gps_valid,gps_hdop,gps_quality |
 | `trajectory_gps_<session_id>.csv`  | GPS 轨迹（含姿态估计） | timestamp,x,y,z,frame,pitch,roll,yaw,attitude_source,velocity,attitude_valid |
 | `gps_positions_map.pcd` | **建图结束时**保存的地图坐标系下 GPS 位置点云（与 global_map.pcd 同目录） | PCD 格式：x,y,z 为地图系坐标（米），intensity 为点索引 |
 
@@ -65,8 +76,8 @@ plt.savefig('odom_vs_gps.png', dpi=150)
 | 参数 | 类型 | 默认 | 说明 |
 |------|------|------|------|
 | `trajectory_log_enable` | bool | true | 是否写入轨迹 CSV |
-| `trajectory_log_after_mapping_only` | bool | **true** | 为 true 时仅在建图完成（saveMapToFiles）时写 trajectory_odom CSV（关键帧+最终GPS），保证与 GPS 在同一地图系；为 false 时边建图边写（调试用） |
-| `trajectory_log_dir`    | string | "" | 边建图边写时的输出目录。**建图完成后**：trajectory_odom 会同时写入 save_map 的 output_dir 与 trajectory_log_dir（若两者不同），便于在 logs 目录直接找到该 CSV |
+| `trajectory_log_after_mapping_only` | bool | **true** | **推荐保持 true**。为 true 时仅在建图完成（saveMapToFiles）时写 trajectory_odom CSV（关键帧+最终 GPS，地图系），与 keyframe_poses.pcd 同系；为 false 时边建图边写（调试用，轨迹为 odom 系，与 GPS 不重合） |
+| `trajectory_log_dir`    | string | "" | 边建图边写时的输出目录。**建图完成后**：trajectory_odom 会同时写入 save_map 的 **output_dir**（首选）与 trajectory_log_dir（若两者不同）。做轨迹-GPS 对比时请用 **output_dir** 下的文件 |
 
 在 launch 或 config 中可覆盖，例如：
 

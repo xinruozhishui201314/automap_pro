@@ -349,7 +349,7 @@ void RvizPublisher::publishLoopMarkers(
         line.id    = id++;
         line.type  = visualization_msgs::msg::Marker::LINE_STRIP;
         line.action= visualization_msgs::msg::Marker::ADD;
-        line.scale.x = 0.25;
+        line.scale.x = 0.1;
         line.color.r = lc->is_inter_session ? 1.0f : 0.0f;
         line.color.g = lc->is_inter_session ? 0.5f : 1.0f;
         line.color.b = 0.0f;
@@ -507,7 +507,7 @@ void RvizPublisher::publishGPSMarkers(const std::vector<SubMap::Ptr>& submaps) {
         if (!sm || !sm->has_valid_gps) continue;
         // 使用优化后位姿，与轨迹一致（子图中心即 GPS 约束节点）
         Eigen::Vector3d pos = sm->pose_w_anchor_optimized.translation();
-        auto sphere = makeSphereMarker("gps", id++, pos, 2.5, makeColor(0.0f, 0.6f, 1.0f, 0.85f));
+        auto sphere = makeSphereMarker("gps", id++, pos, 0.8, makeColor(0.0f, 0.6f, 1.0f, 0.85f));
         markers.markers.push_back(sphere);
     }
     gps_marker_pub_->publish(markers);
@@ -529,7 +529,7 @@ void RvizPublisher::publishGPSMarkersWithConstraintLines(
         if (gps_idx >= gps_positions_map.size()) break;
         Eigen::Vector3d pos = sm->pose_w_anchor_optimized.translation();
         markers.markers.push_back(
-            makeSphereMarker("gps", sphere_id++, pos, 2.5, makeColor(0.0f, 0.6f, 1.0f, 0.85f)));
+            makeSphereMarker("gps", sphere_id++, pos, 0.8, makeColor(0.0f, 0.6f, 1.0f, 0.85f)));
         markers.markers.push_back(
             makeLineMarker("gps_constraint_lines", static_cast<int>(gps_idx),
                            pos, gps_positions_map[gps_idx], line_c, 0.15));
@@ -542,6 +542,9 @@ void RvizPublisher::publishGPSAlignment(const GPSAlignResult& result,
                                         const std::vector<SubMap::Ptr>& submaps) {
     if (!node_ || !gps_marker_pub_ || !result.success) return;
     visualization_msgs::msg::MarkerArray markers;
+    // 先清除旧命名空间，避免重复触发对齐时 marker 堆积导致显示异常
+    markers.markers.push_back(makeDeleteAllMarkers("gps_align").markers.front());
+    markers.markers.push_back(makeDeleteAllMarkers("gps_aligned").markers.front());
     Pose3d T_align = Pose3d(result.R_gps_lidar) * Eigen::Translation3d(result.t_gps_lidar);
     auto axes = makeAxisMarkers("gps_align", 0, T_align, 3.0);
     for (auto& m : axes.markers) markers.markers.push_back(std::move(m));
@@ -549,7 +552,7 @@ void RvizPublisher::publishGPSAlignment(const GPSAlignResult& result,
     for (const auto& sm : submaps) {
         if (!sm || !sm->has_valid_gps) continue;
         markers.markers.push_back(makeSphereMarker("gps_aligned", static_cast<int>(markers.markers.size()),
-            sm->pose_w_anchor_optimized.translation(), 1.5, c));
+            sm->pose_w_anchor_optimized.translation(), 0.6, c));
     }
     gps_marker_pub_->publish(markers);
 }
@@ -585,7 +588,7 @@ void RvizPublisher::publishGPSPositionsInMap(const std::vector<Eigen::Vector3d>&
     std_msgs::msg::ColorRGBA c = makeColor(0.0f, 0.8f, 0.4f, 0.85f);  // 青绿色，表示真实 GPS 位置（地图系）
     for (size_t i = 0; i < positions_map.size(); ++i) {
         markers.markers.push_back(
-            makeSphereMarker("gps_positions_map", static_cast<int>(i), positions_map[i], 0.8, c));
+            makeSphereMarker("gps_positions_map", static_cast<int>(i), positions_map[i], 0.5, c));
     }
     gps_positions_map_pub_->publish(markers);
 }

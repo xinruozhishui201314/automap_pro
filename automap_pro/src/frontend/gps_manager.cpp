@@ -20,6 +20,9 @@ GPSManager::GPSManager() {
     keyframe_match_window_s_ = cfg.gpsKeyframeMatchWindowS();
     keyframe_max_hdop_       = cfg.gpsKeyframeMaxHdop();
     max_interp_gap_s_        = cfg.gpsMaxInterpGapS();
+    extrapolation_margin_s_  = cfg.gpsExtrapolationMarginS();
+    extrapolation_uncertainty_scale_ = cfg.gpsExtrapolationUncertaintyScale();
+    velocity_estimation_window_s_   = cfg.gpsVelocityEstimationWindowS();
     quality_hdop_thresh_    = cfg.gpsQualityThreshold();
     rmse_accept_thresh_     = cfg.gpsAlignRmseThresh();
     good_samples_needed_    = cfg.gpsGoodSamplesNeeded();
@@ -52,11 +55,14 @@ void GPSManager::applyConfig() {
     keyframe_match_window_s_ = cfg.gpsKeyframeMatchWindowS();
     keyframe_max_hdop_     = cfg.gpsKeyframeMaxHdop();
     max_interp_gap_s_      = cfg.gpsMaxInterpGapS();
+    extrapolation_margin_s_ = cfg.gpsExtrapolationMarginS();
+    extrapolation_uncertainty_scale_ = cfg.gpsExtrapolationUncertaintyScale();
+    velocity_estimation_window_s_   = cfg.gpsVelocityEstimationWindowS();
     quality_hdop_thresh_   = cfg.gpsQualityThreshold();
     rmse_accept_thresh_   = cfg.gpsAlignRmseThresh();
     good_samples_needed_  = cfg.gpsGoodSamplesNeeded();
-    ALOG_INFO(MOD, "[applyConfig] min_align_points={} min_align_dist_m={:.1f} keyframe_match_window_s={:.2f}",
-              min_align_points_, min_align_dist_m_, keyframe_match_window_s_);
+    ALOG_INFO(MOD, "[applyConfig] min_align_points={} min_align_dist_m={:.1f} keyframe_match_window_s={:.2f} good_samples_needed={} rmse_thresh={:.2f}m (align triggers when good_sample_count>=good_samples_needed and try_align passes dist/points)",
+              min_align_points_, min_align_dist_m_, keyframe_match_window_s_, good_samples_needed_, rmse_accept_thresh_);
 }
 
 void GPSManager::addGPSMeasurement(
@@ -151,6 +157,12 @@ void GPSManager::addGPSMeasurement(
         ALOG_DEBUG(MOD, "GPS good sample #{} hdop={:.2f} quality={} enu=({:.2f},{:.2f},{:.2f})",
                    good_sample_count_, hdop, static_cast<int>(quality),
                    pos_enu.x(), pos_enu.y(), pos_enu.z());
+        // 诊断：接近或达到对齐触发阈值时打 INFO，便于分析为何未触发
+        if (good_sample_count_ == 1 || good_sample_count_ == good_samples_needed_ ||
+            (good_samples_needed_ > 5 && good_sample_count_ == (good_samples_needed_ * 5) / 10)) {
+            ALOG_INFO(MOD, "[GPS_DIAG] good_sample_count={} (needed={}) hdop={:.2f} quality={} → align triggers when count>=needed and try_align passes dist/points",
+                      good_sample_count_, good_samples_needed_, hdop, static_cast<int>(quality));
+        }
     } else {
         ALOG_DEBUG(MOD, "GPS low quality: hdop={:.2f} quality={} sats={}",
                    hdop, static_cast<int>(quality), num_sats);
@@ -172,8 +184,12 @@ void GPSManager::addGPSMeasurement(
     // 触发对齐判断：若设置了 align_scheduler_ 则异步调度，否则在锁外同步执行 try_align()，避免持锁执行回调导致死锁
     if (state_ == GPSAlignState::NOT_ALIGNED &&
         good_sample_count_ >= good_samples_needed_) {
-        ALOG_INFO(MOD, "Sufficient good GPS samples ({}), triggering alignment...",
-                  good_sample_count_);
+        // 诊断：对齐触发条件满足（样本数）；try_align 内会再检查 kf 窗口与累积距离
+        double acc_dist = 0.0;
+        for (size_t i = 1; i < kf_window_.size(); ++i)
+            acc_dist += (kf_window_[i].second.translation() - kf_window_[i-1].second.translation()).norm();
+        ALOG_INFO(MOD, "[GPS_ALIGN] Trigger: good_sample_count={} (needed={}) kf_window={} gps_window={} accumulated_dist_m={:.1f} (min={:.1f}); try_align will run and check dist/points",
+                  good_sample_count_, good_samples_needed_, kf_window_.size(), gps_window_.size(), acc_dist, min_align_dist_m_);
         pending_align_.store(true);
         if (align_scheduler_) {
             align_scheduler_();
@@ -264,7 +280,8 @@ void GPSManager::try_align() {
     const size_t kf_sz = kf_window_.size();
     const size_t gps_sz = gps_window_.size();
     if (kf_window_.empty() || gps_window_.empty()) {
-        ALOG_DEBUG(MOD, "[GPS_ALIGN] try_align skip reason=empty kf_window={} gps_window={}", kf_sz, gps_sz);
+        ALOG_INFO(MOD, "[GPS_ALIGN] try_align skip: kf_window={} gps_window={} reason=empty (need both non-empty)",
+                  kf_sz, gps_sz);
         return;
     }
 
@@ -274,7 +291,8 @@ void GPSManager::try_align() {
                        kf_window_[i-1].second.translation()).norm();
     }
     if (total_dist < min_align_dist_m_) {
-        ALOG_DEBUG(MOD, "[GPS_ALIGN] try_align skip reason=dist_too_short dist={:.1f}m min={:.1f}m", total_dist, min_align_dist_m_);
+        ALOG_INFO(MOD, "[GPS_ALIGN] try_align skip: total_dist_m={:.1f} min_required={:.1f} kf_window={} reason=dist_too_short (need more keyframes/distance)",
+                  total_dist, min_align_dist_m_, kf_sz);
         return;
     }
 
@@ -283,7 +301,8 @@ void GPSManager::try_align() {
         if (g.quality >= GPSQuality::MEDIUM) good_gps_count++;
     }
     if ((int)good_gps_count < min_align_points_) {
-        ALOG_DEBUG(MOD, "[GPS_ALIGN] try_align skip reason=insufficient_points good_gps={} min={}", good_gps_count, min_align_points_);
+        ALOG_INFO(MOD, "[GPS_ALIGN] try_align skip: good_gps_count={} min_required={} total_dist_m={:.1f} reason=insufficient_points (need more MEDIUM+ GPS in window)",
+                  good_gps_count, min_align_points_, total_dist);
         return;
     }
 
@@ -293,8 +312,10 @@ void GPSManager::try_align() {
     GPSAlignResult result = compute_svd_alignment();
 
     if (result.success && result.rmse_m < rmse_accept_thresh_) {
-        ALOG_INFO(MOD, "GPS alignment SUCCESS: rmse={:.3f}m matched={} pts",
-                  result.rmse_m, result.matched_points);
+        double rot_deg = std::atan2(result.R_gps_lidar(1, 0), result.R_gps_lidar(0, 0)) * 180.0 / M_PI;
+        ALOG_INFO(MOD, "GPS alignment SUCCESS: rmse={:.3f}m matched={} pts R_z_deg={:.2f} t=({:.2f},{:.2f},{:.2f})",
+                  result.rmse_m, result.matched_points, rot_deg,
+                  result.t_gps_lidar.x(), result.t_gps_lidar.y(), result.t_gps_lidar.z());
         align_result_ = result;
         state_ = GPSAlignState::ALIGNED;
         std::vector<AlignCallback> cbs = align_cbs_;
@@ -403,7 +424,11 @@ GPSAlignResult GPSManager::compute_svd_alignment() {
         }
     }
 
-    if ((int)pairs.size() < min_align_points_) return result;
+    if ((int)pairs.size() < min_align_points_) {
+        ALOG_INFO(MOD, "[GPS_ALIGN] SVD skip: time_matched_pairs={} min_required={} (GPS timestamps not close enough to keyframes; check keyframe_match_window_s / GPS rate)",
+                  static_cast<int>(pairs.size()), min_align_points_);
+        return result;
+    }
 
     // 中心化
     Eigen::Vector3d gps_centroid = Eigen::Vector3d::Zero();
@@ -498,6 +523,26 @@ Eigen::Vector3d GPSManager::enu_to_map(const Eigen::Vector3d& enu) const {
     if (state_ != GPSAlignState::ALIGNED && state_ != GPSAlignState::DEGRADED)
         return enu;
     return align_result_.R_gps_lidar * enu + align_result_.t_gps_lidar;
+}
+
+std::pair<Eigen::Vector3d, std::string> GPSManager::enu_to_map_with_frame(const Eigen::Vector3d& enu) const {
+    if (state_ != GPSAlignState::ALIGNED && state_ != GPSAlignState::DEGRADED)
+        return {enu, "enu"};
+    return {align_result_.R_gps_lidar * enu + align_result_.t_gps_lidar, "map"};
+}
+
+int GPSManager::getGoodSampleCount() const {
+    std::lock_guard<std::mutex> lk(mutex_);
+    return good_sample_count_;
+}
+
+double GPSManager::getAccumulatedDistM() const {
+    std::lock_guard<std::mutex> lk(mutex_);
+    double total_dist = 0.0;
+    for (size_t i = 1; i < kf_window_.size(); ++i) {
+        total_dist += (kf_window_[i].second.translation() - kf_window_[i - 1].second.translation()).norm();
+    }
+    return total_dist;
 }
 
 std::vector<std::pair<double, Eigen::Vector3d>> GPSManager::getGpsPositionsInMapFrame() const {
@@ -605,9 +650,9 @@ std::optional<GPSMeasurement> GPSManager::queryByTimestamp(double ts) const {
                 if (r.timestamp > win_max) win_max = r.timestamp;
             }
         }
-        ALOG_WARN(MOD, "[queryByTimestamp] ts={:.3f} result=not_found window_size={} max_dt={:.1f}s "
-                  "window_ts=[{:.3f}, {:.3f}] (若 ts 不在区间内则扩大 keyframe_match_window_s)",
-                  ts, gps_window_.size(), max_dt, win_min, win_max);
+        ALOG_WARN(MOD, "[queryByTimestamp] ts={:.3f} result=not_found window_size={} max_dt_s={:.2f} "
+                  "window_ts=[{:.3f}, {:.3f}] (odom_ts outside GPS window or min_dt_to_nearest>max_dt; consider keyframe_match_window_s>={:.2f})",
+                  ts, gps_window_.size(), max_dt, win_min, win_max, max_dt);
         return std::nullopt;
     }
     GPSMeasurement m;
@@ -643,6 +688,83 @@ std::optional<GPSMeasurement> GPSManager::queryByTimestampForLog(double ts, doub
     m.quality      = best->quality;
     m.hdop         = best->hdop;
     m.is_valid     = (best->quality >= GPSQuality::MEDIUM);
+    return m;
+}
+
+std::optional<Eigen::Vector3d> GPSManager::estimateGpsVelocityLocked(double ts) const {
+    const double half = velocity_estimation_window_s_ * 0.5;
+    std::vector<std::pair<double, Eigen::Vector3d>> pts;
+    for (const auto& r : gps_window_) {
+        if (r.timestamp >= ts - half && r.timestamp <= ts + half && r.quality >= GPSQuality::MEDIUM) {
+            pts.push_back({r.timestamp, isAligned() ? enu_to_map(r.pos_enu) : r.pos_enu});
+        }
+    }
+    if (pts.size() < 2) return std::nullopt;
+    std::sort(pts.begin(), pts.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+    Eigen::Vector3d sum_vel = Eigen::Vector3d::Zero();
+    double sum_dt = 0.0;
+    for (size_t i = 1; i < pts.size(); ++i) {
+        double dt = pts[i].first - pts[i - 1].first;
+        if (dt > 0.01 && dt < velocity_estimation_window_s_) {
+            sum_vel += (pts[i].second - pts[i - 1].second) / dt;
+            sum_dt += 1.0;
+        }
+    }
+    if (sum_dt < 0.5) return std::nullopt;
+    return sum_vel / sum_dt;
+}
+
+std::optional<Eigen::Vector3d> GPSManager::estimateGpsVelocity(double ts) const {
+    std::lock_guard<std::mutex> lk(mutex_);
+    return estimateGpsVelocityLocked(ts);
+}
+
+std::optional<GPSMeasurement> GPSManager::queryByTimestampEnhanced(double ts) const {
+    auto m_opt = queryByTimestamp(ts);
+    if (m_opt) return m_opt;
+
+    std::lock_guard<std::mutex> lk(mutex_);
+    if (gps_window_.size() < 2) return std::nullopt;
+
+    double win_min = gps_window_.front().timestamp;
+    double win_max = win_min;
+    for (const auto& r : gps_window_) {
+        if (r.timestamp < win_min) win_min = r.timestamp;
+        if (r.timestamp > win_max) win_max = r.timestamp;
+    }
+    const double margin = extrapolation_margin_s_;
+    const GPSRecord* anchor = nullptr;
+    double dt_extrap = 0.0;
+    if (ts < win_min && (win_min - ts) <= margin) {
+        anchor = &gps_window_.front();
+        dt_extrap = ts - anchor->timestamp;
+    } else if (ts > win_max && (ts - win_max) <= margin) {
+        anchor = &gps_window_.back();
+        dt_extrap = ts - anchor->timestamp;
+    } else {
+        return std::nullopt;
+    }
+
+    auto vel_opt = estimateGpsVelocityLocked(anchor->timestamp);
+    if (!vel_opt) return std::nullopt;
+
+    Eigen::Vector3d pos = (isAligned() ? enu_to_map(anchor->pos_enu) : anchor->pos_enu) + (*vel_opt) * dt_extrap;
+    double hdop_safe = std::max(anchor->hdop, 0.1);
+    double sigma_h = hdop_safe * 0.5 * std::sqrt(extrapolation_uncertainty_scale_);
+    double sigma_v = hdop_safe * 1.0 * std::sqrt(extrapolation_uncertainty_scale_);
+
+    GPSMeasurement m;
+    m.timestamp    = ts;
+    m.position_enu = pos;
+    m.quality      = anchor->quality;
+    m.hdop         = anchor->hdop;
+    m.is_valid     = (anchor->hdop <= keyframe_max_hdop_);
+    m.covariance   = Eigen::Matrix3d::Zero();
+    m.covariance(0, 0) = sigma_h * sigma_h;
+    m.covariance(1, 1) = sigma_h * sigma_h;
+    m.covariance(2, 2) = sigma_v * sigma_v;
+    ALOG_DEBUG(MOD, "[queryByTimestampEnhanced] ts={:.3f} mode=extrapolate dt={:.3f} anchor_ts={:.3f}",
+              ts, dt_extrap, anchor->timestamp);
     return m;
 }
 

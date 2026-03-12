@@ -116,6 +116,12 @@ public:
     }
     /** 双样本线性插值时允许的最大时间间隔(秒)，超过则退化为最近邻。默认 2.0 */
     double gpsMaxInterpGapS() const { return std::max(0.2, get<double>("gps.max_interp_gap_s", 2.0)); }
+    /** 外推边界(秒)：ts 在 GPS 窗口边缘 ± margin 内时启用速度外推。默认 0.5 */
+    double gpsExtrapolationMarginS() const { return std::max(0.1, get<double>("gps.extrapolation_margin_s", 0.5)); }
+    /** 外推协方差放大倍数。默认 2.0 */
+    double gpsExtrapolationUncertaintyScale() const { return std::max(1.0, get<double>("gps.extrapolation_uncertainty_scale", 2.0)); }
+    /** 速度估计窗口(秒)。默认 2.0 */
+    double gpsVelocityEstimationWindowS() const { return std::max(0.5, get<double>("gps.velocity_estimation_window_s", 2.0)); }
     /** GPS 滑动窗口最大条数（gps_window_/kf_window_），超限 FIFO 淘汰，防长时间运行 OOM。默认 5000 */
     size_t gpsMaxWindowSize() const {
         int v = get<int>("gps.max_window_size", 5000);
@@ -259,12 +265,16 @@ public:
     }
 
     // ── HBA ───────────────────────────────────────────────
+    /** 是否启用 HBA（周期/对齐/结束时的触发）。false 时仅跑 ISAM2+GPS，用于隔离双路 GTSAM 崩溃。默认 true */
+    bool   hbaEnabled()         const { return get<bool>("backend.hba.enabled", true); }
     int    hbaTotalLayers()     const { return get<int>("backend.hba.total_layer_num", 3); }
     int    hbaThreadNum()       const { return get<int>("backend.hba.thread_num", 8); }
     int    hbaTriggerSubmaps()  const { return get<int>("backend.hba.trigger_every_n_submaps", 10); }
     bool   hbaOnLoop()          const { return get<bool>("backend.hba.trigger_on_loop", false); }
     bool   hbaOnFinish()        const { return get<bool>("backend.hba.trigger_on_finish", true); }
     std::string hbaDataPath()   const { return get<std::string>("backend.hba.data_path", "/tmp/hba_data"); }
+    /** 是否允许使用 GTSAM fallback 做 HBA（无 hba_api 时）。生产建议 false，避免 double free；见 docs/HBA_GTSAM_FALLBACK_DOUBLE_FREE_FIX.md */
+    bool   hbaGtsamFallbackEnabled() const { return get<bool>("backend.hba.enable_gtsam_fallback", false); }
 
     // ── 地图（东北天 ENU 统一坐标系）──────────────────────────────────────
     double mapVoxelSize()       const { return std::max(0.2, get<double>("map.voxel_size", 0.2)); }

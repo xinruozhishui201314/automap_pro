@@ -1,6 +1,7 @@
 #include "automap_pro/backend/incremental_optimizer.h"
 #include "automap_pro/backend/gtsam_guard.h"
 #include "automap_pro/core/config_manager.h"
+#include "automap_pro/core/crash_report.h"
 #include "automap_pro/core/logger.h"
 #include "automap_pro/core/structured_logger.h"
 #include "automap_pro/core/metrics.h"
@@ -11,14 +12,115 @@
 #include <rclcpp/rclcpp.hpp>
 #include <gtsam/base/Matrix.h>
 #include <gtsam/base/Vector.h>
+#include <gtsam/nonlinear/LevenbergMarquardtOptimizer.h>
 #include <Eigen/SVD>
 #include <chrono>
+#include <set>
 #include <string>
 
 namespace automap_pro {
 
 // GTSAM Symbol 约定：s(sm_id) = Symbol('s', sm_id)
 static gtsam::Symbol SM(int id) { return gtsam::Symbol('s', id); }
+
+// ── 优化前约束全量转储与合理性校验（便于崩溃精准定位）────────────────────────────
+namespace {
+struct ConstraintValidation {
+    bool all_keys_exist = true;
+    bool all_values_finite = true;
+    std::string message;
+};
+
+void logAllConstraintsAndValidate(
+    const gtsam::NonlinearFactorGraph& graph,
+    const gtsam::Values& values,
+    const char* tag,
+    ConstraintValidation* out_validation)
+{
+    auto log = rclcpp::get_logger("automap_system");
+    const size_t nf = graph.size();
+    const size_t nv = values.size();
+    RCLCPP_INFO(log, "[GTSAM_CONSTRAINTS] tag=%s total_factors=%zu total_values=%zu (优化前全量约束，崩溃时 grep GTSAM_CONSTRAINTS 定位)",
+                tag, nf, nv);
+
+    std::set<gtsam::Key> value_key_set;
+    for (const gtsam::Key k : values.keys())
+        value_key_set.insert(k);
+
+    for (size_t i = 0; i < nf; ++i) {
+        const auto& f = graph[i];
+        gtsam::KeyVector kv = f->keys();
+        std::string keys_str;
+        std::string in_vals_str;
+        std::string finite_str;
+        bool factor_ok = true;
+        for (gtsam::Key k : kv) {
+            keys_str += (keys_str.empty() ? "" : ",") + std::to_string(k);
+            bool in_vals = (value_key_set.count(k) != 0);
+            in_vals_str += (in_vals_str.empty() ? "" : ",") + std::string(in_vals ? "yes" : "NO");
+            bool finite = false;
+            if (in_vals && values.exists(k)) {
+                try {
+                    auto p = values.at<gtsam::Pose3>(k);
+                    Eigen::Vector3d t = p.translation();
+                    Eigen::Matrix3d R = p.rotation().matrix();
+                    finite = t.array().isFinite().all() && R.array().isFinite().all();
+                } catch (...) {
+                    finite = false;
+                }
+                if (!finite) factor_ok = false;
+            } else if (!in_vals) {
+                factor_ok = false;
+            }
+            finite_str += (finite_str.empty() ? "" : ",") + std::string(finite ? "yes" : (in_vals ? "nan/inf" : "n/a"));
+        }
+        const char* type_str = "Other";
+        if (dynamic_cast<const gtsam::PriorFactor<gtsam::Pose3>*>(f.get())) type_str = "Prior";
+        else if (dynamic_cast<const gtsam::GPSFactor*>(f.get())) type_str = "GPS";
+        else if (dynamic_cast<const gtsam::BetweenFactor<gtsam::Pose3>*>(f.get())) type_str = "Between";
+        RCLCPP_INFO(log, "[GTSAM_CONSTRAINTS] factor %zu type=%s keys=[%s] keys_in_values=[%s] value_finite=[%s] valid=%s",
+                    i, type_str, keys_str.c_str(), in_vals_str.c_str(), finite_str.c_str(), factor_ok ? "yes" : "NO");
+        if (out_validation) {
+            for (gtsam::Key k : kv)
+                if (value_key_set.count(k) == 0) out_validation->all_keys_exist = false;
+            if (!factor_ok) out_validation->all_values_finite = false;
+        }
+    }
+
+    for (const gtsam::Key k : values.keys()) {
+        std::string pose_str = "n/a";
+        bool finite = false;
+        try {
+            auto p = values.at<gtsam::Pose3>(k);
+            Eigen::Vector3d t = p.translation();
+            Eigen::Matrix3d R = p.rotation().matrix();
+            finite = t.array().isFinite().all() && R.array().isFinite().all();
+            pose_str = "x=" + std::to_string(t.x()) + " y=" + std::to_string(t.y()) + " z=" + std::to_string(t.z());
+        } catch (...) {
+            pose_str = "at_failed";
+        }
+        RCLCPP_INFO(log, "[GTSAM_CONSTRAINTS] value key=%zu %s finite=%s",
+                    static_cast<size_t>(k), pose_str.c_str(), finite ? "1" : "0");
+        if (out_validation && !finite) out_validation->all_values_finite = false;
+    }
+
+    if (out_validation) {
+        for (size_t i = 0; i < nf; ++i) {
+            for (gtsam::Key k : graph[i]->keys()) {
+                if (value_key_set.count(k) == 0) {
+                    out_validation->all_keys_exist = false;
+                    break;
+                }
+            }
+        }
+        out_validation->message = out_validation->all_keys_exist && out_validation->all_values_finite
+            ? "ok" : ("keys_exist=" + std::string(out_validation->all_keys_exist ? "1" : "0") +
+                     " values_finite=" + std::string(out_validation->all_values_finite ? "1" : "0"));
+    }
+    RCLCPP_INFO(log, "[GTSAM_CONSTRAINTS] tag=%s validation done %s (若崩溃在 error() 或 optimize() 内，见上一 GTSAM_CONSTRAINTS 约束列表)",
+                tag, out_validation ? out_validation->message.c_str() : "n/a");
+}
+}  // anonymous namespace
 
 IncrementalOptimizer::IncrementalOptimizer() {
     ensureGtsamTbbSerialized();
@@ -36,6 +138,8 @@ IncrementalOptimizer::IncrementalOptimizer() {
     // 关闭线性化缓存，避免 GPS 对齐后 commitAndUpdate 时在 linearize 路径发生 double free
     //（与 borglab/gtsam#1189 同类：NoiseModelFactor::linearize -> free 处崩溃）
     params.cacheLinearizedFactors = false;
+    // ✅ 新增：关闭非线性误差评估，减少 TBB 调用路径（减少并发导致 double free 的机会）
+    params.evaluateNonlinearError = false;
 
     isam2_ = gtsam::ISAM2(params);
     // 使用 Diagonal 方差作为“近似固定先验”（可配置），避免 Constrained 退出时 SIGSEGV；适度先验利于点云清晰度，过强易导致数值刚度
@@ -86,7 +190,8 @@ void IncrementalOptimizer::addOdomFactor(
     std::unique_lock<std::shared_mutex> lk(rw_mutex_);
     if (!node_exists_.count(from) || !node_exists_.count(to)) return;
 
-    auto noise = infoToNoise(info_matrix);
+    // 使用 Diagonal 噪声避免 Gaussian::Covariance 在 linearize 路径触发 double free（即使 TBB 已关）
+    auto noise = infoToNoiseDiagonal(info_matrix);
     pending_graph_.add(gtsam::BetweenFactor<gtsam::Pose3>(
         SM(from), SM(to), toPose3(rel), noise));
     factor_count_++;
@@ -111,8 +216,8 @@ OptimizationResult IncrementalOptimizer::addLoopFactor(
             return OptimizationResult{};
         }
 
-        // 回环约束使用 Huber 鲁棒核（抑制错误回环的影响）
-        auto base_noise = infoToNoise(info_matrix);
+        // 回环约束使用 Huber 鲁棒核；base 用 Diagonal 避免 linearize 路径 double free
+        auto base_noise = infoToNoiseDiagonal(info_matrix);
         gtsam::noiseModel::Base::shared_ptr robust_noise = gtsam::noiseModel::Robust::Create(
             gtsam::noiseModel::mEstimator::Huber::Create(1.345),
             base_noise);
@@ -318,15 +423,49 @@ void IncrementalOptimizer::addGPSFactorsBatch(const std::vector<GPSFactorItem>& 
 
 OptimizationResult IncrementalOptimizer::forceUpdate() {
     // ✅ 修复：使用 try-catch 包裹，防止 GTSAM 内部 SIGSEGV 导致进程崩溃
+    bool had_pending = hasPendingFactorsOrValues();
+    size_t queue_d = getQueueDepth();
+    auto force_t0 = std::chrono::steady_clock::now();
+    RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+        "[ISAM2_DIAG][TRACE] step=forceUpdate_enter had_pending=%d queue_depth=%zu (调用方见 ensureBackendCompletedAndFlushBeforeHBA 或 finish_mapping)",
+        had_pending ? 1 : 0, queue_d);
+    RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+        "[CRASH_CONTEXT] caller=forceUpdate had_pending=%d queue_depth=%zu (崩溃时最后一条 CRASH_CONTEXT 即上一成功步骤)",
+        had_pending ? 1 : 0, queue_d);
     try {
         std::unique_lock<std::shared_mutex> lk(rw_mutex_);
-        return commitAndUpdate();
+        size_t pf = pending_graph_.size();
+        size_t pv = pending_values_.size();
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[ISAM2_DIAG][TRACE] step=forceUpdate_holding_lock pending_factors=%zu pending_values=%zu (崩溃在 commitAndUpdate 内则见 ISAM2_DIAG step=)",
+            pf, pv);
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[CRASH_CONTEXT] step=forceUpdate_about_to_call_commitAndUpdate pending_factors=%zu pending_values=%zu",
+            pf, pv);
+        OptimizationResult res = commitAndUpdate();
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[ISAM2_DIAG][TRACE] step=forceUpdate_commitAndUpdate_returned success=%d nodes=%d",
+            res.success ? 1 : 0, res.nodes_updated);
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[CRASH_CONTEXT] step=forceUpdate_exit success=%d nodes=%d",
+            res.success ? 1 : 0, res.nodes_updated);
+        double force_elapsed_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - force_t0).count();
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[ISAM2_DIAG][TRACE] step=forceUpdate_exit success=%d nodes=%d elapsed_ms=%.1f",
+            res.success ? 1 : 0, res.nodes_updated, force_elapsed_ms);
+        return res;
     } catch (const std::exception& e) {
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[ISAM2_DIAG][CRASH_TRACE] step=forceUpdate_exception exception=%s (崩溃发生在 commitAndUpdate 内，见上一 TRACE step)",
+            e.what());
         ALOG_ERROR(MOD, "forceUpdate failed: {}", e.what());
         RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
             "[IncrementalOptimizer][EXCEPTION] forceUpdate: %s", e.what());
         return OptimizationResult{};
     } catch (...) {
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[ISAM2_DIAG][CRASH_TRACE] step=forceUpdate_unknown_exception (崩溃发生在 forceUpdate 内 commitAndUpdate，见上一 TRACE step)");
         ALOG_ERROR(MOD, "forceUpdate: unknown exception");
         RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
             "[IncrementalOptimizer][EXCEPTION] forceUpdate: unknown exception");
@@ -345,11 +484,25 @@ OptimizationResult IncrementalOptimizer::commitAndUpdate() {
         return OptimizationResult{};
     }
 
+    optimization_in_progress_.store(true, std::memory_order_release);
+    struct Guard {
+        std::atomic<bool>* flag;
+        ~Guard() { flag->store(false, std::memory_order_release); }
+    } guard{&optimization_in_progress_};
+
     const size_t pf = pending_graph_.size();
     const size_t pv = pending_values_.size();
     std::string params = "pending_factors=" + std::to_string(pf) + " pending_values=" + std::to_string(pv);
     GtsamCallScope scope(GtsamCaller::ISAM2, "commitAndUpdate", params, true);
 
+    // 精准定位：若崩溃在 commitAndUpdate 内，grep CRASH_TRACE 或 step= 可确定最后到达的步骤
+    auto tid = std::hash<std::thread::id>{}(std::this_thread::get_id());
+    RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+        "[ISAM2_DIAG][TRACE] step=commitAndUpdate_enter tid=0x%zx pending_factors=%zu pending_values=%zu (崩溃时 grep CRASH_TRACE 或 step= 定位)",
+        static_cast<size_t>(tid), pf, pv);
+    RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+        "[CRASH_CONTEXT] step=commitAndUpdate_enter pending_factors=%zu pending_values=%zu tid=0x%zx",
+        pf, pv, static_cast<size_t>(tid));
     RCLCPP_INFO(rclcpp::get_logger("automap_system"),
         "[ISAM2_DIAG] commitAndUpdate enter pending_factors=%zu pending_values=%zu (若崩溃在此后、无 done→崩溃在 isam2_.update 内部)",
         pf, pv);
@@ -415,6 +568,9 @@ OptimizationResult IncrementalOptimizer::commitAndUpdate() {
             "[ISAM2_DIAG][CRITICAL] DEFER single-node update (factors=%zu values=%zu types=[%s]) "
             "- avoid GTSAM first-update double free (borglab/gtsam#1189), pending until 2+ nodes",
             pf, pv, factor_types_str.c_str());
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[CRASH_CONTEXT] step=commitAndUpdate_defer_return single_prior_only=%d all_factors_same_key=%d (未调用 isam2_.update)",
+            single_prior_only ? 1 : 0, all_factors_same_key ? 1 : 0);
         scope.setSuccess(true);
         return OptimizationResult{};  // 不清空 pending，等第二节点+odom 后一起 update
     }
@@ -429,20 +585,116 @@ OptimizationResult IncrementalOptimizer::commitAndUpdate() {
     auto t0 = std::chrono::steady_clock::now();
     AUTOMAP_TIMED_SCOPE(MOD, "iSAM2::update", 200.0);
 
+    bool used_first_update_three_phase = false;  // 用于最终日志 path=
+
     try {
-        // 传入副本，避免 GTSAM 内部持有对 pending_ 的引用时我们 clear 导致 double free
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[CRASH_CONTEXT] step=commitAndUpdate_before_copy pending_factors=%zu pending_values=%zu", pf, pv);
         gtsam::NonlinearFactorGraph graph_copy(pending_graph_);
         gtsam::Values values_copy(pending_values_);
         RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-            "[ISAM2_DIAG] update call enter (graph_copy.size=%zu values_copy.size=%zu)%s",
-            graph_copy.size(), values_copy.size(), is_first_update ? " [FIRST_UPDATE]" : "");
-        isam2_.update(graph_copy, values_copy);
+            "[ISAM2_DIAG][TRACE] step=copy_graph_values_done factors=%zu values=%zu (崩溃在此后则与 copy 无关)",
+            graph_copy.size(), values_copy.size());
         RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-            "[ISAM2_DIAG] update call exit (before calculateEstimate)");
-        current_estimate_ = isam2_.calculateEstimate();
+            "[CRASH_CONTEXT] step=commitAndUpdate_copy_done graph_size=%zu values_size=%zu is_first_update=%d",
+            graph_copy.size(), values_copy.size(), is_first_update ? 1 : 0);
+
+        // ═══════════════════════════════════════════════════════════════════════════════
+        // ✅ P0 V5 彻底修复：首次 update 完全跳过优化，仅注入 values，保留 factors 到下次 update。
+        //    根本原因：GTSAM 的 NoiseModelFactor::error() 在首次调用时存在 double free bug
+        //    (borglab/gtsam#1189)，无论是 ISAM2 还是 LM 都会触发。
+        //    之前的 V4 LM_then_ISAM2 方案仍会在 LM 构造函数内调用 error() 导致崩溃。
+        // 方案：Step1 仅注入 values（空 graph，不触发 linearize）
+        //       Step2 保留 factors 在 pending 中，等第二次增量 update 处理
+        // ═══════════════════════════════════════════════════════════════════════════════
+        if (is_first_update) {
+            used_first_update_three_phase = true;  // 复用变量，实际表示使用了首次特殊路径
+            RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                "[ISAM2_DIAG][V5] first update path=SKIP_OPTIMIZATION (bypass all GTSAM linearize)");
+            RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                "[CRASH_CONTEXT] step=first_update_v5_enter factors=%zu values=%zu",
+                graph_copy.size(), values_copy.size());
+            // V5 首次 update：不访问因子内部（prior/measurementIn/noiseModel/measured），避免 GTSAM 内部 free 路径触发 SIGSEGV，见 FIX_ISAM2_FIRST_UPDATE_DOUBLE_FREE_20260311.md
+
+            // Step1: 仅注入 values，空 graph（不触发 linearize）
+            gtsam::NonlinearFactorGraph empty_graph;
+            crash_report::setLastStep("first_update_v5_update_values");
+            RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                "[ISAM2_DIAG][TRACE] step=first_update_v5_pre_update_values");
+            RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                "[CRASH_CONTEXT] step=first_update_v5_pre_update_values nodes=%zu", values_copy.size());
+            isam2_.update(empty_graph, values_copy);
+            RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                "[ISAM2_DIAG][TRACE] step=first_update_v5_post_update_values");
+            RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                "[CRASH_CONTEXT] step=first_update_v5_post_update_values");
+
+            // Step2: 不清空 pending_graph_，保留所有 factors 到下次 update
+            // 注意：这里故意不清空 pending_graph_，让它留在 pending 中等下次增量 update 处理
+            // pending_graph_ 的清空逻辑在函数末尾会根据 used_first_update_three_phase 跳过
+
+            // Step3: 直接用初始值作为当前估计（不做优化）
+            current_estimate_ = values_copy;
+            RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                "[ISAM2_DIAG][V5] first update done: injected %zu values, deferred %zu factors to next update",
+                values_copy.size(), graph_copy.size());
+            RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                "[CRASH_CONTEXT] step=first_update_v5_done deferred_factors=%zu", graph_copy.size());
+        } else {
+            // 常规 ISAM2 增量 update：优化前同样输出全量约束便于定位
+            RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                "[ISAM2_DIAG] commitAndUpdate path=incremental (graph_copy.size=%zu values_copy.size=%zu)",
+                graph_copy.size(), values_copy.size());
+            RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                "[CRASH_CONTEXT] step=incremental_constraints_dump_enter");
+            ConstraintValidation inc_validation;
+            logAllConstraintsAndValidate(graph_copy, values_copy, "incremental_before_isam2", &inc_validation);
+            RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                "[ISAM2_DIAG][TRACE] step=incremental_constraints_dump_done all_keys_exist=%s all_values_finite=%s",
+                inc_validation.all_keys_exist ? "1" : "0", inc_validation.all_values_finite ? "1" : "0");
+            RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                "[CRASH_CONTEXT] step=incremental_pre_update (若崩溃则发生在 isam2_.update(graph_copy, values_copy) 内)");
+            RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                "[ISAM2_DIAG][TRACE] step=isam2_update_invoke");
+            crash_report::setLastStep("incremental_isam2_update");
+            isam2_.update(graph_copy, values_copy);
+            RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                "[ISAM2_DIAG][TRACE] step=isam2_update_returned");
+            RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                "[CRASH_CONTEXT] step=incremental_post_update");
+            RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                "[CRASH_CONTEXT] step=incremental_calculateEstimate_enter");
+            current_estimate_ = isam2_.calculateEstimate();
+            RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                "[ISAM2_DIAG][TRACE] step=calculateEstimate_done");
+            RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                "[CRASH_CONTEXT] step=incremental_calculateEstimate_done nodes=%zu", current_estimate_.size());
+        }
+        // === 清空 pending：首次 update 保留 factors 到下次处理，常规 update 清空全部 ===
+        if (used_first_update_three_phase) {
+            // V5: 首次 update 仅清空 values（已注入 ISAM2），保留 factors 到下次增量 update
+            pending_values_.clear();
+            RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                "[CRASH_CONTEXT] step=commitAndUpdate_v5_deferred_factors pending_graph_size=%zu (保留到下次 update)",
+                pending_graph_.size());
+            RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                "[ISAM2_DIAG][V5] pending_graph_ NOT cleared, will be processed in next incremental update");
+        } else {
+            // 常规增量 update：清空全部 pending
+            pending_graph_.resize(0);
+            pending_values_.clear();
+        }
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[CRASH_CONTEXT] step=commitAndUpdate_exit_success");
     } catch (const std::exception& e) {
         scope.setSuccess(false);
         ALOG_ERROR(MOD, "iSAM2 update FAILED: {}", e.what());
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[ISAM2_DIAG][CRASH_TRACE] step=commitAndUpdate_exception exception=%s (崩溃或异常发生在上一 TRACE step 与本次之间)",
+            e.what());
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[CRASH_CONTEXT] step=commitAndUpdate_caught_exception exception=%s (上一 CRASH_CONTEXT step 即崩溃前最后成功步骤)",
+            e.what());
         RCLCPP_INFO(rclcpp::get_logger("automap_system"),
             "[ISAM2_DIAG] commitAndUpdate done success=0 exception=%s", e.what());
         RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
@@ -456,9 +708,6 @@ OptimizationResult IncrementalOptimizer::commitAndUpdate() {
         fail.success = false;
         return fail;
     }
-
-    pending_graph_.resize(0);
-    pending_values_.clear();
 
     auto t1 = std::chrono::steady_clock::now();
     double elapsed = std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -496,14 +745,15 @@ OptimizationResult IncrementalOptimizer::commitAndUpdate() {
     recordOptimizationSuccess(elapsed);
 
     scope.setSuccess(true);
-    ALOG_INFO(MOD, "iSAM2 update done: nodes={} elapsed={:.1f}ms total_factors={}",
-              res.nodes_updated, res.elapsed_ms, factor_count_);
+    const char* path_str = used_first_update_three_phase ? "first_update_V5_SKIP_OPTIMIZATION" : "incremental";
+    ALOG_INFO(MOD, "iSAM2 update done: path={} nodes={} elapsed={:.1f}ms total_factors={}",
+              path_str, res.nodes_updated, res.elapsed_ms, factor_count_);
     RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-        "[ISAM2_DIAG] commitAndUpdate done elapsed_ms=%.1f nodes=%d success=1",
-        res.elapsed_ms, res.nodes_updated);
+        "[ISAM2_DIAG] commitAndUpdate done path=%s elapsed_ms=%.1f nodes=%d success=1",
+        path_str, res.elapsed_ms, res.nodes_updated);
     RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-        "[PRECISION][OPT] iSAM2_update nodes_updated=%d elapsed_ms=%.1f factor_count=%d",
-        res.nodes_updated, res.elapsed_ms, factor_count_);
+        "[PRECISION][OPT] iSAM2_update path=%s nodes_updated=%d elapsed_ms=%.1f factor_count=%d",
+        path_str, res.nodes_updated, res.elapsed_ms, factor_count_);
 
     notifyPoseUpdate(poses);
     return res;
@@ -634,6 +884,16 @@ Pose3d IncrementalOptimizer::fromPose3(const gtsam::Pose3& p) const {
     return T;
 }
 
+gtsam::noiseModel::Diagonal::shared_ptr
+IncrementalOptimizer::infoToNoiseDiagonal(const Mat66d& info) const {
+    gtsam::Vector6 vars;
+    for (int i = 0; i < 6; ++i) {
+        double diag = info(i, i);
+        vars(i) = std::max(1.0 / std::max(diag, 1e-6), 1e-6);
+    }
+    return gtsam::noiseModel::Diagonal::Variances(vars);
+}
+
 gtsam::noiseModel::Gaussian::shared_ptr
 IncrementalOptimizer::infoToNoise(const Mat66d& info) const {
     // 检查奇异性：使用 SVD 分解判断秩和条件数
@@ -704,6 +964,7 @@ void IncrementalOptimizer::optLoop() {
         const char* type_str = (task.type == OptimTaskType::LOOP_FACTOR) ? "LOOP_FACTOR"
             : (task.type == OptimTaskType::GPS_FACTOR) ? "GPS_FACTOR" : "BATCH_UPDATE";
         size_t queue_after = getQueueDepth();
+        auto task_t0 = std::chrono::steady_clock::now();
         RCLCPP_INFO(rclcpp::get_logger("automap_system"),
             "[ISAM2_DIAG] optLoop pop type=%s queue_remaining=%zu (崩溃在 commitAndUpdate 时此处为 opt 线程)",
             type_str, queue_after);
@@ -714,7 +975,7 @@ void IncrementalOptimizer::optLoop() {
                 std::unique_lock<std::shared_mutex> lk(rw_mutex_);
                 if (!prior_noise_) continue;
                 if (!node_exists_.count(task.from_id) || !node_exists_.count(task.to_id)) continue;
-                auto base_noise = infoToNoise(task.info_matrix);
+                auto base_noise = infoToNoiseDiagonal(task.info_matrix);
                 auto robust_noise = gtsam::noiseModel::Robust::Create(
                     gtsam::noiseModel::mEstimator::Huber::Create(1.345), base_noise);
                 pending_graph_.add(gtsam::BetweenFactor<gtsam::Pose3>(
@@ -737,14 +998,24 @@ void IncrementalOptimizer::optLoop() {
             } else if (task.type == OptimTaskType::BATCH_UPDATE && task.action) {
                 task.action();
             }
+            double task_elapsed_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - task_t0).count();
+            RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                "[ISAM2_DIAG] optLoop task type=%s done elapsed_ms=%.1f queue_remaining=%zu",
+                type_str, task_elapsed_ms, getQueueDepth());
         } catch (const std::exception& e) {
             // ✅ P0 修复：捕获异常，防止单个任务失败导致 optLoop 终止
+            double task_elapsed_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - task_t0).count();
             RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
-                "[IncrementalOptimizer][EXCEPTION] optLoop task %s failed: %s", type_str, e.what());
+                "[IncrementalOptimizer][EXCEPTION] optLoop task %s failed after %.1fms: %s",
+                type_str, task_elapsed_ms, e.what());
             ALOG_ERROR(MOD, "optLoop task %s failed: {}", type_str, e.what());
         } catch (...) {
+            double task_elapsed_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - task_t0).count();
             RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
-                "[IncrementalOptimizer][EXCEPTION] optLoop task %s unknown exception", type_str);
+                "[IncrementalOptimizer][EXCEPTION] optLoop task %s unknown exception after %.1fms", type_str, task_elapsed_ms);
             ALOG_ERROR(MOD, "optLoop task %s unknown exception", type_str);
         }
     }
@@ -783,21 +1054,28 @@ void IncrementalOptimizer::enqueueOptTasks(const std::vector<OptimTask>& tasks) 
 
 void IncrementalOptimizer::waitForPendingTasks() {
     const size_t initial_depth = getQueueDepth();
-    if (initial_depth == 0) return;
-    ALOG_INFO(MOD, "[ISAM2_QUEUE] waitForPendingTasks enter queue_depth={} max_wait_ms=5000", initial_depth);
+    const bool initial_busy = optimization_in_progress_.load(std::memory_order_acquire);
+    if (initial_depth == 0 && !initial_busy) return;
+    ALOG_INFO(MOD, "[ISAM2_QUEUE] waitForPendingTasks enter queue_depth={} opt_busy={} max_wait_ms=5000",
+              initial_depth, initial_busy ? 1 : 0);
     constexpr int kMaxWaitMs = 5000;
     constexpr int kChunkMs = 10;
     int waited_ms = 0;
-    while (getQueueDepth() > 0 && waited_ms < kMaxWaitMs) {
+    while (waited_ms < kMaxWaitMs) {
+        const size_t depth = getQueueDepth();
+        const bool busy = optimization_in_progress_.load(std::memory_order_acquire);
+        if (depth == 0 && !busy) break;
         std::this_thread::sleep_for(std::chrono::milliseconds(kChunkMs));
         waited_ms += kChunkMs;
     }
     const size_t final_depth = getQueueDepth();
-    if (final_depth > 0) {
-        ALOG_WARN(MOD, "[ISAM2_QUEUE] waitForPendingTasks timeout after {}ms queue_depth={} (backend continues)",
-                  kMaxWaitMs, final_depth);
+    const bool still_busy = optimization_in_progress_.load(std::memory_order_acquire);
+    if (final_depth > 0 || still_busy) {
+        ALOG_WARN(MOD, "[ISAM2_QUEUE] waitForPendingTasks timeout after {}ms queue_depth={} opt_busy={} (backend continues)",
+                  kMaxWaitMs, final_depth, still_busy ? 1 : 0);
     } else {
-        ALOG_INFO(MOD, "[ISAM2_QUEUE] waitForPendingTasks done waited_ms={}", waited_ms);
+        ALOG_INFO(MOD, "[ISAM2_QUEUE] waitForPendingTasks done waited_ms={} (queue empty and no commitAndUpdate in progress)",
+                  waited_ms);
     }
 }
 

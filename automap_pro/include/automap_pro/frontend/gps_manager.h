@@ -2,12 +2,13 @@
 
 #include "automap_pro/core/data_types.h"
 #include "automap_pro/sensor/attitude_estimator.h"
+#include <atomic>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <vector>
-#include <functional>
-#include <atomic>
 
 namespace automap_pro {
 
@@ -59,6 +60,19 @@ public:
     /** 轨迹日志用：放宽时间窗口的查询（1Hz GPS + 时间偏差时仍可匹配），max_dt_s 建议 0.5~1.0 */
     std::optional<GPSMeasurement> queryByTimestampForLog(double ts, double max_dt_s = 0.5) const;
 
+    /**
+     * 增强版时间戳查询：在 queryByTimestamp 基础上支持边界外推与协方差缩放。
+     * - 先尝试线性插值 / 最近邻；若失败且 ts 在窗口边缘 ± extrapolation_margin_s 内，则用速度模型外推。
+     * - 外推时协方差乘以 extrapolation_uncertainty_scale。
+     */
+    std::optional<GPSMeasurement> queryByTimestampEnhanced(double ts) const;
+
+    /** 在给定时间戳附近估计 GPS 速度（用于外推），需窗口内至少 2 个点。内部持锁。 */
+    std::optional<Eigen::Vector3d> estimateGpsVelocity(double ts) const;
+
+    /** 假定已持 mutex_，在 ts 附近估计速度（供 queryByTimestampEnhanced 使用）。 */
+    std::optional<Eigen::Vector3d> estimateGpsVelocityLocked(double ts) const;
+
     /** 当前 GPS 质量 */
     GPSQuality currentQuality() const;
 
@@ -95,6 +109,23 @@ public:
 
     /** 将 GPS ENU 坐标转换为 LiDAR 地图坐标系下的位置 */
     Eigen::Vector3d enu_to_map(const Eigen::Vector3d& enu) const;
+
+    /**
+     * 将 GPS ENU 坐标转换为地图系位置，并返回实际坐标系名称（"map" 或 "enu"）。
+     * 未对齐时返回 enu 原样且 frame="enu"，便于调用方正确填写 gps_frame 列。
+     */
+    std::pair<Eigen::Vector3d, std::string> enu_to_map_with_frame(const Eigen::Vector3d& enu) const;
+
+    /** 诊断用：当前连续高质量 GPS 样本数（用于判断是否接近触发对齐） */
+    int getGoodSampleCount() const;
+    /** 诊断用：当前关键帧窗口内轨迹累积距离（米），用于判断是否满足 min_align_dist_m */
+    double getAccumulatedDistM() const;
+    /** 诊断用：关键帧匹配 GPS 的最大时间差(s)（来自配置 keyframe_match_window_s） */
+    double getKeyframeMatchWindowS() const { return keyframe_match_window_s_; }
+    /** 诊断用：对齐所需最小点数、最小累积距离(m)、所需高质量样本数 */
+    int getMinAlignPoints() const { return min_align_points_; }
+    double getMinAlignDistM() const { return min_align_dist_m_; }
+    int getGoodSamplesNeeded() const { return good_samples_needed_; }
 
     /**
      * 获取当前滑动窗口内所有 GPS 点在地图坐标系下的位置（建图结束时导出 PCD 用）。
@@ -167,6 +198,9 @@ private:
     double keyframe_match_window_s_ = 1.0;   // 关键帧匹配 GPS 的最大时间差(s)，1Hz GPS 建议 0.5~1.0
     double keyframe_max_hdop_       = 15.0;  // 关键帧绑定 GPS 的 HDOP 上界，放宽弱 GPS 场景（M2DGR 等）
     double max_interp_gap_s_        = 2.0;   // 双样本线性插值最大间隔(s)，超过则退化为最近邻
+    double extrapolation_margin_s_  = 0.5;   // 外推边界(s)，窗口边缘 ± margin 内启用速度外推
+    double extrapolation_uncertainty_scale_ = 2.0;  // 外推协方差放大倍数
+    double velocity_estimation_window_s_   = 2.0;  // 速度估计窗口(s)
     double quality_hdop_thresh_ = 12.0;  // 【修复】放宽：2.0→12.0 适配弱GPS
     double rmse_accept_thresh_  = 5.0;   // 【修复】放宽：1.5→5.0 弱GPS噪声大
     int    good_samples_needed_ = 20;    // 【修复】降低：30→20 弱GPS高质量帧少

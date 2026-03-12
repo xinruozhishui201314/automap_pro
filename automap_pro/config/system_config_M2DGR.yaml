@@ -235,10 +235,14 @@ gps:
   # 可选：若指定 enu_origin，则系统使用该经纬高作为 ENU 原点，首条 GPS 不再改写原点。
   # 典型用法：室外固定测试场地/生产地图，保持统一原点，便于多次回放与多车复用。
   # enu_origin: [31.026058, 121.436795, 26.8]   # 示例：lat, lon, alt（WGS84）
-  align_min_points:       20      # ⬇️ 降低（50→30），弱GPS场景高质量点少
-  align_min_distance_m:   15.0
-  keyframe_match_window_s: 1.0   # 关键帧匹配 GPS 的最大时间差(s)；1Hz GPS 时 0.5 易导致 queryByTimestamp not_found，建议 1.0~1.5
-  max_interp_gap_s:        2.0   # 双样本线性插值最大间隔(s)，超过则退化为最近邻；位置线性插值，姿态由里程计提供
+  align_min_points:       10      # 计划优化：50→10，弱GPS场景高质量点少，便于尽早触发对齐
+  align_min_distance_m:   20.0    # 计划优化：30→20，降低累积里程要求
+  keyframe_match_window_s: 1.5   # 关键帧匹配 GPS 的最大时间差(s)；1Hz GPS 时 0.5 易导致 queryByTimestamp not_found，建议 1.5~2.0
+  max_interp_gap_s:        3.0   # 双样本线性插值最大间隔(s)，超过则退化为最近邻；位置线性插值，姿态由里程计提供
+  # 【增强】外推配置：当关键帧时间戳在GPS窗口边缘时，使用速度模型外推
+  extrapolation_margin_s: 0.5          # 外推边界(margin)，ts在窗口边缘±margin内时启用外推
+  extrapolation_uncertainty_scale: 2.0  # 外推协方差放大倍数
+  velocity_estimation_window_s: 2.0    # 速度估计窗口大小(s)
   # 【修复】M2DGR弱GPS场景参数调整： HDOP通常8-12，需要放宽阈值
   # 原因：M2DGR是城市峡谷场景，GPS多路径效应严重，HDOP约8-12
   # 原配置 quality_threshold_hdop=2.0 导致所有GPS被判定为LOW
@@ -247,7 +251,7 @@ gps:
   # 【增强】关键帧绑定 GPS 的 HDOP 上界，用于判定 is_valid（M2DGR 的 HDOP≈10）
   keyframe_max_hdop:       15.0  # HDOP≤15 即认为可绑定到关键帧；M2DGR 实测 HDOP≈10
   align_rmse_threshold_m:  5.0   # ⬆️ 放宽RMSE容忍（1.5→5.0），弱GPS噪声大
-  good_samples_needed:    20      # ⬇️ 降低（30→20），弱GPS高质量帧少
+  good_samples_needed:    10      # 计划优化：50→10，弱GPS高质量帧少，便于尽早触发对齐
   add_constraints_on_align: true
   factor_interval_m:       5.0
   factor_weight:           0.5   # ⬇️ 减弱权重（1.0→0.5），弱GPS噪声大，避免过约束
@@ -325,6 +329,7 @@ backend:
     # 先验方差：仅作用于第一个子图节点。1e-8=平衡清晰度与固定原点；过小(如1e-12)易过约束加重刚度；可试 1e-6 若追求更柔和
     prior_variance:         1e-8
   hba:
+    enabled:                 true   # false=仅跑 ISAM2+GPS，用于隔离双路 GTSAM 崩溃
     total_layer_num:         3
     thread_num:              8
     trigger_every_n_submaps: 10
@@ -333,6 +338,8 @@ backend:
     data_path:               "/tmp/hba_data"
     pcd_name_fill_num:       0      # get_hba_params 读取，缺省 0
     enable_gps_factor:       true   # get_hba_params 读取，GPS 约束是否加入 HBA
+    # 无 hba_api 时是否用 GTSAM fallback。生产建议 false，避免 double free；见 docs/HBA_GTSAM_FALLBACK_DOUBLE_FREE_FIX.md
+    enable_gtsam_fallback:   true
   hba_cal_mme:                      # get_hba_cal_mme_params 读取（launch 启用 cal_MME 时）
     file_path:               "/tmp/hba_data"
     thr_num:                 16

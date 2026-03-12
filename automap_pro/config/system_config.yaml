@@ -307,10 +307,11 @@ backend:
   publish_global_map_every_n_processed: 100
   isam2:
     relinearize_threshold: 0.01
-    relinearize_skip:       1
-    enable_relinearization: true
+    relinearize_skip:       10     # 增加到10，减少 TBB 并行触发机会（临时规避）
+    enable_relinearization: false  # 临时禁用重线性化，避免 GTSAM TBB 竞态导致 double free
     prior_variance:         1e-8   # 先验方差(仅首节点)，过小易过约束影响清晰度，见 CONFIG_M2DGR_BLUR_OPTIMIZATION.md
   hba:
+    enabled:                 true   # false=仅跑 ISAM2+GPS，用于隔离双路 GTSAM 崩溃
     total_layer_num:         3
     thread_num:              8
     trigger_every_n_submaps: 10
@@ -319,6 +320,8 @@ backend:
     data_path:               "/tmp/hba_data"
     pcd_name_fill_num:       0
     enable_gps_factor:       true
+    # 无 hba_api 时是否用 GTSAM fallback 做 HBA。生产建议 false，避免 double free；见 docs/HBA_GTSAM_FALLBACK_DOUBLE_FREE_FIX.md
+    enable_gtsam_fallback:   true
   hba_cal_mme:
     file_path:               "/tmp/hba_data"
     thr_num:                 16

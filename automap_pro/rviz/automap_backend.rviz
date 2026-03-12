@@ -75,10 +75,11 @@ Visualization Manager:
       Use Fixed Frame: true
 
     # 轨迹：里程计 / 优化后 / 关键帧
+    # 里程计原始轨迹（默认隐藏，按需开启对比）
     - Alpha: 1
       Class: rviz_default_plugins/Path
       Color: 255; 200; 50
-      Enabled: true
+      Enabled: false
       Name: odom path
       Topic:
         Depth: 5
@@ -115,12 +116,13 @@ Visualization Manager:
         Reliability Policy: Reliable
         Value: /automap/loop_markers
       Use Fixed Frame: true
+    # 回环候选点云（默认隐藏，调试时开启）
     - Alpha: 0.8
       Autocompute Value Bounds: true
       Class: rviz_default_plugins/PointCloud2
       Color: 255; 100; 255
       Decay Time: 0
-      Enabled: true
+      Enabled: false
       Name: loop_candidate_cloud
       Size (m): 0.02
       Topic:
@@ -129,7 +131,7 @@ Visualization Manager:
         Value: /automap/loop_candidate_cloud
       Use Fixed Frame: true
 
-    # GPS 约束
+    # GPS 约束（子图中心位置，对齐后显示优化后的位置）
     - Class: rviz_default_plugins/MarkerArray
       Enabled: true
       Name: GPS Constraints / Marker
@@ -138,34 +140,38 @@ Visualization Manager:
         Reliability Policy: Reliable
         Value: /automap/gps_markers
       Use Fixed Frame: true
+    # GPS 质量（按关键帧显示，调试用）
     - Class: rviz_default_plugins/MarkerArray
-      Enabled: true
+      Enabled: false
       Name: GPS质量
       Topic:
         Depth: 5
         Reliability Policy: Reliable
         Value: /automap/gps_quality
       Use Fixed Frame: true
+    # GPS 原始路径（默认隐藏，对齐后使用 aligned_path）
     - Alpha: 0.9
       Class: rviz_default_plugins/Path
       Color: 100; 200; 255
-      Enabled: true
+      Enabled: false
       Name: GPS origin path
       Topic:
         Depth: 5
         Reliability Policy: Reliable
         Value: /automap/gps_raw_path
       Use Fixed Frame: true
+    # GPS 对齐后路径（默认隐藏，对齐后手动启用）
     - Alpha: 0.9
       Class: rviz_default_plugins/Path
       Color: 50; 255; 200
-      Enabled: true
+      Enabled: false
       Name: GPS aligned_path
       Topic:
         Depth: 5
         Reliability Policy: Reliable
         Value: /automap/gps_aligned_path
       Use Fixed Frame: true
+    # 真实 GPS 位置（地图系，对齐后显示）
     - Class: rviz_default_plugins/MarkerArray
       Enabled: true
       Name: true GPS postitions
@@ -201,9 +207,9 @@ Visualization Manager:
         Value: /automap/submap_graph
       Use Fixed Frame: true
 
-    # 后端优化与因子图
+    # 后端优化与因子图（调试用，默认隐藏）
     - Class: rviz_default_plugins/MarkerArray
-      Enabled: true
+      Enabled: false
       Name: cooordinate_backend
       Topic:
         Depth: 5
@@ -211,7 +217,7 @@ Visualization Manager:
         Value: /automap/coordinate_frames
       Use Fixed Frame: true
     - Class: rviz_default_plugins/MarkerArray
-      Enabled: true
+      Enabled: false
       Name: covariance_ellipses
       Topic:
         Depth: 5
@@ -219,7 +225,7 @@ Visualization Manager:
         Value: /automap/covariance_ellipses
       Use Fixed Frame: true
     - Class: rviz_default_plugins/MarkerArray
-      Enabled: true
+      Enabled: false
       Name: factor_graph
       Topic:
         Depth: 5
@@ -227,7 +233,7 @@ Visualization Manager:
         Value: /automap/factor_graph
       Use Fixed Frame: true
     - Class: rviz_default_plugins/MarkerArray
-      Enabled: true
+      Enabled: false
       Name: hba_result
       Topic:
         Depth: 5

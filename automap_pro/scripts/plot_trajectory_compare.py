@@ -111,6 +111,33 @@ def load_odom(path: str):
     return df
 
 
+def _hint_if_likely_different_frames(df: pd.DataFrame) -> None:
+    """若轨迹近原点且 GPS 较远，提示可能为 odom 系 CSV，建议使用保存目录下的 CSV。"""
+    if not all(c in df.columns for c in ["x", "y", "gps_x", "gps_y"]):
+        return
+    # 取首行或前几行中有有效 GPS 的行（有匹配时 gps_x/gps_y 非零或 gps_valid==1）
+    if "gps_valid" in df.columns:
+        sample = df[df["gps_valid"] == 1].head(1)
+    else:
+        sample = df[((df["gps_x"] != 0) | (df["gps_y"] != 0))].head(1)
+    if sample.empty:
+        sample = df.head(1)  # 无有效 GPS 时用首行（可能全 0）
+    if sample.empty:
+        return
+    row = sample.iloc[0]
+    tx, ty = float(row["x"]), float(row["y"])
+    gx, gy = float(row["gps_x"]), float(row["gps_y"])
+    near_origin = abs(tx) < 0.3 and abs(ty) < 0.3
+    gps_far = abs(gx) > 0.5 or abs(gy) > 0.5
+    if near_origin and gps_far:
+        print(
+            "[提示] 当前 CSV 中轨迹与 GPS 似在不同坐标系（轨迹近原点、GPS 较远）。"
+            "若需重合对比，请使用**建图保存目录**（与 keyframe_poses.pcd 同目录）下的 trajectory_odom_*.csv，"
+            "并保持 trajectory_log_after_mapping_only=true。详见 docs/TRAJECTORY_LOG_AND_PLOT.md §2.0。",
+            file=sys.stderr,
+        )
+
+
 def _nearest_point(x_click: float, y_click: float, series: list) -> tuple:
     """在多个 (x_arr, y_arr, label) 中找离 (x_click, y_click) 最近的数据点。返回 (x, y, label, dist)。"""
     best = (None, None, "", float("inf"))
@@ -344,6 +371,7 @@ def main():
     has_gps = all(col in odom_df.columns for col in ['gps_x', 'gps_y', 'gps_z', 'gps_valid'])
     if has_gps:
         print("[info] Using new CSV format (GPS columns in odom file)")
+        _hint_if_likely_different_frames(odom_df)
         if args.gps:
             print("[warn] --gps parameter ignored (GPS already in odom file)", file=sys.stderr)
     else:

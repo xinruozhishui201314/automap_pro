@@ -687,6 +687,8 @@ except Exception as e:
         -e OMP_NUM_THREADS=1 \
         -e EIGEN_NUM_THREADS=1 \
         -e MKL_NUM_THREADS=1 \
+        -e TBB_NUM_THREADS=1 \
+        -e AUTOMAP_GTSAM_SERIAL=1 \
         -v /tmp/.X11-unix:/tmp/.X11-unix:rw \
         -v /dev:/dev \
         -v "${WORKSPACE_DIR}:/root/automap_ws:rw" \
@@ -696,10 +698,12 @@ except Exception as e:
         -w /root/automap_ws \
         "${IMAGE_NAME}" \
         /bin/bash -c "
-            # ✅ 修复：限制线程数以避免 GTSAM TBB 并行导致 SIGSEGV
+            # ✅ 修复：限制线程数以避免 GTSAM TBB 并行导致 SIGSEGV / double free (borglab/gtsam#1189)
             export OMP_NUM_THREADS=1
             export EIGEN_NUM_THREADS=1
             export MKL_NUM_THREADS=1
+            export TBB_NUM_THREADS=1
+            export AUTOMAP_GTSAM_SERIAL=1
 
             source /opt/ros/humble/setup.bash
             # 先加载 install_deps（GTSAM/TEASER++/vikit），再加载主工作空间

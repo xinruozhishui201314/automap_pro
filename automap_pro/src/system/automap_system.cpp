@@ -1,5 +1,6 @@
 #include "automap_pro/system/automap_system.h"
 #include "automap_pro/core/config_manager.h"
+#include "automap_pro/core/crash_report.h"
 #include "automap_pro/core/logger.h"
 #include "automap_pro/core/metrics.h"
 #include "automap_pro/core/error_monitor.h"
@@ -52,6 +53,7 @@ AutoMapSystem::AutoMapSystem(const rclcpp::NodeOptions& options)
     ALOG_INFO(MOD, "=== AutoMapSystem v2.0 starting ===");
     ALOG_INFO(MOD, "Build type={} log_dir={} log_level={}", CMAKE_BUILD_TYPE_STR, log_dir, log_lvl);
     RCLCPP_INFO(get_logger(), "[AutoMapSystem][INIT] Step 1: Logger inited, log_dir=%s log_level=%s", log_dir.c_str(), log_lvl.c_str());
+    crash_report::installCrashHandler();
 
     loadConfigAndInit();
     RCLCPP_INFO(get_logger(), "[AutoMapSystem][INIT] Step 2: loadConfigAndInit() done");
@@ -205,6 +207,10 @@ void AutoMapSystem::loadConfigAndInit() {
     }
     RCLCPP_INFO(get_logger(), "[AutoMapSystem][CONFIG] trajectory_log_enable=%d trajectory_log_after_mapping_only=%d trajectory_log_dir=%s",
                 trajectory_log_enabled_ ? 1 : 0, trajectory_log_after_mapping_only_ ? 1 : 0, trajectory_log_dir_.c_str());
+    if (trajectory_log_enabled_ && trajectory_log_after_mapping_only_) {
+        RCLCPP_INFO(get_logger(),
+            "[AutoMapSystem][CONFIG] trajectory_odom will be written only at save (keyframe+GPS, map frame); use the CSV in save output_dir for trajectory-GPS comparison.");
+    }
 
     // 缓冲：帧队列长度与空闲超时，计算跟不上时可增大队列、拉长超时，允许“算慢一点”
     max_frame_queue_size_ = ConfigManager::instance().frameQueueMaxSize();
@@ -388,7 +394,7 @@ void AutoMapSystem::deferredSetupModules() {
             auto sm = submap_manager_.getSubmap(sm_id);
             if (!sm || sm->keyframes.empty()) return std::nullopt;
             double ts = sm->t_start;
-            return gps_manager_.queryByTimestamp(ts);
+            return gps_manager_.queryByTimestampEnhanced(ts);
         });
     gps_compensator_->registerGpsFactorCallback(
         [this](int sm_id, const Eigen::Vector3d& pos_map, const Eigen::Matrix3d& cov, bool /*is_compensated*/) {
@@ -870,9 +876,10 @@ void AutoMapSystem::backendWorkerLoop() {
                                 idle_sec, idle_timeout_sec, submap_manager_.submapCount());
                     try {
                         if (submap_manager_.submapCount() > 0) {
-                            if (ConfigManager::instance().hbaOnFinish()) {
+                            if (ConfigManager::instance().hbaEnabled() && ConfigManager::instance().hbaOnFinish()) {
                                 auto all = submap_manager_.getAllSubmaps();
                                 RCLCPP_INFO(get_logger(), "[AutoMapSystem][PIPELINE] event=sensor_idle_final_hba_enter submaps=%zu", all.size());
+                                ensureBackendCompletedAndFlushBeforeHBA();
                                 hba_optimizer_.triggerAsync(all, true);
                                 RCLCPP_INFO(get_logger(), "[AutoMapSystem][PIPELINE] event=sensor_idle_final_hba_done");
                             }
@@ -1281,7 +1288,7 @@ void AutoMapSystem::tryCreateKeyFrame(double ts, const Pose3d& pose, const Mat66
 
     GPSMeasurement gps;
     bool has_gps = false;
-    auto gps_opt = gps_manager_.queryByTimestamp(ts);
+    auto gps_opt = gps_manager_.queryByTimestampEnhanced(ts);
     if (gps_opt) {
         gps     = *gps_opt;
         has_gps = gps.is_valid;
@@ -1300,16 +1307,18 @@ void AutoMapSystem::tryCreateKeyFrame(double ts, const Pose3d& pose, const Mat66
                 std::abs(gps_opt->timestamp - ts));
         }
     } else {
-        // 【增强日志】添加 GPS 首帧时间戳和延迟诊断
+        // 【增强日志】添加 GPS 窗口、max_dt、时间关系，便于精确分析未匹配原因
         double first_gps_ts = gps_manager_.getFirstGpsTimestamp();
         double last_gps_ts = gps_manager_.getLastGpsTimestamp();
+        double max_dt_s = gps_manager_.getKeyframeMatchWindowS();
         double delay_to_first_gps = (first_gps_ts > 0.0) ? (ts - first_gps_ts) : 0.0;
+        double gap_to_window = (first_gps_ts > 0.0 && last_gps_ts > 0.0)
+            ? (ts < first_gps_ts ? first_gps_ts - ts : (ts > last_gps_ts ? ts - last_gps_ts : 0.0))
+            : 0.0;
         RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 30000,
-            "[GPS_KF_BIND] ts=%.3f found_gps=false window_size=%zu first_gps=%.3f last_gps=%.3f delay_to_first_gps=%.3fs "
-            "(若 delay_to_first_gps > 0 则 odom 早于 GPS %.3fs | 检查 bag GPS 话题或 keyframe_match_window_s config)",
-            ts, gps_manager_.getGpsWindowSize(),            first_gps_ts, last_gps_ts,
-            delay_to_first_gps,
-            std::abs(delay_to_first_gps));
+            "[GPS_KF_BIND] ts=%.3f found_gps=false window_size=%zu max_dt_s=%.2f gps_ts_range=[%.3f, %.3f] delay_to_first_gps=%.3fs gap_to_window=%.3fs "
+            "(no GPS within max_dt_s of odom_ts; odom before first_gps or after last_gps or nearest_gps_dt>max_dt)",
+            ts, gps_manager_.getGpsWindowSize(), max_dt_s, first_gps_ts, last_gps_ts, delay_to_first_gps, gap_to_window);
     }
     auto t_after_gps = KfClock::now();
     double ms_gps = 1e-6 * std::chrono::duration_cast<std::chrono::microseconds>(t_after_gps - t_after_voxel).count();
@@ -1448,11 +1457,14 @@ void AutoMapSystem::onSubmapFrozen(const SubMap::Ptr& submap) {
         gps_compensator_->registerSubmap(submap);
     }
 
-    // 检查 HBA 周期触发
-    const int hba_trigger = ConfigManager::instance().hbaTriggerSubmaps();
-    if (frozen_submap_count_ % hba_trigger == 0) {
-        auto all = submap_manager_.getAllSubmaps();
-        hba_optimizer_.triggerAsync(all, false);
+    // 检查 HBA 周期触发（backend.hba.enabled=false 时仅跑 ISAM2+GPS，用于隔离双路 GTSAM）
+    if (ConfigManager::instance().hbaEnabled()) {
+        const int hba_trigger = ConfigManager::instance().hbaTriggerSubmaps();
+        if (frozen_submap_count_ % hba_trigger == 0) {
+            auto all = submap_manager_.getAllSubmaps();
+            ensureBackendCompletedAndFlushBeforeHBA();
+            hba_optimizer_.triggerAsync(all, false);
+        }
         // RCLCPP_INFO(get_logger(), "[AutoMapSystem][SM] HBA trigger (frozen_count=%d mod %d) submaps=%zu",
         //            frozen_submap_count_, hba_trigger, all.size());
         // RCLCPP_INFO(get_logger(), "[AutoMapSystem][PIPELINE] event=hba_trigger frozen=%d submaps=%zu", frozen_submap_count_, all.size());
@@ -1706,6 +1718,26 @@ void AutoMapSystem::onGPSAligned(const GPSAlignResult& result) {
     try {
         auto all_sm = submap_manager_.getAllSubmaps();
         rviz_publisher_.publishGPSAlignment(result, all_sm);
+        // 对齐后立即刷新地图系 GPS 与约束线，保证 RViz 中轨迹、关键帧与 GPS 位置重合显示
+        std::vector<Eigen::Vector3d> gps_positions_map_for_submaps;
+        for (const auto& sm : all_sm) {
+            if (!sm || !sm->has_valid_gps) continue;
+            gps_positions_map_for_submaps.push_back(gps_manager_.enu_to_map(sm->gps_center));
+        }
+        if (!gps_positions_map_for_submaps.empty()) {
+            rviz_publisher_.publishGPSMarkersWithConstraintLines(all_sm, gps_positions_map_for_submaps);
+            rviz_publisher_.publishGPSTrajectory(all_sm, gps_positions_map_for_submaps, true);
+        }
+        std::vector<Eigen::Vector3d> gps_positions_map;
+        for (const auto& sm : all_sm) {
+            if (!sm) continue;
+            for (const auto& kf : sm->keyframes) {
+                if (!kf || !kf->has_valid_gps) continue;
+                gps_positions_map.push_back(gps_manager_.enu_to_map(kf->gps.position_enu));
+            }
+        }
+        if (!gps_positions_map.empty())
+            rviz_publisher_.publishGPSPositionsInMap(gps_positions_map);
     } catch (const std::exception& e) {
         RCLCPP_WARN(get_logger(), "[AutoMapSystem][EXCEPTION] publishGPSAlignment: %s", e.what());
     } catch (...) {
@@ -1718,10 +1750,13 @@ void AutoMapSystem::onGPSAligned(const GPSAlignResult& result) {
         result.t_gps_lidar.x(), result.t_gps_lidar.y(), result.t_gps_lidar.z());
     RCLCPP_INFO(get_logger(), "[AutoMapSystem][PIPELINE] event=gps_aligned rmse_m=%.3f matched=%d", result.rmse_m, result.matched_points);
 
-    // 批量为历史子图补充 GPS 因子（对齐前积累的 GPS 数据）
+    // 批量为历史子图补充 GPS 因子（gps.add_constraints_on_align=false 时跳过，仅 HBA 用 GPS，用于隔离）
     addBatchGPSFactors();
 
-    // 通知 HBA 优化器（带 GPS 约束的全局优化）
+    // 后端完成并释放 GTSAM 相关变量后再触发 HBA（HBA 使用 GPS 约束 + 后端 T_w_b_optimized 初始值）
+    ensureBackendCompletedAndFlushBeforeHBA();
+
+    // 通知 HBA 优化器（带 GPS 约束的全局优化；backend.hba.enabled=false 时内部不触发）
     auto all = submap_manager_.getAllSubmaps();
     hba_optimizer_.onGPSAligned(result, all);
 }
@@ -1729,6 +1764,13 @@ void AutoMapSystem::onGPSAligned(const GPSAlignResult& result) {
 void AutoMapSystem::addBatchGPSFactors() {
     if (gps_batch_added_) return;
     gps_batch_added_ = true;
+
+    // gps.add_constraints_on_align=false 时不向 ISAM2 添加 GPS 因子（仅 HBA 用 GPS，用于隔离双路 GTSAM）
+    if (!ConfigManager::instance().gpsAddConstraintsOnAlign()) {
+        RCLCPP_INFO(get_logger(), "[AutoMapSystem][GPS_BATCH] skipped (gps.add_constraints_on_align=false, ISAM2 no GPS)");
+        return;
+    }
+
     RCLCPP_INFO(get_logger(), "[AutoMapSystem][GPS_BATCH] enter (grep GPS_BATCH 可追踪批量 GPS 因子与 waitForPendingTasks)");
 
     auto all_sm = submap_manager_.getFrozenSubmaps();
@@ -1813,6 +1855,42 @@ void AutoMapSystem::addBatchGPSFactors() {
             added, historical_bound, total_added, all_sm.size());
         RCLCPP_INFO(get_logger(), "[AutoMapSystem][PIPELINE] event=gps_batch_factors_added count=%d", total_added);
     }
+}
+
+void AutoMapSystem::ensureBackendCompletedAndFlushBeforeHBA() {
+    // 设计约束：必须先完成后端 GTSAM（iSAM2）优化提交并释放 GTSAM 状态，再启动 HBA 做一次最终全局优化，以保证全局一致性。
+    // 原因：(1) 后端与 HBA 共用 GTSAM，不能同时持有；(2) HBA 需要基于当前已提交的因子图做 batch PGO；(3) 先 flush 再 HBA 可避免 double free 与状态不一致。
+    RCLCPP_INFO(get_logger(),
+        "[AutoMapSystem][HBA][DESIGN] 必须先完成后端 iSAM2 提交并释放 GTSAM，再启动 HBA 做最终全局优化以保证全局一致性（flush 完成后再 trigger HBA）");
+    size_t qd = isam2_optimizer_.getQueueDepth();
+    RCLCPP_INFO(get_logger(),
+        "[AutoMapSystem][HBA][TRACE] step=ensureBackendCompletedAndFlushBeforeHBA_enter queue_depth=%zu (崩溃时 grep TRACE 定位)",
+        qd);
+    RCLCPP_INFO(get_logger(),
+        "[CRASH_CONTEXT] step=ensureBackend_enter queue_depth=%zu (崩溃时最后一条 CRASH_CONTEXT 即上一成功步骤)",
+        qd);
+    RCLCPP_INFO(get_logger(), "[AutoMapSystem][HBA] ensureBackendCompletedAndFlushBeforeHBA: wait for backend idle then flush");
+    RCLCPP_INFO(get_logger(), "[CRASH_CONTEXT] step=ensureBackend_waitForPendingTasks_enter");
+    isam2_optimizer_.waitForPendingTasks();
+    RCLCPP_INFO(get_logger(), "[AutoMapSystem][HBA][TRACE] step=waitForPendingTasks_done");
+    RCLCPP_INFO(get_logger(), "[CRASH_CONTEXT] step=ensureBackend_waitForPendingTasks_done");
+    bool has_pending = isam2_optimizer_.hasPendingFactorsOrValues();
+    RCLCPP_INFO(get_logger(),
+        "[AutoMapSystem][HBA][TRACE] step=ensureBackend_has_pending has_pending=%d (1=将调用 forceUpdate)",
+        has_pending ? 1 : 0);
+    RCLCPP_INFO(get_logger(),
+        "[CRASH_CONTEXT] step=ensureBackend_has_pending_done has_pending=%d", has_pending ? 1 : 0);
+    if (has_pending) {
+        RCLCPP_INFO(get_logger(),
+            "[AutoMapSystem][HBA] flush backend pending before HBA (release GTSAM state) has_pending=1 → calling forceUpdate (若崩溃在 forceUpdate 内见 ISAM2_DIAG TRACE)");
+        RCLCPP_INFO(get_logger(),
+            "[CRASH_CONTEXT] step=ensureBackend_before_forceUpdate (若崩溃则发生在 forceUpdate/commitAndUpdate 内，见 ISAM2_DIAG CRASH_CONTEXT)");
+        isam2_optimizer_.forceUpdate();
+        RCLCPP_INFO(get_logger(), "[AutoMapSystem][HBA][TRACE] step=forceUpdate_after_flush_done");
+        RCLCPP_INFO(get_logger(), "[CRASH_CONTEXT] step=ensureBackend_after_forceUpdate");
+    }
+    RCLCPP_INFO(get_logger(), "[AutoMapSystem][PIPELINE] event=backend_flushed_before_hba (HBA will use GTSAM after backend release)");
+    RCLCPP_INFO(get_logger(), "[CRASH_CONTEXT] step=ensureBackend_exit");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2117,6 +2195,7 @@ void AutoMapSystem::handleTriggerHBA(
     auto all = submap_manager_.getAllSubmaps();
     RCLCPP_INFO(get_logger(), "[AutoMapSystem] Triggered HBA (wait=%d)", req->wait_for_result);
     RCLCPP_INFO(get_logger(), "[AutoMapSystem][PIPELINE] event=trigger_hba_called wait=%d submaps=%zu", req->wait_for_result ? 1 : 0, all.size());
+    ensureBackendCompletedAndFlushBeforeHBA();
     hba_optimizer_.triggerAsync(all, req->wait_for_result);
     res->success = true;
     res->message = "HBA triggered";
@@ -2230,28 +2309,52 @@ void AutoMapSystem::handleFinishMapping(
         return;
     }
     RCLCPP_INFO(get_logger(), "[AutoMapSystem][PIPELINE] event=finish_mapping_service (final HBA + save + shutdown)");
+    RCLCPP_INFO(get_logger(),
+        "[CRASH_CONTEXT] step=finish_mapping_enter (崩溃时最后一条 CRASH_CONTEXT 即上一成功步骤)");
     try {
         if (submap_manager_.submapCount() > 0) {
-            if (ConfigManager::instance().hbaOnFinish()) {
+            if (ConfigManager::instance().hbaEnabled() && ConfigManager::instance().hbaOnFinish()) {
                 auto all = submap_manager_.getAllSubmaps();
                 RCLCPP_INFO(get_logger(), "[AutoMapSystem][PIPELINE] event=finish_mapping_final_hba_enter submaps=%zu", all.size());
+                RCLCPP_INFO(get_logger(),
+                    "[CRASH_CONTEXT] step=finish_mapping_before_ensureBackend submaps=%zu (若崩溃则发生在 ensureBackend 或 forceUpdate/commitAndUpdate 内)",
+                    all.size());
+                RCLCPP_INFO(get_logger(),
+                    "[AutoMapSystem][HBA][TRACE] step=finish_mapping_ensureBackend_enter");
+                ensureBackendCompletedAndFlushBeforeHBA();
+                RCLCPP_INFO(get_logger(),
+                    "[CRASH_CONTEXT] step=finish_mapping_after_ensureBackend");
+                RCLCPP_INFO(get_logger(),
+                    "[AutoMapSystem][HBA][TRACE] step=finish_mapping_ensureBackend_done");
+                RCLCPP_INFO(get_logger(),
+                    "[CRASH_CONTEXT] step=finish_mapping_before_hba_trigger submaps=%zu", all.size());
                 hba_optimizer_.triggerAsync(all, true);
                 RCLCPP_INFO(get_logger(), "[AutoMapSystem][PIPELINE] event=finish_mapping_final_hba_done");
+                RCLCPP_INFO(get_logger(),
+                    "[CRASH_CONTEXT] step=finish_mapping_after_hba_trigger");
             }
             std::string out_dir = getOutputDir();
             RCLCPP_INFO(get_logger(), "[AutoMapSystem][PIPELINE] event=finish_mapping_save_enter output_dir=%s", out_dir.c_str());
+            RCLCPP_INFO(get_logger(), "[CRASH_CONTEXT] step=finish_mapping_before_save output_dir=%s", out_dir.c_str());
             saveMapToFiles(out_dir);
             RCLCPP_INFO(get_logger(), "[AutoMapSystem][PIPELINE] event=finish_mapping_save_done output_dir=%s", out_dir.c_str());
+            RCLCPP_INFO(get_logger(), "[CRASH_CONTEXT] step=finish_mapping_after_save");
         }
         res->success = true;
         res->message = "Map saved, requesting shutdown";
         RCLCPP_INFO(get_logger(), "[AutoMapSystem] finish_mapping: requesting context shutdown (end mapping)");
+        RCLCPP_INFO(get_logger(), "[CRASH_CONTEXT] step=finish_mapping_success_before_shutdown");
         rclcpp::shutdown();
     } catch (const std::exception& e) {
+        RCLCPP_INFO(get_logger(),
+            "[CRASH_CONTEXT] step=finish_mapping_caught_exception exception=%s (上一 CRASH_CONTEXT step 即崩溃前最后成功步骤)",
+            e.what());
         RCLCPP_ERROR(get_logger(), "[AutoMapSystem] finish_mapping failed: %s", e.what());
         res->success = false;
         res->message = std::string("exception: ") + e.what();
     } catch (...) {
+        RCLCPP_INFO(get_logger(),
+            "[CRASH_CONTEXT] step=finish_mapping_caught_unknown_exception (上一 CRASH_CONTEXT step 即崩溃前最后成功步骤)");
         RCLCPP_ERROR(get_logger(), "[AutoMapSystem] finish_mapping failed: unknown exception");
         res->success = false;
         res->message = "unknown exception";
@@ -2371,28 +2474,45 @@ void AutoMapSystem::writeTrajectoryOdom(double ts, const Pose3d& pose, const Mat
             RCLCPP_INFO(get_logger(),
                 "[AutoMapSystem][TRAJ_LOG] GPS window empty at first row. If bag has GPS: grep 'LivoBridge\\[GPS\\]' and 'GPS_DIAG' in logs; after ~45s see '[LivoBridge][GPS_DIAG] Still 0 NavSatFix' if topic not received.");
         }
+        if (!gps_manager_.isAligned()) {
+            RCLCPP_WARN(get_logger(),
+                "[AutoMapSystem][TRAJ_LOG] GPS not aligned! gps_frame will be ENU, not map. Check: good_samples=%d (need=%d) accumulated_dist_m=%.1f (min=%.1f) state=%d",
+                gps_manager_.getGoodSampleCount(), gps_manager_.getGoodSamplesNeeded(),
+                gps_manager_.getAccumulatedDistM(), gps_manager_.getMinAlignDistM(), static_cast<int>(gps_manager_.state()));
+        }
     }
-    
+    // 周期性未对齐诊断（每 200 行打一次），便于长时间运行仍可定位
+    if (!gps_manager_.isAligned() && row > 0 && (row % 200 == 0)) {
+        RCLCPP_INFO(get_logger(),
+            "[AutoMapSystem][TRAJ_LOG] still not aligned at row=%u: good_samples=%d need=%d dist_m=%.1f min_dist=%.1f state=%d",
+            row, gps_manager_.getGoodSampleCount(), gps_manager_.getGoodSamplesNeeded(),
+            gps_manager_.getAccumulatedDistM(), gps_manager_.getMinAlignDistM(), static_cast<int>(gps_manager_.state()));
+    }
+
     // 查询当前时间戳对应的GPS数据；有匹配即记录（不要求 quality>=MEDIUM），便于分析；gps_valid 表示是否达到 MEDIUM 及以上
     // 使用 1.0s 时间窗：1Hz GPS + 10Hz odom 时，0.5s 窗会导致每 5 行无匹配（间隔内 odom 与前后 GPS 均 >0.5s），1.0s 可覆盖整秒内 odom
     double gps_x = 0.0, gps_y = 0.0, gps_z = 0.0;
     double gps_hdop = 0.0;
     int gps_quality = 0;  // 0=INVALID 1=LOW 2=MEDIUM 3=HIGH 4=EXCELLENT
     bool gps_valid = false;
-    const char* gps_frame = "none";
+    std::string gps_frame_str = "none";
 
     auto gps_opt = gps_manager_.queryByTimestampForLog(ts, kTrajectoryLogGpsMaxDt);
     if (gps_opt) {
-        // 只要有时间匹配的 GPS 就写入位置与质量信息
-        Eigen::Vector3d pos = gps_manager_.isAligned() ?
-            gps_manager_.enu_to_map(gps_opt->position_enu) : gps_opt->position_enu;
+        // 使用 enu_to_map_with_frame 保证位置与坐标系标签一致（未对齐时为 enu，已对齐为 map）
+        auto [pos, frame] = gps_manager_.enu_to_map_with_frame(gps_opt->position_enu);
         gps_x = pos.x();
         gps_y = pos.y();
         gps_z = pos.z();
-        gps_frame = gps_manager_.isAligned() ? "map" : "enu";
+        gps_frame_str = frame;
         gps_hdop = gps_opt->hdop;
         gps_quality = static_cast<int>(gps_opt->quality);
         gps_valid = gps_opt->is_valid;  // quality >= MEDIUM
+        // 首行且未对齐时说明坐标系含义，便于分析轨迹对比
+        if (row == 0 && frame == "enu") {
+            RCLCPP_INFO(get_logger(),
+                "[AutoMapSystem][TRAJ_LOG] CSV: trajectory (x,y,z)=map frame; gps_x/gps_y/gps_z=enu (not aligned). Use gps_frame column; after align both in map.");
+        }
     } else {
         // 无时间匹配：打少量诊断日志
         static std::atomic<uint32_t> traj_no_gps_count{0};
@@ -2430,7 +2550,7 @@ void AutoMapSystem::writeTrajectoryOdom(double ts, const Pose3d& pose, const Mat
         << q.x() << "," << q.y() << "," << q.z() << "," << q.w() << ","
         << px << "," << py << "," << pz << ","
         << gps_x << "," << gps_y << "," << gps_z << ","
-        << gps_frame << "," << (gps_valid ? "1" : "0") << ","
+        << gps_frame_str << "," << (gps_valid ? "1" : "0") << ","
         << gps_hdop << "," << gps_quality << "\n";
     trajectory_odom_file_.flush();
 }
@@ -2440,13 +2560,13 @@ void AutoMapSystem::writeTrajectoryOdomAfterMapping(const std::string& output_di
     auto all_sm = submap_manager_.getAllSubmaps();
     std::vector<std::pair<double, Pose3d>> kf_poses;
     std::vector<Mat66d> kf_covs;
+    // 与 keyframe_poses.pcd / trajectory_tum.txt 完全一致：仅使用 T_w_b_optimized，不做 fallback，
+    // 保证 CSV 中 (x,y,z) 与 PCD 及 RViz 优化轨迹同源，轨迹与 GPS 列才能重合对比
     for (const auto& sm : all_sm) {
         if (!sm) continue;
         for (const auto& kf : sm->keyframes) {
             if (!kf) continue;
-            Pose3d T = kf->T_w_b_optimized;
-            if (T.matrix().isApprox(Eigen::Matrix4d::Identity(), 1e-6) && !kf->T_w_b.matrix().isApprox(Eigen::Matrix4d::Identity(), 1e-6))
-                T = kf->T_w_b;
+            const Pose3d& T = kf->T_w_b_optimized;
             kf_poses.emplace_back(kf->timestamp, T);
             kf_covs.push_back(kf->covariance);
         }
@@ -2454,6 +2574,12 @@ void AutoMapSystem::writeTrajectoryOdomAfterMapping(const std::string& output_di
     if (kf_poses.empty()) {
         RCLCPP_INFO(get_logger(), "[AutoMapSystem][TRAJ_LOG] writeTrajectoryOdomAfterMapping: no keyframes, skip");
         return;
+    }
+    RCLCPP_INFO(get_logger(),
+        "[AutoMapSystem][TRAJ_LOG] writing trajectory_odom at save (keyframe+GPS, map frame); same frame as keyframe_poses.pcd / gps_positions_map.pcd — use this file in save dir for trajectory-GPS comparison.");
+    if (!gps_manager_.isAligned()) {
+        RCLCPP_WARN(get_logger(),
+            "[AutoMapSystem][TRAJ_LOG] GPS not aligned: gps_x/gps_y/gps_z will be in ENU frame; trajectory vs GPS may not coincide in plot. Consider triggering GPS align before save if needed.");
     }
     const std::string filename = "trajectory_odom_" + trajectory_session_id_ + ".csv";
     const std::string path_primary = output_dir + "/" + filename;
@@ -2486,13 +2612,12 @@ void AutoMapSystem::writeTrajectoryOdomAfterMapping(const std::string& output_di
         double gps_x = 0.0, gps_y = 0.0, gps_z = 0.0, gps_hdop = 0.0;
         int gps_quality = 0;
         bool gps_valid = false;
-        const char* gps_frame = "none";
+        std::string gps_frame_str = "none";
         auto gps_opt = gps_manager_.queryByTimestampForLog(ts, kGpsMaxDt);
         if (gps_opt) {
-            Eigen::Vector3d pos = gps_manager_.isAligned() ?
-                gps_manager_.enu_to_map(gps_opt->position_enu) : gps_opt->position_enu;
+            auto [pos, frame] = gps_manager_.enu_to_map_with_frame(gps_opt->position_enu);
             gps_x = pos.x(); gps_y = pos.y(); gps_z = pos.z();
-            gps_frame = gps_manager_.isAligned() ? "map" : "enu";
+            gps_frame_str = frame;
             gps_hdop = gps_opt->hdop;
             gps_quality = static_cast<int>(gps_opt->quality);
             gps_valid = gps_opt->is_valid;
@@ -2508,7 +2633,7 @@ void AutoMapSystem::writeTrajectoryOdomAfterMapping(const std::string& output_di
             << q.x() << "," << q.y() << "," << q.z() << "," << q.w() << ","
             << px << "," << py << "," << pz << ","
             << gps_x << "," << gps_y << "," << gps_z << ","
-            << gps_frame << "," << (gps_valid ? "1" : "0") << ","
+            << gps_frame_str << "," << (gps_valid ? "1" : "0") << ","
             << gps_hdop << "," << gps_quality << "\n";
         const std::string line_str = line.str();
         out << line_str;
@@ -2517,11 +2642,13 @@ void AutoMapSystem::writeTrajectoryOdomAfterMapping(const std::string& output_di
     out.close();
     if (out_log.is_open()) {
         out_log.close();
-        RCLCPP_INFO(get_logger(), "[AutoMapSystem][TRAJ_LOG] wrote trajectory_odom (keyframe+GPS) to %s and %s (%zu rows)",
-                    path_primary.c_str(), (trajectory_log_dir_ + "/" + filename).c_str(), kf_poses.size());
+        RCLCPP_INFO(get_logger(),
+            "[AutoMapSystem][TRAJ_LOG] wrote trajectory_odom (keyframe+GPS, map frame) to %s and %s (%zu rows). For trajectory-GPS comparison use the file in save dir (same as keyframe_poses.pcd).",
+            path_primary.c_str(), (trajectory_log_dir_ + "/" + filename).c_str(), kf_poses.size());
     } else {
-        RCLCPP_INFO(get_logger(), "[AutoMapSystem][TRAJ_LOG] wrote trajectory_odom (keyframe+GPS) to %s (%zu rows)",
-                    path_primary.c_str(), kf_poses.size());
+        RCLCPP_INFO(get_logger(),
+            "[AutoMapSystem][TRAJ_LOG] wrote trajectory_odom (keyframe+GPS, map frame) to %s (%zu rows). Use this file for trajectory-GPS comparison (same frame as keyframe_poses.pcd).",
+            path_primary.c_str(), kf_poses.size());
     }
 }
 
