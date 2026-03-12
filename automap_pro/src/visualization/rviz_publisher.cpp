@@ -261,16 +261,19 @@ void RvizPublisher::publishKeyframePoses(const std::vector<KeyFrame::Ptr>& keyfr
 }
 
 void RvizPublisher::publishGPSTrajectory(const std::vector<SubMap::Ptr>& submaps, bool show_aligned) {
-    publishGPSTrajectory(submaps, std::vector<Eigen::Vector3d>{}, show_aligned);
+    // 无 map 系位置时（未对齐）raw 使用 gps_center（ENU），标为 "enu" 避免与 map 混系
+    publishGPSTrajectory(submaps, std::vector<Eigen::Vector3d>{}, show_aligned, "enu");
 }
 
 void RvizPublisher::publishGPSTrajectory(const std::vector<SubMap::Ptr>& submaps,
                                           const std::vector<Eigen::Vector3d>& gps_positions_map,
-                                          bool show_aligned) {
+                                          bool show_aligned,
+                                          const std::string& raw_path_frame_id) {
     if (!node_ || !gps_raw_path_pub_) return;
     nav_msgs::msg::Path raw_path, aligned_path;
     raw_path.header.stamp = aligned_path.header.stamp = node_->now();
-    raw_path.header.frame_id = aligned_path.header.frame_id = frame_id_;
+    raw_path.header.frame_id = raw_path_frame_id;  // raw：map 系或 enu 系由调用方指定
+    aligned_path.header.frame_id = frame_id_;      // 对齐轨迹始终为 map
     size_t map_idx = 0;
     const bool use_map_frame = !gps_positions_map.empty();
     for (const auto& sm : submaps) {
@@ -287,6 +290,7 @@ void RvizPublisher::publishGPSTrajectory(const std::vector<SubMap::Ptr>& submaps
             ps.pose.position.z = sm->gps_center.z();
         }
         raw_path.poses.push_back(ps);
+        ps.header = aligned_path.header;
         ps.pose.position.x = sm->pose_w_anchor_optimized.translation().x();
         ps.pose.position.y = sm->pose_w_anchor_optimized.translation().y();
         ps.pose.position.z = sm->pose_w_anchor_optimized.translation().z();

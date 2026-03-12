@@ -1,9 +1,12 @@
 #include "automap_pro/system/automap_system.h"
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp/executors.hpp>
+#include <cstdio>
 #include <iostream>
 
 int main(int argc, char** argv) {
+    fprintf(stderr, "[LOAD_TRACE] automap_system main() entered (if crash before this, it was during .so load / libgtsam static init)\n");
+    fflush(stderr);
     try {
         rclcpp::init(argc, argv);
     } catch (const std::exception& e) {
@@ -17,6 +20,8 @@ int main(int argc, char** argv) {
     options.use_intra_process_comms(true);
 
     try {
+        fprintf(stderr, "[LOAD_TRACE] about to create AutoMapSystem (IncrementalOptimizer will be constructed here; if crash, see [IncrementalOptimizer][LOAD_TRACE] logs)\n");
+        fflush(stderr);
         auto node = std::make_shared<automap_pro::AutoMapSystem>(options);
         // 多线程 Executor：odom/cloud/kfinfo 等回调可并行，避免单线程下背压或慢回调阻塞其它回调，充分发挥多核
         rclcpp::executors::MultiThreadedExecutor exec(

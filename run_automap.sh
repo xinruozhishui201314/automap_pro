@@ -706,9 +706,27 @@ except Exception as e:
             export AUTOMAP_GTSAM_SERIAL=1
 
             source /opt/ros/humble/setup.bash
-            # 先加载 install_deps（GTSAM/TEASER++/vikit），再加载主工作空间
+            # 优先使用 build_gtsam_no_tbb 编译的 GTSAM，避免与镜像/install_deps 中的 GTSAM 冲突（如 undefined symbol: NonlinearFactor::rekey）
+            # 编译 GTSAM：在 automap_ws 下执行 scripts/build_gtsam_no_tbb.sh，或容器内 /root/automap_ws 下已有该目录
+            if [ -d build_gtsam_no_tbb/gtsam ] && [ -f build_gtsam_no_tbb/gtsam/libgtsam.so ]; then
+              export LD_LIBRARY_PATH=\"build_gtsam_no_tbb/gtsam:build_gtsam_no_tbb/gtsam_unstable:\$LD_LIBRARY_PATH\"
+              echo \"[INFO] 使用 build_gtsam_no_tbb 的 GTSAM 库（覆盖镜像/install_deps）\" 1>&2
+            fi
+            # 先加载 install_deps（TEASER++/vikit 等），再加载主工作空间。
+            # ⚠️ 重要：不要默认强行使用 install_deps/gtsam/lib。
+            #     该目录下的预编译 GTSAM 可能与系统 Eigen/PCL flags 不一致，导致启动时在 lago.cpp 静态初始化触发
+            #     double free or corruption (out)（见 docs/FIX_GTSAM_LAGO_STATIC_INIT_DOUBLE_FREE.md）。
+            #
+            # 如确实需要使用 install_deps 里的 GTSAM，请显式设置：
+            #   export AUTOMAP_USE_INSTALL_DEPS_GTSAM=1
             if [ -f install_deps/setup.bash ]; then source install_deps/setup.bash; fi
-            for d in install_deps/gtsam/lib install_deps/teaserpp/lib; do [ -d \"\$d\" ] && export LD_LIBRARY_PATH=\"\$d:\$LD_LIBRARY_PATH\"; done
+            if [ -d install_deps/teaserpp/lib ]; then
+              export LD_LIBRARY_PATH=\"install_deps/teaserpp/lib:\$LD_LIBRARY_PATH\"
+            fi
+            if [ \"\${AUTOMAP_USE_INSTALL_DEPS_GTSAM:-0}\" = \"1\" ] && [ -d install_deps/gtsam/lib ]; then
+              export LD_LIBRARY_PATH=\"install_deps/gtsam/lib:\$LD_LIBRARY_PATH\"
+              echo \"[WARN] AUTOMAP_USE_INSTALL_DEPS_GTSAM=1: forcing LD_LIBRARY_PATH prepend install_deps/gtsam/lib\" 1>&2
+            fi
             source install/setup.bash
             ${CONTAINER_LAUNCH_CMD}
         "

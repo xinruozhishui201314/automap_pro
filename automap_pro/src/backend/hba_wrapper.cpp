@@ -183,7 +183,7 @@ void HBAWrapper::broadcastPoseUpdates() {
     // Publish optimized path
     nav_msgs::msg::Path path;
     path.header.stamp    = node_->now();
-    path.header.frame_id = "world";
+    path.header.frame_id = "map";  // 与后端 odom_path/optimized_path 统一，RViz Fixed Frame=map
     {
         std::lock_guard<std::mutex> lk(result_mutex_);
         for (const auto& [kf_id, pose] : optimized_kf_poses_) {

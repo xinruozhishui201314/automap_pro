@@ -54,9 +54,12 @@ public:
     /** 等待队列清空且当前无 HBA 运行，最多等待 timeout_ms 毫秒（用于关闭时限时等待） */
     void waitUntilIdleFor(std::chrono::milliseconds timeout_ms);
 
-    /** GPS 对齐完成后，批量为已有关键帧添加 GPS 因子 */
+    /** GPS 对齐完成后，批量为已有关键帧添加 GPS 因子并立即触发 HBA（若仅建图结束时做一次 HBA，则改用 setGPSAlignedState） */
     void onGPSAligned(const GPSAlignResult& align_result,
                       const std::vector<SubMap::Ptr>& all_submaps);
+
+    /** 仅设置 GPS 对齐状态，不触发 HBA（建图结束时的那次 HBA 会使用该状态添加 GPS 约束） */
+    void setGPSAlignedState(const GPSAlignResult& align_result);
 
     // ── 状态查询 ──────────────────────────────────────────────────────────
     bool isRunning() const { return hba_running_.load(); }

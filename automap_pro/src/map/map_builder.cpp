@@ -404,15 +404,15 @@ void MapBuilder::buildFromKeyFramesImpl(const std::vector<KeyFrame::Ptr>& keyfra
         
         if (!kf || !kf->cloud_body || kf->cloud_body->empty()) continue;
         
-        // 变换到世界坐标系
+        // 变换到世界坐标系（统一使用优化后位姿，保证 GPS/回环/HBA 后地图与轨迹一致）
         CloudXYZI world_cloud;
-        transformCloudToWorld(kf->cloud_body, kf->T_w_b, world_cloud);
+        transformCloudToWorld(kf->cloud_body, kf->T_w_b_optimized, world_cloud);
         
         // 合并到基础地图
         mergeCloud(std::make_shared<CloudXYZI>(world_cloud), base_map_);
         
         // 同时添加到全局地图
-        global_map_->addCloud(kf->cloud_body, kf->T_w_b);
+        global_map_->addCloud(kf->cloud_body, kf->T_w_b_optimized);
         
         processed++;
         
@@ -433,10 +433,18 @@ void MapBuilder::buildFromSubmapsImpl(const std::vector<SubMap::Ptr>& submaps) {
     
     for (const auto& sm : submaps) {
         if (!sm) continue;
-        
-        // 直接使用子图的合并点云（已在世界系）
-        if (sm->merged_cloud && !sm->merged_cloud->empty()) {
-            mergeCloud(sm->merged_cloud, base_map_);
+
+        // 重要：不要直接复用 sm->merged_cloud。
+        // merged_cloud 是冻结时用当时的 T_w_b 变换得到的“世界系点云”，后端优化后会变“旧位姿”。
+        // 这里统一从每个关键帧的 body 点云 + T_w_b_optimized 重投影，保证每次重建都反映最新位姿。
+        if (sm->keyframes.empty()) continue;
+        for (const auto& kf : sm->keyframes) {
+            if (!kf || !kf->cloud_body || kf->cloud_body->empty()) continue;
+            CloudXYZI world_cloud;
+            transformCloudToWorld(kf->cloud_body, kf->T_w_b_optimized, world_cloud);
+            if (!world_cloud.empty()) {
+                mergeCloud(std::make_shared<CloudXYZI>(world_cloud), base_map_);
+            }
         }
     }
     
@@ -450,13 +458,13 @@ void MapBuilder::addKeyFrameImpl(const KeyFrame::Ptr& kf) {
     
     // 变换到世界坐标系
     CloudXYZI world_cloud;
-    transformCloudToWorld(kf->cloud_body, kf->T_w_b, world_cloud);
+    transformCloudToWorld(kf->cloud_body, kf->T_w_b_optimized, world_cloud);
     
     // 合并到基础地图
     mergeCloud(std::make_shared<CloudXYZI>(world_cloud), base_map_);
     
     // 同时添加到全局地图
-    global_map_->addCloud(kf->cloud_body, kf->T_w_b);
+    global_map_->addCloud(kf->cloud_body, kf->T_w_b_optimized);
 }
 
 void MapBuilder::addSubmapImpl(const SubMap::Ptr& sm) {

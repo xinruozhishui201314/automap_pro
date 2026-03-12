@@ -193,6 +193,8 @@ void AutoMapSystem::loadConfigAndInit() {
                     gps_enabled_from_config_ ? "true" : "false", gps_topic_from_config_.c_str());
         RCLCPP_INFO(get_logger(), "[AutoMapSystem][GPS_DIAG] config_path=%s gps_topic=%s (M2DGR bag: /ublox/fix; grep LivoBridge\\[GPS\\] for first message)",
                     config_path.c_str(), gps_topic_from_config_.c_str());
+        RCLCPP_INFO(get_logger(), "[AutoMapSystem][CONFIG] backend.hba.enable_gtsam_fallback=%s (HBA GTSAM fallback; false=skip HBA when no hba_api, grep HBA CONFIG to verify)",
+                    ConfigManager::instance().hbaGtsamFallbackEnabled() ? "true" : "false");
     } else {
         gps_enabled_from_config_ = false;
         gps_topic_from_config_   = "/gps/fix";
@@ -1457,18 +1459,7 @@ void AutoMapSystem::onSubmapFrozen(const SubMap::Ptr& submap) {
         gps_compensator_->registerSubmap(submap);
     }
 
-    // 检查 HBA 周期触发（backend.hba.enabled=false 时仅跑 ISAM2+GPS，用于隔离双路 GTSAM）
-    if (ConfigManager::instance().hbaEnabled()) {
-        const int hba_trigger = ConfigManager::instance().hbaTriggerSubmaps();
-        if (frozen_submap_count_ % hba_trigger == 0) {
-            auto all = submap_manager_.getAllSubmaps();
-            ensureBackendCompletedAndFlushBeforeHBA();
-            hba_optimizer_.triggerAsync(all, false);
-        }
-        // RCLCPP_INFO(get_logger(), "[AutoMapSystem][SM] HBA trigger (frozen_count=%d mod %d) submaps=%zu",
-        //            frozen_submap_count_, hba_trigger, all.size());
-        // RCLCPP_INFO(get_logger(), "[AutoMapSystem][PIPELINE] event=hba_trigger frozen=%d submaps=%zu", frozen_submap_count_, all.size());
-    }
+    // HBA 仅在建图结束时触发一次，子图冻结时不再周期触发（见 sensor_idle / finish_mapping）
     // 数据触发：子图冻结后异步发布全局地图，不阻塞后端
     map_publish_pending_.store(true);
     map_publish_cv_.notify_one();
@@ -1604,6 +1595,7 @@ void AutoMapSystem::onPoseUpdated(const std::unordered_map<int, Pose3d>& poses) 
     } catch (...) {
         RCLCPP_WARN(get_logger(), "[AutoMapSystem][EXCEPTION] publishOptimizedPath: unknown exception");
     }
+
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1620,6 +1612,16 @@ void AutoMapSystem::onHBADone(const HBAResult& result) {
         "[AutoMapSystem][HBA] done success=1 MME=%.4f poses=%zu iter_layer=%d elapsed=%.1fms",
         result.final_mme, pose_count, result.iterations_per_layer, result.elapsed_ms);
     RCLCPP_INFO(get_logger(), "[AutoMapSystem][PIPELINE] event=hba_done MME=%.4f poses=%zu elapsed=%.0fms", result.final_mme, pose_count, result.elapsed_ms);
+
+    auto all_sm = submap_manager_.getFrozenSubmaps();
+    // 在写回 HBA 结果之前采样 iSAM2 当前估计，用于分离度诊断（pose_w_anchor 为冻结初值，非 iSAM2 估计）
+    std::unordered_map<int, Pose3d> isam2_poses_before_hba;
+    for (const auto& sm : all_sm) {
+        if (!sm) continue;
+        isam2_poses_before_hba[sm->id] = isam2_optimizer_.getPose(sm->id);
+    }
+    RCLCPP_INFO(get_logger(), "[AutoMapSystem][BACKEND][HBA] isam2_poses_sampled=%zu (before updateAllFromHBA, for separation metric)",
+        isam2_poses_before_hba.size());
 
     // 将 HBA 优化结果写回所有子图的关键帧（用于显示和全局图构建）
     submap_manager_.updateAllFromHBA(result);
@@ -1646,11 +1648,9 @@ void AutoMapSystem::onHBADone(const HBAResult& result) {
     // 使用指导：
     //   - 显示/导出：使用 HBA 结果（当前做法 ✅）
     //   - 新因子约束：基于 iSAM2 估计（快速约束）
-    //   - 诊断：定期检查两轨位姿差值（见下）
+    //   - 诊断：定期检查两轨位姿差值（见下，使用 updateAllFromHBA 前采样的 iSAM2 估计）
     // ─────────────────────────────────────────────────────────────────────────────
     
-    auto all_sm = submap_manager_.getFrozenSubmaps();
-
     // 位姿/点云已更新：刷新 RViz 优化轨迹与关键帧位姿，便于实时看到 HBA 结果
     try {
         rviz_publisher_.publishOptimizedPath(all_sm);
@@ -1661,22 +1661,22 @@ void AutoMapSystem::onHBADone(const HBAResult& result) {
         RCLCPP_WARN(get_logger(), "[AutoMapSystem][EXCEPTION] HBA viz refresh: unknown exception");
     }
     
-    // 诊断：计算 HBA 与 iSAM2 的位姿分离程度
+    // 诊断：计算 HBA 与 iSAM2 的位姿分离程度（iSAM2 为 updateAllFromHBA 前的当前估计）
     double max_drift = 0.0;
     double sum_drift = 0.0;
+    const double kDriftTraceThreshold = 0.05;  // 单子图 drift > 5cm 时打一条 trace 便于定位
     for (const auto& sm : all_sm) {
         if (!sm) continue;
-        
-        // 获取 HBA 优化结果（新）
-        Pose3d hba_pose = sm->pose_w_anchor_optimized;
-        
-        // 获取 iSAM2 当前估计（旧，可能滞后）
-        Pose3d isam2_pose = sm->pose_w_anchor;  // iSAM2 的位姿存储在 pose_w_anchor（初始化后不变）
-        
-        // 计算欧氏距离
+        Pose3d hba_pose = sm->pose_w_anchor_optimized;  // 已为 HBA 结果
+        auto it = isam2_poses_before_hba.find(sm->id);
+        Pose3d isam2_pose = (it != isam2_poses_before_hba.end()) ? it->second : Pose3d::Identity();
         double drift = (hba_pose.translation() - isam2_pose.translation()).norm();
         max_drift = std::max(max_drift, drift);
         sum_drift += drift;
+        if (drift > kDriftTraceThreshold) {
+            RCLCPP_INFO(get_logger(), "[AutoMapSystem][BACKEND][HBA] separation sm_id=%d drift=%.3fm (grep BACKEND HBA separation 定位大偏差子图)",
+                sm->id, drift);
+        }
     }
     
     double avg_drift = all_sm.empty() ? 0.0 : sum_drift / all_sm.size();
@@ -1753,12 +1753,8 @@ void AutoMapSystem::onGPSAligned(const GPSAlignResult& result) {
     // 批量为历史子图补充 GPS 因子（gps.add_constraints_on_align=false 时跳过，仅 HBA 用 GPS，用于隔离）
     addBatchGPSFactors();
 
-    // 后端完成并释放 GTSAM 相关变量后再触发 HBA（HBA 使用 GPS 约束 + 后端 T_w_b_optimized 初始值）
-    ensureBackendCompletedAndFlushBeforeHBA();
-
-    // 通知 HBA 优化器（带 GPS 约束的全局优化；backend.hba.enabled=false 时内部不触发）
-    auto all = submap_manager_.getAllSubmaps();
-    hba_optimizer_.onGPSAligned(result, all);
+    // 仅更新 HBA 的 GPS 对齐状态，不在此处触发 HBA；整段建图只在结束时做一次 HBA（sensor_idle / finish_mapping）
+    hba_optimizer_.setGPSAlignedState(result);
 }
 
 void AutoMapSystem::addBatchGPSFactors() {
@@ -1824,10 +1820,11 @@ void AutoMapSystem::addBatchGPSFactors() {
         // 调用 GPSManager 为历史帧查找 GPS 绑定
         auto bindings = gps_manager_.getHistoricalGPSBindings(kf_without_gps, 0.5);
         
+        // 历史绑定位置必须转为 map 系（addGPSFactor 约束的是 map 系），此处已在对齐成功回调内故 enu_to_map 有效
         std::vector<IncrementalOptimizer::GPSFactorItem> hist_items;
         for (const auto& [submap_id, gps_meas] : bindings) {
             if (!gps_meas.is_valid) continue;
-            hist_items.push_back({ submap_id, gps_meas.position_enu, gps_meas.covariance });
+            hist_items.push_back({ submap_id, gps_manager_.enu_to_map(gps_meas.position_enu), gps_meas.covariance });
             historical_bound++;
         }
         
@@ -1993,23 +1990,25 @@ void AutoMapSystem::publishGlobalMap() {
         rviz_publisher_.publishSubmapGraph(all_sm);
         rviz_publisher_.publishOptimizedPath(all_sm);
         rviz_publisher_.publishKeyframePoses(collectKeyframesFromSubmaps(all_sm));
-        // GPS 约束：子图中心 + 约束线（子图中心 -> 地图系 GPS），一次发布；并发布 GPS 轨迹 Path
+        // GPS 约束：仅在对齐后使用 map 系位置，避免未对齐时把 ENU 标成 map
         {
             std::vector<Eigen::Vector3d> gps_positions_map_for_submaps;
-            for (const auto& sm : all_sm) {
-                if (!sm || !sm->has_valid_gps) continue;
-                gps_positions_map_for_submaps.push_back(gps_manager_.enu_to_map(sm->gps_center));
+            if (gps_aligned_) {
+                for (const auto& sm : all_sm) {
+                    if (!sm || !sm->has_valid_gps) continue;
+                    gps_positions_map_for_submaps.push_back(gps_manager_.enu_to_map(sm->gps_center));
+                }
             }
             if (!gps_positions_map_for_submaps.empty()) {
                 rviz_publisher_.publishGPSMarkersWithConstraintLines(all_sm, gps_positions_map_for_submaps);
-                rviz_publisher_.publishGPSTrajectory(all_sm, gps_positions_map_for_submaps, true);
+                rviz_publisher_.publishGPSTrajectory(all_sm, gps_positions_map_for_submaps, true, "map");
             } else {
                 rviz_publisher_.publishGPSMarkers(all_sm);
-                rviz_publisher_.publishGPSTrajectory(all_sm, true);
+                rviz_publisher_.publishGPSTrajectory(all_sm, true);  // raw 使用 gps_center(ENU)，frame_id=enu
             }
         }
-        // 真实 GPS 位置（按关键帧）转换到地图系后发布（供 RViz 显示）
-        {
+        // 真实 GPS 位置（按关键帧）转换到地图系后发布（仅对齐后有效）
+        if (gps_aligned_) {
             std::vector<Eigen::Vector3d> gps_positions_map;
             for (const auto& sm : all_sm) {
                 if (!sm) continue;

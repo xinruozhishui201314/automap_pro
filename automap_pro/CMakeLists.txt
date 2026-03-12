@@ -4,7 +4,14 @@ project(automap_pro VERSION 2.0.0)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type")
-set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native -DNDEBUG")
+# 与 GTSAM/PCL 同进程时避免 -march=native 导致 Eigen ABI 不一致引发 double free（见 docs/FIX_GTSAM_LAGO_STATIC_INIT_DOUBLE_FREE.md）
+option(AUTOMAP_AVOID_MARCH_NATIVE "Build Release without -march=native to align ABI with GTSAM/PCL (avoid lago static-init double free)" ON)
+if(AUTOMAP_AVOID_MARCH_NATIVE)
+  set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG")
+  message(STATUS "[automap_pro] AUTOMAP_AVOID_MARCH_NATIVE=ON: Release build without -march=native (GTSAM/PCL ABI alignment)")
+else()
+  set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native -DNDEBUG")
+endif()
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -Wno-unused-parameter -Wno-deprecated-declarations")
 
 # ──────────────────────────────────────────────────────────
@@ -90,6 +97,7 @@ endif()
 
 # GTSAM（iSAM2）
 find_package(GTSAM REQUIRED)
+message(STATUS "[automap_pro] GTSAM found (startup double free in lago? see docs/FIX_GTSAM_LAGO_STATIC_INIT_DOUBLE_FREE.md)")
 
 # Ceres（可选）
 find_package(Ceres QUIET)
@@ -266,6 +274,7 @@ add_library(automap_core SHARED
   src/core/config_manager.cpp
   src/core/map_frame_config.cpp
   src/core/logger.cpp
+  src/core/load_trace.cpp
   src/core/utils.cpp
   src/core/error_code.cpp
   src/core/error_monitor.cpp
@@ -328,6 +337,7 @@ endif()
 # 库：automap_backend（iSAM2 + HBA API 封装）
 # ──────────────────────────────────────────────────────────
 add_library(automap_backend SHARED
+  src/backend/load_trace.cpp
   src/backend/gtsam_guard.cpp
   src/backend/incremental_optimizer.cpp
   src/backend/delayed_gps_compensator.cpp

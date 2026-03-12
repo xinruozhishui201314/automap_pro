@@ -30,6 +30,8 @@
 namespace automap_pro {
 #ifdef USE_GTSAM_FALLBACK
 namespace {
+constexpr double kMaxReasonableTranslationNorm = 1e6;
+
 static gtsam::Pose3 toGtsamPose3(const Pose3d& T) {
     Eigen::Quaterniond q(T.rotation());
     gtsam::Rot3 rot = gtsam::Rot3::Quaternion(q.w(), q.x(), q.y(), q.z());
@@ -161,6 +163,11 @@ void HBAOptimizer::onGPSAligned(
     // GPS 对齐后立即触发一次全局优化（backend.hba.enabled=false 时跳过，仅 ISAM2+GPS）
     if (ConfigManager::instance().hbaEnabled())
         triggerAsync(all_submaps, false);
+}
+
+void HBAOptimizer::setGPSAlignedState(const GPSAlignResult& align_result) {
+    gps_aligned_      = true;
+    gps_align_result_ = align_result;
 }
 
 void HBAOptimizer::workerLoop() {
@@ -351,13 +358,17 @@ HBAResult HBAOptimizer::runHBA(const PendingTask& task) {
         result.optimized_poses = api_result.optimized_poses;
     } else {
         result.success = false;
-        RCLCPP_WARN(rclcpp::get_logger("automap_system"),
-            "[HBA][BACKEND] HBA failed: %s", api_result.error_msg.c_str());
+        RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+            "[HBA][BACKEND][EXCEPTION] HBA API failed: %s (grep HBA BACKEND EXCEPTION)", api_result.error_msg.c_str());
+        ALOG_ERROR(MOD, "HBA API failed: {}", api_result.error_msg);
         fprintf(stderr, "[HBAOptimizer] HBA failed: %s\n",
                 api_result.error_msg.c_str());
     }
 
 #elif defined(USE_GTSAM_FALLBACK)
+    RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+        "[HBA][CONFIG] backend.hba.enable_gtsam_fallback=%d (1=run GTSAM fallback, 0=skip; verify config file has enable_gtsam_fallback: true)",
+        ConfigManager::instance().hbaGtsamFallbackEnabled() ? 1 : 0);
     if (!ConfigManager::instance().hbaGtsamFallbackEnabled()) {
         RCLCPP_WARN(rclcpp::get_logger("automap_system"),
             "[HBA][BACKEND] GTSAM fallback disabled (backend.hba.enable_gtsam_fallback=false), skipping HBA");
@@ -380,13 +391,43 @@ HBAResult HBAOptimizer::runHBA(const PendingTask& task) {
 HBAResult HBAOptimizer::runGTSAMFallback(const PendingTask& task) {
     HBAResult result;
     result.success = false;
-    if (task.keyframes.empty()) return result;
+    if (task.keyframes.empty()) {
+        RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+            "[HBA][BACKEND][VALIDATION] GTSAM fallback: no keyframes, abort");
+        return result;
+    }
 
     std::vector<KeyFrame::Ptr> sorted_kfs = task.keyframes;
     std::sort(sorted_kfs.begin(), sorted_kfs.end(),
               [](const KeyFrame::Ptr& a, const KeyFrame::Ptr& b) {
                   return a->timestamp < b->timestamp;
               });
+
+    // 约束合理性：所有关键帧位姿有限且平移在合理范围内，否则不进入 GTSAM 避免崩溃
+    auto poseForInitial = [](const KeyFrame::Ptr& kf) -> Pose3d {
+        const Pose3d& o = kf->T_w_b_optimized;
+        const Pose3d& t = kf->T_w_b;
+        if ((o.translation() - t.translation()).norm() > 1e-9 || !o.rotation().isApprox(t.rotation()))
+            return o;
+        return t;
+    };
+    for (size_t i = 0; i < sorted_kfs.size(); ++i) {
+        Pose3d p = poseForInitial(sorted_kfs[i]);
+        const auto& t = p.translation();
+        const auto& R = p.rotation();
+        if (!t.allFinite() || !R.allFinite()) {
+            RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+                "[HBA][BACKEND][VALIDATION] GTSAM fallback: keyframe[%zu] pose non-finite, abort (grep HBA VALIDATION)",
+                i);
+            return result;
+        }
+        if (t.norm() > kMaxReasonableTranslationNorm) {
+            RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+                "[HBA][BACKEND][VALIDATION] GTSAM fallback: keyframe[%zu] translation norm=%.1f > %.0f, abort",
+                i, t.norm(), kMaxReasonableTranslationNorm);
+            return result;
+        }
+    }
 
     ensureGtsamTbbSerialized();
     GtsamCallScope scope(GtsamCaller::HBA, "GTSAM_fallback",
@@ -442,15 +483,16 @@ HBAResult HBAOptimizer::runGTSAMFallback(const PendingTask& task) {
                 const auto& kf = sorted_kfs[i];
                 if (!kf->has_valid_gps || kf->gps.quality == GPSQuality::INVALID || kf->gps.quality == GPSQuality::LOW)
                     continue;
-                // 校验 position_enu 有限
-                const auto& pos = kf->gps.position_enu;
-                if (!pos.allFinite()) {
+                const auto& pos_enu = kf->gps.position_enu;
+                if (!pos_enu.allFinite()) {
                     RCLCPP_WARN(rclcpp::get_logger("automap_system"),
                         "[HBA][GTSAM] skip GPS factor kf=%zu: non-finite position_enu", i);
                     ALOG_WARN(MOD, "HBA GTSAM: skip GPS kf={} non-finite position_enu", i);
                     continue;
                 }
-                gtsam::Point3 pt(pos.x(), pos.y(), pos.z());
+                // 与 iSAM2 一致：位姿在 map 系，GPS 观测也转换到 map 系（enu_to_map）
+                Eigen::Vector3d pos_map = gps_align_result_.R_gps_lidar * pos_enu + gps_align_result_.t_gps_lidar;
+                gtsam::Point3 pt(pos_map.x(), pos_map.y(), pos_map.z());
                 Eigen::Matrix3d c = kf->gps.covariance;
                 if (!c.allFinite()) {
                     RCLCPP_WARN(rclcpp::get_logger("automap_system"),
@@ -466,6 +508,11 @@ HBAResult HBAOptimizer::runGTSAMFallback(const PendingTask& task) {
                 graph.add(gtsam::GPSFactor(KF(i), pt, noise));
                 factor_type_log.push_back("GPS(k" + std::to_string(i) + ")");
                 gps_factors_added++;
+            }
+            if (gps_factors_added > 0) {
+                RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                    "[HBA][GTSAM][BACKEND] GPS positions in map frame (enu_to_map applied) gps_factors=%zu (grep BACKEND 定位坐标系)",
+                    gps_factors_added);
             }
         }
 
@@ -511,22 +558,53 @@ HBAResult HBAOptimizer::runGTSAMFallback(const PendingTask& task) {
             "[HBA][GTSAM] pre-LM: graph_copy.size=%zu initial_copy.size=%zu initial_keys_sample=[%s]",
             graph_copy.size(), initial_copy.size(), key_sample.c_str());
 
-        // 可选：检查所有因子的 key 均在 initial 中，避免 key 缺失导致未定义行为
+        // 约束合理性：所有因子的 key 均在 initial 中，且所有 value 有限、平移在合理范围内
         bool key_ok = true;
         for (size_t idx = 0; idx < graph_copy.size() && key_ok; ++idx) {
             for (gtsam::Key k : graph_copy[idx]->keys()) {
                 if (!initial_copy.exists(k)) {
-                    RCLCPP_WARN(rclcpp::get_logger("automap_system"),
-                        "[HBA][GTSAM] key mismatch: factor[%zu] key %zu not in initial", idx, static_cast<size_t>(k));
+                    RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+                        "[HBA][BACKEND][VALIDATION] GTSAM fallback: factor[%zu] key %zu not in initial, abort",
+                        idx, static_cast<size_t>(k));
                     key_ok = false;
                     break;
                 }
             }
         }
         if (!key_ok) {
-            RCLCPP_WARN(rclcpp::get_logger("automap_system"),
-                "[HBA][GTSAM] key consistency check failed, skipping LM optimization");
-            ALOG_WARN(MOD, "HBA GTSAM: factor key not in initial, skip");
+            ALOG_ERROR(MOD, "HBA GTSAM: factor key not in initial, skip");
+            return result;
+        }
+        bool values_ok = true;
+        for (gtsam::Key k : initial_copy.keys()) {
+            try {
+                auto p = initial_copy.at<gtsam::Pose3>(k);
+                Eigen::Vector3d t = p.translation();
+                Eigen::Matrix3d R = p.rotation().matrix();
+                if (!t.array().isFinite().all() || !R.array().isFinite().all()) {
+                    RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+                        "[HBA][BACKEND][VALIDATION] GTSAM fallback: initial value key=%zu non-finite, abort",
+                        static_cast<size_t>(k));
+                    values_ok = false;
+                    break;
+                }
+                if (t.norm() > kMaxReasonableTranslationNorm) {
+                    RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+                        "[HBA][BACKEND][VALIDATION] GTSAM fallback: initial value key=%zu translation norm=%.1f > %.0f, abort",
+                        static_cast<size_t>(k), t.norm(), kMaxReasonableTranslationNorm);
+                    values_ok = false;
+                    break;
+                }
+            } catch (const std::exception& e) {
+                RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+                    "[HBA][BACKEND][VALIDATION] GTSAM fallback: initial value key=%zu exception: %s, abort",
+                    static_cast<size_t>(k), e.what());
+                values_ok = false;
+                break;
+            }
+        }
+        if (!values_ok) {
+            ALOG_ERROR(MOD, "HBA GTSAM: initial values validation failed, skip");
             return result;
         }
 
@@ -556,14 +634,15 @@ HBAResult HBAOptimizer::runGTSAMFallback(const PendingTask& task) {
             "[HBA][BACKEND] GTSAM fallback done: poses=%zu", result.optimized_poses.size());
         ALOG_INFO(MOD, "HBA GTSAM fallback done: optimized_poses={}", result.optimized_poses.size());
     } catch (const std::exception& e) {
-        RCLCPP_WARN(rclcpp::get_logger("automap_system"),
-            "[HBA][BACKEND] GTSAM fallback failed: %s", e.what());
+        RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+            "[HBA][BACKEND][EXCEPTION] GTSAM fallback failed: %s (grep HBA BACKEND EXCEPTION)", e.what());
         ALOG_ERROR(MOD, "HBA GTSAM fallback exception: {}", e.what());
-        fprintf(stderr, "[HBAOptimizer] GTSAM fallback: %s\n", e.what());
+        fprintf(stderr, "[HBAOptimizer] GTSAM fallback exception: %s\n", e.what());
     } catch (...) {
-        RCLCPP_WARN(rclcpp::get_logger("automap_system"),
-            "[HBA][BACKEND] GTSAM fallback unknown exception (若为 double free，检查 FIX_GPS_BATCH_SIGSEGV 7.1/7.2 与 pre-LM 日志)");
+        RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+            "[HBA][BACKEND][EXCEPTION] GTSAM fallback unknown exception (若为 double free，检查 FIX_GPS_BATCH_SIGSEGV 与 pre-LM 日志，grep HBA BACKEND EXCEPTION)");
         ALOG_ERROR(MOD, "HBA GTSAM fallback: unknown exception");
+        fprintf(stderr, "[HBAOptimizer] GTSAM fallback: unknown exception\n");
     }
     return result;
 }

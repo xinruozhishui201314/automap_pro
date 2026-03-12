@@ -23,11 +23,15 @@ namespace automap_pro {
 // GTSAM Symbol 约定：s(sm_id) = Symbol('s', sm_id)
 static gtsam::Symbol SM(int id) { return gtsam::Symbol('s', id); }
 
-// ── 优化前约束全量转储与合理性校验（便于崩溃精准定位）────────────────────────────
+// ── 优化前约束全量转储与合理性校验（便于崩溃精准定位，校验失败则中止 update 避免触发 GTSAM 崩溃）──
 namespace {
+// 平移合理范围（米），超出视为异常输入，避免 GTSAM 数值问题
+constexpr double kMaxReasonableTranslationNorm = 1e6;
+
 struct ConstraintValidation {
     bool all_keys_exist = true;
     bool all_values_finite = true;
+    bool all_values_reasonable = true;  // 平移/旋转在合理范围内
     std::string message;
 };
 
@@ -90,17 +94,22 @@ void logAllConstraintsAndValidate(
     for (const gtsam::Key k : values.keys()) {
         std::string pose_str = "n/a";
         bool finite = false;
+        bool reasonable = false;
         try {
             auto p = values.at<gtsam::Pose3>(k);
             Eigen::Vector3d t = p.translation();
             Eigen::Matrix3d R = p.rotation().matrix();
             finite = t.array().isFinite().all() && R.array().isFinite().all();
+            double tnorm = t.norm();
+            reasonable = finite && (tnorm <= kMaxReasonableTranslationNorm);
             pose_str = "x=" + std::to_string(t.x()) + " y=" + std::to_string(t.y()) + " z=" + std::to_string(t.z());
+            if (out_validation && finite && tnorm > kMaxReasonableTranslationNorm)
+                out_validation->all_values_reasonable = false;
         } catch (...) {
             pose_str = "at_failed";
         }
-        RCLCPP_INFO(log, "[GTSAM_CONSTRAINTS] value key=%zu %s finite=%s",
-                    static_cast<size_t>(k), pose_str.c_str(), finite ? "1" : "0");
+        RCLCPP_INFO(log, "[GTSAM_CONSTRAINTS] value key=%zu %s finite=%s reasonable=%s",
+                    static_cast<size_t>(k), pose_str.c_str(), finite ? "1" : "0", reasonable ? "1" : "0");
         if (out_validation && !finite) out_validation->all_values_finite = false;
     }
 
@@ -113,9 +122,12 @@ void logAllConstraintsAndValidate(
                 }
             }
         }
-        out_validation->message = out_validation->all_keys_exist && out_validation->all_values_finite
-            ? "ok" : ("keys_exist=" + std::string(out_validation->all_keys_exist ? "1" : "0") +
-                     " values_finite=" + std::string(out_validation->all_values_finite ? "1" : "0"));
+        out_validation->message =
+            (out_validation->all_keys_exist && out_validation->all_values_finite && out_validation->all_values_reasonable)
+                ? "ok"
+                : ("keys_exist=" + std::string(out_validation->all_keys_exist ? "1" : "0") +
+                   " values_finite=" + std::string(out_validation->all_values_finite ? "1" : "0") +
+                   " values_reasonable=" + std::string(out_validation->all_values_reasonable ? "1" : "0"));
     }
     RCLCPP_INFO(log, "[GTSAM_CONSTRAINTS] tag=%s validation done %s (若崩溃在 error() 或 optimize() 内，见上一 GTSAM_CONSTRAINTS 约束列表)",
                 tag, out_validation ? out_validation->message.c_str() : "n/a");
@@ -123,7 +135,12 @@ void logAllConstraintsAndValidate(
 }  // anonymous namespace
 
 IncrementalOptimizer::IncrementalOptimizer() {
+    RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+        "[IncrementalOptimizer][LOAD_TRACE] constructor entered (about to ensureGtsamTbbSerialized)");
+    fflush(stdout);
     ensureGtsamTbbSerialized();
+    RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+        "[IncrementalOptimizer][LOAD_TRACE] ensureGtsamTbbSerialized done (about to read config and build ISAM2Params)");
     const auto& cfg = ConfigManager::instance();
 
     gtsam::ISAM2Params params;
@@ -141,7 +158,12 @@ IncrementalOptimizer::IncrementalOptimizer() {
     // ✅ 新增：关闭非线性误差评估，减少 TBB 调用路径（减少并发导致 double free 的机会）
     params.evaluateNonlinearError = false;
 
+    RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+        "[IncrementalOptimizer][LOAD_TRACE] ISAM2Params set (about to construct gtsam::ISAM2; if crash here, see borglab/gtsam#1189 / lago static init)");
+    fflush(stdout);
     isam2_ = gtsam::ISAM2(params);
+    RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+        "[IncrementalOptimizer][LOAD_TRACE] gtsam::ISAM2 constructed ok (about to set prior_noise_)");
     // 使用 Diagonal 方差作为“近似固定先验”（可配置），避免 Constrained 退出时 SIGSEGV；适度先验利于点云清晰度，过强易导致数值刚度
     double pvar = cfg.isam2PriorVariance();
     prior_var6_.resize(6);
@@ -166,8 +188,24 @@ void IncrementalOptimizer::addSubMapNode(int sm_id, const Pose3d& init_pose, boo
         return;
     }
     if (node_exists_.count(sm_id)) return;
-    node_exists_[sm_id] = true;
 
+    // 约束合理性：拒绝非法初始位姿，避免后续 update 触发 GTSAM 异常
+    const Eigen::Vector3d& t = init_pose.translation();
+    const Eigen::Matrix3d& R = init_pose.rotation();
+    if (!t.allFinite() || !R.allFinite()) {
+        RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+            "[IncrementalOptimizer][BACKEND][VALIDATION] addSubMapNode sm_id=%d init_pose non-finite, skip (grep BACKEND VALIDATION)",
+            sm_id);
+        return;
+    }
+    if (t.norm() > kMaxReasonableTranslationNorm) {
+        RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+            "[IncrementalOptimizer][BACKEND][VALIDATION] addSubMapNode sm_id=%d translation norm=%.1f > %.0f, skip",
+            sm_id, t.norm(), kMaxReasonableTranslationNorm);
+        return;
+    }
+
+    node_exists_[sm_id] = true;
     pending_values_.insert(SM(sm_id), toPose3(init_pose));
     node_count_++;
 
@@ -189,6 +227,28 @@ void IncrementalOptimizer::addOdomFactor(
 {
     std::unique_lock<std::shared_mutex> lk(rw_mutex_);
     if (!node_exists_.count(from) || !node_exists_.count(to)) return;
+
+    // 约束合理性：拒绝非法 rel/info 进入 pending，避免后续 update 触发 GTSAM 异常
+    const Eigen::Vector3d& t = rel.translation();
+    const Eigen::Matrix3d& R = rel.rotation();
+    if (!t.allFinite() || !R.allFinite()) {
+        RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+            "[IncrementalOptimizer][BACKEND][VALIDATION] addOdomFactor from=%d to=%d rel non-finite, skip",
+            from, to);
+        return;
+    }
+    if (t.norm() > kMaxReasonableTranslationNorm) {
+        RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+            "[IncrementalOptimizer][BACKEND][VALIDATION] addOdomFactor from=%d to=%d translation norm=%.1f > %.0f, skip",
+            from, to, t.norm(), kMaxReasonableTranslationNorm);
+        return;
+    }
+    if (!info_matrix.allFinite()) {
+        RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+            "[IncrementalOptimizer][BACKEND][VALIDATION] addOdomFactor from=%d to=%d info_matrix non-finite, skip",
+            from, to);
+        return;
+    }
 
     // 使用 Diagonal 噪声避免 Gaussian::Covariance 在 linearize 路径触发 double free（即使 TBB 已关）
     auto noise = infoToNoiseDiagonal(info_matrix);
@@ -213,6 +273,31 @@ OptimizationResult IncrementalOptimizer::addLoopFactor(
         if (node_exists_.find(from) == node_exists_.end() ||
             node_exists_.find(to) == node_exists_.end()) {
             ALOG_DEBUG(MOD, "addLoopFactor: from=%d or to=%d not exists, skip", from, to);
+            RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                "[IncrementalOptimizer][BACKEND][LOOP] skip addLoopFactor from=%d to=%d (node not in graph, grep BACKEND LOOP 定位)",
+                from, to);
+            return OptimizationResult{};
+        }
+
+        // 约束合理性：拒绝非法 rel/info，避免触发 GTSAM 异常
+        const Eigen::Vector3d& rel_t = rel.translation();
+        const Eigen::Matrix3d& rel_R = rel.rotation();
+        if (!rel_t.allFinite() || !rel_R.allFinite()) {
+            RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+                "[IncrementalOptimizer][BACKEND][VALIDATION] addLoopFactor from=%d to=%d rel non-finite, skip",
+                from, to);
+            return OptimizationResult{};
+        }
+        if (rel_t.norm() > kMaxReasonableTranslationNorm) {
+            RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+                "[IncrementalOptimizer][BACKEND][VALIDATION] addLoopFactor from=%d to=%d translation norm=%.1f > %.0f, skip",
+                from, to, rel_t.norm(), kMaxReasonableTranslationNorm);
+            return OptimizationResult{};
+        }
+        if (!info_matrix.allFinite()) {
+            RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+                "[IncrementalOptimizer][BACKEND][VALIDATION] addLoopFactor from=%d to=%d info_matrix non-finite, skip",
+                from, to);
             return OptimizationResult{};
         }
 
@@ -256,6 +341,23 @@ void IncrementalOptimizer::addGPSFactor(
         // ✅ 修复：显式检查节点存在性
         if (node_exists_.find(sm_id) == node_exists_.end()) {
             ALOG_DEBUG(MOD, "addGPSFactor: sm_id=%d not exists, skip", sm_id);
+            RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                "[IncrementalOptimizer][BACKEND][GPS] skip addGPSFactor sm_id=%d (node not in graph, grep BACKEND GPS 定位)",
+                sm_id);
+            return;
+        }
+
+        // 约束合理性：拒绝非法 GPS 位置/协方差，避免后续 update 触发 GTSAM 异常
+        if (!pos_map.allFinite()) {
+            RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+                "[IncrementalOptimizer][BACKEND][VALIDATION] addGPSFactor sm_id=%d pos_map non-finite, skip",
+                sm_id);
+            return;
+        }
+        if (!cov3x3.allFinite()) {
+            RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+                "[IncrementalOptimizer][BACKEND][VALIDATION] addGPSFactor sm_id=%d cov3x3 non-finite, skip",
+                sm_id);
             return;
         }
 
@@ -569,6 +671,9 @@ OptimizationResult IncrementalOptimizer::commitAndUpdate() {
             "- avoid GTSAM first-update double free (borglab/gtsam#1189), pending until 2+ nodes",
             pf, pv, factor_types_str.c_str());
         RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[IncrementalOptimizer][BACKEND][PIPELINE] event=commit_deferred reason=%s factors=%zu values=%zu (grep BACKEND PIPELINE 定位)",
+            single_prior_only ? "single_prior" : "all_factors_same_key", pf, pv);
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
             "[CRASH_CONTEXT] step=commitAndUpdate_defer_return single_prior_only=%d all_factors_same_key=%d (未调用 isam2_.update)",
             single_prior_only ? 1 : 0, all_factors_same_key ? 1 : 0);
         scope.setSuccess(true);
@@ -614,8 +719,43 @@ OptimizationResult IncrementalOptimizer::commitAndUpdate() {
             RCLCPP_INFO(rclcpp::get_logger("automap_system"),
                 "[CRASH_CONTEXT] step=first_update_v5_enter factors=%zu values=%zu",
                 graph_copy.size(), values_copy.size());
-            // V5 首次 update：不访问因子内部（prior/measurementIn/noiseModel/measured），避免 GTSAM 内部 free 路径触发 SIGSEGV，见 FIX_ISAM2_FIRST_UPDATE_DOUBLE_FREE_20260311.md
-
+            // V5 首次 update 前：校验 values 合法，避免注入 nan/inf 或超大平移导致 GTSAM 异常
+            bool first_values_ok = true;
+            for (const gtsam::Key k : values_copy.keys()) {
+                try {
+                    auto p = values_copy.at<gtsam::Pose3>(k);
+                    Eigen::Vector3d t = p.translation();
+                    Eigen::Matrix3d R = p.rotation().matrix();
+                    if (!t.array().isFinite().all() || !R.array().isFinite().all()) {
+                        RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+                            "[IncrementalOptimizer][BACKEND][VALIDATION] first update value key=%zu non-finite - abort (grep BACKEND VALIDATION)",
+                            static_cast<size_t>(k));
+                        first_values_ok = false;
+                        break;
+                    }
+                    if (t.norm() > kMaxReasonableTranslationNorm) {
+                        RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+                            "[IncrementalOptimizer][BACKEND][VALIDATION] first update value key=%zu translation norm=%.1f > %.0f - abort",
+                            static_cast<size_t>(k), t.norm(), kMaxReasonableTranslationNorm);
+                        first_values_ok = false;
+                        break;
+                    }
+                } catch (const std::exception& e) {
+                    RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+                        "[IncrementalOptimizer][BACKEND][VALIDATION] first update value key=%zu exception: %s - abort",
+                        static_cast<size_t>(k), e.what());
+                    first_values_ok = false;
+                    break;
+                }
+            }
+            if (!first_values_ok) {
+                pending_graph_.resize(0);
+                pending_values_.clear();
+                scope.setSuccess(false);
+                recordOptimizationFailure("first_update_values_validation_failed");
+                METRICS_GAUGE_SET(metrics::ISAM2_LAST_SUCCESS, 0.0);
+                return OptimizationResult{};
+            }
             // Step1: 仅注入 values，空 graph（不触发 linearize）
             gtsam::NonlinearFactorGraph empty_graph;
             crash_report::setLastStep("first_update_v5_update_values");
@@ -641,7 +781,7 @@ OptimizationResult IncrementalOptimizer::commitAndUpdate() {
             RCLCPP_INFO(rclcpp::get_logger("automap_system"),
                 "[CRASH_CONTEXT] step=first_update_v5_done deferred_factors=%zu", graph_copy.size());
         } else {
-            // 常规 ISAM2 增量 update：优化前同样输出全量约束便于定位
+            // 常规 ISAM2 增量 update：优化前全量约束校验，任一不合理则中止 update 避免触发 GTSAM 崩溃
             RCLCPP_INFO(rclcpp::get_logger("automap_system"),
                 "[ISAM2_DIAG] commitAndUpdate path=incremental (graph_copy.size=%zu values_copy.size=%zu)",
                 graph_copy.size(), values_copy.size());
@@ -650,8 +790,24 @@ OptimizationResult IncrementalOptimizer::commitAndUpdate() {
             ConstraintValidation inc_validation;
             logAllConstraintsAndValidate(graph_copy, values_copy, "incremental_before_isam2", &inc_validation);
             RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-                "[ISAM2_DIAG][TRACE] step=incremental_constraints_dump_done all_keys_exist=%s all_values_finite=%s",
-                inc_validation.all_keys_exist ? "1" : "0", inc_validation.all_values_finite ? "1" : "0");
+                "[ISAM2_DIAG][TRACE] step=incremental_constraints_dump_done all_keys_exist=%s all_values_finite=%s all_values_reasonable=%s",
+                inc_validation.all_keys_exist ? "1" : "0", inc_validation.all_values_finite ? "1" : "0",
+                inc_validation.all_values_reasonable ? "1" : "0");
+
+            bool validation_ok = inc_validation.all_keys_exist && inc_validation.all_values_finite && inc_validation.all_values_reasonable;
+            if (!validation_ok) {
+                RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+                    "[IncrementalOptimizer][BACKEND][VALIDATION] constraint validation FAILED: %s - aborting iSAM2 update to avoid crash (grep BACKEND VALIDATION)",
+                    inc_validation.message.c_str());
+                ALOG_ERROR(MOD, "constraint validation failed: {} - abort update", inc_validation.message);
+                pending_graph_.resize(0);
+                pending_values_.clear();
+                scope.setSuccess(false);
+                recordOptimizationFailure(inc_validation.message.c_str());
+                METRICS_GAUGE_SET(metrics::ISAM2_LAST_SUCCESS, 0.0);
+                return OptimizationResult{};
+            }
+
             RCLCPP_INFO(rclcpp::get_logger("automap_system"),
                 "[CRASH_CONTEXT] step=incremental_pre_update (若崩溃则发生在 isam2_.update(graph_copy, values_copy) 内)");
             RCLCPP_INFO(rclcpp::get_logger("automap_system"),
@@ -712,19 +868,27 @@ OptimizationResult IncrementalOptimizer::commitAndUpdate() {
     auto t1 = std::chrono::steady_clock::now();
     double elapsed = std::chrono::duration<double, std::milli>(t1 - t0).count();
 
-    // 提取所有位姿
+    // 提取所有位姿（先 exists 再 at，避免异常控制流，符合 GTSAM 推荐用法）
     std::unordered_map<int, Pose3d> poses;
     for (const auto& kv : node_exists_) {
         int id = kv.first;
+        gtsam::Key key = SM(id);
+        if (!current_estimate_.exists(key)) {
+            ALOG_ERROR(MOD, "iSAM2 extract pose sm_id={} not in current_estimate (node_exists_ vs estimate mismatch)", id);
+            RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+                "[IncrementalOptimizer][BACKEND] sm_id=%d not in estimate, skip (node_exists_.size=%zu estimate.size=%zu)",
+                id, node_exists_.size(), current_estimate_.size());
+            continue;
+        }
         try {
-            auto p = current_estimate_.at<gtsam::Pose3>(SM(id));
+            auto p = current_estimate_.at<gtsam::Pose3>(key);
             poses[id] = fromPose3(p);
         } catch (const std::exception& e) {
             ALOG_ERROR(MOD, "iSAM2 extract pose sm_id={} exception: {}", id, e.what());
             RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
                 "[IncrementalOptimizer][EXCEPTION] extract pose sm_id=%d: %s", id, e.what());
         } catch (...) {
-            ALOG_ERROR(MOD, "iSAM2 extract pose sm_id={} unknown exception (not in estimate?)", id);
+            ALOG_ERROR(MOD, "iSAM2 extract pose sm_id={} unknown exception", id);
             RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
                 "[IncrementalOptimizer][EXCEPTION] extract pose sm_id=%d: unknown exception", id);
         }
@@ -735,6 +899,13 @@ OptimizationResult IncrementalOptimizer::commitAndUpdate() {
     res.nodes_updated = (int)poses.size();
     res.elapsed_ms    = elapsed;
     res.submap_poses  = poses;
+
+    // 健康检查：node_exists_ 与 current_estimate_ 一致性（V5 首次路径或异常后可能不一致）
+    if (poses.size() != node_exists_.size()) {
+        RCLCPP_WARN(rclcpp::get_logger("automap_system"),
+            "[IncrementalOptimizer][BACKEND][HEALTH] pose count mismatch: poses=%zu node_exists_=%zu path=%s (grep BACKEND HEALTH)",
+            poses.size(), node_exists_.size(), used_first_update_three_phase ? "first_V5" : "incremental");
+    }
 
     // V1: 单次 update 耗时分布与队列深度；V2: 可观测性 last success
     METRICS_HISTOGRAM_OBSERVE(metrics::ISAM2_OPTIMIZE_TIME_MS, elapsed);
@@ -783,23 +954,41 @@ std::unordered_map<int, Pose3d> IncrementalOptimizer::getAllPoses() const {
     std::shared_lock<std::shared_mutex> lk(rw_mutex_);
     std::unordered_map<int, Pose3d> out;
     for (const auto& kv : node_exists_) {
+        int id = kv.first;
+        gtsam::Key key = SM(id);
+        if (!current_estimate_.exists(key)) {
+            ALOG_ERROR(MOD, "getAllPoses sm_id={} not in current_estimate, skip", id);
+            continue;
+        }
         try {
-            auto p = current_estimate_.at<gtsam::Pose3>(SM(kv.first));
-            out[kv.first] = fromPose3(p);
+            auto p = current_estimate_.at<gtsam::Pose3>(key);
+            out[id] = fromPose3(p);
         } catch (const std::exception& e) {
-            ALOG_ERROR(MOD, "getAllPoses sm_id={} exception: {}", kv.first, e.what());
+            ALOG_ERROR(MOD, "getAllPoses sm_id={} exception: {}", id, e.what());
             RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
-                "[IncrementalOptimizer][EXCEPTION] getAllPoses sm_id=%d: %s", kv.first, e.what());
+                "[IncrementalOptimizer][EXCEPTION] getAllPoses sm_id=%d: %s", id, e.what());
         } catch (...) {
-            ALOG_ERROR(MOD, "getAllPoses sm_id={} unknown exception", kv.first);
+            ALOG_ERROR(MOD, "getAllPoses sm_id={} unknown exception", id);
             RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
-                "[IncrementalOptimizer][EXCEPTION] getAllPoses sm_id=%d: unknown exception", kv.first);
+                "[IncrementalOptimizer][EXCEPTION] getAllPoses sm_id=%d: unknown exception", id);
         }
     }
     return out;
 }
 
 void IncrementalOptimizer::reset() {
+    // 先清空优化队列并重置进度标志，避免 opt 线程随后处理旧任务访问已清空状态
+    size_t queue_cleared = 0;
+    {
+        std::lock_guard<std::mutex> qlk(opt_queue_mutex_);
+        queue_cleared = opt_queue_.size();
+        while (!opt_queue_.empty()) opt_queue_.pop();
+    }
+    optimization_in_progress_.store(false, std::memory_order_release);
+    RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+        "[IncrementalOptimizer][BACKEND][RESET] queue_cleared=%zu optimization_in_progress=0 (grep BACKEND RESET 定位 reset 调用)",
+        queue_cleared);
+
     std::unique_lock<std::shared_mutex> lk(rw_mutex_);
     gtsam::ISAM2Params params;
     params.relinearizeThreshold = ConfigManager::instance().isam2RelinThresh();
@@ -894,45 +1083,46 @@ IncrementalOptimizer::infoToNoiseDiagonal(const Mat66d& info) const {
     return gtsam::noiseModel::Diagonal::Variances(vars);
 }
 
-gtsam::noiseModel::Gaussian::shared_ptr
+gtsam::noiseModel::Base::shared_ptr
 IncrementalOptimizer::infoToNoise(const Mat66d& info) const {
-    // 检查奇异性：使用 SVD 分解判断秩和条件数
+    // 秩缺/病态时返回 Diagonal 保守方差，与 infoToNoiseDiagonal 及双路 GTSAM 策略一致（避免 Gaussian::Covariance 在 linearize 路径 double free）
+    gtsam::Vector6 conservative_var;
+    conservative_var.setConstant(1.0);
+
     Eigen::JacobiSVD<Mat66d> svd(info, Eigen::ComputeFullU | Eigen::ComputeFullV);
-    
-    // 检查秩是否满秩（rank < 6 表示奇异）
     const int rank = svd.rank();
     if (rank < 6) {
-        ALOG_WARN("IncrementalOptimizer", 
-                  "Information matrix rank-deficient (rank={}/6), using conservative covariance", rank);
-        gtsam::Matrix66 cov = gtsam::Matrix66::Identity() * 1.0;
-        return gtsam::noiseModel::Gaussian::Covariance(cov);
+        ALOG_WARN("IncrementalOptimizer",
+                  "Information matrix rank-deficient (rank={}/6), using conservative diagonal", rank);
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[IncrementalOptimizer][BACKEND][NOISE] infoToNoise fallback reason=rank_deficient rank=%d/6 (grep BACKEND NOISE 定位)",
+            rank);
+        return gtsam::noiseModel::Diagonal::Variances(conservative_var);
     }
 
-    // ✅ 修复：收紧条件数阈值（从 1e8 降到 1e6），更早触发正则化
-    // ✅ 修复：对所有情况使用相对正则化（避免数值不稳定）
     const double max_sv = svd.singularValues()(0);
     const double min_sv = svd.singularValues()(5);
     const double cond = (max_sv > 1e-12) ? (max_sv / min_sv) : 1e12;
 
     if (min_sv < 1e-6 || cond > 1e6) {
-        ALOG_WARN(MOD, "Information matrix rank-deficient (rank={}/6, cond={:.2e}), using conservative covariance", rank, cond);
-        gtsam::Matrix66 cov = gtsam::Matrix66::Identity() * 1.0;
-        return gtsam::noiseModel::Gaussian::Covariance(cov);
+        ALOG_WARN(MOD, "Information matrix ill-conditioned (rank={}/6, cond={:.2e}), using conservative diagonal", rank, cond);
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[IncrementalOptimizer][BACKEND][NOISE] infoToNoise fallback reason=ill_conditioned rank=%d cond=%.2e (grep BACKEND NOISE 定位)",
+            rank, cond);
+        return gtsam::noiseModel::Diagonal::Variances(conservative_var);
     }
 
-    // ✅ 修复：使用相对正则化，确保最小特征值不低于 1e-12
     Mat66d info_reg = info + Mat66d::Identity() * std::max(1e-6, min_sv * 1e-3);
-    
     gtsam::Matrix66 cov = info_reg.inverse().cast<double>();
-    cov = 0.5 * (cov + cov.transpose());  // 确保对称
+    cov = 0.5 * (cov + cov.transpose());
 
-    // ✅ 修复：检查求逆结果是否有效
     if (!cov.allFinite()) {
-        ALOG_ERROR(MOD, "Regularized inverse contains NaN/Inf, using fallback covariance");
+        ALOG_ERROR(MOD, "Regularized inverse contains NaN/Inf, using fallback diagonal");
         RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
-            "[IncrementalOptimizer][EXCEPTION] Regularized inverse contains NaN/Inf, using fallback covariance");
-        cov = gtsam::Matrix66::Identity() * 1.0;
-        return gtsam::noiseModel::Gaussian::Covariance(cov);
+            "[IncrementalOptimizer][EXCEPTION] Regularized inverse contains NaN/Inf, using fallback diagonal");
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[IncrementalOptimizer][BACKEND][NOISE] infoToNoise fallback reason=non_finite (grep BACKEND NOISE 定位)");
+        return gtsam::noiseModel::Diagonal::Variances(conservative_var);
     }
 
     ALOG_DEBUG(MOD, "InfoToNoise: cond={:.2e} reg_factor={:.2e}", cond, min_sv * 1e-3);
@@ -1073,9 +1263,15 @@ void IncrementalOptimizer::waitForPendingTasks() {
     if (final_depth > 0 || still_busy) {
         ALOG_WARN(MOD, "[ISAM2_QUEUE] waitForPendingTasks timeout after {}ms queue_depth={} opt_busy={} (backend continues)",
                   kMaxWaitMs, final_depth, still_busy ? 1 : 0);
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[IncrementalOptimizer][BACKEND][PIPELINE] event=wait_pending_timeout waited_ms=%d queue_depth=%zu opt_busy=%d (grep BACKEND PIPELINE 定位)",
+            waited_ms, final_depth, still_busy ? 1 : 0);
     } else {
         ALOG_INFO(MOD, "[ISAM2_QUEUE] waitForPendingTasks done waited_ms={} (queue empty and no commitAndUpdate in progress)",
                   waited_ms);
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[IncrementalOptimizer][BACKEND][PIPELINE] event=wait_pending_done waited_ms=%d (grep BACKEND PIPELINE 定位)",
+            waited_ms);
     }
 }
 

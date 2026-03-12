@@ -35,6 +35,8 @@ std::mutex& globalGtsamMutex() {
 static void applyTbbSerialized() {
     // ✅ P0 修复：限制所有并行库的线程数为 1
     // 这是解决 SIGSEGV 崩溃的关键！
+    fprintf(stderr, "[GTSAM_Guard][LOAD_TRACE] applyTbbSerialized: setting OMP/EIGEN/MKL/TBB env and Eigen::setNbThreads(1)\n");
+    fflush(stderr);
 
     // 方法1: 设置环境变量（对某些库有效，包括子进程）
     #ifdef __linux__
@@ -97,7 +99,11 @@ static std::string threadIdString() {
 } // namespace
 
 void ensureGtsamTbbSerialized() {
+    fprintf(stderr, "[GTSAM_Guard][LOAD_TRACE] ensureGtsamTbbSerialized entered (first GTSAM-related call in process; about to applyTbbSerialized)\n");
+    fflush(stderr);
     applyTbbSerialized();
+    fprintf(stderr, "[GTSAM_Guard][LOAD_TRACE] ensureGtsamTbbSerialized done\n");
+    fflush(stderr);
 }
 
 bool gtsamGlobalMutexEnabled() {

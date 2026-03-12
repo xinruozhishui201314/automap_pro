@@ -196,6 +196,16 @@ def _launch_nodes_offline(context, *args, **kwargs):
         sys.stderr.write("{} [WARN] config_path 为空，automap_system 将使用默认配置\n".format(_LP))
         sys.stderr.flush()
     run_automap_under_gdb = LaunchConfiguration("run_automap_under_gdb", default="false").perform(context).lower() == "true"
+    # 可选：预加载 libgtsam 以尝试规避 lago 静态初始化 double free（见 docs/FIX_GTSAM_LAGO_STATIC_INIT_DOUBLE_FREE.md）
+    gtsam_preload_path = LaunchConfiguration("gtsam_preload_path", default="").perform(context).strip()
+    automap_env = None
+    if gtsam_preload_path and os.path.isfile(gtsam_preload_path):
+        automap_env = {"LD_PRELOAD": gtsam_preload_path}
+        sys.stderr.write("{} [GTSAM] LD_PRELOAD={} (avoid lago static-init double free)\n".format(_LP, gtsam_preload_path))
+        sys.stderr.flush()
+    elif gtsam_preload_path:
+        sys.stderr.write("{} [WARN] gtsam_preload_path 指定但文件不存在: {}，忽略\n".format(_LP, gtsam_preload_path))
+        sys.stderr.flush()
     # launch_ros Node 的 prefix 多元素 list 会被错误拼接；用包装脚本可靠调用 gdb
     gdb_wrapper = os.path.join(launch_dir, "run_under_gdb.sh")
     automap_prefix = [gdb_wrapper] if (run_automap_under_gdb and os.path.isfile(gdb_wrapper)) else []
@@ -207,12 +217,15 @@ def _launch_nodes_offline(context, *args, **kwargs):
         sys.stderr.flush()
     automap_system_node = None
     try:
-        automap_system_node = Node(
+        node_kw = dict(
             package="automap_pro", executable="automap_system_node", name="automap_system",
             output="screen",
             parameters=[{"config_file": config_path_str}, {"use_sim_time": True}],
             prefix=automap_prefix,
         )
+        if automap_env is not None:
+            node_kw["additional_env"] = automap_env
+        automap_system_node = Node(**node_kw)
         nodes.append(automap_system_node)
     except Exception as e:
         _log_launch_exception("创建 automap_system Node", e)
@@ -362,6 +375,7 @@ def generate_launch_description():
         DeclareLaunchArgument("use_hba_cal_mme", default_value="false", description="Launch HBA cal_MME node (params from system_config.backend.hba_cal_mme)"),
         DeclareLaunchArgument("use_hba_visualize", default_value="false", description="Launch HBA visualize node (params from system_config.backend.hba_visualize)"),
         DeclareLaunchArgument("run_automap_under_gdb", default_value="false", description="Run automap_system_node under GDB; on crash prints full backtrace (requires gdb in container)"),
+        DeclareLaunchArgument("gtsam_preload_path", default_value="", description="If set to path of libgtsam.so.4, set LD_PRELOAD to try avoiding lago static-init double free (see docs/FIX_GTSAM_LAGO_STATIC_INIT_DOUBLE_FREE.md)"),
         DeclareLaunchArgument("run_fast_livo_under_gdb", default_value="false", description="Run fastlivo_mapping under GDB; use when frontend SIGSEGV to get backtrace (e.g. frame=10 crash)"),
         OpaqueFunction(function=_log_bag_path),
         bag_play_action,

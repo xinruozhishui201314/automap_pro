@@ -32,11 +32,13 @@ fi
 mkdir -p ${BUILD_DIR}
 cd ${BUILD_DIR}
 
-# 配置 CMake - 禁用 TBB
+# 配置 CMake
 echo "配置 GTSAM CMake..."
 cmake ${GTSAM_SOURCE_DIR} \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_INSTALL_PREFIX=${INSTALL_PREFIX} \
+    -DGTSAM_USE_SYSTEM_EIGEN=ON \
+    -DGTSAM_BUILD_WITH_MARCH_NATIVE=OFF \
     -DGTSAM_WITH_TBB=OFF \
     -DGTSAM_BUILD_TYPE=Release \
     -DBUILD_SHARED_LIBS=ON \

@@ -204,7 +204,8 @@ private:
     // ── 私有工具 ──────────────────────────────────────────────────────────
     gtsam::Pose3 toPose3(const Pose3d& T) const;
     Pose3d       fromPose3(const gtsam::Pose3& p) const;
-    gtsam::noiseModel::Gaussian::shared_ptr infoToNoise(const Mat66d& info) const;
+    /** 信息矩阵转噪声（秩缺/病态时返回 Diagonal 以与双路 GTSAM 策略一致；当前仅 infoToNoiseDiagonal 用于因子图） */
+    gtsam::noiseModel::Base::shared_ptr infoToNoise(const Mat66d& info) const;
     /** 从信息矩阵对角线构造 Diagonal 噪声，避免 Gaussian::Covariance 在 linearize 路径 double free */
     gtsam::noiseModel::Diagonal::shared_ptr infoToNoiseDiagonal(const Mat66d& info) const;
     OptimizationResult commitAndUpdate();

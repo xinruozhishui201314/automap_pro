@@ -311,7 +311,7 @@ loop_closure:
     cbar2:            1.0
     voxel_size:       0.4
     max_points:       8000   # 回环匹配前单侧点云最大点数（voxel 后 cap），增大可提高几何约束强度
-    min_inlier_ratio: 0.30
+    min_inlier_ratio: 0.20   # 放宽以增加回环接受率（原 0.30）；若误匹配增多可改回 0.25/0.30，grep LOOP_ACCEPTED 验证
     max_rmse_m:       0.3
     icp_refine:       true
 
@@ -338,8 +338,8 @@ backend:
     data_path:               "/tmp/hba_data"
     pcd_name_fill_num:       0      # get_hba_params 读取，缺省 0
     enable_gps_factor:       true   # get_hba_params 读取，GPS 约束是否加入 HBA
-    # 无 hba_api 时是否用 GTSAM fallback。生产建议 false，避免 double free；见 docs/HBA_GTSAM_FALLBACK_DOUBLE_FREE_FIX.md
-    enable_gtsam_fallback:   true
+    # 无 hba_api 时是否用 GTSAM fallback。true=建图结束/周期时执行 HBA 全局优化；false=跳过 HBA（仅 iSAM2）。生产建议 false 避免 double free；见 docs/HBA_GTSAM_FALLBACK_DOUBLE_FREE_FIX.md
+    enable_gtsam_fallback:   true   # 必须 true 时 HBA 才会运行（无 hba_api 时）；启动后 grep "HBA CONFIG" 或 "enable_gtsam_fallback" 验证
   hba_cal_mme:                      # get_hba_cal_mme_params 读取（launch 启用 cal_MME 时）
     file_path:               "/tmp/hba_data"
     thr_num:                 16

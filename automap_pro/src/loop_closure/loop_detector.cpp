@@ -169,7 +169,7 @@ void LoopDetector::computeDescriptorAsync(const SubMap::Ptr& submap) {
         auto req = std::make_shared<overlap_transformer_msgs::srv::ComputeDescriptor::Request>();
         pcl::toROSMsg(*submap->downsampled_cloud, req->pointcloud);
         req->pointcloud.header.stamp    = node_->now();
-        req->pointcloud.header.frame_id = "body";
+        req->pointcloud.header.frame_id = "map";  // 点云为世界系（与 merged_cloud/downsampled_cloud 一致）
 
         // ✅ 正确异步模式：async_send_request + callback，不阻塞 Worker 线程
         desc_client_->async_send_request(req,
@@ -539,6 +539,8 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
                 ALOG_INFO(MOD, "[LoopDetector][LOOP_OK] 回环约束已发布(parallel) query_id={} target_id={} inlier={:.3f} rmse={:.4f}m",
                           query->id, target->id, lc->inlier_ratio, lc->rmse);
                 if (node_) {
+                    RCLCPP_INFO(node_->get_logger(), "[LOOP_ACCEPTED] query_id=%d target_id=%d inlier_ratio=%.3f rmse=%.4fm (grep LOOP_ACCEPTED to verify loop constraints)",
+                                query->id, target->id, lc->inlier_ratio, lc->rmse);
                     RCLCPP_INFO(node_->get_logger(), "[LoopDetector] Loop %d↔%d | inlier=%.2f rmse=%.3f", lc->submap_i, lc->submap_j, lc->inlier_ratio, lc->rmse);
                 }
                 publishLoopConstraint(lc);
@@ -665,6 +667,8 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
         ALOG_INFO(MOD, "[LoopDetector][LOOP_OK] 回环约束已发布 query_id={} target_id={} inlier={:.3f} rmse={:.4f}m score={:.3f}",
                   query->id, target->id, lc->inlier_ratio, lc->rmse, lc->overlap_score);
         if (node_) {
+            RCLCPP_INFO(node_->get_logger(), "[LOOP_ACCEPTED] query_id=%d target_id=%d inlier_ratio=%.3f rmse=%.4fm (grep LOOP_ACCEPTED to verify loop constraints)",
+                        query->id, target->id, lc->inlier_ratio, lc->rmse);
             RCLCPP_INFO(node_->get_logger(),
                 "[LoopDetector] Loop %d↔%d | inlier=%.2f rmse=%.3f score=%.2f",
                 lc->submap_i, lc->submap_j, lc->inlier_ratio, lc->rmse, lc->overlap_score);

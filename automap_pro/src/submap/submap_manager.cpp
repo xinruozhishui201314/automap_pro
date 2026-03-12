@@ -533,6 +533,13 @@ void SubMapManager::updateSubmapPose(int submap_id, const Pose3d& new_pose) {
         SLOG_DEBUG(MOD, "SM#{} pose updated: trans={:.3f}m rot={:.1f}°",
                      sm->id, translation_diff,
                      rotation_diff * 180.0 / M_PI);
+        // 大增量时打 trace 便于定位优化/回环导致的大幅位姿更新
+        const double rot_deg = rotation_diff * 180.0 / M_PI;
+        if (translation_diff > 0.5 || rot_deg > 5.0) {
+            RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                "[SubMapMgr][BACKEND][POSE_UPDATE] sm_id=%d large_delta trans=%.3fm rot=%.1fdeg (grep BACKEND POSE_UPDATE 定位)",
+                sm->id, translation_diff, rot_deg);
+        }
 
         // 更新所有关键帧的优化位姿
         Pose3d delta = new_pose * old_anchor.inverse();

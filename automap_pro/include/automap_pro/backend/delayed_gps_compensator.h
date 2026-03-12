@@ -47,6 +47,9 @@ struct GPSFactorInfo {
  *   2. GPS对齐成功时调用 onGPSAligned()，标记已对齐并收集历史子图
  *   3. 回环优化完成时调用 onPoseOptimized()，自动补偿涉及的待补偿子图
  *   4. 新子图冻结时若已对齐，立即补偿
+ *
+ * 坐标系约定：仅在 GPS 已对齐后添加因子；enuToMap 使用 align_result_（与 GPSManager 对齐结果一致），
+ * 将 ENU 转为 map 系，保证与 iSAM2 节点同系。
  */
 class DelayedGPSCompensator {
 public:

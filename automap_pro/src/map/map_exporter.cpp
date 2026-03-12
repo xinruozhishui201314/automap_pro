@@ -146,13 +146,31 @@ bool MapExporter::exportSubmaps(const std::vector<SubMap::Ptr>& submaps,
     
     for (size_t i = 0; i < submaps.size(); ++i) {
         const auto& sm = submaps[i];
-        if (!sm || !sm->merged_cloud || sm->merged_cloud->empty()) continue;
+        if (!sm) continue;
         
         std::string filename = filename_prefix + "_" + std::to_string(sm->id) + ".pcd";
         std::string full_path = config_.output_dir + "/" + filename;
         
+        // 注意：不要直接导出 sm->merged_cloud。
+        // merged_cloud 是冻结时按当时的 T_w_b 变换得到的“世界系点云”，后端优化（GPS/回环/HBA）后会与轨迹不一致。
+        // 这里按 KeyFrame 的 body 点云 + T_w_b_optimized 重投影后再导出，保证导出的子图与最终位姿一致。
+        CloudXYZIPtr world(new CloudXYZI);
+        if (!sm->keyframes.empty()) {
+            for (const auto& kf : sm->keyframes) {
+                if (!kf || !kf->cloud_body || kf->cloud_body->empty()) continue;
+                CloudXYZI tmp;
+                Eigen::Affine3f T_f = kf->T_w_b_optimized.cast<float>();
+                pcl::transformPointCloud(*kf->cloud_body, tmp, T_f);
+                *world += tmp;
+            }
+        } else if (sm->merged_cloud && !sm->merged_cloud->empty()) {
+            // 兜底：若无 keyframes 列表，则退化为 merged_cloud（可能与优化后不一致）
+            *world = *sm->merged_cloud;
+        }
+        if (!world || world->empty()) continue;
+
         // 降采样
-        CloudXYZIPtr export_cloud = downsampleCloud(sm->merged_cloud, config_.base_resolution);
+        CloudXYZIPtr export_cloud = downsampleCloud(world, config_.base_resolution);
         
         bool success = exportPCD(export_cloud, full_path);
         if (success) success_count++;

@@ -76,14 +76,15 @@ public:
 
     /**
      * 发布 GPS 轨迹 Path：/automap/gps_raw_path（原始）、/automap/gps_aligned_path（对齐后）。
-     * 若传入 gps_positions_map 非空，raw path 使用地图系坐标（与 RViz Fixed Frame 一致）；
-     * 否则 raw 使用子图 gps_center（ENU），可能与 map 系不一致。
+     * 若传入 gps_positions_map 非空，raw path 使用地图系坐标，frame_id=raw_path_frame_id（默认 "map"）；
+     * 否则 raw 使用子图 gps_center（ENU），frame_id=raw_path_frame_id，未对齐时应传 "enu" 避免 ENU 标成 map。
      */
     void publishGPSTrajectory(const std::vector<SubMap::Ptr>& submaps,
                               bool show_aligned = true);
     void publishGPSTrajectory(const std::vector<SubMap::Ptr>& submaps,
                               const std::vector<Eigen::Vector3d>& gps_positions_map,
-                              bool show_aligned = true);
+                              bool show_aligned = true,
+                              const std::string& raw_path_frame_id = "map");
 
     /** 发布轨迹对比（优化前后） */
     void publishTrajectoryComparison(

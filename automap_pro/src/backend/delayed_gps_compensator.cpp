@@ -302,12 +302,12 @@ Eigen::Matrix3d DelayedGPSCompensator::computeGPSCovariance(GPSQuality quality, 
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ENU到地图坐标转换
+// ENU到地图坐标转换（仅在对齐后用于因子，align_result_ 与 GPSManager 一致）
 // ─────────────────────────────────────────────────────────────────────────────
 
 Eigen::Vector3d DelayedGPSCompensator::enuToMap(const Eigen::Vector3d& pos_enu) const {
     if (!gps_aligned_) {
-        return pos_enu;  // 未对齐时返回原坐标
+        return pos_enu;  // 未对齐时返回原坐标；补偿逻辑应仅在对齐后执行，不向因子图写入 ENU
     }
     
     // 复制对齐结果到局部变量，避免在无锁读取时看到“半更新”状态
