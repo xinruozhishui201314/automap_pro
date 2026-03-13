@@ -51,6 +51,9 @@ public:
     /** 添加初始子图节点（第一个 submap 设 fixed=true） */
     void addSubMapNode(int sm_id, const Pose3d& init_pose, bool fixed = false);
 
+    /** 强制更新现有节点的位姿（用于HBA完成后同步） */
+    void updateSubMapNodePose(int sm_id, const Pose3d& pose);
+
     /** 添加子图间里程计因子，可能触发 commit */
     void addOdomFactor(int from, int to, const Pose3d& rel, const Mat66d& info_matrix);
 
@@ -60,6 +63,13 @@ public:
      */
     OptimizationResult addLoopFactor(int from, int to,
                                       const Pose3d& rel, const Mat66d& info_matrix);
+
+    /**
+     * 仅将回环约束加入 pending，不触发 commit（用于子图内多条回环时批量提交，避免每条一次 commit）
+     * 调用方需在本帧内随后调用 forceUpdate() 一次完成提交
+     */
+    void addLoopFactorDeferred(int from, int to,
+                               const Pose3d& rel, const Mat66d& info_matrix);
 
     /**
      * 添加 GPS 绝对位置因子（GPSFactor，仅 X/Y/Z 位置，不约束姿态）
@@ -161,6 +171,16 @@ public:
 
     /** 重置优化器（用于崩溃恢复） */
     void resetForRecovery();
+
+    // ===== 公共诊断方法 =====
+    /** 手动将 pending values 标记为存在于 current_estimate_（GTSAM 单节点延迟问题的 workaround） */
+    void markPendingValuesAsEstimated();
+
+    /** 获取当前 pending values 数量（用于诊断） */
+    size_t pendingValuesCount() const;
+
+    /** 获取当前 pending factors 数量（用于诊断） */
+    size_t pendingFactorsCount() const;
 
 private:
     // 健康状态数据

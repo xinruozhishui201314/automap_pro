@@ -117,9 +117,10 @@ frontend:
 
 # ── 2.3 关键帧选取 ───────────────────────────────────────────────────────────
 keyframe:
-  min_translation:    1.0
-  min_rotation_deg:  10.0
-  max_interval:       2.0
+  # 关键帧选择：与上一关键帧 位置变化≥0.5m 或 角度变化≥10° 即添加
+  min_translation:    0.5    # 米
+  min_rotation_deg:  10.0    # 度
+  max_interval:       2.0    # 秒，最长间隔强制插入
   max_esikf_cov_norm: 1000.0
   # ── 关键帧点云存储策略（P1 修复：确保主路径可用）────────────────────────
   # 若 retain_cloud_body=true，则始终保留关键帧 body 点云

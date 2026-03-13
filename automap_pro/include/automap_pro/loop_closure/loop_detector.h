@@ -166,6 +166,8 @@ private:
     int intra_submap_min_keyframe_gap_ = 10;
     /** 子图内回环检测：描述子相似度阈值 */
     double intra_submap_overlap_threshold_ = 0.3;
+    /** 子图内回环：每帧最多对多少候选做 TEASER（≤0 不限制），避免单帧 10s+ */
+    int intra_submap_max_teaser_candidates_ = 5;
 
     // ── 私有方法 ──────────────────────────────────────────────────────────
     void descWorkerLoop();

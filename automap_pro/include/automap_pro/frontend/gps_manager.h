@@ -57,6 +57,14 @@ public:
      */
     std::optional<GPSMeasurement> queryByTimestamp(double ts) const;
 
+    /**
+     * 按位置查找最近 GPS，再用该 GPS 时间戳做插值（用于关键帧–GPS 绑定）。
+     * - 在 map 系下找 gps_window_ 中与 position_map 距离最近的 GPS 记录，取其时间戳 t*，
+     *   返回 queryByTimestamp(t*)（即在该时间戳处的插值结果）。
+     * - 仅当已对齐（isAligned）时使用，保证 keyframe 与 GPS 同在 map 系；未对齐时返回 null，调用方应回退到 queryByTimestampEnhanced(ts)。
+     */
+    std::optional<GPSMeasurement> queryByNearestPosition(const Eigen::Vector3d& position_map) const;
+
     /** 轨迹日志用：放宽时间窗口的查询（1Hz GPS + 时间偏差时仍可匹配），max_dt_s 建议 0.5~1.0 */
     std::optional<GPSMeasurement> queryByTimestampForLog(double ts, double max_dt_s = 0.5) const;
 

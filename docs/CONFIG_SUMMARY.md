@@ -391,7 +391,7 @@ gps_weights:
 #### 2.5.2 后端与回环行为说明（GPS / HBA fallback / iSAM2 / 最后一子图）
 
 - **GPS 依赖**：要使轨迹带 GPS 约束与对齐，需在 `system_config*.yaml` 中设 `sensor.gps.enabled: true`，且 bag 能发布 GPS 话题（如 `/ublox/fix`）。若使用 ublox，需安装 `ublox_msgs`，否则 rosbag2 会忽略该话题，GPS 窗口始终为空、不会触发对齐与约束。轨迹 CSV 的 GPS 列仅在 `sensor.gps.enabled=true` 且有数据时填充。
-- **HBA GTSAM fallback**：`backend.hba.enable_gtsam_fallback` 控制“无 HBA 外接服务时是否用 GTSAM 做建图结束时的全局优化”。设为 `true` 时，finish_mapping 会执行 GTSAM 优化；设为 `false` 时日志会出现 `HBA: GTSAM fallback disabled by config, skip`，属配置预期。
+- **HBA GTSAM fallback**：`backend.hba.enable_gtsam_fallback` 控制“无 HBA 外接服务时是否用 GTSAM 做建图结束时的全局优化”。设为 `true` 时，finish_mapping 会执行 GTSAM 优化；设为 `false` 时日志会出现 `HBA: GTSAM fallback disabled by config, skip`，属配置预期。**离线 + 无 HBA API 且 enable_gtsam_fallback=false 时，HBA 永不执行，仅依赖 ISAM2 增量优化**；若需本 run 做 HBA 可设为 true 并验证无双 GTSAM 并发（见 FIX_GTSAM_LAGO_STATIC_INIT_DOUBLE_FREE.md）。
 - **iSAM2 首次 update 时机**：若无回环因子、无 GPS 因子入队，后端仅在 **finish_mapping** 的 `ensureBackendCompletedAndFlushBeforeHBA()` 中调用 `forceUpdate()`，即 iSAM2 的首次 update 发生在建图结束时。有 LOOP/GPS 任务时，optLoop 会在运行中多次 `commitAndUpdate()`。
 - **最后一子图入图**：finish_mapping 会先调用 **强制冻结当前活跃子图**（`forceFreezeActiveSubmapForFinish()`），再执行 ensureBackend 与 forceUpdate，保证“子图数量与因子图节点数一致”，最后一子图位姿参与优化并被写入保存结果。
 - **回环阈值**：子图内/间回环依赖 TEASER 几何验证；若日志中始终无 `[INTRA_LOOP][ADD_FACTOR]` 或 inter 的 addLoopFactor，可查 `LOOP_COMPUTE`/`TEASER` 日志（如 `teaser_fail reason=teaser_extremely_few_inliers`）。可适当放宽 `loop_closure.teaser.validation.min_inlier_ratio` 或代码中的 `safe_min`（弱重叠场景），并关注误匹配。

@@ -283,8 +283,10 @@ void SubMapManager::freezeActiveSubmap(const SubMap::Ptr& sm) {
 
         bool enqueued = false;
         {
+            // 缩短等待时间 3s→1s，避免 addKeyFrame 阶段长时间阻塞后端（见 BACKEND_STUCK 分析）
+            static constexpr int kFreezePostWaitSec = 1;
             std::unique_lock<std::mutex> lk(freeze_post_mutex_);
-            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(kFreezePostWaitSec);
             while (freeze_post_queue_.size() >= kMaxFreezePostQueueSize && freeze_post_running_.load()) {
                 if (freeze_post_cv_.wait_until(lk, deadline, [this] {
                     return freeze_post_queue_.size() < kMaxFreezePostQueueSize || !freeze_post_running_.load();

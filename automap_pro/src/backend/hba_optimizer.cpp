@@ -70,8 +70,24 @@ void HBAOptimizer::onSubmapFrozen(const SubMap::Ptr& submap) {
     const auto& cfg = ConfigManager::instance();
     frozen_count_++;
 
-    if (frozen_count_ % cfg.hbaTriggerSubmaps() != 0) return;
-    if (!cfg.hbaOnLoop()) return;  // 周期性触发
+    // 增强诊断日志：记录触发条件检查
+    RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+        "[HBA][CHECK] onSubmapFrozen: frozen_count=%d trigger_mod=%d hbaOnLoop=%d hbaEnabled=%d gps_aligned=%d",
+        frozen_count_, cfg.hbaTriggerSubmaps(), cfg.hbaOnLoop() ? 1 : 0,
+        ConfigManager::instance().hbaEnabled() ? 1 : 0, gps_aligned_ ? 1 : 0);
+
+    if (frozen_count_ % cfg.hbaTriggerSubmaps() != 0) {
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[HBA][CHECK] skip: frozen_count=%d mod %d != 0",
+            frozen_count_, cfg.hbaTriggerSubmaps());
+        return;
+    }
+
+    if (!cfg.hbaOnLoop()) {
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[HBA][CHECK] skip: hbaOnLoop=false");
+        return;
+    }
 
     // 收集子图所有 KF（这里仅放入单个子图，实际由 AutoMapSystem 传入全量）
     std::lock_guard<std::mutex> lk(queue_mutex_);
@@ -86,6 +102,9 @@ void HBAOptimizer::onSubmapFrozen(const SubMap::Ptr& submap) {
         pending_queue_.push(std::move(task));
         queue_cv_.notify_one();
         trigger_count_++;
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[HBA][TRIGGER] onSubmapFrozen: sm_id=%d kf_count=%zu queue_depth=%zu trigger_count=%d gps_aligned=%d",
+            submap->id, kf_count, qdepth, trigger_count_, gps_aligned_ ? 1 : 0);
         ALOG_INFO(MOD, "HBA triggered by frozen submap: kf_count={} queue_depth={}", kf_count, qdepth);
     }
 }

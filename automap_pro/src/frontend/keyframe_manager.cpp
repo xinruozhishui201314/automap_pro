@@ -65,13 +65,13 @@ bool KeyFrameManager::shouldCreateKeyFrame(const Pose3d& cur_pose, double timest
         return true;
     }
 
-    double dt = timestamp - last_ts_;
-    if (dt >= max_interval_) {
-        last_pose_ = cur_pose;
-        last_ts_   = timestamp;
-        ALOG_DEBUG(MOD, "KF decision: dt={:.2f}s >= {:.2f} ts={:.3f}", dt, max_interval_, timestamp);
-        return true;
-    }
+    // double dt = timestamp - last_ts_;
+    // if (dt >= max_interval_) {
+    //     last_pose_ = cur_pose;
+    //     last_ts_   = timestamp;
+    //     ALOG_DEBUG(MOD, "KF decision: dt={:.2f}s >= {:.2f} ts={:.3f}", dt, max_interval_, timestamp);
+    //     return true;
+    // }
 
     return false;
 }

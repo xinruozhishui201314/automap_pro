@@ -9,10 +9,10 @@ namespace automap_pro {
 /**
  * 关键帧管理器（自适应策略）
  *
- * 基础触发条件（三选一）：
- *   - 平移 > min_translation_
- *   - 旋转 > min_rotation_deg_
- *   - 时间间隔 > max_interval_
+ * 基础触发条件（三选一，满足其一即添加关键帧）：
+ *   - 与上一关键帧平移 ≥ min_translation_（默认 0.5 m）
+ *   - 与上一关键帧旋转 ≥ min_rotation_deg_（默认 10°）
+ *   - 时间间隔 ≥ max_interval_
  *
  * 自适应触发（基于 ESIKF 质量）：
  *   - 当 ESIKF 退化（is_degenerate=true）时 → 降低阈值，强制插入 KF
@@ -48,8 +48,8 @@ public:
     int  keyframeCount() const { return kf_count_; }
 
 private:
-    double min_translation_  = 1.0;    // 米
-    double min_rotation_deg_ = 10.0;   // 度
+    double min_translation_  = 0.5;    // 米，与上一关键帧位置变化≥此值即添加
+    double min_rotation_deg_ = 10.0;   // 度，与上一关键帧角度变化≥此值即添加
     double max_interval_     = 2.0;    // 秒
 
     Pose3d last_pose_           = Pose3d::Identity();

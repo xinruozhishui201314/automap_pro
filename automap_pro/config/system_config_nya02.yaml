@@ -71,7 +71,7 @@ gps_fusion:
 
 # ── 2.2.5 关键帧配置（P1 修复）────────────────────────────────────────
 keyframe:
-  min_translation: 1.0
+  min_translation: 0.5    # 位置变化≥0.5m 或 角度≥10° 即添加
   min_rotation_deg: 10.0
   max_interval: 2.0
   max_esikf_cov_norm: 1000.0
@@ -169,7 +169,7 @@ frontend:
 
 # ── 2.4 关键帧策略（P1 修复：点云存储）──────────────────────────────────────
 keyframe:
-  min_translation: 1.0
+  min_translation: 0.5    # 位置变化≥0.5m 或 角度≥10° 即添加
   min_rotation_deg: 10.0
   max_interval: 2.0
   max_esikf_cov_norm: 1000.0

@@ -35,6 +35,13 @@ static inline int64_t nowMs() {
 namespace fs = std::filesystem;
 namespace automap_pro {
 
+// P3: 关键帧ID编码常量
+// 用于区分子图级节点和关键帧级节点：
+//   - 子图级节点: id < MAX_KF_PER_SUBMAP (0, 1, 2, ...)
+//   - 关键帧级节点: id >= MAX_KF_PER_SUBMAP (submap_id * MAX_KF_PER_SUBMAP + keyframe_index)
+// 使用 100000 作为阈值，支持每个子图最多10万个关键帧
+constexpr int MAX_KF_PER_SUBMAP = 100000;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // 构造与初始化
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1461,9 +1468,9 @@ void AutoMapSystem::tryCreateKeyFrame(double ts, const Pose3d& pose, const Mat66
                         active_sm->id, query_idx, loops.size());
                     // 子图内回环：仅加入 pending，本帧末尾一次 commit，避免每条回环一次 commitAndUpdate 导致 30s+ 卡住
                     for (const auto& lc : loops) {
-                        constexpr int KEYFRAME_ID_MULTIPLIER = 10000;
-                        int node_i = lc->submap_i * KEYFRAME_ID_MULTIPLIER + lc->keyframe_i;
-                        int node_j = lc->submap_j * KEYFRAME_ID_MULTIPLIER + lc->keyframe_j;
+                        // P3: 使用 MAX_KF_PER_SUBMAP 编码关键帧节点ID
+                        int node_i = lc->submap_i * MAX_KF_PER_SUBMAP + lc->keyframe_i;
+                        int node_j = lc->submap_j * MAX_KF_PER_SUBMAP + lc->keyframe_j;
                         const auto& kf_i = active_sm->keyframes[lc->keyframe_i];
                         const auto& kf_j = active_sm->keyframes[lc->keyframe_j];
                         if (kf_i && kf_j) {
@@ -1567,7 +1574,6 @@ void AutoMapSystem::onSubmapFrozen(const SubMap::Ptr& submap) {
     // 添加子图节点到 iSAM2
     bool is_first = (isam2_optimizer_.nodeCount() == 0);
     isam2_optimizer_.addSubMapNode(submap->id, submap->pose_w_anchor, is_first);
-    // RCLCPP_INFO(get_logger(), "[AutoMapSystem][PIPELINE] event=isam2_node_added sm_id=%d is_first=%d node_count=%d", submap->id, is_first ? 1 : 0, isam2_optimizer_.nodeCount());
 
     // 添加里程计因子（与前一个子图之间）
     auto all_sm = submap_manager_.getFrozenSubmaps();
@@ -1580,9 +1586,36 @@ void AutoMapSystem::onSubmapFrozen(const SubMap::Ptr& submap) {
             Mat66d info = computeOdomInfoMatrix(prev, submap, rel);
             isam2_optimizer_.addOdomFactor(prev->id, submap->id, rel, info);
         }
-        // RCLCPP_DEBUG(get_logger(), "[AutoMapSystem][SM] odom factor prev_sm=%d cur_sm=%d info_norm=%.2e",
-        //              prev->id, submap->id, info.norm());
-        // RCLCPP_INFO(get_logger(), "[AutoMapSystem][PIPELINE] event=odom_factor_added prev_sm=%d cur_sm=%d", prev->id, submap->id);
+    }
+
+    // 关键修复：添加节点和因子后立即 forceUpdate，确保节点被提交到 iSAM2 图
+    // 避免 GPS 对齐时因 node_count=0 导致所有 GPS 因子被跳过
+    auto update_result = isam2_optimizer_.forceUpdate();
+
+    // 增强诊断日志：显示更多信息用于定位问题
+    int current_node_count = isam2_optimizer_.nodeCount();
+    size_t pending_vals = isam2_optimizer_.pendingValuesCount();
+    size_t pending_facts = isam2_optimizer_.pendingFactorsCount();
+    RCLCPP_INFO(get_logger(),
+        "[AutoMapSystem][SM] onSubmapFrozen: sm_id=%d forceUpdate success=%d nodes=%d "
+        "nodeCount=%d pending_values=%zu pending_factors=%zu",
+        submap->id, update_result.success, update_result.nodes_updated,
+        current_node_count, pending_vals, pending_facts);
+
+    // 如果 forceUpdate 返回 0 节点，说明 GTSAM 单节点延迟问题
+    // 需要添加 workaround：手动将节点标记为存在于 current_estimate_
+    if (update_result.nodes_updated == 0 && current_node_count > 0) {
+        RCLCPP_WARN(get_logger(),
+            "[AutoMapSystem][SM] WARNING: sm_id=%d forceUpdate returned 0 nodes (GTSAM single-node defer issue), "
+            "applying workaround to mark pending values as estimated",
+            submap->id);
+        isam2_optimizer_.markPendingValuesAsEstimated();
+
+        // workaround 后再次尝试 forceUpdate
+        auto retry_result = isam2_optimizer_.forceUpdate();
+        RCLCPP_INFO(get_logger(),
+            "[AutoMapSystem][SM] onSubmapFrozen: sm_id=%d after workaround retry success=%d nodes=%d",
+            submap->id, retry_result.success, retry_result.nodes_updated);
     }
 
     // 建图精度日志：子图冻结时的几何与锚定帧不确定性
@@ -1672,6 +1705,12 @@ void AutoMapSystem::onLoopDetected(const LoopConstraint::Ptr& lc) {
     ALOG_INFO(MOD, "Loop detected: SM#{} ↔ SM#{} score={:.3f} trans=[{:.2f},{:.2f},{:.2f}] (enqueue)",
               lc->submap_i, lc->submap_j, lc->overlap_score, tx, ty, tz);
 
+    // 增强诊断：记录当前 ISAM2 状态
+    RCLCPP_INFO(get_logger(),
+        "[AutoMapSystem][LOOP][DIAG] before enqueue: nodeCount=%d factorCount=%d pendingValues=%zu pendingFactors=%zu",
+        isam2_optimizer_.nodeCount(), isam2_optimizer_.factorCount(),
+        isam2_optimizer_.pendingValuesCount(), isam2_optimizer_.pendingFactorsCount());
+
     // performance.async_isam2_update: 直接入队 iSAM2 异步执行，不经过 loop_opt_thread
     if (ConfigManager::instance().asyncIsam2Update()) {
         IncrementalOptimizer::OptimTask t;
@@ -1681,6 +1720,12 @@ void AutoMapSystem::onLoopDetected(const LoopConstraint::Ptr& lc) {
         t.rel_pose = lc->delta_T;
         t.info_matrix = lc->information;
         isam2_optimizer_.enqueueOptTask(t);
+
+        // 增强诊断：记录入队后状态
+        RCLCPP_INFO(get_logger(),
+            "[AutoMapSystem][LOOP][DIAG] async enqueue done: queue_depth=%zu",
+            isam2_optimizer_.getQueueDepth());
+
         state_ = SystemState::MAPPING;
         return;
     }
@@ -1707,9 +1752,12 @@ void AutoMapSystem::onLoopDetected(const LoopConstraint::Ptr& lc) {
             RCLCPP_WARN(get_logger(), "[AutoMapSystem][LOOP] loop factor queue full (max=%zu), dropping loop sm_i=%d sm_j=%d (apply sync fallback)", kMaxLoopFactorQueueSize, lc->submap_i, lc->submap_j);
             lk.unlock();
             auto result = isam2_optimizer_.addLoopFactor(lc->submap_i, lc->submap_j, lc->delta_T, lc->information);
-            if (result.success) {
-                RCLCPP_INFO(get_logger(), "[AutoMapSystem][LOOP] sync fallback nodes_updated=%d elapsed=%.1fms", result.nodes_updated, result.elapsed_ms);
-            }
+
+            // 增强诊断：记录同步执行结果
+            RCLCPP_INFO(get_logger(),
+                "[AutoMapSystem][LOOP] sync fallback: sm_i=%d sm_j=%d success=%d nodes_updated=%d elapsed=%.1fms",
+                lc->submap_i, lc->submap_j, result.success ? 1 : 0, result.nodes_updated, result.elapsed_ms);
+
             state_ = SystemState::MAPPING;
             return;
         }
@@ -1721,11 +1769,42 @@ void AutoMapSystem::onLoopDetected(const LoopConstraint::Ptr& lc) {
 // ─────────────────────────────────────────────────────────────────────────────
 // 位姿更新（来自 iSAM2）
 // ─────────────────────────────────────────────────────────────────────────────
+// P3 修复：区分子图级节点和关键帧级节点
+// 使用数值范围来区分节点类型：
+//   - 子图级: 0 <= id < MAX_KF_PER_SUBMAP
+//   - 关键帧级: id >= MAX_KF_PER_SUBMAP
+// 这样避免了原方案使用数值>=10000判断导致的潜在冲突问题
+
 void AutoMapSystem::onPoseUpdated(const std::unordered_map<int, Pose3d>& poses) {
     const size_t n = poses.size();
     int first_id = -1;
     double first_x = 0, first_y = 0, first_z = 0;
-    for (const auto& [sm_id, pose] : poses) {
+    
+    // P3: 区分子图级节点('s')和关键帧级节点('k')
+    // 由于 GTSAM Symbol 使用字符区分，这里通过解析 node_id 的范围来判断
+    // 子图级: 0 <= id < MAX_KF_PER_SUBMAP (子图数量有限)
+    // 关键帧级: id >= MAX_KF_PER_SUBMAP (子图ID * MAX_KF_PER_SUBMAP + keyframe_index)
+    std::vector<std::pair<int, Pose3d>> submap_poses;  // 子图级节点
+    std::vector<std::pair<int, Pose3d>> kf_poses;      // 关键帧级节点
+    
+    for (const auto& [node_id, pose] : poses) {
+        // 判断是子图级还是关键帧级
+        if (node_id >= MAX_KF_PER_SUBMAP) {
+            kf_poses.emplace_back(node_id, pose);
+        } else {
+            submap_poses.emplace_back(node_id, pose);
+        }
+    }
+    
+    // P3 诊断日志：记录两种节点的数量
+    if (n > 0) {
+        RCLCPP_INFO(get_logger(),
+            "[AutoMapSystem][POSE][SPLIT] total=%zu submap_nodes=%zu kf_nodes=%zu",
+            n, submap_poses.size(), kf_poses.size());
+    }
+    
+    // 处理子图级节点：更新子图锚点
+    for (const auto& [sm_id, pose] : submap_poses) {
         if (first_id < 0) {
             first_id = sm_id;
             first_x = pose.translation().x();
@@ -1734,6 +1813,42 @@ void AutoMapSystem::onPoseUpdated(const std::unordered_map<int, Pose3d>& poses) 
         }
         submap_manager_.updateSubmapPose(sm_id, pose);
     }
+    
+    // P3: 处理关键帧级节点：更新活跃子图中对应关键帧的 T_w_b_optimized
+    // 关键帧级节点 ID = submap_id * MAX_KF_PER_SUBMAP + keyframe_index
+    // 注意：iSAM2 返回的关键帧级节点的 Pose 是优化后的全局位姿（世界坐标系）
+    // 应该直接使用 kf_pose 作为 T_w_b_optimized
+    if (!kf_poses.empty()) {
+        auto active_sm = submap_manager_.getActiveSubmap();
+        if (active_sm && active_sm->state == SubMapState::ACTIVE) {
+            // 更新活跃子图中对应关键帧的 T_w_b_optimized
+            int updated_kf_count = 0;
+            for (const auto& [node_id, kf_pose] : kf_poses) {
+                // 解析 node_id 获取 submap_id 和 keyframe_index
+                int kf_sm_id = node_id / MAX_KF_PER_SUBMAP;
+                int kf_idx = node_id % MAX_KF_PER_SUBMAP;
+                
+                // 只处理活跃子图的关键帧
+                if (kf_sm_id == active_sm->id && kf_idx < static_cast<int>(active_sm->keyframes.size())) {
+                    auto& kf = active_sm->keyframes[kf_idx];
+                    if (kf) {
+                        // 直接使用 iSAM2 返回的优化位姿（全局坐标）
+                        kf->T_w_b_optimized = kf_pose;
+                        updated_kf_count++;
+                    }
+                }
+            }
+            if (updated_kf_count > 0) {
+                RCLCPP_INFO(get_logger(),
+                    "[AutoMapSystem][POSE][KF] updated %d keyframes in active submap %d (from iSAM2 kf-nodes, global pose)",
+                    updated_kf_count, active_sm->id);
+            }
+        } else {
+            RCLCPP_DEBUG(get_logger(),
+                "[AutoMapSystem][POSE][KF] no active submap, skip kf-node updates");
+        }
+    }
+    
     RCLCPP_INFO(get_logger(),
         "[AutoMapSystem][POSE] updated count=%zu first_sm_id=%d pos=[%.2f,%.2f,%.2f]",
         n, first_id, first_x, first_y, first_z);
@@ -1938,12 +2053,14 @@ void AutoMapSystem::onHBADone(const HBAResult& result) {
         ALOG_DEBUG(MOD, "P2 HBA-iSAM2 drift acceptable: max={:.3f}m", max_drift);
     }
     
-    // 尝试同步 iSAM2（近似方法，精确方法需重建因子图）
-    // 注意：这里 addSubMapNode 会因为节点已存在而被拒绝，但保留代码以备未来 GTSAM 版本升级
+    // 尝试同步 iSAM2：使用新添加的 updateSubMapNodePose 方法强制更新
+    int synced_count = 0;
     for (const auto& sm : all_sm) {
         if (!sm) continue;
-        isam2_optimizer_.addSubMapNode(sm->id, sm->pose_w_anchor_optimized, false);
+        isam2_optimizer_.updateSubMapNodePose(sm->id, sm->pose_w_anchor_optimized);
+        synced_count++;
     }
+    RCLCPP_INFO(get_logger(), "[AutoMapSystem][BACKEND][HBA] synced %d nodes to iSAM2 (using updateSubMapNodePose)", synced_count);
     
     ALOG_INFO(MOD,
         "P2: HBA done, iSAM2 estimated (separate tracks). "

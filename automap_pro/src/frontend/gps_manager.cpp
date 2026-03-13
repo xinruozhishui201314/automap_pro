@@ -6,6 +6,7 @@
 #include <GeographicLib/LocalCartesian.hpp>
 #include <Eigen/SVD>
 #include <chrono>
+#include <limits>
 #include <numeric>
 #include <cmath>
 
@@ -665,6 +666,35 @@ std::optional<GPSMeasurement> GPSManager::queryByTimestamp(double ts) const {
               "hdop={:.2f} quality={} is_valid={} keyframe_max_hdop={:.1f}",
               ts, best_dt, best->timestamp, best->hdop, static_cast<int>(best->quality), m.is_valid, keyframe_max_hdop_);
     return m;
+}
+
+std::optional<GPSMeasurement> GPSManager::queryByNearestPosition(const Eigen::Vector3d& position_map) const {
+    // 仅在对齐后使用，保证 GPS 与 keyframe 同在 map 系
+    if (state_ != GPSAlignState::ALIGNED && state_ != GPSAlignState::DEGRADED) {
+        ALOG_DEBUG(MOD, "[queryByNearestPosition] skipped: not aligned, fallback to time-based");
+        return std::nullopt;
+    }
+    double nearest_ts = 0.0;
+    {
+        std::lock_guard<std::mutex> lk(mutex_);
+        if (gps_window_.empty()) return std::nullopt;
+        double best_sq = std::numeric_limits<double>::max();
+        for (const auto& r : gps_window_) {
+            Eigen::Vector3d pos_map = enu_to_map(r.pos_enu);
+            double sq = (pos_map - position_map).squaredNorm();
+            if (sq < best_sq) {
+                best_sq = sq;
+                nearest_ts = r.timestamp;
+            }
+        }
+    }
+    // 用最近位置对应的时间戳做插值
+    auto m_opt = queryByTimestamp(nearest_ts);
+    if (m_opt) {
+        ALOG_DEBUG(MOD, "[queryByNearestPosition] position_map=[{:.2f},{:.2f},{:.2f}] nearest_ts={:.3f} found",
+                  position_map.x(), position_map.y(), position_map.z(), nearest_ts);
+    }
+    return m_opt;
 }
 
 std::optional<GPSMeasurement> GPSManager::queryByTimestampForLog(double ts, double max_dt_s) const {
