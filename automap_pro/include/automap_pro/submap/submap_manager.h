@@ -97,6 +97,12 @@ public:
     /** 发布错误事件到 ROS2 话题 */
     void publishErrorEvent(int submap_id, const automap_pro::ErrorDetail& error);
 
+    /**
+     * 建图结束前强制冻结当前活跃子图（若存在），使最后一子图进入 iSAM2 因子图，保证 submap 数量与图节点一致。
+     * 同步执行：voxel + frozen 回调在本次调用内完成，返回后 ensureBackend/forceUpdate 可包含该子图。
+     */
+    void forceFreezeActiveSubmapForFinish();
+
 private:
     std::vector<SubMap::Ptr>  submaps_;
     SubMap::Ptr               active_submap_;

@@ -1,8 +1,13 @@
 #pragma once
 #include <algorithm>
+#include <cstdlib>
+#include <map>
+#include <sstream>
+#include <type_traits>
 #include <string>
 #include <yaml-cpp/yaml.h>
 #include <Eigen/Dense>
+#include <rclcpp/rclcpp.hpp>
 
 namespace automap_pro {
 
@@ -13,8 +18,18 @@ public:
         return inst;
     }
 
+    /**
+     * 全工程唯一配置入口：整个进程应只调用一次 load（由 AutoMapSystem::loadConfigAndInit 或主节点在启动时调用）。
+     * 前端、后端、回环等均通过 ConfigManager::instance() 读参，不再单独读 YAML。
+     * 重复调用：若路径与已加载相同则忽略；若路径不同则抛异常，避免多源不一致。
+     */
     void load(const std::string& yaml_path);
-    void loadFromFile(const std::string& yaml_path) { load(yaml_path); }  // 别名，nodes 使用
+    void loadFromFile(const std::string& yaml_path) { load(yaml_path); }  // 别名，standalone 节点使用
+
+    /** 是否已加载过配置（任意组件可通过此判断是否可安全使用 getter） */
+    bool isLoaded() const { return !config_file_path_.empty(); }
+    /** 当前加载的配置文件路径（唯一源；未加载时为空） */
+    const std::string& configFilePath() const { return config_file_path_; }
 
     // ── 系统 ──────────────────────────────────────────────
     std::string systemName()    const { return get<std::string>("system.name",    "AutoMap-Pro"); }
@@ -24,17 +39,32 @@ public:
     double      sensorIdleTimeoutSec() const { return std::max(1.0, sensor_idle_timeout_sec_); }
     /** 是否在传感器空闲超时后自动执行最终 HBA、导出地图并结束建图 */
     bool        autoFinishOnSensorIdle() const { return get<bool>("system.auto_finish_on_sensor_idle", true); }
-    /** 离线模式“播完再结束”：为 true 时不依赖传感器空闲自动结束，仅由 /automap/finish_mapping 服务触发（launch 在 bag 播完后调用） */
-    bool        offlineFinishAfterBag() const { return get<bool>("system.offline_finish_after_bag", false); }
-    /** 后端帧队列最大长度；计算跟不上时可适当增大，允许“算慢一点”缓冲更多帧（内存占用增加） */
+    /** 离线模式“播完再结束”；load() 时从 system 节缓存 */
+    bool        offlineFinishAfterBag() const {
+        if (system_queue_cached_) return system_offline_finish_after_bag_;
+        return get<bool>("system.offline_finish_after_bag", false);
+    }
+    /** 后端帧队列最大长度；load() 时从 system 节缓存，避免 get() 路径解析与文件不一致 */
     size_t      frameQueueMaxSize() const {
+        if (system_queue_cached_) {
+            size_t v = static_cast<size_t>(system_frame_queue_max_size_);
+            if (v < 100) return 100;
+            if (v > 10000) return 10000;
+            return v;
+        }
         int v = get<int>("system.frame_queue_max_size", 500);
         if (v < 100) return 100;
         if (v > 10000) return 10000;
         return static_cast<size_t>(v);
     }
-    /** 入口缓冲队列长度；回调只写入此队列后快速返回，背压在 feeder 线程，避免阻塞 Executor；默认 16 */
+    /** 入口缓冲队列长度；load() 时从 system 节缓存 */
     size_t      ingressQueueMaxSize() const {
+        if (system_queue_cached_) {
+            size_t v = static_cast<size_t>(system_ingress_queue_max_size_);
+            if (v < 2) return 2;
+            if (v > 256) return 256;
+            return v;
+        }
         int v = get<int>("system.ingress_queue_max_size", 16);
         if (v < 2) return 2;
         if (v > 256) return 256;
@@ -62,11 +92,14 @@ public:
     }
 
     // ── 传感器（ROS2 话题默认从配置文件 sensor: 节读取）────────────────────────
-    std::string lidarTopic()    const { return get<std::string>("sensor.lidar.topic", "/os1_cloud_node1/points"); }
-    std::string imuTopic()      const { return get<std::string>("sensor.imu.topic",   "/imu/imu"); }
+    /** 优先用 load() 时缓存的 sensor.lidar.topic，再 get()/Raw，保证与文件一致（见 LOG_ANALYSIS 配置修复） */
+    std::string lidarTopic() const;
+    /** 优先用 load() 时缓存的 sensor.imu.topic，再 get()/Raw */
+    std::string imuTopic() const;
     /** 从 sensor.gps.topic 读取；若 get() 因键路径问题返回默认值，则从 YAML 直接读取兜底（避免 LivoBridge 误用 /gps/fix） */
     std::string gpsTopic() const;
-    bool        gpsEnabled()    const { return get<bool>("sensor.gps.enabled", false); }
+    /** 从 sensor.gps.enabled 读取；优先从 YAML 直接读 cfg_["sensor"]["gps"]["enabled"]，与 gpsTopic() 一致，避免 get() 路径解析问题导致始终为 false */
+    bool gpsEnabled() const;
     bool        cameraEnabled() const { return get<bool>("sensor.camera.enabled", false); }
     std::string cameraTopic()   const { return get<std::string>("sensor.camera.topic", "/camera/image_raw"); }
 
@@ -79,7 +112,7 @@ public:
     std::string frontendCloudFrame() const { return get<std::string>("frontend.cloud_frame", "world"); }
 
     // ── 关键帧 ────────────────────────────────────────────
-    double kfMinTranslation()   const { return get<double>("keyframe.min_translation", 1.0); }
+    double kfMinTranslation()   const { return get<double>("keyframe.min_translation", 0.5); }
     double kfMinRotationDeg()   const { return get<double>("keyframe.min_rotation_deg", 10.0); }
     double kfMaxInterval()      const { return get<double>("keyframe.max_interval", 2.0); }
     double kfMaxEsikfCovNorm()  const { return get<double>("keyframe.max_esikf_cov_norm", 1e3); }
@@ -99,19 +132,22 @@ public:
     double submapMatchRes()     const { return std::max(0.2, get<double>("submap.match_resolution", 0.4)); }
     double submapMergeRes()     const { return std::max(0.2, get<double>("submap.merge_resolution", 0.2)); }
 
-    // ── GPS 延迟对齐 ──────────────────────────────────────
-    int    gpsAlignMinPoints()  const { return get<int>("gps.align_min_points", 50); }
-    double gpsAlignMinDist()    const { return get<double>("gps.align_min_distance_m", 30.0); }
-    double gpsQualityThreshold()const { return get<double>("gps.quality_threshold_hdop", 2.0); }
-    double gpsAlignRmseThresh() const { return get<double>("gps.align_rmse_threshold_m", 1.5); }
-    int    gpsGoodSamplesNeeded()const { return get<int>("gps.good_samples_needed", 30); }
-    bool   gpsAddConstraintsOnAlign() const { return get<bool>("gps.add_constraints_on_align", true); }
-    double gpsFactorIntervalM() const { return get<double>("gps.factor_interval_m", 5.0); }
+    // ── GPS 延迟对齐（load() 时一次性读入缓存，getter 仅返回缓存值，保证与日志一致）──────────────────────
+    int    gpsAlignMinPoints()  const { return gps_cached_ ? gps_align_min_points_  : get<int>("gps.align_min_points", 50); }
+    double gpsAlignMinDist()    const { return gps_cached_ ? gps_align_min_distance_m_ : get<double>("gps.align_min_distance_m", 30.0); }
+    double gpsQualityThreshold()const { return gps_cached_ ? gps_quality_threshold_hdop_ : get<double>("gps.quality_threshold_hdop", 2.0); }
+    double gpsAlignRmseThresh() const { return gps_cached_ ? gps_align_rmse_threshold_m_ : get<double>("gps.align_rmse_threshold_m", 1.5); }
+    int    gpsGoodSamplesNeeded()const { return gps_cached_ ? gps_good_samples_needed_ : get<int>("gps.good_samples_needed", 30); }
+    bool   gpsAddConstraintsOnAlign() const { return gps_cached_ ? gps_add_constraints_on_align_ : get<bool>("gps.add_constraints_on_align", true); }
+    double gpsFactorIntervalM() const { return gps_cached_ ? gps_factor_interval_m_ : get<double>("gps.factor_interval_m", 5.0); }
     /** 关键帧匹配 GPS 的最大时间差(秒)。1Hz GPS 时建议 0.5~1.0，原 0.1 易导致 has_gps=0。默认 0.5 */
-    double gpsKeyframeMatchWindowS() const { return std::max(0.1, get<double>("gps.keyframe_match_window_s", 0.5)); }
+    double gpsKeyframeMatchWindowS() const {
+        if (gps_cached_) return gps_keyframe_match_window_s_;
+        return std::max(0.1, get<double>("gps.keyframe_match_window_s", 0.5));
+    }
     /** 关键帧绑定 GPS 时允许的最大 HDOP（放宽 M2DGR 等弱 GPS 场景）。默认 12.0 */
     double gpsKeyframeMaxHdop() const {
-        double v = get<double>("gps.keyframe_max_hdop", 12.0);
+        double v = gps_cached_ ? gps_keyframe_max_hdop_ : get<double>("gps.keyframe_max_hdop", 12.0);
         return std::max(0.1, std::min(99.0, v));
     }
     /** 双样本线性插值时允许的最大时间间隔(秒)，超过则退化为最近邻。默认 2.0 */
@@ -128,12 +164,27 @@ public:
         return static_cast<size_t>(std::max(1000, std::min(50000, v)));
     }
     /** GPS 因子权重：>1 加强约束（协方差缩小），<1 减弱约束；默认 1.0 */
-    double gpsFactorWeight() const { return std::max(0.01, get<double>("gps.factor_weight", 1.0)); }
+    double gpsFactorWeight() const {
+        double v = gps_cached_ ? gps_factor_weight_ : get<double>("gps.factor_weight", 1.0);
+        return std::max(0.01, v);
+    }
     /** 按质量自动缩放：EXCELLENT/HIGH/MEDIUM 对应因子强度倍数（>1 则该质量约束更强），与 factor_weight 相乘 */
-    double gpsFactorQualityScaleExcellent() const { return std::max(0.1, get<double>("gps.factor_quality_scale_excellent", 2.0)); }
-    double gpsFactorQualityScaleHigh()      const { return std::max(0.1, get<double>("gps.factor_quality_scale_high", 1.0)); }
-    double gpsFactorQualityScaleMedium()    const { return std::max(0.1, get<double>("gps.factor_quality_scale_medium", 0.5)); }
-    double gpsFactorQualityScaleLow()       const { return std::max(0.1, get<double>("gps.factor_quality_scale_low", 0.25)); }
+    double gpsFactorQualityScaleExcellent() const {
+        double v = gps_cached_ ? gps_factor_quality_scale_excellent_ : get<double>("gps.factor_quality_scale_excellent", 2.0);
+        return std::max(0.1, v);
+    }
+    double gpsFactorQualityScaleHigh() const {
+        double v = gps_cached_ ? gps_factor_quality_scale_high_ : get<double>("gps.factor_quality_scale_high", 1.0);
+        return std::max(0.1, v);
+    }
+    double gpsFactorQualityScaleMedium() const {
+        double v = gps_cached_ ? gps_factor_quality_scale_medium_ : get<double>("gps.factor_quality_scale_medium", 0.5);
+        return std::max(0.1, v);
+    }
+    double gpsFactorQualityScaleLow() const {
+        double v = gps_cached_ ? gps_factor_quality_scale_low_ : get<double>("gps.factor_quality_scale_low", 0.25);
+        return std::max(0.1, v);
+    }
     // ── GPS 延迟补偿（对齐后历史帧/回环帧补偿）────────────────────────────────────
     bool   gpsDelayedCompensationEnabled() const { return get<bool>("gps.delayed_compensation.enabled", true); }
     bool   gpsCompensateOnLoop()           const { return get<bool>("gps.delayed_compensation.compensate_on_loop", true); }
@@ -203,6 +254,29 @@ public:
         return std::max(0.0, v);
     }
     int    loopWorkerThreads()  const { return get<int>("loop_closure.worker_threads", 2); }
+
+    // ── 子图内回环检测配置 ─────────────────────────────────────────────────
+    /** 子图内回环检测：关键帧之间最小时间间隔（秒） */
+    double intraSubmapLoopMinTemporalGap() const {
+        return get<double>("loop_closure.intra_submap_min_temporal_gap_s", 5.0);
+    }
+    /** 子图内回环检测：是否启用 */
+    bool intraSubmapLoopEnabled() const {
+        return get<bool>("loop_closure.intra_submap_enabled", false);
+    }
+    /** 子图内回环检测：关键帧之间最小索引间隔（避免相邻帧假回环） */
+    int intraSubmapLoopMinKeyframeGap() const {
+        return get<int>("loop_closure.intra_submap_min_keyframe_gap", 10);
+    }
+    /** 子图内回环检测：描述子相似度阈值 */
+    double intraSubmapLoopOverlapThreshold() const {
+        return get<double>("loop_closure.intra_submap_overlap_threshold", 0.3);
+    }
+    /** 子图内回环：每帧最多对多少候选做 TEASER 配准（避免候选过多导致 10s+ 卡住），≤0 表示不限制 */
+    int intraSubmapLoopMaxTeaserCandidates() const {
+        return get<int>("loop_closure.intra_submap_max_teaser_candidates", 5);
+    }
+
     /** 回环描述子队列最大长度，超限丢弃最低优先级，防无界堆积。默认 128 */
     size_t loopMaxDescQueueSize() const {
         int v = get<int>("loop_closure.max_desc_queue_size", 128);
@@ -215,7 +289,8 @@ public:
     }
 
     // ── OverlapTransformer ────────────────────────────────
-    std::string overlapModelPath()   const { return get<std::string>("loop_closure.overlap_transformer.model_path", ""); }
+    /** 返回 model_path，${CMAKE_CURRENT_SOURCE_DIR} 已在 load() 中展开为配置所在包根目录；未加载时走 get() */
+    std::string overlapModelPath()   const;
     int    rangeImageH()             const { return get<int>("loop_closure.overlap_transformer.proj_H", 64); }
     int    rangeImageW()             const { return get<int>("loop_closure.overlap_transformer.proj_W", 900); }
     float  fovUp()                   const { return get<float>("loop_closure.overlap_transformer.fov_up",   3.0f); }
@@ -231,6 +306,16 @@ public:
     double teaserMaxRMSE()      const { return get<double>("loop_closure.teaser.max_rmse_m", 0.3); }
     int    teaserMaxPoints()    const { return std::max(500, get<int>("loop_closure.teaser.max_points", 8000)); }
     bool   teaserICPRefine()    const { return get<bool>("loop_closure.teaser.icp_refine", true); }
+    /** 最小安全内点数：TEASER 内点数低于此值会拒绝（防崩溃/误匹配）。弱重叠场景可放宽至 6，需关注误匹配。 */
+    int    teaserMinSafeInliers() const {
+        int v = get<int>("loop_closure.teaser.min_safe_inliers", 10);
+        return std::max(1, std::min(50, v));
+    }
+    /** 回环最小相对平移(米)：低于此值的回环视为 trivial 不加入图，提高回环质量。默认 0.05 */
+    double loopMinRelativeTranslationM() const {
+        double v = get<double>("loop_closure.teaser.min_relative_translation_m", 0.05);
+        return std::max(0.0, std::min(10.0, v));
+    }
 
     // ── 后端帧率控制（前端每帧都发，后端可每隔 N 帧处理一帧以减轻负载）────────────────
     /** 每隔多少帧处理一帧（1=每帧都处理，5=默认跳过4帧处理1帧）；仅影响后端 tryCreateKeyFrame，队列仍每帧弹出不阻塞 */
@@ -275,6 +360,11 @@ public:
     std::string hbaDataPath()   const { return get<std::string>("backend.hba.data_path", "/tmp/hba_data"); }
     /** 是否允许使用 GTSAM fallback 做 HBA（无 hba_api 时）。生产建议 false，避免 double free；见 docs/HBA_GTSAM_FALLBACK_DOUBLE_FREE_FIX.md */
     bool   hbaGtsamFallbackEnabled() const { return get<bool>("backend.hba.enable_gtsam_fallback", false); }
+    /** 前端数据（点云/里程计）超过此秒数未到达且后端队列已空时，触发一次 HBA。≤0 表示不按空闲触发，仅依赖 trigger_on_finish/周期。默认 10.0 */
+    double hbaFrontendIdleTriggerSec() const {
+        double v = get<double>("backend.hba.frontend_idle_trigger_sec", 10.0);
+        return v < 0.0 ? 0.0 : v;
+    }
 
     // ── 地图（东北天 ENU 统一坐标系）──────────────────────────────────────
     double mapVoxelSize()       const { return std::max(0.2, get<double>("map.voxel_size", 0.2)); }
@@ -295,10 +385,65 @@ public:
 
 private:
     YAML::Node cfg_;
+    /** 加载过的配置文件路径；全工程唯一源，用于“只加载一次”守卫与 configFilePath() */
+    std::string config_file_path_;
     /** 传感器空闲超时（秒），load() 中根据 mode.type 与 mode.online/offline 设置；无 mode 时用 system.sensor_idle_timeout_sec */
     double sensor_idle_timeout_sec_{10.0};
-    /** 直接从 cfg_ 读取 sensor.gps.topic，用于 gpsTopic() 兜底 */
+
+    /** load() 时一次性读取的 GPS 配置缓存，避免重复解析 YAML 与默认值不一致 */
+    bool gps_cached_{false};
+    int    gps_align_min_points_{50};
+    double gps_align_min_distance_m_{30.0};
+    double gps_quality_threshold_hdop_{2.0};
+    double gps_align_rmse_threshold_m_{1.5};
+    int    gps_good_samples_needed_{30};
+    bool   gps_add_constraints_on_align_{true};
+    double gps_factor_interval_m_{5.0};
+    double gps_keyframe_match_window_s_{0.5};
+    double gps_keyframe_max_hdop_{12.0};
+    double gps_factor_weight_{1.0};
+    double gps_factor_quality_scale_excellent_{2.0};
+    double gps_factor_quality_scale_high_{1.0};
+    double gps_factor_quality_scale_medium_{0.5};
+    double gps_factor_quality_scale_low_{0.25};
+    /** 直接从 cfg_ 读取 sensor.gps/lidar/imu.topic，用于 getter 兜底，保证与 YAML 一致 */
     std::string getSensorGpsTopicRaw() const;
+    std::string getSensorLidarTopicRaw() const;
+    std::string getSensorImuTopicRaw() const;
+    /** load() 时从 flatten 结果填充：当 get()/Raw 路径解析失败时由此回退，保证与 CONFIG_FILE_PARAMS 一致（见 LOG_ANALYSIS 配置读取修复） */
+    std::map<std::string, std::string> flat_params_cache_;
+    /** load() 时从 flat 或 YAML 填写的 sensor 话题缓存，避免 get() 返回默认值 */
+    bool sensor_lidar_topic_cached_{false};
+    bool sensor_imu_topic_cached_{false};
+    std::string sensor_lidar_topic_value_;
+    std::string sensor_imu_topic_value_;
+    /** load() 时从 flat 或 YAML 填写的 model_path 展开后缓存（${CMAKE_CURRENT_SOURCE_DIR} 已替换为包根目录） */
+    std::string overlap_model_path_expanded_;
+    /** load() 时从 system 节读入并缓存，保证 CONFIG_READ_BACK 与文件一致 */
+    bool system_queue_cached_{false};
+    int system_frame_queue_max_size_{500};
+    int system_ingress_queue_max_size_{16};
+    bool system_offline_finish_after_bag_{false};
+    /** load() 时从 sensor.gps.enabled 读入并缓存，避免 gpsEnabled() 与 load() 内诊断不一致（见 LOG_ANALYSIS） */
+    bool sensor_gps_enabled_cached_{false};
+    bool sensor_gps_enabled_value_{false};
+
+    /** 从 flat_params_cache_ 解析字符串为 T，get() 在 node 路径失败时回退使用 */
+    template<typename T>
+    T parseFlatValue(const std::string& s, const T& default_val) const {
+        try {
+            if constexpr (std::is_same_v<T, std::string>) return s;
+            if constexpr (std::is_same_v<T, int>) return static_cast<int>(std::stoi(s));
+            if constexpr (std::is_same_v<T, double>) return std::stod(s);
+            if constexpr (std::is_same_v<T, float>) return std::stof(s);
+            if constexpr (std::is_same_v<T, bool>) {
+                if (s == "true" || s == "1" || s == "yes") return true;
+                if (s == "false" || s == "0" || s == "no") return false;
+                return default_val;
+            }
+        } catch (...) {}
+        return default_val;
+    }
 
     template<typename T>
     T get(const std::string& key, const T& default_val) const {
@@ -307,11 +452,24 @@ private:
             std::istringstream ss(key);
             std::string token;
             while (std::getline(ss, token, '.')) {
-                if (!node.IsMap() || !node[token]) return default_val;
+                if (!node.IsMap() || !node[token]) break;
                 node = node[token];
             }
-            return node.as<T>();
-        } catch (...) { return default_val; }
+            if (!ss.eof()) { /* 未消费完 token，路径中断，走 flat 回退 */ }
+            else {
+                try {
+                    T v = node.as<T>();
+                    return v;
+                } catch (...) {}
+            }
+        } catch (...) {}
+        auto it = flat_params_cache_.find(key);
+        if (it != flat_params_cache_.end()) {
+            try {
+                return parseFlatValue<T>(it->second, default_val);
+            } catch (...) {}
+        }
+        return default_val;
     }
 
     ConfigManager() = default;

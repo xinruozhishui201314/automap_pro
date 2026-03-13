@@ -529,6 +529,10 @@ void AutoMapSystem::setupTimers() {
 void AutoMapSystem::onOdometry(double ts, const Pose3d& pose, const Mat66d& cov) {
     static std::atomic<int> backend_odom_recv_count{0};
     const int seq = backend_odom_recv_count.fetch_add(1) + 1;
+
+    // [TRACE] 精准追踪：里程计入口
+    ALOG_TRACE_STEP("AutoMapSystem", "onOdometry_enter");
+
     if (seq <= 5 || seq % 500 == 0) {
         RCLCPP_INFO(get_logger(),
             "[AutoMapSystem][BACKEND][RECV] odom #%d ts=%.3f pos=[%.2f,%.2f,%.2f] (backend entry)",
@@ -588,9 +592,15 @@ void AutoMapSystem::onOdometry(double ts, const Pose3d& pose, const Mat66d& cov)
 }
 
 void AutoMapSystem::onCloud(double ts, const CloudXYZIPtr& cloud) {
+    // [TRACE] 精准追踪：点云入口
+    ALOG_TRACE_STEP("AutoMapSystem", "onCloud_enter");
+
     const size_t pts = cloud ? cloud->size() : 0u;
     (void)pts;
-    if (!first_cloud_logged_.exchange(true)) {}
+    if (!first_cloud_logged_.exchange(true)) {
+        RCLCPP_INFO(get_logger(), "[AutoMapSystem][DATA] First cloud received ts=%.3f pts=%zu", ts, pts);
+        RCLCPP_INFO(get_logger(), "[AutoMapSystem][PIPELINE] event=first_cloud ts=%.3f pts=%zu", ts, pts);
+    }
     {
         std::lock_guard<std::mutex> lk(data_mutex_);
         last_cloud_    = cloud;
@@ -656,6 +666,10 @@ void AutoMapSystem::onCloud(double ts, const CloudXYZIPtr& cloud) {
         if (shutdown_requested_.load(std::memory_order_acquire)) return;
         ingress_queue_.push(std::move(f));
         ingress_not_empty_cv_.notify_one();
+
+        // [TRACE] 精准追踪：点云已入队
+        ALOG_TRACE_STEP("AutoMapSystem", "onCloud_queued");
+
     }
     size_t qs = 0;
     { std::lock_guard<std::mutex> lk(frame_queue_mutex_); qs = frame_queue_.size(); }
@@ -732,6 +746,9 @@ void AutoMapSystem::feederLoop() {
     feeder_heartbeat_ts_ms_.store(nowMs(), std::memory_order_release);  // 初始心跳
     
     while (!shutdown_requested_.load(std::memory_order_acquire)) {
+        // [TRACE] 精准追踪：feeder 循环开始
+        ALOG_TRACE_STEP("AutoMapSystem", "feeder_loop_iter");
+
         feeder_heartbeat_ts_ms_.store(nowMs(), std::memory_order_release);  // 更新心跳
         FrameToProcess f;
         {
@@ -826,6 +843,10 @@ void AutoMapSystem::backendWorkerLoop() {
 #ifdef __linux__
     pthread_setname_np(pthread_self(), "automap_backend");
 #endif
+
+    // [TRACE] 精准追踪：后端 worker 启动
+    ALOG_TRACE_STEP("AutoMapSystem", "backendWorkerLoop_start");
+
     const std::string cloud_frame = ConfigManager::instance().frontendCloudFrame();
     const int process_every_n_config = ConfigManager::instance().backendProcessEveryNFrames();
     const int override_n = process_every_n_override_.load(std::memory_order_acquire);
@@ -842,8 +863,24 @@ void AutoMapSystem::backendWorkerLoop() {
     static auto s_last_backend_heartbeat_wall = std::chrono::steady_clock::now();
     constexpr int BACKEND_HEARTBEAT_INTERVAL_SEC = 30;
 
+    // 🔧 DEBUG: 记录后端启动时间，用于诊断卡死
+    const auto backend_start_time = std::chrono::steady_clock::now();
+    RCLCPP_INFO(get_logger(), "[AutoMapSystem][BACKEND][DIAG] backendWorkerLoop started at t=0, waiting for frames...");
+
     while (!shutdown_requested_.load(std::memory_order_acquire)) {
-        backend_heartbeat_ts_ms_.store(nowMs(), std::memory_order_release);  // 更新心跳
+        // 🔧 DEBUG: 每次循环开始时更新心跳，便于定位卡在循环的哪个阶段
+        backend_heartbeat_ts_ms_.store(nowMs(), std::memory_order_release);
+        // 🔧 DEBUG: 记录循环迭代次数和运行时间
+        static int loop_iter = 0;
+        static auto loop_start_time = std::chrono::steady_clock::now();
+        loop_iter++;
+        auto now_wall = std::chrono::steady_clock::now();
+        double loop_elapsed_sec = std::chrono::duration<double>(now_wall - loop_start_time).count();
+        if (loop_iter % 10 == 1) {  // 每10次迭代输出一次
+            RCLCPP_DEBUG(get_logger(), "[AutoMapSystem][BACKEND][DIAG] loop_iter=%d elapsed_sec=%.1f",
+                        loop_iter, loop_elapsed_sec);
+        }
+
         // 异步 GPS 对齐：若 addGPSMeasurement 已触发调度，在此线程执行 try_align()，不阻塞 ROS 回调
         gps_manager_.runScheduledAlignment();
         FrameToProcess f;
@@ -851,12 +888,17 @@ void AutoMapSystem::backendWorkerLoop() {
         bool woke_by_data = false;
         {
             std::unique_lock<std::mutex> lock(frame_queue_mutex_);
+            // 🔧 DEBUG: 在等待数据前打印日志
+            RCLCPP_DEBUG(get_logger(), "[AutoMapSystem][BACKEND][DIAG] waiting for frame... queue_size=%zu", frame_queue_.size());
             woke_by_data = frame_queue_cv_.wait_for(lock, wait_chunk, [this] {
                 return shutdown_requested_.load(std::memory_order_acquire) || !frame_queue_.empty();
             });
             if (shutdown_requested_.load(std::memory_order_acquire)) break;
 
             qs_after_wait = frame_queue_.size();
+            // 🔧 DEBUG: 记录队列状态
+            RCLCPP_DEBUG(get_logger(), "[AutoMapSystem][BACKEND][DIAG] wakeup: woke_by_data=%d queue_size=%zu",
+                        woke_by_data ? 1 : 0, qs_after_wait);
             if (!woke_by_data) {
                 RCLCPP_DEBUG(get_logger(), "[AutoMapSystem][BACKEND] wait_done reason=timeout queue=%zu (backend 每 2s 唤醒一次，无数据则继续等；若长期无数据见 BACKEND HEARTBEAT)",
                               qs_after_wait);
@@ -901,6 +943,27 @@ void AutoMapSystem::backendWorkerLoop() {
                     }
                     break;
                 }
+                }
+                // 若配置了 frontend_idle_trigger_sec：10s 无前端数据且后端队列/ingress 已空时触发一次 HBA（不结束建图，仅做一次优化）
+                const double idle_trigger_sec = ConfigManager::instance().hbaFrontendIdleTriggerSec();
+                if (idle_trigger_sec > 0 && ConfigManager::instance().hbaEnabled() &&
+                    first_cloud_logged_.load(std::memory_order_acquire) && submap_manager_.submapCount() > 0) {
+                    auto now_idle = std::chrono::steady_clock::now();
+                    double frontend_idle_sec = std::chrono::duration<double>(now_idle - last_sensor_data_wall_time_).count();
+                    if (frontend_idle_sec >= idle_trigger_sec && !hba_triggered_by_frontend_idle_.exchange(true)) {
+                        size_t ingress_sz = 0;
+                        { std::lock_guard<std::mutex> lk(ingress_mutex_); ingress_sz = ingress_queue_.size(); }
+                        if (ingress_sz == 0) {
+                            lock.unlock();
+                            RCLCPP_INFO(get_logger(),
+                                "[AutoMapSystem][PIPELINE] event=hba_triggered_by_frontend_idle frontend_idle_sec=%.1f submaps=%d (10s 无前端数据且后端已处理完)",
+                                frontend_idle_sec, submap_manager_.submapCount());
+                            ensureBackendCompletedAndFlushBeforeHBA();
+                            auto all = submap_manager_.getAllSubmaps();
+                            hba_optimizer_.triggerAsync(all, false);
+                            continue;
+                        }
+                    }
                 }
                 // 队列空时也打心跳，便于在合并日志中确认后端在“等数据”而非卡死；带 livo/ingress 诊断便于定位断点
                 {
@@ -974,6 +1037,9 @@ void AutoMapSystem::backendWorkerLoop() {
             continue;
         }
         const int processed_no = backend_frames_actually_processed_.fetch_add(1) + 1;
+        // 🔧 DEBUG: 在处理帧之前打印日志
+        RCLCPP_INFO(get_logger(), "[AutoMapSystem][BACKEND][DIAG] about_to_process frame_no=%d processed_no=%d",
+                    frame_no, processed_no);
         if (frame_no <= 20) {
             RCLCPP_INFO(get_logger(), "[AutoMapSystem][BACKEND][DIAG] popped frame_no=%d ts=%.3f queue_after_pop=%zu (wait saw %zu) session_id=%lu",
                         frame_no, f.ts, qs_after_pop, qs_after_wait, current_session_id_);
@@ -983,6 +1049,9 @@ void AutoMapSystem::backendWorkerLoop() {
             RCLCPP_INFO(get_logger(), "[AutoMapSystem][CRASH_CONTEXT] step=backend_worker_processing session_id=%lu frame_no=%d processed_no=%d ts=%.3f (grep CRASH_CONTEXT to locate crash)",
                         current_session_id_, frame_no, processed_no, f.ts);
         }
+        // 🔧 DEBUG: 在获取 keyframe_mutex 之前打印日志
+        RCLCPP_DEBUG(get_logger(), "[AutoMapSystem][BACKEND][DIAG] about_to_lock keyframe_mutex processed_no=%d", processed_no);
+
         // 按时间戳从缓存对齐 pose/cov 和 kfinfo，不阻塞生产者
         Pose3d pose = Pose3d::Identity();
         Mat66d cov  = Mat66d::Identity() * 1e-4;
@@ -1018,12 +1087,12 @@ void AutoMapSystem::backendWorkerLoop() {
         }
         using Clock = std::chrono::steady_clock;
         const auto t0 = Clock::now();
+        RCLCPP_INFO(get_logger(), "[AutoMapSystem][BACKEND][STEP] step=tryCreateKeyFrame_enter processed_no=%d ts=%.3f (grep BACKEND STEP 精准定位卡住阶段)",
+                    processed_no, f.ts);
         try {
-            {
-                std::lock_guard<std::mutex> lk(keyframe_mutex_);
-                tryCreateKeyFrame(f.ts, pose, cov, cloud_for_kf, &kfinfo_copy,
-                    (f.cloud_ds && !f.cloud_ds->empty()) ? &f.cloud_ds : nullptr);
-            }
+            std::lock_guard<std::mutex> lk(keyframe_mutex_);
+            tryCreateKeyFrame(f.ts, pose, cov, cloud_for_kf, &kfinfo_copy,
+                (f.cloud_ds && !f.cloud_ds->empty()) ? &f.cloud_ds : nullptr);
         } catch (const std::exception& e) {
             RCLCPP_ERROR(get_logger(), "[AutoMapSystem][BACKEND][EXCEPTION] worker session_id=%lu frame_no=%d ts=%.3f: %s", current_session_id_, frame_no, f.ts, e.what());
             RCLCPP_INFO(get_logger(), "[TRACE] step=backend_worker result=fail reason=exception session_id=%lu frame_no=%d ts=%.3f step_where=tryCreateKeyFrame what=%s",
@@ -1036,6 +1105,27 @@ void AutoMapSystem::backendWorkerLoop() {
             ErrorMonitor::instance().recordError(ErrorDetail(errors::UNKNOWN_ERROR, "backend worker unknown exception"));
         }
         const double duration_ms = 1e-6 * std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - t0).count();
+        RCLCPP_INFO(get_logger(), "[AutoMapSystem][BACKEND][STEP] step=tryCreateKeyFrame_exit processed_no=%d duration_ms=%.1f (grep BACKEND STEP 定位卡住)",
+                    processed_no, duration_ms);
+        if (processed_no % 100 == 0 || duration_ms > 5000.0) {
+            RCLCPP_INFO(get_logger(), "[AutoMapSystem][BACKEND][DIAG] frame_processed_done frame_no=%d processed_no=%d ts=%.3f duration_ms=%.1f (grep to locate last completed frame when stuck)",
+                        frame_no, processed_no, f.ts, duration_ms);
+        }
+        if (duration_ms > 5000.0 && duration_ms <= 30000.0) {
+            RCLCPP_INFO(get_logger(), "[AutoMapSystem][BACKEND][SLOW] processed_no=%d ts=%.3f duration_ms=%.1f (>5s, 可能 ISAM2/回环/GPS 批次；若持续见 STUCK)",
+                        processed_no, f.ts, duration_ms);
+        }
+        // 强化日志：每帧处理时间超过 60 秒时告警，便于检测 commitAndUpdate 卡死
+        // 超过 60 秒则强制重置 ISAM2 恢复系统
+        if (duration_ms > 60000.0) {
+            RCLCPP_ERROR(get_logger(), "[AutoMapSystem][BACKEND][STUCK] processed_no=%d ts=%.3f duration_ms=%.1f (>60s) - forcing ISAM2 reset!",
+                        processed_no, f.ts, duration_ms);
+            isam2_optimizer_.reset();
+            RCLCPP_INFO(get_logger(), "[AutoMapSystem][BACKEND][STUCK] ISAM2 reset complete after stuck detection");
+        } else if (duration_ms > 30000.0) {
+            RCLCPP_WARN(get_logger(), "[AutoMapSystem][BACKEND][STUCK] processed_no=%d ts=%.3f duration_ms=%.1f (>30s) - possible commitAndUpdate deadlock!",
+                        processed_no, f.ts, duration_ms);
+        }
         const int map_interval = ConfigManager::instance().backendPublishGlobalMapEveryNProcessed();
         if ((processed_no <= 3 || duration_ms > 200.0) && processed_no % map_interval != 0) {
             RCLCPP_DEBUG(get_logger(), "[AutoMapSystem][BACKEND] worker processed #%d ts=%.3f duration_ms=%.1f", processed_no, f.ts, duration_ms);
@@ -1290,7 +1380,10 @@ void AutoMapSystem::tryCreateKeyFrame(double ts, const Pose3d& pose, const Mat66
 
     GPSMeasurement gps;
     bool has_gps = false;
-    auto gps_opt = gps_manager_.queryByTimestampEnhanced(ts);
+    // 优先按位置匹配：找与当前关键帧位置最近的 GPS，用其时间戳做插值；无对齐或未命中时回退到时间戳匹配
+    auto gps_opt = gps_manager_.queryByNearestPosition(cur_pose.translation());
+    if (!gps_opt)
+        gps_opt = gps_manager_.queryByTimestampEnhanced(ts);
     if (gps_opt) {
         gps     = *gps_opt;
         has_gps = gps.is_valid;
@@ -1341,11 +1434,62 @@ void AutoMapSystem::tryCreateKeyFrame(double ts, const Pose3d& pose, const Mat66
     double ms_create_kf = 1e-6 * std::chrono::duration_cast<std::chrono::microseconds>(t_after_create_kf - t_after_gps).count();
     RCLCPP_DEBUG(get_logger(), "[AutoMapSystem][BACKEND][KF_STEP] ts=%.3f step=createKeyFrame done kf_id=%lu", ts, kf->id);
 
+    RCLCPP_INFO(get_logger(), "[AutoMapSystem][BACKEND][STEP] step=addKeyFrame_enter ts=%.3f kf_id=%lu sm_id=%d (grep BACKEND STEP 定位卡住)",
+                ts, kf->id, kf->submap_id);
     submap_manager_.addKeyFrame(kf);
     auto t_after_add_submap = KfClock::now();
     double ms_add_submap = 1e-6 * std::chrono::duration_cast<std::chrono::microseconds>(t_after_add_submap - t_after_create_kf).count();
-    RCLCPP_DEBUG(get_logger(), "[AutoMapSystem][BACKEND][KF_STEP] ts=%.3f step=addKeyFrame done sm_id=%d", ts, kf->submap_id);
+    RCLCPP_INFO(get_logger(), "[AutoMapSystem][BACKEND][STEP] step=addKeyFrame_exit ts=%.3f duration_ms=%.1f (grep BACKEND STEP 定位卡住)", ts, ms_add_submap);
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // 子图内回环检测（新增）
+    // ─────────────────────────────────────────────────────────────────────────
+    RCLCPP_INFO(get_logger(), "[AutoMapSystem][BACKEND][STEP] step=intra_loop_enter ts=%.3f (grep BACKEND STEP 定位卡住)", ts);
+    auto t_before_intra_loop = KfClock::now();
+    {
+        auto active_sm = submap_manager_.getActiveSubmap();
+        if (active_sm && active_sm->id >= 0) {
+            int query_idx = static_cast<int>(active_sm->keyframes.size()) - 1;
+            if (query_idx >= 0) {
+                RCLCPP_INFO(get_logger(),
+                    "[INTRA_LOOP][TRIGGER] submap_id=%d kf_idx=%d ts=%.3f (checking intra-submap loop)",
+                    active_sm->id, query_idx, ts);
+                auto loops = loop_detector_.detectIntraSubmapLoop(active_sm, query_idx);
+                if (!loops.empty()) {
+                    RCLCPP_INFO(get_logger(),
+                        "[INTRA_LOOP][RESULT] submap_id=%d kf_idx=%d detected=%zu loops (batch commit)",
+                        active_sm->id, query_idx, loops.size());
+                    // 子图内回环：仅加入 pending，本帧末尾一次 commit，避免每条回环一次 commitAndUpdate 导致 30s+ 卡住
+                    for (const auto& lc : loops) {
+                        constexpr int KEYFRAME_ID_MULTIPLIER = 10000;
+                        int node_i = lc->submap_i * KEYFRAME_ID_MULTIPLIER + lc->keyframe_i;
+                        int node_j = lc->submap_j * KEYFRAME_ID_MULTIPLIER + lc->keyframe_j;
+                        const auto& kf_i = active_sm->keyframes[lc->keyframe_i];
+                        const auto& kf_j = active_sm->keyframes[lc->keyframe_j];
+                        if (kf_i && kf_j) {
+                            isam2_optimizer_.addSubMapNode(node_i, kf_i->T_w_b, false);
+                            isam2_optimizer_.addSubMapNode(node_j, kf_j->T_w_b, false);
+                            RCLCPP_INFO(get_logger(),
+                                "[INTRA_LOOP][ADD_FACTOR] submap=%d kf_i=%d kf_j=%d node_i=%d node_j=%d (deferred)",
+                                lc->submap_i, lc->keyframe_i, lc->keyframe_j, node_i, node_j);
+                            isam2_optimizer_.addLoopFactorDeferred(node_i, node_j, lc->delta_T, lc->information);
+                        }
+                    }
+                    // 本帧所有子图内回环因子一次提交，避免 N 次 commitAndUpdate
+                    isam2_optimizer_.forceUpdate();
+                }
+            }
+        }
+    }
+    auto t_after_intra_loop = KfClock::now();
+    double ms_intra_loop = 1e-6 * std::chrono::duration_cast<std::chrono::microseconds>(t_after_intra_loop - t_before_intra_loop).count();
+    RCLCPP_INFO(get_logger(), "[AutoMapSystem][BACKEND][STEP] step=intra_loop_exit ts=%.3f duration_ms=%.1f (grep BACKEND STEP 定位卡住)", ts, ms_intra_loop);
+    if (ms_intra_loop > 100.0) {
+        RCLCPP_INFO(get_logger(), "[AutoMapSystem][BACKEND][KF_STEP_TIMING] ts=%.3f step=intra_loop_ms=%.1f (grep KF_STEP_TIMING)", ts, ms_intra_loop);
+    }
+
+    RCLCPP_INFO(get_logger(), "[AutoMapSystem][BACKEND][STEP] step=gps_factor_enter ts=%.3f (grep BACKEND STEP 定位卡住)", ts);
+    auto t_before_gps_factor = KfClock::now();
     if (gps_aligned_ && has_gps && kf->submap_id >= 0) {
         Eigen::Vector3d pos_map = gps_manager_.enu_to_map(gps.position_enu);
         Eigen::Matrix3d cov = gps.covariance;
@@ -1365,6 +1509,12 @@ void AutoMapSystem::tryCreateKeyFrame(double ts, const Pose3d& pose, const Mat66
             isam2_optimizer_.addGPSFactor(kf->submap_id, pos_map, cov);
         }
     }
+    auto t_after_gps_factor = KfClock::now();
+    double ms_gps_factor = 1e-6 * std::chrono::duration_cast<std::chrono::microseconds>(t_after_gps_factor - t_before_gps_factor).count();
+    RCLCPP_INFO(get_logger(), "[AutoMapSystem][BACKEND][STEP] step=gps_factor_exit ts=%.3f duration_ms=%.1f (grep BACKEND STEP 定位卡住)", ts, ms_gps_factor);
+    if (ms_gps_factor > 100.0) {
+        RCLCPP_INFO(get_logger(), "[AutoMapSystem][BACKEND][KF_STEP_TIMING] ts=%.3f step=gps_factor_ms=%.1f (grep KF_STEP_TIMING)", ts, ms_gps_factor);
+    }
 
     // 投递到 viz 线程，不阻塞；有界队列满时丢弃最旧
     {
@@ -1376,6 +1526,12 @@ void AutoMapSystem::tryCreateKeyFrame(double ts, const Pose3d& pose, const Mat66
     }
 
     double ms_total = 1e-6 * std::chrono::duration_cast<std::chrono::microseconds>(KfClock::now() - kf_t0).count();
+    // 分步耗时便于定位卡点：voxel/gps_query/createKf/addKf/intra_loop/gps_factor 等
+    if (ms_total > 500.0 || (kf->id <= 3)) {
+        RCLCPP_INFO(get_logger(),
+            "[AutoMapSystem][BACKEND][KF_STEP_TIMING] ts=%.3f kf_id=%lu voxel=%.1f gps=%.1f create=%.1f add=%.1f intra_loop=%.1f gps_fac=%.1f total=%.1f (grep KF_STEP_TIMING 定位慢步骤)",
+            ts, kf->id, ms_voxel, ms_gps, ms_create_kf, ms_add_submap, ms_intra_loop, ms_gps_factor, ms_total);
+    }
     RCLCPP_INFO(get_logger(),
         "[AutoMapSystem][KF] created kf_id=%lu sm_id=%d ts=%.3f pts=%zu has_gps=%d total_ms=%.1f",
         kf->id, kf->submap_id, ts, cur_cloud->size(), has_gps ? 1 : 0, ms_total);
@@ -1454,6 +1610,16 @@ void AutoMapSystem::onSubmapFrozen(const SubMap::Ptr& submap) {
     // 提交到回环检测器
     loop_detector_.addSubmap(submap);
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // 子图内回环检测：冻结时准备描述子数据库（新增）
+    // ─────────────────────────────────────────────────────────────────────────
+    {
+        RCLCPP_INFO(get_logger(),
+            "[INTRA_LOOP][PREPARE_SUBMAP] submap_id=%d keyframes=%zu (preparing descriptors on freeze)",
+            submap->id, submap->keyframes.size());
+        loop_detector_.prepareIntraSubmapDescriptors(submap);
+    }
+
     // 延迟 GPS 补偿：子图冻结时注册，GPS 对齐后或回环优化后补偿
     if (gps_compensator_ && gps_compensator_->isEnabled()) {
         gps_compensator_->registerSubmap(submap);
@@ -1483,6 +1649,22 @@ void AutoMapSystem::onLoopDetected(const LoopConstraint::Ptr& lc) {
     const double ty = lc->delta_T.translation().y();
     const double tz = lc->delta_T.translation().z();
     const double info_norm = lc->information.norm();
+    // 同子图同节点回环无效：后端图节点按 submap_id，sm_i==sm_j 即 from==to，Between 退化
+    if (lc->submap_i == lc->submap_j) {
+        RCLCPP_INFO(get_logger(), "[AutoMapSystem][LOOP] skip same-submap loop sm_i=sm_j=%d (invalid Between factor; quality filter)", lc->submap_i);
+        state_ = SystemState::MAPPING;
+        return;
+    }
+    // 回环质量：相对平移过小视为 trivial 约束，不加入图（可配置 loop_closure.teaser.min_relative_translation_m）
+    const double trans_norm = std::sqrt(tx*tx + ty*ty + tz*tz);
+    const double min_trans_m = ConfigManager::instance().loopMinRelativeTranslationM();
+    if (min_trans_m > 0 && trans_norm < min_trans_m) {
+        RCLCPP_INFO(get_logger(), "[AutoMapSystem][LOOP] skip trivial loop sm_i=%d sm_j=%d trans_norm=%.3fm < %.2fm (quality filter)",
+            lc->submap_i, lc->submap_j, trans_norm, min_trans_m);
+        state_ = SystemState::MAPPING;
+        return;
+    }
+
     RCLCPP_INFO(get_logger(),
         "[AutoMapSystem][LOOP] detected sm_i=%d sm_j=%d score=%.3f inlier=%.3f rmse=%.3f trans=[%.2f,%.2f,%.2f] info_norm=%.2f (enqueue for async iSAM2)",
         lc->submap_i, lc->submap_j, lc->overlap_score, lc->inlier_ratio, lc->rmse, tx, ty, tz, info_norm);
@@ -1556,6 +1738,39 @@ void AutoMapSystem::onPoseUpdated(const std::unordered_map<int, Pose3d>& poses) 
         "[AutoMapSystem][POSE] updated count=%zu first_sm_id=%d pos=[%.2f,%.2f,%.2f]",
         n, first_id, first_x, first_y, first_z);
     RCLCPP_INFO(get_logger(), "[AutoMapSystem][PIPELINE] event=pose_updated count=%zu first_sm_id=%d", n, first_id);
+
+    // ========== 实时更新 GPS 显示 ==========
+    // 每次 iSAM2 优化后，实时更新 GPS 标记位置，使用 KeyFrame 优化位姿
+    if (gps_aligned_) {
+        try {
+            auto all_sm = submap_manager_.getAllSubmaps();
+
+            // SubMap 级别 GPS 标记 - 使用优化后的 anchor 位姿
+            std::vector<Eigen::Vector3d> gps_positions_map_for_submaps;
+            for (const auto& sm : all_sm) {
+                if (!sm || !sm->has_valid_gps) continue;
+                gps_positions_map_for_submaps.push_back(sm->pose_w_anchor_optimized.translation());
+            }
+            if (!gps_positions_map_for_submaps.empty()) {
+                rviz_publisher_.publishGPSMarkersWithConstraintLines(all_sm, gps_positions_map_for_submaps);
+            }
+
+            // KeyFrame 级别 GPS 位置 - 使用每个 KeyFrame 的优化位姿
+            std::vector<Eigen::Vector3d> gps_positions_map;
+            for (const auto& sm : all_sm) {
+                if (!sm) continue;
+                for (const auto& kf : sm->keyframes) {
+                    if (!kf || !kf->has_valid_gps) continue;
+                    gps_positions_map.push_back(kf->T_w_b_optimized.translation());
+                }
+            }
+            if (!gps_positions_map.empty()) {
+                rviz_publisher_.publishGPSPositionsInMap(gps_positions_map);
+            }
+        } catch (const std::exception& e) {
+            RCLCPP_DEBUG(get_logger(), "[AutoMapSystem][POSE][GPS] update exception: %s", e.what());
+        } catch (...) {}
+    }
 
     // ✅ P3 修复：发布优化后轨迹（按 submap_id 排序，保证 Path 在 RViz 中按顺序连线）
     opt_path_.header.stamp    = now();
@@ -1652,6 +1867,36 @@ void AutoMapSystem::onHBADone(const HBAResult& result) {
     // ─────────────────────────────────────────────────────────────────────────────
     
     // 位姿/点云已更新：刷新 RViz 优化轨迹与关键帧位姿，便于实时看到 HBA 结果
+    // ========== HBA 完成后更新 GPS 显示 ==========
+    if (gps_aligned_) {
+        try {
+            // SubMap 级别 GPS 标记 - 使用优化后的 anchor 位姿
+            std::vector<Eigen::Vector3d> gps_positions_map_for_submaps;
+            for (const auto& sm : all_sm) {
+                if (!sm || !sm->has_valid_gps) continue;
+                gps_positions_map_for_submaps.push_back(sm->pose_w_anchor_optimized.translation());
+            }
+            if (!gps_positions_map_for_submaps.empty()) {
+                rviz_publisher_.publishGPSMarkersWithConstraintLines(all_sm, gps_positions_map_for_submaps);
+            }
+
+            // KeyFrame 级别 GPS 位置 - 使用每个 KeyFrame 的优化位姿
+            std::vector<Eigen::Vector3d> gps_positions_map;
+            for (const auto& sm : all_sm) {
+                if (!sm) continue;
+                for (const auto& kf : sm->keyframes) {
+                    if (!kf || !kf->has_valid_gps) continue;
+                    gps_positions_map.push_back(kf->T_w_b_optimized.translation());
+                }
+            }
+            if (!gps_positions_map.empty()) {
+                rviz_publisher_.publishGPSPositionsInMap(gps_positions_map);
+            }
+        } catch (const std::exception& e) {
+            RCLCPP_WARN(get_logger(), "[AutoMapSystem][HBA][GPS] update exception: %s", e.what());
+        } catch (...) {}
+    }
+
     try {
         rviz_publisher_.publishOptimizedPath(all_sm);
         rviz_publisher_.publishKeyframePoses(collectKeyframesFromSubmaps(all_sm));
@@ -1718,22 +1963,32 @@ void AutoMapSystem::onGPSAligned(const GPSAlignResult& result) {
     try {
         auto all_sm = submap_manager_.getAllSubmaps();
         rviz_publisher_.publishGPSAlignment(result, all_sm);
-        // 对齐后立即刷新地图系 GPS 与约束线，保证 RViz 中轨迹、关键帧与 GPS 位置重合显示
+
+        // ========== 修复：使用 KeyFrame 优化位姿显示 GPS ==========
+        // 原始方案：显示的是 GPS 原始位置 (enu_to_map(gps.position_enu))
+        // 新方案：显示的是 KeyFrame 优化后的位姿 (T_w_b_optimized)
+        // 这样 GPS 标记会跟随后端优化移动，与优化轨迹一致
+
+        // 1. SubMap 级别的 GPS 标记和轨迹 - 使用优化后的 anchor 位姿
         std::vector<Eigen::Vector3d> gps_positions_map_for_submaps;
         for (const auto& sm : all_sm) {
             if (!sm || !sm->has_valid_gps) continue;
-            gps_positions_map_for_submaps.push_back(gps_manager_.enu_to_map(sm->gps_center));
+            // 使用 SubMap anchor 的优化位姿（而不是原始 GPS 位置）
+            gps_positions_map_for_submaps.push_back(sm->pose_w_anchor_optimized.translation());
         }
         if (!gps_positions_map_for_submaps.empty()) {
             rviz_publisher_.publishGPSMarkersWithConstraintLines(all_sm, gps_positions_map_for_submaps);
             rviz_publisher_.publishGPSTrajectory(all_sm, gps_positions_map_for_submaps, true);
         }
+
+        // 2. KeyFrame 级别的 GPS 位置 - 使用每个 KeyFrame 的优化位姿
         std::vector<Eigen::Vector3d> gps_positions_map;
         for (const auto& sm : all_sm) {
             if (!sm) continue;
             for (const auto& kf : sm->keyframes) {
                 if (!kf || !kf->has_valid_gps) continue;
-                gps_positions_map.push_back(gps_manager_.enu_to_map(kf->gps.position_enu));
+                // 使用 KeyFrame 的优化位姿（而不是原始 GPS ENU 位置）
+                gps_positions_map.push_back(kf->T_w_b_optimized.translation());
             }
         }
         if (!gps_positions_map.empty())
@@ -1780,8 +2035,9 @@ void AutoMapSystem::addBatchGPSFactors() {
         // 先等待所有待处理任务完成
         isam2_optimizer_.waitForPendingTasks();
 
-        // 关键修复：先 flush 已有 pending（value+prior+odom），避免与 GPS 因子同批 update 触发 GTSAM double free
-        // 日志显示崩溃时 pending_factors=2 pending_values=1 且两因子同 key → Prior(s1)+GPS(s1) 同批，linearize 时崩溃
+        // 关键修复：对齐后先 forceUpdate，确保首节点（及已有 pending）已提交，避免 addGPSFactor(sm_id=0) 报 "node not in graph"
+        // 再根据需要 flush 与 GPS 同 key 的 pending，避免 Prior+GPS 同批 update 触发 GTSAM double free
+        isam2_optimizer_.forceUpdate();
         if (isam2_optimizer_.hasPendingFactorsOrValues()) {
             RCLCPP_INFO(get_logger(), "[GPS_BATCH][DIAG] flush pending before adding GPS (avoid Prior+GPS same key in one update)");
             isam2_optimizer_.forceUpdate();
@@ -1797,6 +2053,8 @@ void AutoMapSystem::addBatchGPSFactors() {
         if (added > 0) {
             isam2_optimizer_.forceUpdate();
         }
+        // Flush deferred GPS factors (e.g. sm_id=0 when node was not in graph earlier) after first forceUpdate may have committed nodes
+        isam2_optimizer_.forceUpdate();
         if (added > 0) {
             RCLCPP_INFO(get_logger(), "[GPS_BATCH][DIAG] phase=existing_sync added=%d (forced sync to avoid SIGSEGV)", added);
         }
@@ -1991,12 +2249,14 @@ void AutoMapSystem::publishGlobalMap() {
         rviz_publisher_.publishOptimizedPath(all_sm);
         rviz_publisher_.publishKeyframePoses(collectKeyframesFromSubmaps(all_sm));
         // GPS 约束：仅在对齐后使用 map 系位置，避免未对齐时把 ENU 标成 map
+        // ========== 修复：使用 KeyFrame 优化位姿而非原始 GPS 位置 ==========
         {
             std::vector<Eigen::Vector3d> gps_positions_map_for_submaps;
             if (gps_aligned_) {
                 for (const auto& sm : all_sm) {
                     if (!sm || !sm->has_valid_gps) continue;
-                    gps_positions_map_for_submaps.push_back(gps_manager_.enu_to_map(sm->gps_center));
+                    // 使用 SubMap anchor 的优化位姿（而不是原始 GPS ENU 位置）
+                    gps_positions_map_for_submaps.push_back(sm->pose_w_anchor_optimized.translation());
                 }
             }
             if (!gps_positions_map_for_submaps.empty()) {
@@ -2008,13 +2268,15 @@ void AutoMapSystem::publishGlobalMap() {
             }
         }
         // 真实 GPS 位置（按关键帧）转换到地图系后发布（仅对齐后有效）
+        // ========== 修复：使用 KeyFrame 优化位姿而非原始 GPS 位置 ==========
         if (gps_aligned_) {
             std::vector<Eigen::Vector3d> gps_positions_map;
             for (const auto& sm : all_sm) {
                 if (!sm) continue;
                 for (const auto& kf : sm->keyframes) {
                     if (!kf || !kf->has_valid_gps) continue;
-                    gps_positions_map.push_back(gps_manager_.enu_to_map(kf->gps.position_enu));
+                    // 使用 KeyFrame 的优化位姿（而不是原始 GPS ENU 位置）
+                    gps_positions_map.push_back(kf->T_w_b_optimized.translation());
                 }
             }
             if (!gps_positions_map.empty())
@@ -2312,19 +2574,21 @@ void AutoMapSystem::handleFinishMapping(
         "[CRASH_CONTEXT] step=finish_mapping_enter (崩溃时最后一条 CRASH_CONTEXT 即上一成功步骤)");
     try {
         if (submap_manager_.submapCount() > 0) {
+            // 强制冻结当前活跃子图，使最后一子图进入 iSAM2 因子图，保证 submap 数量与图节点一致
+            submap_manager_.forceFreezeActiveSubmapForFinish();
+            auto all = submap_manager_.getAllSubmaps();
+            RCLCPP_INFO(get_logger(),
+                "[CRASH_CONTEXT] step=finish_mapping_before_ensureBackend submaps=%zu (若崩溃则发生在 ensureBackend 或 forceUpdate/commitAndUpdate 内)",
+                all.size());
+            RCLCPP_INFO(get_logger(),
+                "[AutoMapSystem][HBA][TRACE] step=finish_mapping_ensureBackend_enter");
+            ensureBackendCompletedAndFlushBeforeHBA();
+            RCLCPP_INFO(get_logger(),
+                "[CRASH_CONTEXT] step=finish_mapping_after_ensureBackend");
+            RCLCPP_INFO(get_logger(),
+                "[AutoMapSystem][HBA][TRACE] step=finish_mapping_ensureBackend_done");
             if (ConfigManager::instance().hbaEnabled() && ConfigManager::instance().hbaOnFinish()) {
-                auto all = submap_manager_.getAllSubmaps();
                 RCLCPP_INFO(get_logger(), "[AutoMapSystem][PIPELINE] event=finish_mapping_final_hba_enter submaps=%zu", all.size());
-                RCLCPP_INFO(get_logger(),
-                    "[CRASH_CONTEXT] step=finish_mapping_before_ensureBackend submaps=%zu (若崩溃则发生在 ensureBackend 或 forceUpdate/commitAndUpdate 内)",
-                    all.size());
-                RCLCPP_INFO(get_logger(),
-                    "[AutoMapSystem][HBA][TRACE] step=finish_mapping_ensureBackend_enter");
-                ensureBackendCompletedAndFlushBeforeHBA();
-                RCLCPP_INFO(get_logger(),
-                    "[CRASH_CONTEXT] step=finish_mapping_after_ensureBackend");
-                RCLCPP_INFO(get_logger(),
-                    "[AutoMapSystem][HBA][TRACE] step=finish_mapping_ensureBackend_done");
                 RCLCPP_INFO(get_logger(),
                     "[CRASH_CONTEXT] step=finish_mapping_before_hba_trigger submaps=%zu", all.size());
                 hba_optimizer_.triggerAsync(all, true);

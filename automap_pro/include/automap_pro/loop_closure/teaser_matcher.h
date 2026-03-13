@@ -23,12 +23,13 @@ public:
                  const Pose3d& initial_guess = Pose3d::Identity()) const;
 
 private:
-    double noise_bound_      = 0.1;
-    double cbar2_            = 1.0;
-    double voxel_size_       = 0.4;
-    double min_inlier_ratio_ = 0.30;
-    double max_rmse_         = 0.3;
-    int    max_points_       = 4000;
+    double noise_bound_       = 0.1;
+    double cbar2_             = 1.0;
+    double voxel_size_        = 0.4;
+    double min_inlier_ratio_  = 0.30;
+    double max_rmse_          = 0.3;
+    int    max_points_        = 4000;
+    int    min_safe_inliers_  = 10;  // TEASER 内点数低于此拒绝；弱重叠可配 min_safe_inliers 放宽
 
     CloudXYZIPtr preprocess(const CloudXYZIPtr& cloud) const;
 };

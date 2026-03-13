@@ -334,6 +334,47 @@ void SubMapManager::freezeActiveSubmap(const SubMap::Ptr& sm) {
     SLOG_END_SPAN();
 }
 
+void SubMapManager::forceFreezeActiveSubmapForFinish() {
+    SubMap::Ptr sm;
+    {
+        std::lock_guard<std::mutex> lk(mutex_);
+        sm = active_submap_;
+        if (!sm || sm->state != SubMapState::ACTIVE) {
+            if (sm)
+                RCLCPP_DEBUG(rclcpp::get_logger("automap_system"),
+                    "[SubMapMgr][FINISH_FREEZE] no active submap to force-freeze (state=%d)", static_cast<int>(sm->state));
+            return;
+        }
+        sm->state = SubMapState::FROZEN;
+        publishEvent(sm, "FROZEN");
+        METRICS_INCREMENT(metrics::SUBMAPS_FROZEN);
+        active_submap_ = nullptr;
+    }
+    RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+        "[SubMapMgr][FINISH_FREEZE] force-freeze sm_id=%d (sync, so last submap enters factor graph)", sm->id);
+    try {
+        if (sm->merged_cloud && !sm->merged_cloud->empty()) {
+            CloudXYZIPtr ds = utils::voxelDownsample(sm->merged_cloud, static_cast<float>(match_res_));
+            if (!ds || ds->empty()) ds = sm->merged_cloud;
+            sm->downsampled_cloud = ds;
+            METRICS_HISTOGRAM_OBSERVE(metrics::POINTCLOUD_SIZE, static_cast<double>(sm->merged_cloud->size()));
+        }
+        std::vector<SubMapFrozenCallback> cbs_copy;
+        { std::lock_guard<std::mutex> lk(frozen_cbs_mutex_); cbs_copy = frozen_cbs_; }
+        for (auto& cb : cbs_copy) cb(sm);
+        HEALTH_UPDATE_QUEUE("submap", getFrozenSubmaps().size());
+        HEALTH_UPDATE_QUEUE("loop", 0);
+    } catch (const std::exception& e) {
+        auto error = ErrorDetail(errors::SUBMAP_STATE_INVALID, fmt::format("forceFreezeActiveSubmapForFinish sm_id={}: {}", sm->id, e.what()));
+        error.context().operation = "forceFreezeActiveSubmapForFinish";
+        error.context().file = __FILE__;
+        error.context().line = __LINE__;
+        RCLCPP_ERROR(rclcpp::get_logger("automap_system"), "[SubMapManager] forceFreezeActiveSubmapForFinish: %s", e.what());
+        publishErrorEvent(sm->id, error);
+        METRICS_INCREMENT(metrics::ERRORS_TOTAL);
+    }
+}
+
 void SubMapManager::freezePostProcessLoop() {
     while (freeze_post_running_.load()) {
         SubMap::Ptr sm;

@@ -30,12 +30,13 @@ inline long getLwpForLog() {
 
 TeaserMatcher::TeaserMatcher() {
     const auto& cfg = ConfigManager::instance();
-    noise_bound_      = cfg.teaserNoiseBound();
-    cbar2_            = cfg.teaserCbar2();
-    voxel_size_       = cfg.teaserVoxelSize();
-    min_inlier_ratio_ = cfg.teaserMinInlierRatio();
-    max_rmse_         = cfg.teaserMaxRMSE();
-    max_points_       = cfg.teaserMaxPoints();
+    noise_bound_       = cfg.teaserNoiseBound();
+    cbar2_             = cfg.teaserCbar2();
+    voxel_size_        = cfg.teaserVoxelSize();
+    min_inlier_ratio_  = cfg.teaserMinInlierRatio();
+    max_rmse_          = cfg.teaserMaxRMSE();
+    max_points_        = cfg.teaserMaxPoints();
+    min_safe_inliers_  = cfg.teaserMinSafeInliers();
 }
 
 CloudXYZIPtr TeaserMatcher::preprocess(const CloudXYZIPtr& cloud) const {
@@ -232,6 +233,46 @@ TeaserMatcher::Result TeaserMatcher::match(
             ALOG_WARN(MOD, "[FPFH_DIAG] tid={} corrs={} dist_p10={:.2f}m p50={:.2f}m p90={:.2f}m "
                       "(p90>>5m 表示存在大量误匹配)",
                       tid, corrs.size(), p10, p50, p90);
+
+            // ========== 修复：如果 p90 过大（>10m），过滤掉距离过大的对应点 ==========
+            // 问题根因：FPFH 匹配找到"语义相似"但"空间距离极远"的点对（如相似墙角）
+            // 解决方案：使用 p50 估计初始变换，然后过滤距离异常的点
+            const double kGeoFilterThreshold = 10.0;  // 超过 10m 的对应点视为误匹配
+            if (p90 > kGeoFilterThreshold && !distances.empty()) {
+                ALOG_WARN(MOD, "[FPFH_GEO_FILTER] tid={} p90={:.2f}m > threshold={:.2f}m, applying geometric filter",
+                          tid, p90, kGeoFilterThreshold);
+
+                // 使用距离中位数作为"初始估计"
+                const double median_dist = p50;
+                const double filter_margin = median_dist * 2.0;  // 允许 2 倍中位数范围
+                const double abs_threshold = std::max(median_dist + filter_margin, kGeoFilterThreshold);
+
+                std::vector<std::pair<int, int>> filtered_corrs;
+                filtered_corrs.reserve(corrs.size());
+                for (const auto& [si, ti] : corrs) {
+                    const auto& sp = src->points[si];
+                    const auto& tp = tgt->points[ti];
+                    double d = std::sqrt((sp.x - tp.x) * (sp.x - tp.x) +
+                                        (sp.y - tp.y) * (sp.y - tp.y) +
+                                        (sp.z - tp.z) * (sp.z - tp.z));
+                    if (d <= abs_threshold) {
+                        filtered_corrs.emplace_back(si, ti);
+                    }
+                }
+
+                ALOG_WARN(MOD, "[FPFH_GEO_FILTER] tid={} filtered_corrs={}/{} ({:.1f}%) median_dist={:.2f}m threshold={:.2f}m",
+                          tid, filtered_corrs.size(), corrs.size(),
+                          100.0 * filtered_corrs.size() / corrs.size(),
+                          median_dist, abs_threshold);
+
+                if (filtered_corrs.size() >= 10) {
+                    corrs = std::move(filtered_corrs);
+                    result.num_correspondences = static_cast<int>(corrs.size());
+                } else {
+                    ALOG_WARN(MOD, "[FPFH_GEO_FILTER] tid={} filtered_corrs={} < 10, keeping original corrs",
+                              tid, filtered_corrs.size());
+                }
+            }
         }
 
         if ((int)corrs.size() < 10) {
@@ -332,8 +373,8 @@ TeaserMatcher::Result TeaserMatcher::match(
         const auto max_clique = solver->getInlierMaxClique();
         const int inliers = static_cast<int>(max_clique.size());
         const float ratio = corrs.empty() ? 0.f : static_cast<float>(inliers) / static_cast<float>(corrs.size());
-        ALOG_INFO(MOD, "[LOOP_COMPUTE][TEASER] teaser_done inliers={} corrs={} ratio={:.3f} valid={} (精准优化: inliers<10 会拒绝，可调 safe_min 或改进初值)",
-                  inliers, static_cast<int>(corrs.size()), ratio, (inliers >= 10 && ratio >= min_inlier_ratio_) ? 1 : 0);
+        ALOG_INFO(MOD, "[LOOP_COMPUTE][TEASER] teaser_done inliers={} corrs={} ratio={:.3f} valid={} (精准优化: inliers<min_safe_inliers 会拒绝，可调 loop_closure.teaser.min_safe_inliers)",
+                  inliers, static_cast<int>(corrs.size()), ratio, (inliers >= min_safe_inliers_ && ratio >= min_inlier_ratio_) ? 1 : 0);
         ALOG_INFO(MOD, "[tid={}] step=teaser_inlier_computed inliers={}/{} ratio={:.2f} thresh={}",
                  tid, inliers, corrs.size(), ratio, min_inlier_ratio_);
 
@@ -368,24 +409,22 @@ TeaserMatcher::Result TeaserMatcher::match(
         }
 
         // ===【V3 激进修复】双重安全检查：提前 abort + 延迟析构===
-        const int kMinSafeInliers = 10;
-        if (inliers < kMinSafeInliers) {
-            ALOG_INFO(MOD, "[LOOP_COMPUTE][TEASER] teaser_fail reason=teaser_extremely_few_inliers inliers={} safe_min={} (精准优化: 可放宽 safe_min 或改进 FPFH/重叠)",
-                      inliers, kMinSafeInliers);
+        if (inliers < min_safe_inliers_) {
+            ALOG_INFO(MOD, "[LOOP_COMPUTE][TEASER] teaser_fail reason=teaser_extremely_few_inliers inliers={} safe_min={} (精准优化: 可放宽 loop_closure.teaser.min_safe_inliers 或改进 FPFH/重叠)",
+                      inliers, min_safe_inliers_);
             ALOG_WARN(MOD, "[tid={}] [CRITICAL_V3] step=teaser_extremely_few_inliers inliers={} < safe_threshold={}, HIGH CRASH RISK",
-                     tid, inliers, kMinSafeInliers);
+                     tid, inliers, min_safe_inliers_);
             ALOG_INFO(MOD, "[CRASH_TRACE][tid={} lwp={}] step=teaser_solver_abort_low_inliers solver_ptr={} inliers={} safe_min={}",
-                      tid, getLwpForLog(), static_cast<const void*>(solver.get()), inliers, kMinSafeInliers);
-            std::cerr << "[CRASH_TRACE_CRITICAL] lwp=" << getLwpForLog() 
-                      << " step=teaser_extremely_few_inliers inliers=" << inliers 
-                      << " safe_min=" << kMinSafeInliers << std::endl;
+                      tid, getLwpForLog(), static_cast<const void*>(solver.get()), inliers, min_safe_inliers_);
+            std::cerr << "[CRASH_TRACE_CRITICAL] lwp=" << getLwpForLog()
+                      << " step=teaser_extremely_few_inliers inliers=" << inliers
+                      << " safe_min=" << min_safe_inliers_ << std::endl;
             // 【关键修复】使用 release() 让 solver 自然析构，延长生命周期直到函数退出
-            // 这样可以在析构时有更多栈帧来捕获异常
             solver.release();
             ALOG_INFO(MOD, "[CRASH_TRACE][tid={} lwp={}] step=teaser_solver_released solver_ptr_released=true",
                       tid, getLwpForLog());
             ALOG_INFO(MOD, "[TRACE] step=loop_match result=fail reason=teaser_extremely_few_inliers tid={} inliers={} safe_min={} (V3: released solver)",
-                     tid, inliers, kMinSafeInliers);
+                     tid, inliers, min_safe_inliers_);
             return result;
         }
 

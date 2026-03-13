@@ -557,14 +557,12 @@ std::vector<std::pair<double, Eigen::Vector3d>> GPSManager::getGpsPositionsInMap
 }
 
 GPSQuality GPSManager::hdop_to_quality(double hdop) const {
-    // 【修复】放宽质量阈值，适配弱GPS场景（如M2DGR HDOP≈10）
+    // 使用配置文件中的 quality_threshold_hdop 值，而非硬编码
     // 原阈值：EXCELLENT≤1, HIGH≤2, MEDIUM≤5, LOW≤20
-    // 新阈值：EXCELLENT≤1, HIGH≤2, MEDIUM≤10, LOW≤20
-    // 原因：M2DGR等城市场景GPS遮挡严重，HDOP通常8-12，按原阈值全为LOW，
-    //       导致对齐永远无法触发、GPS约束完全禁用
+    // 适配弱GPS场景（如M2DGR HDOP≈10）：MEDIUM≤quality_hdop_thresh_（默认12.0）
     if (hdop <= 1.0) return GPSQuality::EXCELLENT;
     if (hdop <= 2.0) return GPSQuality::HIGH;
-    if (hdop <= 10.0) return GPSQuality::MEDIUM;  // 修改：5.0 → 10.0
+    if (hdop <= quality_hdop_thresh_) return GPSQuality::MEDIUM;
     if (hdop <= 20.0) return GPSQuality::LOW;
     return GPSQuality::INVALID;
 }

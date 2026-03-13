@@ -6,6 +6,7 @@
 
 #include <automap_pro/msg/loop_constraint_msg.hpp>
 #include <pcl_conversions/pcl_conversions.h>
+#include <pcl/filters/voxel_grid.h>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -25,6 +26,12 @@ LoopDetector::LoopDetector() {
     max_rmse_          = cfg.teaserMaxRMSE();
     use_icp_refine_    = cfg.teaserICPRefine();
     worker_thread_num_ = std::max(1, cfg.loopWorkerThreads());
+
+    // 子图内回环检测参数
+    intra_submap_enabled_ = cfg.intraSubmapLoopEnabled();
+    intra_submap_min_temporal_gap_ = cfg.intraSubmapLoopMinTemporalGap();
+    intra_submap_min_keyframe_gap_ = cfg.intraSubmapLoopMinKeyframeGap();
+    intra_submap_overlap_threshold_ = cfg.intraSubmapLoopOverlapThreshold();
 }
 
 LoopDetector::~LoopDetector() { stop(); }
@@ -32,6 +39,10 @@ LoopDetector::~LoopDetector() { stop(); }
 void LoopDetector::init(rclcpp::Node::SharedPtr node) {
     node_ = node;
     const auto& cfg = ConfigManager::instance();
+
+    RCLCPP_INFO(node_->get_logger(),
+        "[LoopDetector][CONFIG] min_submap_gap=%d (from loop_closure.min_submap_gap; intra-submap candidates not filtered by gap)",
+        min_submap_gap_);
 
     // 加载 OverlapTransformer 模型（LibTorch Level 1）
     std::string model_path = cfg.overlapModelPath();
@@ -246,21 +257,28 @@ void LoopDetector::onDescriptorReady(const SubMap::Ptr& submap) {
         return;
     }
 
-    // 过滤候选（时间/子图间隔）
+    // 过滤候选（时间/子图间隔）：子图内回环（query 与 candidate 同 submap_id）不按 min_submap_gap 过滤，仅子图间过滤
     std::vector<OverlapTransformerInfer::Candidate> valid_candidates;
     int filtered_by_gap = 0;
     for (const auto& cand : candidates) {
-        if (cand.session_id == submap->session_id &&
-            std::abs(cand.submap_id - submap->id) < min_submap_gap_) {
+        if (cand.session_id != submap->session_id) {
+            valid_candidates.push_back(cand);
+            continue;
+        }
+        if (cand.submap_id == submap->id) {
+            valid_candidates.push_back(cand);
+            continue;
+        }
+        if (std::abs(cand.submap_id - submap->id) <= min_submap_gap_) {
             filtered_by_gap++;
             continue;
         }
         valid_candidates.push_back(cand);
     }
-    
+
     if (valid_candidates.empty()) {
-        ALOG_WARN(MOD, "[LoopDetector][GAP_FILTER] query_id={} 候选数={} 均因 min_submap_gap={} 被过滤 → 无回环候选。"
-                  " 可尝试将 loop_closure.min_submap_gap 设为 2，或确保轨迹有闭环",
+        ALOG_WARN(MOD, "[LoopDetector][GAP_FILTER] query_id={} 候选数={} 均因 min_submap_gap={} 被过滤（子图内候选已放行）→ 无回环候选。"
+                  " 可尝试将 loop_closure.min_submap_gap 调小或确保轨迹有闭环",
                   submap->id, candidates.size(), min_submap_gap_);
         return;
     }
@@ -739,6 +757,422 @@ void LoopDetector::publishLoopConstraint(const LoopConstraint::Ptr& lc) {
         for (int j = 0; j < 6; ++j)
             msg.information_matrix[i*6+j] = lc->information(i,j);
     constraint_pub_->publish(msg);
+}
+
+void LoopDetector::prepareIntraSubmapDescriptors(const SubMap::Ptr& submap) {
+    // ═══════════════════════════════════════════════════════════════════════════
+    // [INTRA_LOOP][PREPARE] 开始准备子图内描述子数据库
+    // 使用 fallback 描述子（深度直方图），不依赖模型
+    // ═══════════════════════════════════════════════════════════════════════════
+    ALOG_INFO(MOD,
+        "[INTRA_LOOP][PREPARE] ====== START ====== submap_id=%d keyframes=%zu model_loaded=%d (using fallback descriptor)",
+        submap ? submap->id : -1,
+        submap ? submap->keyframes.size() : 0,
+        overlap_infer_.isModelLoaded());
+
+    if (!submap) {
+        ALOG_ERROR(MOD, "[INTRA_LOOP][PREPARE] ERROR: submap is null");
+        return;
+    }
+
+    if (submap->keyframes.empty()) {
+        ALOG_WARN(MOD, "[INTRA_LOOP][PREPARE] WARN: submap_id=%d has no keyframes, skip", submap->id);
+        return;
+    }
+
+    // 不再检查模型加载状态，直接使用 computeDescriptor（会自动 fallback）
+    // 如果已有数据，跳过重新计算
+    if (submap->keyframe_descriptors.size() == submap->keyframes.size()) {
+        ALOG_INFO(MOD, "[INTRA_LOOP][PREPARE] descriptors already ready, skip");
+        return;
+    }
+
+    // 清空并重新计算
+    submap->keyframe_descriptors.clear();
+    submap->keyframe_clouds_ds.clear();
+    submap->keyframe_descriptors.reserve(submap->keyframes.size());
+    submap->keyframe_clouds_ds.reserve(submap->keyframes.size());
+
+    int success_count = 0;
+    int null_kf_skipped = 0;
+    int null_cloud_skipped = 0;
+
+    for (size_t i = 0; i < submap->keyframes.size(); ++i) {
+        const auto& kf = submap->keyframes[i];
+        if (!kf) {
+            null_kf_skipped++;
+            submap->keyframe_descriptors.push_back(Eigen::VectorXf::Zero(256));
+            submap->keyframe_clouds_ds.push_back(nullptr);
+            ALOG_WARN(MOD, "[INTRA_LOOP][PREPARE] WARN: keyframe %zu is null, skipped", i);
+            continue;
+        }
+
+        if (!kf->cloud_body) {
+            null_cloud_skipped++;
+            submap->keyframe_descriptors.push_back(Eigen::VectorXf::Zero(256));
+            submap->keyframe_clouds_ds.push_back(nullptr);
+            ALOG_WARN(MOD, "[INTRA_LOOP][PREPARE] WARN: keyframe %zu (id=%lu) has no cloud_body, skipped",
+                      i, kf->id);
+            continue;
+        }
+
+        // 下采样点云
+        CloudXYZIPtr cloud_ds = std::make_shared<pcl::PointCloud<pcl::PointXYZI>>();
+        pcl::VoxelGrid<pcl::PointXYZI> voxel;
+        voxel.setLeafSize(0.5f, 0.5f, 0.5f);
+        voxel.setInputCloud(kf->cloud_body);
+        voxel.filter(*cloud_ds);
+
+        size_t pts_before = kf->cloud_body->size();
+        size_t pts_after = cloud_ds->size();
+        float downsample_ratio = pts_before > 0 ? (float)pts_after / pts_before : 0.0f;
+
+        // 计算描述子
+        auto t0 = std::chrono::steady_clock::now();
+        Eigen::VectorXf desc = overlap_infer_.computeDescriptor(cloud_ds);
+        auto t1 = std::chrono::steady_clock::now();
+        float infer_ms = std::chrono::duration<float, std::milli>(t1 - t0).count();
+
+        float desc_norm = desc.norm();
+        submap->keyframe_descriptors.push_back(desc);
+        submap->keyframe_clouds_ds.push_back(cloud_ds);
+
+        success_count++;
+        ALOG_INFO(MOD,
+            "[INTRA_LOOP][PREPARE] kf_idx=%zu kf_id=%lu pts_before=%zu pts_after=%zu "
+            "downsample_ratio=%.2f desc_norm=%.4f infer_ms=%.2f",
+            i, kf->id, pts_before, pts_after, downsample_ratio, desc_norm, infer_ms);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // [INTRA_LOOP][PREPARE] 完成统计
+    // ═══════════════════════════════════════════════════════════════════════════
+    ALOG_INFO(MOD,
+        "[INTRA_LOOP][PREPARE] ====== DONE ====== "
+        "submap_id=%d total_kf=%zu success=%d null_kf=%d null_cloud=%d "
+        "desc_db_size=%zu clouds_db_size=%zu",
+        submap->id, submap->keyframes.size(),
+        success_count, null_kf_skipped, null_cloud_skipped,
+        submap->keyframe_descriptors.size(), submap->keyframe_clouds_ds.size());
+}
+
+std::vector<LoopConstraint::Ptr> LoopDetector::detectIntraSubmapLoop(
+    const SubMap::Ptr& submap,
+    int query_keyframe_idx) {
+
+    std::vector<LoopConstraint::Ptr> results;
+
+    // 检查是否启用子图内回环检测
+    if (!intra_submap_enabled_) {
+        return results;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // [INTRA_LOOP][DEBUG] 输入参数详细记录
+    // ═══════════════════════════════════════════════════════════════════════════
+    ALOG_INFO(MOD,
+        "[INTRA_LOOP][DEBUG] ====== detectIntraSubmapLoop START ====== "
+        "submap_id=%d query_idx=%d kf_count=%zu "
+        "min_temporal_gap=%.1fs min_keyframe_gap=%d overlap_thresh=%.3f "
+        "min_inlier_ratio=%.3f max_rmse=%.3f",
+        submap ? submap->id : -1, query_keyframe_idx,
+        submap ? submap->keyframes.size() : 0,
+        intra_submap_min_temporal_gap_, intra_submap_min_keyframe_gap_,
+        intra_submap_overlap_threshold_,
+        min_inlier_ratio_, max_rmse_);
+
+    if (!submap || query_keyframe_idx < 0 ||
+        static_cast<size_t>(query_keyframe_idx) >= submap->keyframes.size()) {
+        ALOG_ERROR(MOD,
+            "[INTRA_LOOP][ERROR] INVALID_INPUT: submap_id=%d query_idx=%d kf_size=%zu "
+            "(reason: %s)",
+            submap ? submap->id : -1, query_keyframe_idx,
+            submap ? submap->keyframes.size() : 0,
+            !submap ? "submap_null" :
+            query_keyframe_idx < 0 ? "negative_index" :
+            "index_out_of_range");
+        return results;
+    }
+
+    const auto& query_kf = submap->keyframes[query_keyframe_idx];
+    if (!query_kf) {
+        ALOG_ERROR(MOD, "[INTRA_LOOP][ERROR] query keyframe is null at idx=%d", query_keyframe_idx);
+        return results;
+    }
+
+    if (!query_kf->cloud_body) {
+        ALOG_ERROR(MOD, "[INTRA_LOOP][ERROR] query keyframe has no cloud: kf_id=%lu idx=%d pts=0",
+                   query_kf->id, query_keyframe_idx);
+        return results;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // [INTRA_LOOP][DEBUG] 描述子数据库状态检查
+    // ═══════════════════════════════════════════════════════════════════════════
+    ALOG_INFO(MOD,
+        "[INTRA_LOOP][DEBUG] descriptor_db_status: stored_size=%zu expected_size=%zu match=%d",
+        submap->keyframe_descriptors.size(), submap->keyframes.size(),
+        submap->keyframe_descriptors.size() == submap->keyframes.size());
+
+    // 确保描述子已准备好（调用 prepare 使用 fallback 计算）
+    if (submap->keyframe_descriptors.size() != submap->keyframes.size()) {
+        ALOG_WARN(MOD,
+            "[INTRA_LOOP][WARN] descriptor_size_mismatch: stored=%zu expected=%zu, preparing now...",
+            submap->keyframe_descriptors.size(), submap->keyframes.size());
+        prepareIntraSubmapDescriptors(submap);
+    }
+
+    // prepare 后再次检查（理论上 fallback 都能成功计算）
+    if (submap->keyframe_descriptors.empty() ||
+        submap->keyframe_descriptors.size() != submap->keyframes.size()) {
+        ALOG_WARN(MOD,
+            "[INTRA_LOOP][WARN] skip intra-loop: descriptors not ready (size=%zu, expected=%zu)",
+            submap->keyframe_descriptors.size(), submap->keyframes.size());
+        return results;
+    }
+
+    const auto& query_desc = submap->keyframe_descriptors[query_keyframe_idx];
+    float query_desc_norm = query_desc.norm();
+    ALOG_INFO(MOD,
+        "[INTRA_LOOP][DEBUG] query_descriptor: kf_idx=%d kf_id=%lu norm=%.6f is_zero=%d pts=%zu",
+        query_keyframe_idx, query_kf->id, query_desc_norm,
+        query_desc_norm < 1e-6f,
+        query_kf->cloud_body->size());
+
+    if (query_desc_norm < 1e-6f) {
+        ALOG_ERROR(MOD,
+            "[INTRA_LOOP][ERROR] query descriptor is zero: kf_idx=%d norm=%.6f (skip)",
+            query_keyframe_idx, query_desc_norm);
+        return results;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // [INTRA_LOOP][INFO] 开始检索历史关键帧
+    // ═══════════════════════════════════════════════════════════════════════════
+    ALOG_INFO(MOD,
+        "[INTRA_LOOP][INFO] START_SEARCH: submap_id=%d query_kf_idx=%d query_ts=%.6f "
+        "query_pos=[%.2f,%.2f,%.2f] history_kf_count=%zu",
+        submap->id, query_keyframe_idx, query_kf->timestamp,
+        query_kf->T_w_b.translation().x(),
+        query_kf->T_w_b.translation().y(),
+        query_kf->T_w_b.translation().z(),
+        submap->keyframes.size());
+
+    // 检索历史关键帧（同一子图内）
+    int candidates_found = 0;
+    int temporal_filtered = 0;
+    int index_filtered = 0;
+    int desc_filtered = 0;
+    int null_cand_skipped = 0;
+    int empty_cloud_skipped = 0;
+    int teaser_failed = 0;
+    int teaser_rejected_inlier = 0;
+    int teaser_rejected_rmse = 0;
+
+    for (int i = 0; i < query_keyframe_idx; ++i) {
+        const auto& cand_kf = submap->keyframes[i];
+        if (!cand_kf) {
+            null_cand_skipped++;
+            continue;
+        }
+
+        // 时间间隔过滤
+        double temporal_gap = query_kf->timestamp - cand_kf->timestamp;
+        if (temporal_gap < intra_submap_min_temporal_gap_) {
+            temporal_filtered++;
+            ALOG_DEBUG(MOD,
+                "[INTRA_LOOP][FILTER] TEMPORAL_GAP: query_idx=%d cand_idx=%d cand_ts=%.6f gap=%.2fs < %.1fs (SKIP)",
+                query_keyframe_idx, i, cand_kf->timestamp, temporal_gap, intra_submap_min_temporal_gap_);
+            continue;
+        }
+
+        // 索引间隔过滤（避免相邻帧）
+        int index_gap = query_keyframe_idx - i;
+        if (index_gap < intra_submap_min_keyframe_gap_) {
+            index_filtered++;
+            ALOG_DEBUG(MOD,
+                "[INTRA_LOOP][FILTER] INDEX_GAP: query_idx=%d cand_idx=%d gap=%d < %d (SKIP)",
+                query_keyframe_idx, i, index_gap, intra_submap_min_keyframe_gap_);
+            continue;
+        }
+
+        // 描述子相似度过滤
+        const auto& cand_desc = submap->keyframe_descriptors[i];
+        float cand_desc_norm = cand_desc.norm();
+        if (cand_desc_norm < 1e-6f) {
+            ALOG_DEBUG(MOD, "[INTRA_LOOP][FILTER] CAND_DESC_ZERO: cand_idx=%d norm=%.6f (SKIP)",
+                       i, cand_desc_norm);
+            continue;
+        }
+
+        float similarity = query_desc.dot(cand_desc) / (query_desc_norm * cand_desc_norm);
+        if (similarity < intra_submap_overlap_threshold_) {
+            desc_filtered++;
+            ALOG_DEBUG(MOD,
+                "[INTRA_LOOP][FILTER] SIMILARITY: query_idx=%d cand_idx=%d sim=%.4f < %.3f (SKIP)",
+                query_keyframe_idx, i, similarity, intra_submap_overlap_threshold_);
+            continue;
+        }
+
+        candidates_found++;
+        ALOG_INFO(MOD,
+            "[INTRA_LOOP][CANDIDATE] FOUND: submap_id=%d query_idx=%d cand_idx=%d "
+            "sim=%.4f gap_idx=%d gap_time=%.2fs cand_kf_id=%lu cand_pos=[%.2f,%.2f,%.2f]",
+            submap->id, query_keyframe_idx, i, similarity, index_gap, temporal_gap, cand_kf->id,
+            cand_kf->T_w_b.translation().x(),
+            cand_kf->T_w_b.translation().y(),
+            cand_kf->T_w_b.translation().z());
+
+        // ═══════════════════════════════════════════════════════════════════════
+        // [INTRA_LOOP][DEBUG] 几何验证（TEASER++）开始
+        // ═══════════════════════════════════════════════════════════════════════
+        const auto& query_cloud = submap->keyframe_clouds_ds[query_keyframe_idx];
+        const auto& cand_cloud = submap->keyframe_clouds_ds[i];
+
+        if (!query_cloud || !cand_cloud || query_cloud->empty() || cand_cloud->empty()) {
+            empty_cloud_skipped++;
+            ALOG_ERROR(MOD,
+                "[INTRA_LOOP][ERROR] EMPTY_CLOUD: query_idx=%d cand_idx=%d "
+                "query_valid=%s cand_valid=%s (SKIP)",
+                query_keyframe_idx, i,
+                query_cloud ? "valid" : "null",
+                cand_cloud ? "valid" : "null");
+            continue;
+        }
+
+        ALOG_INFO(MOD,
+            "[INTRA_LOOP][TEASER_START] query_idx=%d cand_idx=%d "
+            "query_pts=%zu cand_pts=%zu",
+            query_keyframe_idx, i, query_cloud->size(), cand_cloud->size());
+
+        // TEASER++ 配准
+        TeaserMatcher::Result teaser_res;
+        bool teaser_success = false;
+        try {
+            teaser_res = teaser_matcher_.match(query_cloud, cand_cloud);
+            teaser_success = teaser_res.success;
+        } catch (const std::exception& e) {
+            ALOG_ERROR(MOD,
+                "[INTRA_LOOP][EXCEPTION] TEASER_EXCEPTION: query_idx=%d cand_idx=%d exception='%s'",
+                query_keyframe_idx, i, e.what());
+            teaser_failed++;
+            continue;
+        } catch (...) {
+            ALOG_ERROR(MOD,
+                "[INTRA_LOOP][EXCEPTION] TEASER_UNKNOWN_EXCEPTION: query_idx=%d cand_idx=%d",
+                query_keyframe_idx, i);
+            teaser_failed++;
+            continue;
+        }
+
+        if (!teaser_success) {
+            teaser_failed++;
+            ALOG_WARN(MOD,
+                "[INTRA_LOOP][TEASER] FAILED_RETURN: query_idx=%d cand_idx=%d success=false (SKIP)",
+                query_keyframe_idx, i);
+            continue;
+        }
+
+        if (!teaser_res.success) {
+            teaser_failed++;
+            ALOG_WARN(MOD,
+                "[INTRA_LOOP][TEASER] INVALID_RESULT: query_idx=%d cand_idx=%d is_valid=false (SKIP)",
+                query_keyframe_idx, i);
+            continue;
+        }
+
+        // 检查 inlier ratio
+        if (teaser_res.inlier_ratio < min_inlier_ratio_) {
+            teaser_rejected_inlier++;
+            ALOG_DEBUG(MOD,
+                "[INTRA_LOOP][TEASER] REJECT_INLIER: query_idx=%d cand_idx=%d "
+                "inlier_ratio=%.4f < %.3f (SKIP)",
+                query_keyframe_idx, i, teaser_res.inlier_ratio, min_inlier_ratio_);
+            continue;
+        }
+
+        // 检查 RMSE
+        if (teaser_res.rmse > max_rmse_) {
+            teaser_rejected_rmse++;
+            ALOG_DEBUG(MOD,
+                "[INTRA_LOOP][TEASER] REJECT_RMSE: query_idx=%d cand_idx=%d "
+                "rmse=%.4f > %.3f (SKIP)",
+                query_keyframe_idx, i, teaser_res.rmse, max_rmse_);
+            continue;
+        }
+
+        // ═══════════════════════════════════════════════════════════════════════
+        // [INTRA_LOOP][INFO] 检测到回环！
+        // ═══════════════════════════════════════════════════════════════════════
+        const Eigen::Vector3d& t = teaser_res.T_tgt_src.translation();
+        const Eigen::Matrix3d rot = teaser_res.T_tgt_src.rotation();
+        const Eigen::Vector3d rpy = Eigen::Matrix3d(rot).eulerAngles(2, 1, 0).reverse();
+        // 根据 inlier ratio 构造信息矩阵（TeaserMatcher::Result 没有 information 字段）
+        double info_scale = teaser_res.inlier_ratio * 100.0;
+        Mat66d information = Mat66d::Identity() * info_scale;
+
+        ALOG_INFO(MOD,
+            "[INTRA_LOOP][DETECTED] ★★★ INTRA_SUBMAP_LOOP ★★★ "
+            "submap_id=%d kf_i=%d kf_j=%d "
+            "overlap=%.4f inlier=%.4f rmse=%.4f "
+            "delta_t=[%.3f,%.3f,%.3f] delta_rpy=[%.2f,%.2f,%.2f] "
+            "info_norm=%.2e",
+            submap->id, i, query_keyframe_idx,
+            similarity, teaser_res.inlier_ratio, teaser_res.rmse,
+            t.x(), t.y(), t.z(),
+            rpy.x() * 180.0 / M_PI, rpy.y() * 180.0 / M_PI, rpy.z() * 180.0 / M_PI,
+            information.norm());
+
+        // 创建回环约束
+        auto lc = std::make_shared<LoopConstraint>();
+        lc->submap_i = submap->id;
+        lc->submap_j = submap->id;
+        lc->session_i = submap->session_id;
+        lc->session_j = submap->session_id;
+        lc->keyframe_i = i;
+        lc->keyframe_j = query_keyframe_idx;
+        lc->overlap_score = similarity;
+        lc->inlier_ratio = teaser_res.inlier_ratio;
+        lc->rmse = teaser_res.rmse;
+        lc->delta_T = teaser_res.T_tgt_src;
+        lc->information = information;
+
+        results.push_back(lc);
+
+        // 发布回环约束
+        publishLoopConstraint(lc);
+
+        // 触发回调
+        for (auto& cb : loop_cbs_) {
+            try {
+                cb(lc);
+            } catch (const std::exception& e) {
+                ALOG_ERROR(MOD, "[INTRA_LOOP][CALLBACK] exception: %s", e.what());
+            }
+        }
+
+        loop_detected_count_++;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // [INTRA_LOOP][SUMMARY] 统计信息
+    // ═══════════════════════════════════════════════════════════════════════════
+    ALOG_INFO(MOD,
+        "[INTRA_LOOP][SUMMARY] ====== detectIntraSubmapLoop END ====== "
+        "submap_id=%d query_kf_idx=%d "
+        "total_history_kf=%zu "
+        "candidates_found=%d "
+        "filtered: null_cand=%d temporal=%d index=%d desc=%d "
+        "teaser: failed=%d reject_inlier=%d reject_rmse=%d empty_cloud=%d "
+        "FINAL_detected=%zu",
+        submap->id, query_keyframe_idx,
+        submap->keyframes.size(),
+        candidates_found,
+        null_cand_skipped, temporal_filtered, index_filtered, desc_filtered,
+        teaser_failed, teaser_rejected_inlier, teaser_rejected_rmse, empty_cloud_skipped,
+        results.size());
+
+    return results;
 }
 
 } // namespace automap_pro

@@ -68,6 +68,20 @@ public:
     /** 序列化描述子数据库（供 SessionManager 持久化） */
     std::vector<std::pair<int, Eigen::VectorXf>> exportDescriptorDB() const;
 
+    // ── 子图内回环检测 ───────────────────────────────────────────────────────
+    /**
+     * @brief 子图内回环检测（复用 LoopDetector 的描述子匹配和几何验证）
+     * @param submap 子图（需已填充 keyframe_clouds_ds）
+     * @param query_keyframe_idx 当前关键帧索引
+     * @return 检测到的回环约束（可能有多个），空表示无回环
+     */
+    std::vector<LoopConstraint::Ptr> detectIntraSubmapLoop(
+        const SubMap::Ptr& submap,
+        int query_keyframe_idx);
+
+    /** 为子图内回环检测准备描述子数据库（首次调用时计算所有关键帧描述子） */
+    void prepareIntraSubmapDescriptors(const SubMap::Ptr& submap);
+
     // ── 状态查询 ──────────────────────────────────────────────────────────
     size_t dbSize()    const;
     size_t queueSize() const;
@@ -142,6 +156,16 @@ private:
     int    worker_thread_num_  = 2;
 
     std::vector<LoopConstraintCallback> loop_cbs_;
+
+    // ── 子图内回环检测参数 ──────────────────────────────────────────────────
+    /** 子图内回环检测：是否启用 */
+    bool intra_submap_enabled_ = false;
+    /** 子图内回环检测：关键帧之间最小时间间隔（秒） */
+    double intra_submap_min_temporal_gap_ = 5.0;
+    /** 子图内回环检测：关键帧之间最小索引间隔（避免相邻帧假回环） */
+    int intra_submap_min_keyframe_gap_ = 10;
+    /** 子图内回环检测：描述子相似度阈值 */
+    double intra_submap_overlap_threshold_ = 0.3;
 
     // ── 私有方法 ──────────────────────────────────────────────────────────
     void descWorkerLoop();

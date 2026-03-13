@@ -22,7 +22,7 @@ system:
   name: "AutoMap-Pro"
   output_dir: "/data/automap_output"
   num_threads: 8
-  log_level: "INFO"          # DEBUG | INFO | WARN | ERROR
+  log_level: "DEBUG"          # DEBUG | INFO | WARN | ERROR
   # 传感器空闲结束建图与缓冲（计算跟不上时可增大 frame_queue_max_size 与 sensor_idle_timeout_sec）
   sensor_idle_timeout_sec: 100.0
   auto_finish_on_sensor_idle: true
@@ -50,8 +50,8 @@ mode:
 performance:
   async_global_map_build: true
   async_isam2_update: false
-  parallel_voxel_downsample: true
-  parallel_teaser_match: true
+  parallel_voxel_downsample: false  # 🔧 DEBUG: 禁用并行下采样
+  parallel_teaser_match: false     # 🔧 DEBUG: 禁用并行 TEASER 匹配
   max_optimization_queue_size: 64
 
 # ┌─────────────────────────────────────────────────────────────────────────────
@@ -89,7 +89,8 @@ frontend:
 
 # ── 2.3 关键帧选取 ───────────────────────────────────────────────────────────
 keyframe:
-  min_translation:    1.0    # 米，最小平移触发
+  # 关键帧选择：与上一关键帧 位置变化≥min_translation 或 角度变化≥min_rotation_deg 即添加
+  min_translation:    0.5    # 米，最小平移触发（满足其一即可）
   min_rotation_deg:  10.0    # 度，最小旋转触发
   max_interval:       2.0    # 秒，最长间隔强制插入
   max_esikf_cov_norm: 1000.0 # ESIKF 协方差范数阈值
@@ -207,9 +208,9 @@ fast_livo:
     interval:         -1     # -1 表示仅在结束时保存一次；>0 表示每 N 帧额外保存一次
 
   debug_log:
-    mat_pre_en: false
-    mat_out_en: false
-    imu_log_en: false
+    mat_pre_en: true   # 🔧 DEBUG: 输出优化前矩阵，便于定位输入异常
+    mat_out_en: true   # 🔧 DEBUG: 输出优化后矩阵，便于定位输出异常
+    imu_log_en: true   # 🔧 DEBUG: 输出 IMU 详细日志
 
   debug:
     plot_time: -10.0
@@ -236,8 +237,8 @@ gps:
   # 典型用法：室外固定测试场地/生产地图，保持统一原点，便于多次回放与多车复用。
   # enu_origin: [31.026058, 121.436795, 26.8]   # 示例：lat, lon, alt（WGS84）
   align_min_points:       10      # 计划优化：50→10，弱GPS场景高质量点少，便于尽早触发对齐
-  align_min_distance_m:   20.0    # 计划优化：30→20，降低累积里程要求
-  keyframe_match_window_s: 1.5   # 关键帧匹配 GPS 的最大时间差(s)；1Hz GPS 时 0.5 易导致 queryByTimestamp not_found，建议 1.5~2.0
+  align_min_distance_m:   10.0    # 计划优化：30→20，降低累积里程要求
+  keyframe_match_window_s: 2.5   # 关键帧匹配 GPS 的最大时间差(s)；1Hz GPS 时 0.5 易导致 queryByTimestamp not_found，建议 2.0~3.0
   max_interp_gap_s:        3.0   # 双样本线性插值最大间隔(s)，超过则退化为最近邻；位置线性插值，姿态由里程计提供
   # 【增强】外推配置：当关键帧时间戳在GPS窗口边缘时，使用速度模型外推
   extrapolation_margin_s: 0.5          # 外推边界(margin)，ts在窗口边缘±margin内时启用外推
@@ -289,7 +290,16 @@ loop_closure:
   overlap_threshold:   0.25      # ⬇️ 降低阈值（从0.30→0.25），在保持准确的前提下检测更多回环
   top_k:               8         # ⬆️ 增加候选数（从5→8），给几何验证更多机会
   min_temporal_gap_s:  30.0
-  min_submap_gap:      2      # 2=短轨迹(如 6 子图)时也能产生回环候选；3=更保守、需更多子图
+  min_submap_gap:      1      # 1=允许相邻子图之间产生回环候选；2=更保守、需间隔子图；短轨迹建议设为 1
+
+  # ── 子图内回环检测参数（新增）──────────────────────────────────────────────
+  # 在同一个子图内部的关键帧之间检测回环，用于纠正子图内部里程计漂移
+  intra_submap_enabled: true
+  intra_submap_min_temporal_gap_s: 5.0    # 关键帧之间最小时间间隔（秒）
+  intra_submap_min_keyframe_gap: 10        # 关键帧之间最小索引间隔（避免相邻帧假回环）
+  intra_submap_overlap_threshold: 0.25     # 描述子相似度阈值
+  intra_submap_max_teaser_candidates: 5    # 每帧最多对多少候选做 TEASER 配准，避免单帧 10s+；≤0 不限制
+
   gps_search_radius_m: 200.0
   # 几何距离预筛：两子图锚定位姿距离超过此值(米)的候选将被过滤，抑制重复结构误检。0=关闭
   geo_prefilter_max_distance_m: 0.0   # 0=关闭；可设为 150~200 抑制远距离相似场景误检
@@ -298,8 +308,8 @@ loop_closure:
   max_desc_queue_size:  128
   max_match_queue_size: 128
   overlap_transformer:
-    # 空则 launch 自动解析为仓库内 src/modular/OverlapTransformer-master/model/pretrained_overlap_transformer.pth.tar（回环粗匹配必须使用该模型）
-    model_path:     ""
+    # 模型路径：优先使用仓库内捆绑模型
+    model_path:     "${CMAKE_CURRENT_SOURCE_DIR}/models/pretrained_overlap_transformer.pth.tar"
     proj_H:         64
     proj_W:         900
     fov_up:         3.0        # KITTI 标准参数，与模型训练一致
@@ -312,34 +322,39 @@ loop_closure:
     voxel_size:       0.4
     max_points:       8000   # 回环匹配前单侧点云最大点数（voxel 后 cap），增大可提高几何约束强度
     min_inlier_ratio: 0.20   # 放宽以增加回环接受率（原 0.30）；若误匹配增多可改回 0.25/0.30，grep LOOP_ACCEPTED 验证
+    min_safe_inliers: 10     # TEASER 内点数低于此拒绝；弱重叠可放宽至 6，需关注误匹配（grep teaser_extremely_few_inliers）
     max_rmse_m:       0.3
+    min_relative_translation_m: 0.05  # 回环最小相对平移(米)，低于此值视为 trivial 不加入图，提高回环质量
     icp_refine:       true
 
 # ── 3.4 后端优化（ISAM2、HBA）────────────────────────────────────────────────
 # HBA 键与 params_from_system_config.get_hba_params / get_hba_cal_mme_params / get_hba_visualize_params 一致
 backend:
-  # 每隔多少帧处理一帧（1=每帧都处理；5=默认跳过4帧处理1帧）
-  process_every_n_frames: 5
+  # 每隔多少帧处理一帧（1=每帧都处理；5=默认跳过4帧处理1帧；10=减少处理频率减轻后端压力）
+  process_every_n_frames: 10
   # 每处理多少帧发布一次全局图（300 降低 buildGlobalMap 调用频率，提升计算效率，见 docs/FULL_LOG_MAPPING_END_AND_FRAME_ANALYSIS.md）
   publish_global_map_every_n_processed: 300
   isam2:
-    relinearize_threshold: 0.01
-    relinearize_skip:       1
+    relinearize_threshold: 0.1    # 从 0.01 增加到 0.1，减少重线性化频率
+    relinearize_skip:       20    # 从 1 增加到 20，大幅减少计算量（每 20 次 update 才检查重线性化）
     enable_relinearization: true
     # 先验方差：仅作用于第一个子图节点。1e-8=平衡清晰度与固定原点；过小(如1e-12)易过约束加重刚度；可试 1e-6 若追求更柔和
     prior_variance:         1e-8
   hba:
-    enabled:                 true   # false=仅跑 ISAM2+GPS，用于隔离双路 GTSAM 崩溃
+    enabled:                 true  # 🔧 DEBUG: 禁用 HBA，完全避免 GTSAM，用于隔离问题
     total_layer_num:         3
     thread_num:              8
     trigger_every_n_submaps: 10
     trigger_on_loop:         false
     trigger_on_finish:       true
+    # 前端数据超过此秒数未到达且后端队列已空时触发一次 HBA；≤0 禁用。用于离线/播完暂停场景下提前做一次优化
+    frontend_idle_trigger_sec: 10.0
     data_path:               "/tmp/hba_data"
     pcd_name_fill_num:       0      # get_hba_params 读取，缺省 0
     enable_gps_factor:       true   # get_hba_params 读取，GPS 约束是否加入 HBA
     # 无 hba_api 时是否用 GTSAM fallback。true=建图结束/周期时执行 HBA 全局优化；false=跳过 HBA（仅 iSAM2）。生产建议 false 避免 double free；见 docs/HBA_GTSAM_FALLBACK_DOUBLE_FREE_FIX.md
-    enable_gtsam_fallback:   true   # 必须 true 时 HBA 才会运行（无 hba_api 时）；启动后 grep "HBA CONFIG" 或 "enable_gtsam_fallback" 验证
+    # 离线 + 无 HBA API 且 enable_gtsam_fallback=false 时，HBA 永不执行，仅依赖 ISAM2 增量优化；若需本 run 做 HBA 可设为 true 并验证无双 GTSAM 并发
+    enable_gtsam_fallback:   true
   hba_cal_mme:                      # get_hba_cal_mme_params 读取（launch 启用 cal_MME 时）
     file_path:               "/tmp/hba_data"
     thr_num:                 16

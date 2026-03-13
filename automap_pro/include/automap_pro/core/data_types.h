@@ -206,6 +206,12 @@ struct SubMap {
 
     std::vector<KeyFrame::Ptr> keyframes;
 
+    // ========== 子图内回环检测：关键帧描述子数据库 ==========
+    // 每个关键帧的 256 维 OverlapTransformer 描述子，用于子图内回环检测
+    std::vector<Eigen::VectorXf> keyframe_descriptors;
+    // 关键帧下采样点云（用于子图内配准）
+    std::vector<CloudXYZIPtr> keyframe_clouds_ds;
+
     // 锚定位姿（第一帧的世界系位姿）
     Pose3d pose_w_anchor           = Pose3d::Identity();
     Pose3d pose_w_anchor_optimized = Pose3d::Identity();

@@ -6,7 +6,7 @@
 set -e
 
 # ── 路径配置 ─────────────────────────────────────────────────────────────────
-OT_DIR="/home/wqs/Documents/github/mapping/OverlapTransformer-master"
+OT_DIR="/home/wqs/Documents/github/automap_pro/automap_pro/src/modular/OverlapTransformer-master"
 MODEL_DIR="/data/models"
 MODEL_NAME="overlapTransformer.pt"
 

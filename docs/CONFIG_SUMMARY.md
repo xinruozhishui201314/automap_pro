@@ -17,6 +17,17 @@
 - **收益**: 通过汇总配置，便于快速理解系统架构、参数调优、故障排查和新手快速上手
 - **风险**: 部分配置存在硬编码路径（如 `/home/jhua`），部署时需注意替换
 
+### 0.1 全工程只读一次配置、同一源
+
+- **约定**: 全工程唯一配置文件（如 `system_config_M2DGR.yaml`）由 launch 指定；**前端 fast-livo 与后端 automap_system 均从该同一源获取参数**，无第二份配置来源。
+- **前端 fast-livo**: Launch 在启动时读一次 `config` 指向的 YAML，用 `params_from_system_config.load_system_config(config_path)` 与 `get_fast_livo2_params(system_config)` 生成 fast_livo 节点所需参数字典，并写入临时 YAML 供 `fastlivo_mapping` 加载。lid_topic / imu_topic 等来自 `sensor.*`，其余来自 `frontend.fast_livo2` 或顶层 `fast_livo`。**不单独维护 fast_livo 配置文件**，与后端同源。
+- **C++ 进程内（后端/回环等）**: 每个进程内配置**只加载一次**，由入口调用 `ConfigManager::instance().load(config_file)`；前端适配（LivoBridge）、后端、回环等**不再单独读 YAML**，统一通过 `ConfigManager::instance()` 取参。
+- **单源守卫**: `ConfigManager` 在首次成功 `load()` 后记录路径；若再次 `load(另一路径)` 会抛异常。同路径重复调用视为幂等。
+- **入口**:
+  - **单体节点（automap_system）**: `AutoMapSystem::loadConfigAndInit()` 从 ROS 参数 `config_file` 取路径并调用 `ConfigManager::instance().load(config_path)`，仅此一处加载；launch 传入的 `config_file` 与 `config` 为同一路径。
+  - **独立节点（map_builder_node / optimizer_node 等）**: 各节点在 `main()` 中根据参数 `config` 调用 `ConfigManager::instance().loadFromFile(config_path)`，同一配置文件路径由 launch 统一传入。
+- **查询**: `ConfigManager::isLoaded()`、`ConfigManager::configFilePath()` 可判断/获取当前唯一配置源。
+
 ---
 
 ## 1. 配置文件分类清单
@@ -338,6 +349,7 @@ loop_closure:
 **参数说明**:
 - `noise_bound=0.1`: 用于TEASER鲁棒估计的噪声假设（米）
 - `min_inlier_ratio=0.30`: 内点率<30%时拒绝配准结果
+- `min_safe_inliers=10`: TEASER 内点个数低于此值拒绝（防崩溃/误匹配）；弱重叠场景可放宽至 6，需关注误匹配（日志 `teaser_extremely_few_inliers`）
 
 ---
 
@@ -375,6 +387,14 @@ gps_weights:
 - **Level 2**: 子图位姿图优化（快速，在线运行）
 - **Level 1**: 关键帧位姿优化（中等速度，定期运行）
 - **Level 0**: 点云BA（慢，离线优化）
+
+#### 2.5.2 后端与回环行为说明（GPS / HBA fallback / iSAM2 / 最后一子图）
+
+- **GPS 依赖**：要使轨迹带 GPS 约束与对齐，需在 `system_config*.yaml` 中设 `sensor.gps.enabled: true`，且 bag 能发布 GPS 话题（如 `/ublox/fix`）。若使用 ublox，需安装 `ublox_msgs`，否则 rosbag2 会忽略该话题，GPS 窗口始终为空、不会触发对齐与约束。轨迹 CSV 的 GPS 列仅在 `sensor.gps.enabled=true` 且有数据时填充。
+- **HBA GTSAM fallback**：`backend.hba.enable_gtsam_fallback` 控制“无 HBA 外接服务时是否用 GTSAM 做建图结束时的全局优化”。设为 `true` 时，finish_mapping 会执行 GTSAM 优化；设为 `false` 时日志会出现 `HBA: GTSAM fallback disabled by config, skip`，属配置预期。
+- **iSAM2 首次 update 时机**：若无回环因子、无 GPS 因子入队，后端仅在 **finish_mapping** 的 `ensureBackendCompletedAndFlushBeforeHBA()` 中调用 `forceUpdate()`，即 iSAM2 的首次 update 发生在建图结束时。有 LOOP/GPS 任务时，optLoop 会在运行中多次 `commitAndUpdate()`。
+- **最后一子图入图**：finish_mapping 会先调用 **强制冻结当前活跃子图**（`forceFreezeActiveSubmapForFinish()`），再执行 ensureBackend 与 forceUpdate，保证“子图数量与因子图节点数一致”，最后一子图位姿参与优化并被写入保存结果。
+- **回环阈值**：子图内/间回环依赖 TEASER 几何验证；若日志中始终无 `[INTRA_LOOP][ADD_FACTOR]` 或 inter 的 addLoopFactor，可查 `LOOP_COMPUTE`/`TEASER` 日志（如 `teaser_fail reason=teaser_extremely_few_inliers`）。可适当放宽 `loop_closure.teaser.validation.min_inlier_ratio` 或代码中的 `safe_min`（弱重叠场景），并关注误匹配。
 
 ---
 
@@ -599,6 +619,12 @@ ros2 topic echo /aft_mapped_to_init | head -n 50
 # 检查优化图
 ros2 topic echo /automap/pose_graph
 ```
+
+### 6.4 问题：GPS 无数据 / HBA 被跳过 / 回环无 ADD_FACTOR
+
+- **GPS 无对齐、轨迹无 GPS 列**：确认 `sensor.gps.enabled: true`；若 bag 含 `/ublox/fix`，需安装 `ublox_msgs` 否则 rosbag2 会忽略该话题。日志中 `[LivoBridge][GPS] GPS disabled` 或 `window_size=0` 表示无 GPS 数据。
+- **HBA 被跳过**：日志出现 `HBA: GTSAM fallback disabled by config, skip` 时，在配置中设 `backend.hba.enable_gtsam_fallback: true` 即可在无 HBA 外接服务时仍做建图结束 GTSAM 优化。
+- **回环始终无 ADD_FACTOR**：查日志 `LOOP_COMPUTE`/`TEASER`（如 `teaser_fail reason=teaser_extremely_few_inliers`）。可适当放宽 `loop_closure.teaser.validation.min_inlier_ratio` 或代码中 TEASER 的 `safe_min`（弱重叠场景），并注意误匹配。
 
 ---
 

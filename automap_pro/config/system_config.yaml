@@ -250,7 +250,7 @@ gps:
   align_min_distance_m:   30.0
   keyframe_match_window_s: 0.5   # 关键帧匹配 GPS 的最大时间差(s)；1Hz GPS 时 0.1 易导致 has_gps=0，建议 0.5~1.0
   max_interp_gap_s:        2.0   # 双样本线性插值最大间隔(s)，超过则退化为最近邻；位置线性插值，姿态由里程计提供
-  quality_threshold_hdop:  2.0
+  quality_threshold_hdop:  12.0
   align_rmse_threshold_m:  1.5
   good_samples_needed:    30
   add_constraints_on_align: true
@@ -295,6 +295,7 @@ loop_closure:
     voxel_size:       0.4
     max_points:       8000   # 回环匹配前单侧点云最大点数（voxel 后 cap）
     min_inlier_ratio: 0.30
+    min_safe_inliers: 10     # TEASER 内点数低于此拒绝；弱重叠场景可放宽至 6，需关注误匹配
     max_rmse_m:       0.3
     icp_refine:       true
 

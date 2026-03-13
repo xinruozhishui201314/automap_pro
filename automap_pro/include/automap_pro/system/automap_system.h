@@ -215,6 +215,8 @@ private:
     // 传感器空闲结束建图：上次收到点云的墙钟时间；超时后触发最终处理并退出
     std::chrono::steady_clock::time_point last_sensor_data_wall_time_{std::chrono::steady_clock::now()};
     std::atomic<bool> sensor_idle_finish_triggered_{false};
+    /** 是否已因「10s 无前端数据且后端处理完」触发过 HBA（仅触发一次，避免重复） */
+    std::atomic<bool> hba_triggered_by_frontend_idle_{false};
     // 后端已从队列弹出的点云帧计数（用于 DATA_FLOW 与帧率控制）
     std::atomic<int> backend_cloud_frames_processed_{0};
     // 后端实际参与 tryCreateKeyFrame 的帧计数（process_every_n_frames 跳帧时与上面不同，用于发布周期）

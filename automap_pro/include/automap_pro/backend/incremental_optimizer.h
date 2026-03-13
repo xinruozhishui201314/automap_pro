@@ -210,6 +210,11 @@ private:
     gtsam::noiseModel::Diagonal::shared_ptr infoToNoiseDiagonal(const Mat66d& info) const;
     OptimizationResult commitAndUpdate();
     void notifyPoseUpdate(const std::unordered_map<int, Pose3d>& poses);
+
+    /** 首节点 defer 时无法加 GPS 因子，缓存待 forceUpdate 成功后补加 */
+    std::vector<GPSFactorItem> pending_gps_factors_;
+    /** 在 current_estimate_ 已有节点后，将 pending_gps_factors_ 中可加入的因子加入图；调用时需已持 rw_mutex_；返回本次加入的因子数 */
+    int flushPendingGPSFactors();
 };
 
 } // namespace automap_pro

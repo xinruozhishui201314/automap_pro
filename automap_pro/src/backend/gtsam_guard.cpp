@@ -33,7 +33,7 @@ std::mutex& globalGtsamMutex() {
 }
 
 static void applyTbbSerialized() {
-    // ✅ P0 修复：限制所有并行库的线程数为 1
+    // P0 修复：限制所有并行库的线程数为 1
     // 这是解决 SIGSEGV 崩溃的关键！
     fprintf(stderr, "[GTSAM_Guard][LOAD_TRACE] applyTbbSerialized: setting OMP/EIGEN/MKL/TBB env and Eigen::setNbThreads(1)\n");
     fflush(stderr);
@@ -107,6 +107,7 @@ void ensureGtsamTbbSerialized() {
 }
 
 bool gtsamGlobalMutexEnabled() {
+    // 默认启用全局互斥（安全优先）
     const char* env = std::getenv("AUTOMAP_GTSAM_SERIAL");
     if (env) {
         bool enabled = (std::string(env) == "1" || std::string(env) == "true" || std::string(env) == "yes");
@@ -136,11 +137,11 @@ GtsamCallScope::GtsamCallScope(GtsamCaller caller, const char* op,
     }
     std::string tid = threadIdString();
     RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-        "[GTSAM_ENTRY] caller=%s op=%s thread_id=%s %s (若崩溃在此后、无 GTSAM_EXIT→崩溃在该次 GTSAM 调用内)",
-        gtsamCallerString(caller_), op_.c_str(), tid.c_str(),
+        "[GTSAM_ENTRY] caller=%s op=%s thread_id=%s use_mutex=%d %s (若崩溃在此后、无 GTSAM_EXIT→崩溃在该次 GTSAM 调用内)",
+        gtsamCallerString(caller_), op_.c_str(), tid.c_str(), use_mutex_ ? 1 : 0,
         params.empty() ? "" : params.c_str());
-    ALOG_DEBUG(GTSAM_GUARD_MOD, "GTSAM_ENTRY caller=%s op=%s thread_id=%s",
-               gtsamCallerString(caller_), op_.c_str(), tid.c_str());
+    ALOG_DEBUG(GTSAM_GUARD_MOD, "GTSAM_ENTRY caller=%s op=%s thread_id=%s use_mutex=%d",
+               gtsamCallerString(caller_), op_.c_str(), tid.c_str(), use_mutex_ ? 1 : 0);
 }
 
 GtsamCallScope::~GtsamCallScope() {
