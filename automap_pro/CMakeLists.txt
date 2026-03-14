@@ -321,7 +321,73 @@ add_library(automap_loop_closure SHARED
   src/loop_closure/icp_refiner.cpp
   src/loop_closure/loop_detector.cpp
 )
-target_include_directories(automap_loop_closure PUBLIC ${AUTOMAP_INCLUDE_DIRS})
+
+# ============================================================
+# ScanContext 详细调试日志
+# ============================================================
+message(STATUS "========================================")
+message(STATUS "ScanContext CMake 配置调试")
+message(STATUS "========================================")
+message(STATUS "SCANCONTEXT_ROOT = '${SCANCONTEXT_ROOT}'")
+message(STATUS "CMAKE_SOURCE_DIR = '${CMAKE_SOURCE_DIR}'")
+message(STATUS "CMAKE_BINARY_DIR = '${CMAKE_BINARY_DIR}'")
+
+# 重要修正：include 路径应该是 Scancontext 目录的父目录！
+# 因为代码中使用的是 #include "Scancontext/Scancontext.h"
+# 所以 include 路径需要包含 Scancontext 目录本身
+if(SCANCONTEXT_ROOT)
+  message(STATUS "[SC] 使用 SCANCONTEXT_ROOT 参数: ${SCANCONTEXT_ROOT}")
+  # 设置为 Scancontext 目录的父目录，这样 #include "Scancontext/Scancontext.h" 才能找到
+  set(SCANCONTEXT_INCLUDE_DIR "${SCANCONTEXT_ROOT}/cpp/module")
+else()
+  # 默认使用容器内路径
+  message(STATUS "[SC] 未设置 SCANCONTEXT_ROOT，使用默认路径")
+  set(SCANCONTEXT_INCLUDE_DIR "/root/automap_ws/src/thrid_party/scancontext_tro/cpp/module")
+endif()
+message(STATUS "SCANCONTEXT_INCLUDE_DIR = '${SCANCONTEXT_INCLUDE_DIR}'")
+
+# 检查目录是否存在
+if(EXISTS "${SCANCONTEXT_INCLUDE_DIR}/Scancontext")
+  message(STATUS "[SC] ✓ ScanContext 目录存在: ${SCANCONTEXT_INCLUDE_DIR}/Scancontext")
+  # 列出目录内容
+  file(GLOB SC_SOURCES "${SCANCONTEXT_INCLUDE_DIR}/Scancontext/*.h")
+  message(STATUS "[SC] 找到 ScanContext 头文件:")
+  foreach(src ${SC_SOURCES})
+    message(STATUS "  - ${src}")
+  endforeach()
+else()
+  message(STATUS "[SC] ✗ ScanContext 目录不存在: ${SCANCONTEXT_INCLUDE_DIR}/Scancontext!")
+  message(STATUS "[SC] 尝试搜索可能的 ScanContext 位置...")
+  
+  # 尝试搜索
+  find_file(SC_HINTS "Scancontext.h" 
+    PATHS 
+      "${CMAKE_SOURCE_DIR}/thrid_party/scancontext_tro/cpp/module/Scancontext"
+      "${CMAKE_SOURCE_DIR}/../scancontext_tro/cpp/module/Scancontext"
+      "/root/automap_ws/src/thrid_party/scancontext_tro/cpp/module/Scancontext"
+      "/root/automap_ws/automap_pro_thrid_party_scancontext/cpp/module/Scancontext"
+    NO_DEFAULT_PATH
+  )
+  if(SC_HINTS)
+    message(STATUS "[SC] 找到 Scancontext.h: ${SC_HINTS}")
+    get_filename_component(SC_DIR ${SC_HINTS} DIRECTORY)
+    message(STATUS "[SC] 建议设置: -DSCANCONTEXT_ROOT=${SC_DIR}/../..")
+  endif()
+endif()
+
+message(STATUS "ScanContext include dir: ${SCANCONTEXT_INCLUDE_DIR}")
+if(NOT EXISTS "${SCANCONTEXT_INCLUDE_DIR}/Scancontext")
+  message(FATAL_ERROR "ScanContext headers not found at: ${SCANCONTEXT_INCLUDE_DIR}/Scancontext")
+endif()
+# 需要同时添加两个目录：
+# 1. cpp/module - 用于 #include "Scancontext/Scancontext.h"
+# 2. cpp/module/Scancontext - 用于 #include <nanoflann.hpp>
+target_include_directories(automap_loop_closure PUBLIC 
+  ${AUTOMAP_INCLUDE_DIRS}
+  ${SCANCONTEXT_INCLUDE_DIR}
+  ${SCANCONTEXT_INCLUDE_DIR}/Scancontext
+)
+message(STATUS "[SC] target_include_directories 已设置（PUBLIC）: ${SCANCONTEXT_INCLUDE_DIR} 和 ${SCANCONTEXT_INCLUDE_DIR}/Scancontext")
 target_link_libraries(automap_loop_closure automap_core automap_submap ${AUTOMAP_LIBS})
 ament_target_dependencies(automap_loop_closure ${AUTOMAP_AMENT_DEPS})
 # 与 PCL 构建对齐，避免 FPFHEstimation 析构时 Eigen aligned_free 崩溃（PCL #4877）

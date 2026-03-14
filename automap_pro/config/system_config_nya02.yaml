@@ -233,6 +233,13 @@ loop_closure:
       max_iterations: 30
       max_correspondence_distance: 1.0
       convergence_threshold: 1.0e-6
+  # ── ScanContext 回环粗匹配 ───────────────────────────────────────────
+  scancontext:
+    enabled:           true    # 是否启用 ScanContext 进行回环检索（默认启用）
+    dist_threshold:    0.13    # ScanContext 距离阈值，越小越严格
+    num_candidates:   5        # 从 KD-Tree 检索的候选数量
+    exclude_recent:   50      # 排除最近 N 个关键帧
+    tree_making_period: 50     # 每隔 N 帧重建一次 KD-Tree
 
 # ── 3.3 后端优化（HBA）──────────────────────────────────────────────────────
 backend:

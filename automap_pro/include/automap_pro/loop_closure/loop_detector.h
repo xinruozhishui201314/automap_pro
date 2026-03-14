@@ -5,6 +5,9 @@
 #include "automap_pro/loop_closure/teaser_matcher.h"
 #include <automap_pro/msg/loop_constraint_msg.hpp>
 
+// ScanContext
+#include "Scancontext/Scancontext.h"
+
 #include <queue>
 #include <thread>
 #include <mutex>
@@ -125,6 +128,15 @@ private:
     OverlapTransformerInfer overlap_infer_;
     TeaserMatcher           teaser_matcher_;
 
+    // ── ScanContext 回环检索 ─────────────────────────────────────────────
+    SCManager               sc_manager_;
+    mutable std::mutex     sc_mutex_;  // 保护 SCManager 的并发访问
+    bool                    use_scancontext_ = false;
+    double                  sc_dist_threshold_ = 0.13;
+    int                     sc_num_candidates_ = 5;
+    int                     sc_exclude_recent_ = 50;
+    int                     sc_tree_making_period_ = 50;
+
     // ── ROS2 资源 ─────────────────────────────────────────────────────────
     rclcpp::Node::SharedPtr node_;
     rclcpp::Publisher<automap_pro::msg::LoopConstraintMsg>::SharedPtr constraint_pub_;
@@ -164,6 +176,8 @@ private:
     double intra_submap_min_temporal_gap_ = 5.0;
     /** 子图内回环检测：关键帧之间最小索引间隔（避免相邻帧假回环） */
     int intra_submap_min_keyframe_gap_ = 10;
+    /** 子图内回环检测：关键帧之间最小距离间隔(米)，避免过密假回环 */
+    double intra_submap_min_distance_gap_ = 3.0;
     /** 子图内回环检测：描述子相似度阈值 */
     double intra_submap_overlap_threshold_ = 0.3;
     /** 子图内回环：每帧最多对多少候选做 TEASER（≤0 不限制），避免单帧 10s+ */
@@ -176,6 +190,11 @@ private:
     void computeDescriptorAsync(const SubMap::Ptr& submap);
     void onDescriptorReady(const SubMap::Ptr& submap);
     void processMatchTask(const MatchTask& task);
+
+    // ScanContext 候选检索
+    std::vector<OverlapTransformerInfer::Candidate> retrieveUsingScanContext(
+        const SubMap::Ptr& submap,
+        const std::vector<SubMap::Ptr>& db_copy);
 
     bool computeDescExternal(const SubMap::Ptr& submap);
     void publishLoopConstraint(const LoopConstraint::Ptr& lc);

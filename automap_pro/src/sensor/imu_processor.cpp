@@ -194,7 +194,19 @@ ImuProcessor::PreintResult ImuProcessor::preintegrate(
             result.delta_p = Eigen::Vector3d::Zero();
             return result;
         }
-        
+
+        // 修复: 对旋转矩阵进行正交化，确保满足SO(3)性质
+        // 使用SVD分解进行正交化: R = U * V^T，确保行列式为正
+        Eigen::JacobiSVD<Eigen::Matrix3d> svd(R, Eigen::ComputeFullU | Eigen::ComputeFullV);
+        Eigen::Matrix3d R_orthogonalized = svd.matrixU() * svd.matrixV().transpose();
+        // 确保行列式为+1（避免反射）
+        if (R_orthogonalized.determinant() < 0) {
+            Eigen::Matrix3d V = svd.matrixV();
+            V.col(2) *= -1;
+            R_orthogonalized = svd.matrixU() * V.transpose();
+        }
+        R = R_orthogonalized;
+
         result.delta_R = R;
         result.delta_v = v;
         result.delta_p = p;

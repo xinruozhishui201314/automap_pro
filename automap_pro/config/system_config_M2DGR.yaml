@@ -297,6 +297,7 @@ loop_closure:
   intra_submap_enabled: true
   intra_submap_min_temporal_gap_s: 5.0    # 关键帧之间最小时间间隔（秒）
   intra_submap_min_keyframe_gap: 10        # 关键帧之间最小索引间隔（避免相邻帧假回环）
+  intra_submap_min_distance_gap_m: 3.0     # 关键帧之间最小距离间隔(米)，避免过密假回环
   intra_submap_overlap_threshold: 0.25     # 描述子相似度阈值
   intra_submap_max_teaser_candidates: 5    # 每帧最多对多少候选做 TEASER 配准，避免单帧 10s+；≤0 不限制
 
@@ -326,6 +327,13 @@ loop_closure:
     max_rmse_m:       0.3
     min_relative_translation_m: 0.05  # 回环最小相对平移(米)，低于此值视为 trivial 不加入图，提高回环质量
     icp_refine:       true
+  # ── ScanContext 回环粗匹配 ───────────────────────────────────────────
+  scancontext:
+    enabled:           true    # 是否启用 ScanContext 进行回环检索（默认启用）
+    dist_threshold:    0.13    # ScanContext 距离阈值，越小越严格
+    num_candidates:   5        # 从 KD-Tree 检索的候选数量
+    exclude_recent:   50      # 排除最近 N 个关键帧
+    tree_making_period: 50     # 每隔 N 帧重建一次 KD-Tree
 
 # ── 3.4 后端优化（ISAM2、HBA）────────────────────────────────────────────────
 # HBA 键与 params_from_system_config.get_hba_params / get_hba_cal_mme_params / get_hba_visualize_params 一致

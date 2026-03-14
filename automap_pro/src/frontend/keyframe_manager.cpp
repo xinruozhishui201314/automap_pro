@@ -87,7 +87,8 @@ KeyFrame::Ptr KeyFrameManager::createKeyFrame(
     uint64_t session_id)
 {
     auto kf = std::make_shared<KeyFrame>();
-    kf->id             = next_id_.fetch_add(1) + 1;
+    // 修复: fetch_add返回旧值，直接使用即可，ID从1开始
+    kf->id             = next_id_.fetch_add(1);
     kf->session_id     = session_id;
     kf->timestamp      = timestamp;
     kf->T_w_b          = T_w_b;

@@ -126,10 +126,11 @@ void SubMapManager::addKeyFrame(const KeyFrame::Ptr& kf) {
             RCLCPP_INFO(rclcpp::get_logger("automap_system"),
                 "[SubMapMgr][ADD_KF_STEP] created new submap sm_id=%d (first KF)", active_submap_->id);
             // 建图精度分析：子图锚定帧位姿协方差(1σ)
+            // 修复: 添加NaN检查，防止协方差矩阵元素为NaN时导致sqrt产生NaN
             const Mat66d& cov = kf->covariance;
-            double pos_std_x = std::sqrt(std::max(0.0, cov(3, 3)));
-            double pos_std_y = std::sqrt(std::max(0.0, cov(4, 4)));
-            double pos_std_z = std::sqrt(std::max(0.0, cov(5, 5)));
+            double pos_std_x = std::isfinite(cov(3, 3)) ? std::sqrt(std::max(0.0, cov(3, 3))) : 0.0;
+            double pos_std_y = std::isfinite(cov(4, 4)) ? std::sqrt(std::max(0.0, cov(4, 4))) : 0.0;
+            double pos_std_z = std::isfinite(cov(5, 5)) ? std::sqrt(std::max(0.0, cov(5, 5))) : 0.0;
             RCLCPP_INFO(rclcpp::get_logger("automap_system"),
                 "[PRECISION][SUBMAP] created sm_id=%d kf_id=%lu pos_std_xyz=[%.4f,%.4f,%.4f]m",
                 active_submap_->id, kf->id, pos_std_x, pos_std_y, pos_std_z);

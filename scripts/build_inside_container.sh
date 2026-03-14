@@ -20,10 +20,22 @@ if [ -d build ] && find build -name CMakeCache.txt -exec grep -l '/workspace/' {
   rm -rf build install log build_teaserpp build_sophus build_ceres
 fi
 
+# 检测 automap_pro/CMakeLists.txt 是否比 build 目录更新，如果是则清理缓存
+if [ -d build/automap_pro ]; then
+  CMAKE_CACHE_TIME=$(find build/automap_pro -name CMakeCache.txt -type f 2>/dev/null | head -1 | xargs stat -c %Y 2>/dev/null || echo 0)
+  CMAKE_FILE_TIME=$(find automap_pro/CMakeLists.txt -type f 2>/dev/null | head -1 | xargs stat -c %Y 2>/dev/null || echo 0)
+  if [ "${CMAKE_FILE_TIME}" -gt "${CMAKE_CACHE_TIME}" ]; then
+    echo '[INFO] CMakeLists.txt 已更新，清理 automap_pro 编译缓存'
+    rm -rf build/automap_pro
+  fi
+fi
+
 # 链入 overlap_transformer_msgs / overlap_transformer_ros2 / hba（若存在）
 [ -d /root/mapping/overlap_transformer_msgs ] && ln -sf /root/mapping/overlap_transformer_msgs src/ 2>/dev/null || true
 [ -d /root/mapping/overlap_transformer_ros2 ] && ln -sf /root/mapping/overlap_transformer_ros2 src/ 2>/dev/null || true
 [ -d /root/mapping/HBA-main/HBA_ROS2 ]        && ln -sf /root/mapping/HBA-main/HBA_ROS2 src/hba 2>/dev/null || true
+
+# ScanContext 在 automap_pro 编译时通过 -DSCANCONTEXT_ROOT 参数传入
 
 if [ -d src/overlap_transformer_msgs ]; then
   echo '========================================'
@@ -190,10 +202,158 @@ else
 fi
 
 # automap_pro
+
+# ============================================================
+# ScanContext 详细定位日志
+# ============================================================
+echo "========================================"
+echo "ScanContext 定位调试"
+echo "========================================"
+
+# 检查可能的源码位置
+echo "[DEBUG-1] 检查 /root/automap_ws/src/ 目录结构:"
+ls -la /root/automap_ws/src/ 2>&1 || echo "[DEBUG-1] /root/automap_ws/src/ 不存在"
+
+echo ""
+echo "[DEBUG-2] 检查 /root/mapping/ 目录结构 (如果存在):"
+ls -la /root/mapping/ 2>&1 || echo "[DEBUG-2] /root/mapping/ 不存在"
+
+echo ""
+echo "[DEBUG-3] 在 /root/mapping 下搜索 scancontext_tro:"
+find /root/mapping -maxdepth 3 -type d -name "scancontext*" 2>/dev/null || echo "[DEBUG-3] 未找到"
+
+echo ""
+echo "[DEBUG-4] 在 /root/automap_ws 下搜索 scancontext_tro:"
+find /root/automap_ws -maxdepth 4 -type d -name "scancontext*" 2>/dev/null || echo "[DEBUG-4] 未找到"
+
+echo ""
+echo "[DEBUG-5] 检查 automap_pro 源码目录:"
+if [ -d "/root/automap_ws/src/automap_pro" ]; then
+    echo "[DEBUG-5] /root/automap_ws/src/automap_pro 存在"
+    ls -la /root/automap_ws/src/automap_pro/ | head -20
+    echo ""
+    echo "[DEBUG-5b] 在 automap_pro 下搜索 scancontext:"
+    find /root/automap_ws/src/automap_pro -maxdepth 5 -type d -name "scancontext*" 2>/dev/null || echo "未找到"
+else
+    echo "[DEBUG-5] /root/automap_ws/src/automap_pro 不存在"
+fi
+
+# 修复 ScanContext 头文件路径：在可写目录创建符号链接
+# 因为容器内 automap_pro 是只读挂载，需要在 /root/automap_ws 下创建链接
+SC_SOURCE=""
+SC_TARGET="/root/automap_ws/automap_pro_thrid_party_scancontext"
+
+# 尝试多个可能的源码位置
+echo ""
+echo "[DEBUG-6] 尝试确定 SC_SOURCE:"
+if [ -d "/root/automap_ws/src/automap_pro/thrid_party/scancontext_tro" ]; then
+    SC_SOURCE="/root/automap_ws/src/automap_pro/thrid_party/scancontext_tro"
+    echo "[DEBUG-6a] 使用 SC_SOURCE=/root/automap_ws/src/automap_pro/thrid_party/scancontext_tro"
+elif [ -d "/root/automap_ws/src/thrid_party/scancontext_tro" ]; then
+    SC_SOURCE="/root/automap_ws/src/thrid_party/scancontext_tro"
+    echo "[DEBUG-6b] 使用 SC_SOURCE=/root/automap_ws/src/thrid_party/scancontext_tro"
+elif [ -d "/root/mapping/scancontext_tro" ]; then
+    SC_SOURCE="/root/mapping/scancontext_tro"
+    echo "[DEBUG-6c] 使用 SC_SOURCE=/root/mapping/scancontext_tro"
+else
+    # 搜索所有可能的 scancontext 目录
+    SC_SOURCE=$(find /root/automap_ws /root/mapping -maxdepth 4 -type d -name "scancontext_tro" 2>/dev/null | head -1)
+    if [ -n "${SC_SOURCE}" ]; then
+        echo "[DEBUG-6d] 使用自动搜索 SC_SOURCE=${SC_SOURCE}"
+    else
+        echo "[DEBUG-6e] 无法找到 scancontext_tro 目录!"
+    fi
+fi
+
+echo ""
+echo "[DEBUG-7] SC_SOURCE=${SC_SOURCE}, SC_TARGET=${SC_TARGET}"
+
+if [ -n "${SC_SOURCE}" ] && [ -d "${SC_SOURCE}" ]; then
+  echo "[DEBUG-7a] SC_SOURCE 目录存在，验证内部结构:"
+  ls -la "${SC_SOURCE}/" 2>&1 | head -20
+  echo ""
+  echo "[DEBUG-7b] 搜索 Scancontext.h:"
+  find "${SC_SOURCE}" -name "Scancontext.h" 2>/dev/null
+
+  if [ ! -L "${SC_TARGET}" ] && [ ! -d "${SC_TARGET}" ]; then
+    echo ""
+    echo "[INFO] 创建 scancontext_tro 符号链接: ${SC_TARGET} -> ${SC_SOURCE}"
+    ln -sfn "${SC_SOURCE}" "${SC_TARGET}"
+  elif [ -L "${SC_TARGET}" ]; then
+    echo "[INFO] scancontext_tro 符号链接已存在: ${SC_TARGET}"
+  fi
+  # 验证链接是否正确
+  if [ -d "${SC_TARGET}/cpp/module/Scancontext" ]; then
+    echo "[OK] ScanContext 路径验证成功: ${SC_TARGET}/cpp/module/Scancontext"
+    echo "[OK] 列出 Scancontext 目录内容:"
+    ls -la "${SC_TARGET}/cpp/module/Scancontext/" 2>&1
+  else
+    echo "[ERROR] ScanContext 路径验证失败!"
+    echo "[ERROR] 检查 ${SC_TARGET} 内容:"
+    ls -la "${SC_TARGET}/" 2>&1 || true
+    echo ""
+    echo "[ERROR] 搜索 Scancontext.h 位置:"
+    find "${SC_TARGET}" -name "Scancontext.h" 2>/dev/null || echo "未找到"
+  fi
+else
+  echo "[ERROR] ScanContext 源目录不存在: ${SC_SOURCE}"
+fi
+
 echo '========================================'
 echo '编译 automap_pro'
 echo '========================================'
-colcon build ${COLCON_PARALLEL} --packages-select automap_pro --cmake-args -DCMAKE_BUILD_TYPE=Release -DNLOHMANN_JSON_LOCAL=/root/automap_ws/src/thrid_party/nlohmann-json3 --event-handlers console_direct+
+echo "[INFO] SCANCONTEXT_ROOT=/root/automap_ws/automap_pro_thrid_party_scancontext"
+echo "[INFO] NLOHMANN_JSON_LOCAL=/root/automap_ws/src/thrid_party/nlohmann-json3"
+
+# 清理 automap_pro 的 CMake 缓存以确保使用新的 SCANCONTEXT_ROOT 参数
+if [ -d build/automap_pro ]; then
+  echo "[INFO] 清理 automap_pro CMake 缓存"
+  rm -rf build/automap_pro
+fi
+
+# 编译前再次确认 scancontext 链接和目录
+echo ""
+echo "[INFO] 编译前确认 ScanContext 状态:"
+if [ -L "/root/automap_ws/automap_pro_thrid_party_scancontext" ]; then
+    echo "[INFO] 符号链接存在:"
+    ls -la /root/automap_ws/automap_pro_thrid_party_scancontext
+    echo ""
+    echo "[INFO] 链接目标内容:"
+    ls -la /root/automap_ws/automap_pro_thrid_party_scancontext/cpp/module/Scancontext/ 2>&1 || echo "目录不存在"
+elif [ -d "/root/automap_ws/automap_pro_thrid_party_scancontext" ]; then
+    echo "[INFO] 目录存在:"
+    ls -la /root/automap_ws/automap_pro_thrid_party_scancontext/cpp/module/Scancontext/ 2>&1 || echo "目录不存在"
+else
+    echo "[ERROR] scancontext 链接/目录不存在!"
+fi
+
+echo ""
+echo "[INFO] 开始编译 automap_pro..."
+
+colcon build ${COLCON_PARALLEL} --packages-select automap_pro --cmake-args -DCMAKE_BUILD_TYPE=Release -DNLOHMANN_JSON_LOCAL=/root/automap_ws/src/thrid_party/nlohmann-json3 -DSCANCONTEXT_ROOT=/root/automap_ws/automap_pro_thrid_party_scancontext --event-handlers console_direct+ 2>&1 | tee /tmp/automap_build.log
+
+BUILD_EXIT_CODE=${PIPESTATUS[0]}
+echo ""
+echo "[INFO] 编译命令退出码: ${BUILD_EXIT_CODE}"
+
+if [ ${BUILD_EXIT_CODE} -ne 0 ]; then
+    echo ""
+    echo "========================================"
+    echo "编译失败，分析错误原因"
+    echo "========================================"
+    echo ""
+    echo "[ERROR-1] 检查 CMake 配置阶段是否检测到 ScanContext:"
+    grep -i "scancontext" /tmp/automap_build.log | head -20 || echo "未找到 ScanContext 相关日志"
+    echo ""
+    echo "[ERROR-2] 检查 CMake 生成的 include directories:"
+    grep -i "include.*dir" /tmp/automap_build.log | head -20 || echo "未找到 include dir 日志"
+    echo ""
+    echo "[ERROR-3] 检查编译错误:"
+    grep -i "error:" /tmp/automap_build.log | head -10 || echo "未找到错误日志"
+    echo ""
+    echo "[ERROR-4] 检查 loop_detector 编译详情:"
+    grep -A5 "loop_detector" /tmp/automap_build.log | head -20 || echo "未找到 loop_detector 日志"
+fi
 
 echo '========================================'
 echo '验证编译产物'

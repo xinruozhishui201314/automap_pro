@@ -22,6 +22,7 @@
 #include <condition_variable>
 #include <atomic>
 #include <future>
+#include <chrono>
 
 namespace automap_pro {
 
@@ -235,6 +236,12 @@ private:
     std::vector<GPSFactorItem> pending_gps_factors_;
     /** 在 current_estimate_ 已有节点后，将 pending_gps_factors_ 中可加入的因子加入图；调用时需已持 rw_mutex_；返回本次加入的因子数 */
     int flushPendingGPSFactors();
+
+    // ===== 修复2: 单节点超时强制优化 =====
+    /** 记录单节点延迟开始时间（用于超时强制优化） */
+    std::chrono::steady_clock::time_point single_node_pending_start_;
+    /** 单节点pending超时阈值（毫秒），超过后强制执行优化 */
+    static constexpr int kSingleNodePendingTimeoutMs = 5000;
 };
 
 } // namespace automap_pro

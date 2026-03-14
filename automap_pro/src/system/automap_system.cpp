@@ -544,9 +544,10 @@ void AutoMapSystem::onOdometry(double ts, const Pose3d& pose, const Mat66d& cov)
         RCLCPP_INFO(get_logger(),
             "[AutoMapSystem][BACKEND][RECV] odom #%d ts=%.3f pos=[%.2f,%.2f,%.2f] (backend entry)",
             seq, ts, pose.translation().x(), pose.translation().y(), pose.translation().z());
-        double pos_std_x = std::sqrt(std::max(0.0, cov(3, 3)));
-        double pos_std_y = std::sqrt(std::max(0.0, cov(4, 4)));
-        double pos_std_z = std::sqrt(std::max(0.0, cov(5, 5)));
+        // 修复: 添加NaN检查，防止协方差矩阵元素为NaN时导致sqrt产生NaN
+        double pos_std_x = std::isfinite(cov(3, 3)) ? std::sqrt(std::max(0.0, cov(3, 3))) : 0.0;
+        double pos_std_y = std::isfinite(cov(4, 4)) ? std::sqrt(std::max(0.0, cov(4, 4))) : 0.0;
+        double pos_std_z = std::isfinite(cov(5, 5)) ? std::sqrt(std::max(0.0, cov(5, 5))) : 0.0;
         RCLCPP_INFO(get_logger(),
             "[PRECISION][ODOM] seq=%d ts=%.4f pos_std_xyz=[%.4f,%.4f,%.4f] pos=[%.3f,%.3f,%.3f]",
             seq, ts, pos_std_x, pos_std_y, pos_std_z,
@@ -1619,13 +1620,14 @@ void AutoMapSystem::onSubmapFrozen(const SubMap::Ptr& submap) {
     }
 
     // 建图精度日志：子图冻结时的几何与锚定帧不确定性
+    // 修复: 添加NaN检查，防止协方差矩阵元素为NaN时导致sqrt产生NaN
     if (!submap->keyframes.empty()) {
         const KeyFrame::Ptr& anchor_kf = submap->keyframes.front();
         if (anchor_kf) {
             const Mat66d& anchor_cov = anchor_kf->covariance;
-            double a_px = std::sqrt(std::max(0.0, anchor_cov(3, 3)));
-            double a_py = std::sqrt(std::max(0.0, anchor_cov(4, 4)));
-            double a_pz = std::sqrt(std::max(0.0, anchor_cov(5, 5)));
+            double a_px = std::isfinite(anchor_cov(3, 3)) ? std::sqrt(std::max(0.0, anchor_cov(3, 3))) : 0.0;
+            double a_py = std::isfinite(anchor_cov(4, 4)) ? std::sqrt(std::max(0.0, anchor_cov(4, 4))) : 0.0;
+            double a_pz = std::isfinite(anchor_cov(5, 5)) ? std::sqrt(std::max(0.0, anchor_cov(5, 5))) : 0.0;
             RCLCPP_INFO(get_logger(),
                 "[PRECISION][SUBMAP] frozen sm_id=%d kf_count=%zu extent_m=%.2f anchor_pos_std_xyz=[%.4f,%.4f,%.4f] total_frozen=%d",
                 submap->id, submap->keyframes.size(), submap->spatial_extent_m, a_px, a_py, a_pz, frozen_submap_count_);
@@ -2921,9 +2923,9 @@ void AutoMapSystem::writeTrajectoryOdom(double ts, const Pose3d& pose, const Mat
     }
 
     Eigen::Quaterniond q(pose.rotation());
-    double px = std::sqrt(std::max(0.0, cov(3, 3)));
-    double py = std::sqrt(std::max(0.0, cov(4, 4)));
-    double pz = std::sqrt(std::max(0.0, cov(5, 5)));
+    double px = std::isfinite(cov(3, 3)) ? std::sqrt(std::max(0.0, cov(3, 3))) : 0.0;
+    double py = std::isfinite(cov(4, 4)) ? std::sqrt(std::max(0.0, cov(4, 4))) : 0.0;
+    double pz = std::isfinite(cov(5, 5)) ? std::sqrt(std::max(0.0, cov(5, 5))) : 0.0;
     trajectory_odom_file_ << std::fixed << std::setprecision(6)
         << ts << ","
         << pose.translation().x() << "," << pose.translation().y() << "," << pose.translation().z() << ","
@@ -3003,9 +3005,9 @@ void AutoMapSystem::writeTrajectoryOdomAfterMapping(const std::string& output_di
             gps_valid = gps_opt->is_valid;
         }
         Eigen::Quaterniond q(pose.rotation());
-        double px = std::sqrt(std::max(0.0, cov(3, 3)));
-        double py = std::sqrt(std::max(0.0, cov(4, 4)));
-        double pz = std::sqrt(std::max(0.0, cov(5, 5)));
+        double px = std::isfinite(cov(3, 3)) ? std::sqrt(std::max(0.0, cov(3, 3))) : 0.0;
+        double py = std::isfinite(cov(4, 4)) ? std::sqrt(std::max(0.0, cov(4, 4))) : 0.0;
+        double pz = std::isfinite(cov(5, 5)) ? std::sqrt(std::max(0.0, cov(5, 5))) : 0.0;
         std::ostringstream line;
         line << std::fixed << std::setprecision(6)
             << ts << ","

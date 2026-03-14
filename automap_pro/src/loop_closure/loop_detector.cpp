@@ -2,6 +2,12 @@
 #include "automap_pro/loop_closure/icp_refiner.h"
 #include "automap_pro/core/config_manager.h"
 #include "automap_pro/core/logger.h"
+
+// ScanContext 依赖
+#include "Scancontext/Scancontext.h"
+#include "nanoflann.hpp"
+
+#include <algorithm>  // for std::max, std::min
 #define MOD "LoopDetector"
 
 #include <automap_pro/msg/loop_constraint_msg.hpp>
@@ -31,8 +37,16 @@ LoopDetector::LoopDetector() {
     intra_submap_enabled_ = cfg.intraSubmapLoopEnabled();
     intra_submap_min_temporal_gap_ = cfg.intraSubmapLoopMinTemporalGap();
     intra_submap_min_keyframe_gap_ = cfg.intraSubmapLoopMinKeyframeGap();
+    intra_submap_min_distance_gap_ = cfg.intraSubmapLoopMinDistanceGap();
     intra_submap_overlap_threshold_ = cfg.intraSubmapLoopOverlapThreshold();
     intra_submap_max_teaser_candidates_ = cfg.intraSubmapLoopMaxTeaserCandidates();
+
+    // ScanContext 参数
+    use_scancontext_ = cfg.scancontextEnabled();
+    sc_dist_threshold_ = cfg.scancontextDistThreshold();
+    sc_num_candidates_ = cfg.scancontextNumCandidates();
+    sc_exclude_recent_ = cfg.scancontextExcludeRecent();
+    sc_tree_making_period_ = cfg.scancontextTreeMakingPeriod();
 }
 
 LoopDetector::~LoopDetector() { stop(); }
@@ -63,6 +77,12 @@ void LoopDetector::init(rclcpp::Node::SharedPtr node) {
         }
     }
 #endif
+
+    // 初始化 ScanContext
+    if (use_scancontext_) {
+        ALOG_INFO(MOD, "[ScanContext] Enabled: dist_threshold=%.3f num_candidates=%d exclude_recent=%d",
+                  sc_dist_threshold_, sc_num_candidates_, sc_exclude_recent_);
+    }
 
     constraint_pub_ = node->create_publisher<automap_pro::msg::LoopConstraintMsg>(
         "/automap/loop_constraint", 100);
@@ -226,9 +246,6 @@ void LoopDetector::onDescriptorReady(const SubMap::Ptr& submap) {
         RCLCPP_INFO(node_->get_logger(), "[LOOP_PHASE] stage=descriptor_done submap_id=%d query_pts=%zu",
                     submap->id, submap->downsampled_cloud ? submap->downsampled_cloud->size() : 0u);
     }
-    // 先加入数据库
-    addToDatabase(submap);
-
     // 检索候选（Stage 1）
     std::vector<SubMap::Ptr> db_copy;
     {
@@ -237,16 +254,26 @@ void LoopDetector::onDescriptorReady(const SubMap::Ptr& submap) {
     }
 
     auto t_retrieve_start = std::chrono::steady_clock::now();
-    auto candidates = overlap_infer_.retrieve(
-        submap->overlap_descriptor,
-        db_copy,
-        top_k_,
-        static_cast<float>(overlap_threshold_),
-        min_submap_gap_,
-        min_temporal_gap_,
-        gps_search_radius_,
-        submap->gps_center,
-        submap->has_valid_gps);
+    std::vector<OverlapTransformerInfer::Candidate> candidates;
+
+    // 根据配置选择候选检索方法
+    if (use_scancontext_) {
+        // 使用 ScanContext 检索候选（需要加锁保护）
+        std::lock_guard<std::mutex> lk(sc_mutex_);
+        candidates = retrieveUsingScanContext(submap, db_copy);
+    } else {
+        // 使用 OverlapTransformer 检索候选
+        candidates = overlap_infer_.retrieve(
+            submap->overlap_descriptor,
+            db_copy,
+            top_k_,
+            static_cast<float>(overlap_threshold_),
+            min_submap_gap_,
+            min_temporal_gap_,
+            gps_search_radius_,
+            submap->gps_center,
+            submap->has_valid_gps);
+    }
     auto t_retrieve_end = std::chrono::steady_clock::now();
     double retrieve_ms = std::chrono::duration<double, std::milli>(t_retrieve_end - t_retrieve_start).count();
 
@@ -528,7 +555,8 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
                               query->id, works[i].cand.submap_id);
                     continue;
                 }
-                int inliers_approx = static_cast<int>(std::round(teaser_res.inlier_ratio * std::max(0, teaser_res.num_correspondences)));
+                // 修复: 确保num_correspondences非负，避免负值导致的问题
+                int inliers_approx = static_cast<int>(std::round(teaser_res.inlier_ratio * std::max(0, std::max(0, teaser_res.num_correspondences))));
                 const char* reason_str = (teaser_res.success && teaser_res.inlier_ratio >= min_inlier_ratio_) ? "ok" : "teaser_fail_or_inlier_low";
                 ALOG_INFO(MOD, "[LOOP_COMPUTE] query_id={} target_id={} result=done success={} inliers≈{} corrs={} inlier_ratio={:.3f} rmse={:.4f} reason={} (parallel)",
                           query->id, works[i].cand.submap_id, teaser_res.success, inliers_approx, teaser_res.num_correspondences,
@@ -570,8 +598,14 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
                 lc->rmse = static_cast<float>(final_rmse);
                 lc->is_inter_session = (query->session_id != target->session_id);
                 lc->status = LoopStatus::ACCEPTED;
+                // 修复: 使用更合理的信息矩阵计算，区分旋转和平移自由度
                 double info_scale = lc->inlier_ratio / (lc->rmse + 1e-3f);
-                lc->information = Mat66d::Identity() * info_scale;
+                // 限制最大信息尺度，避免数值过大导致优化不稳定
+                info_scale = std::min(info_scale, 1e6);
+                Mat66d information = Mat66d::Identity();
+                information.block<3,3>(0,0) *= info_scale * 0.1;  // 平移自由度权重较小
+                information.block<3,3>(3,3) *= info_scale;        // 旋转自由度权重较大
+                lc->information = information;
                 ALOG_INFO(MOD, "[LoopDetector][LOOP_OK] 回环约束已发布(parallel) query_id={} target_id={} inlier={:.3f} rmse={:.4f}m",
                           query->id, target->id, lc->inlier_ratio, lc->rmse);
                 if (node_) {
@@ -645,7 +679,8 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
         }
         double teaser_ms = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - t0).count();
-        int inliers_approx = static_cast<int>(std::round(teaser_res.inlier_ratio * std::max(0, teaser_res.num_correspondences)));
+        // 修复: 确保num_correspondences非负，避免负值导致的问题
+        int inliers_approx = static_cast<int>(std::round(teaser_res.inlier_ratio * std::max(0, std::max(0, teaser_res.num_correspondences))));
         const char* reason_str = (teaser_res.success && teaser_res.inlier_ratio >= min_inlier_ratio_) ? "ok" : "teaser_fail_or_inlier_low";
         ALOG_INFO(MOD, "[LOOP_COMPUTE] query_id={} target_id={} result=done success={} inliers≈{} corrs={} inlier_ratio={:.3f} rmse={:.4f} reason={} ms={:.1f} (精准优化: 若 inliers<10 可调 safe_min; 若 ratio 低可调 FPFH/voxel)",
                   query->id, target->id, teaser_res.success, inliers_approx, teaser_res.num_correspondences,
@@ -697,8 +732,14 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
         lc->status        = LoopStatus::ACCEPTED;
 
         // 信息矩阵：内点比率越高、RMSE越小 → 信息越大
+        // 修复: 使用更合理的信息矩阵计算，区分旋转和平移自由度
         double info_scale = lc->inlier_ratio / (lc->rmse + 1e-3f);
-        lc->information = Mat66d::Identity() * info_scale;
+        // 限制最大信息尺度，避免数值过大导致优化不稳定
+        info_scale = std::min(info_scale, 1e6);
+        Mat66d information = Mat66d::Identity();
+        information.block<3,3>(0,0) *= info_scale * 0.1;  // 平移自由度权重较小
+        information.block<3,3>(3,3) *= info_scale;        // 旋转自由度权重较大
+        lc->information = information;
 
         ALOG_INFO(MOD, "[LoopDetector][LOOP_OK] 回环约束已发布 query_id={} target_id={} inlier={:.3f} rmse={:.4f}m score={:.3f}",
                   query->id, target->id, lc->inlier_ratio, lc->rmse, lc->overlap_score);
@@ -891,11 +932,12 @@ std::vector<LoopConstraint::Ptr> LoopDetector::detectIntraSubmapLoop(
     ALOG_INFO(MOD,
         "[INTRA_LOOP][DEBUG] ====== detectIntraSubmapLoop START ====== "
         "submap_id=%d query_idx=%d kf_count=%zu "
-        "min_temporal_gap=%.1fs min_keyframe_gap=%d overlap_thresh=%.3f "
+        "min_temporal_gap=%.1fs min_keyframe_gap=%d min_dist_gap=%.1fm overlap_thresh=%.3f "
         "min_inlier_ratio=%.3f max_rmse=%.3f",
         submap ? submap->id : -1, query_keyframe_idx,
         submap ? submap->keyframes.size() : 0,
         intra_submap_min_temporal_gap_, intra_submap_min_keyframe_gap_,
+        intra_submap_min_distance_gap_,
         intra_submap_overlap_threshold_,
         min_inlier_ratio_, max_rmse_);
 
@@ -1020,6 +1062,19 @@ std::vector<LoopConstraint::Ptr> LoopDetector::detectIntraSubmapLoop(
             continue;
         }
 
+        // 距离间隔过滤（避免过密帧）
+        if (intra_submap_min_distance_gap_ > 0.0) {
+            const auto& query_pos = query_kf->T_w_b.translation();
+            const auto& cand_pos = cand_kf->T_w_b.translation();
+            double dist_gap = (query_pos - cand_pos).norm();
+            if (dist_gap < intra_submap_min_distance_gap_) {
+                ALOG_DEBUG(MOD,
+                    "[INTRA_LOOP][FILTER] DISTANCE_GAP: query_idx=%d cand_idx=%d dist=%.2fm < %.1fm (SKIP)",
+                    query_keyframe_idx, i, dist_gap, intra_submap_min_distance_gap_);
+                continue;
+            }
+        }
+
         // 描述子相似度过滤
         const auto& cand_desc = submap->keyframe_descriptors[i];
         float cand_desc_norm = cand_desc.norm();
@@ -1029,7 +1084,14 @@ std::vector<LoopConstraint::Ptr> LoopDetector::detectIntraSubmapLoop(
             continue;
         }
 
-        float similarity = query_desc.dot(cand_desc) / (query_desc_norm * cand_desc_norm);
+        // 修复: 添加除法安全检查，防止除零
+        float denominator = query_desc_norm * cand_desc_norm;
+        if (denominator < 1e-10f) {
+            ALOG_DEBUG(MOD, "[INTRA_LOOP][FILTER] DENOMINATOR_ZERO: query_norm=%.6f cand_norm=%.6f (SKIP)",
+                       query_desc_norm, cand_desc_norm);
+            continue;
+        }
+        float similarity = query_desc.dot(cand_desc) / denominator;
         if (similarity < intra_submap_overlap_threshold_) {
             desc_filtered++;
             ALOG_DEBUG(MOD,
@@ -1133,8 +1195,13 @@ std::vector<LoopConstraint::Ptr> LoopDetector::detectIntraSubmapLoop(
         const Eigen::Matrix3d rot = teaser_res.T_tgt_src.rotation();
         const Eigen::Vector3d rpy = Eigen::Matrix3d(rot).eulerAngles(2, 1, 0).reverse();
         // 根据 inlier ratio 构造信息矩阵（TeaserMatcher::Result 没有 information 字段）
+        // 修复: 使用更合理的信息矩阵计算，区分旋转和平移自由度
         double info_scale = teaser_res.inlier_ratio * 100.0;
-        Mat66d information = Mat66d::Identity() * info_scale;
+        // 限制最大信息尺度，避免数值过大导致优化不稳定
+        info_scale = std::min(info_scale, 1e6);
+        Mat66d information = Mat66d::Identity();
+        information.block<3,3>(0,0) *= info_scale * 0.1;  // 平移自由度权重较小
+        information.block<3,3>(3,3) *= info_scale;        // 旋转自由度权重较大
 
         ALOG_INFO(MOD,
             "[INTRA_LOOP][DETECTED] ★★★ INTRA_SUBMAP_LOOP ★★★ "
@@ -1198,6 +1265,208 @@ std::vector<LoopConstraint::Ptr> LoopDetector::detectIntraSubmapLoop(
         results.size());
 
     return results;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ScanContext 候选检索实现
+// ─────────────────────────────────────────────────────────────────────────────
+std::vector<OverlapTransformerInfer::Candidate> LoopDetector::retrieveUsingScanContext(
+    const SubMap::Ptr& submap,
+    const std::vector<SubMap::Ptr>& db_copy) {
+
+    std::vector<OverlapTransformerInfer::Candidate> candidates;
+
+    ALOG_INFO(MOD, "[ScanContext][START] ====== retrieveUsingScanContext START ====== "
+              "query_id=%d db_size=%zu sc_size=%zu",
+              submap->id, db_copy.size(), sc_manager_.polarcontexts_.size());
+
+    if (!use_scancontext_) {
+        ALOG_WARN(MOD, "[ScanContext] ScanContext is disabled, skip retrieval");
+        return candidates;
+    }
+
+    if (!submap || !submap->downsampled_cloud || submap->downsampled_cloud->empty()) {
+        ALOG_WARN(MOD, "[ScanContext] Invalid submap or empty cloud, skip retrieval");
+        return candidates;
+    }
+
+    // 将当前子图的下采样点云转换为 ScanContext 格式
+    pcl::PointCloud<SCPointType> scan_down;
+    scan_down.reserve(submap->downsampled_cloud->size());
+    for (const auto& pt : submap->downsampled_cloud->points) {
+        SCPointType p;
+        p.x = pt.x;
+        p.y = pt.y;
+        p.z = pt.z;
+        p.intensity = 0;
+        scan_down.points.push_back(p);
+    }
+    ALOG_INFO(MOD, "[ScanContext] Converted cloud: query_id=%d pts=%zu",
+              submap->id, scan_down.points.size());
+
+    // 生成当前帧的 ScanContext
+    sc_manager_.makeAndSaveScancontextAndKeys(scan_down);
+    ALOG_INFO(MOD, "[ScanContext] SC generated: query_id=%d total_sc=%zu",
+              submap->id, sc_manager_.polarcontexts_.size());
+
+    // 检查 SCManager 中是否有足够的历史帧用于检索（排除最近的 exclude_recent 帧）
+    int num_available_for_search = static_cast<int>(sc_manager_.polarcontexts_.size()) - sc_exclude_recent_;
+    ALOG_INFO(MOD, "[ScanContext] Check history: total_sc=%zu exclude_recent=%d available=%d",
+              sc_manager_.polarcontexts_.size(), sc_exclude_recent_, num_available_for_search);
+
+    if (num_available_for_search <= 0) {
+        ALOG_INFO(MOD, "[ScanContext] Not enough history frames for search: available=%d <= 0, skip",
+                  num_available_for_search);
+        return candidates;
+    }
+
+    // 获取当前帧的描述子（刚刚添加的，位于末尾）
+    const auto& curr_key = sc_manager_.polarcontext_invkeys_mat_.back();
+    const auto& curr_desc = sc_manager_.polarcontexts_.back();
+    ALOG_INFO(MOD, "[ScanContext] Current frame descriptor ready: idx=%zu",
+              sc_manager_.polarcontexts_.size() - 1);
+
+    // 首次调用或每隔 N 帧重建 KD-Tree
+    // KD-Tree 搜索空间：排除最近的 sc_exclude_recent_ 帧和当前帧
+    bool need_rebuild = (sc_manager_.tree_making_period_conter == 0) ||
+                        (sc_manager_.tree_making_period_conter % sc_tree_making_period_ == 0);
+
+    ALOG_INFO(MOD, "[ScanContext] KD-Tree status: counter=%d period=%d rebuild_needed=%d",
+              sc_manager_.tree_making_period_conter, sc_tree_making_period_, need_rebuild);
+
+    if (need_rebuild) {
+        sc_manager_.polarcontext_invkeys_to_search_.clear();
+        // 排除最近的 sc_exclude_recent_ 帧和当前帧（当前帧在末尾）
+        size_t end_idx = sc_manager_.polarcontext_invkeys_mat_.size() - sc_exclude_recent_ - 1;
+        ALOG_INFO(MOD, "[ScanContext] KD-Tree rebuild: key_mat_size=%zu exclude=%d end_idx=%zu",
+                  sc_manager_.polarcontext_invkeys_mat_.size(), sc_exclude_recent_, end_idx);
+
+        if (end_idx > 0) {
+            sc_manager_.polarcontext_invkeys_to_search_.assign(
+                sc_manager_.polarcontext_invkeys_mat_.begin(),
+                sc_manager_.polarcontext_invkeys_mat_.begin() + end_idx);
+
+            // 重建 KD-Tree
+            sc_manager_.polarcontext_tree_.reset();
+            sc_manager_.polarcontext_tree_ = std::make_unique<InvKeyTree>(
+                sc_manager_.PC_NUM_RING,
+                sc_manager_.polarcontext_invkeys_to_search_,
+                10);
+            ALOG_INFO(MOD, "[ScanContext] KD-Tree rebuilt: search_size=%zu, total_sc=%zu",
+                      sc_manager_.polarcontext_invkeys_to_search_.size(),
+                      sc_manager_.polarcontexts_.size());
+        }
+    }
+    sc_manager_.tree_making_period_conter++;
+
+    // 检查 KD-Tree 是否有效
+    if (!sc_manager_.polarcontext_tree_ || sc_manager_.polarcontext_invkeys_to_search_.empty()) {
+        ALOG_WARN(MOD, "[ScanContext] KD-Tree not available (tree=%p search_space=%zu), skip retrieval",
+                  static_cast<void*>(sc_manager_.polarcontext_tree_.get()),
+                  sc_manager_.polarcontext_invkeys_to_search_.empty() ? 0 : sc_manager_.polarcontext_invkeys_to_search_.size());
+        return candidates;
+    }
+
+    // KD-Tree 检索候选
+    std::vector<size_t> candidate_indexes(sc_num_candidates_);
+    std::vector<float> out_dists_sqr(sc_num_candidates_);
+    nanoflann::KNNResultSet<float> knnsearch_result(sc_num_candidates_);
+    knnsearch_result.init(candidate_indexes.data(), out_dists_sqr.data());
+    sc_manager_.polarcontext_tree_->index->findNeighbors(
+        knnsearch_result, curr_key.data(), nanoflann::SearchParams(10));
+
+    ALOG_INFO(MOD, "[ScanContext] KD-Tree search: num_candidates=%d", sc_num_candidates_);
+    for (int i = 0; i < sc_num_candidates_; ++i) {
+        ALOG_INFO(MOD, "[ScanContext] KD-Tree result[%d]: idx=%zu dist_sq=%.4f",
+                  i, candidate_indexes[i], out_dists_sqr[i]);
+    }
+
+    // 对每个候选计算 SC 距离
+    double min_dist = 10000000;
+    std::vector<std::pair<int, double>> sc_dist_list;  // (db_index, sc_dist)
+
+    ALOG_INFO(MOD, "[ScanContext] Computing SC distance for %d candidates...", sc_num_candidates_);
+
+    for (int i = 0; i < sc_num_candidates_; ++i) {
+        int cand_idx = static_cast<int>(candidate_indexes[i]);
+
+        // cand_idx 是 KD-Tree 搜索空间中的索引，对应 polarcontext_invkeys_to_search_ 的索引
+        // 需要映射到完整的 polarcontexts_ 索引
+        // KD-Tree 搜索空间是 [0, end_idx)，所以完整索引就是 cand_idx
+
+        if (cand_idx < 0 || cand_idx >= static_cast<int>(sc_manager_.polarcontexts_.size()) - 1) {
+            ALOG_WARN(MOD, "[ScanContext] Skip invalid candidate idx=%d (max=%d)",
+                      cand_idx, static_cast<int>(sc_manager_.polarcontexts_.size()) - 1);
+            continue;
+        }
+
+        const auto& cand_sc = sc_manager_.polarcontexts_[cand_idx];
+        auto sc_dist_result = sc_manager_.distanceBtnScanContext(curr_desc, cand_sc);
+        double sc_dist = sc_dist_result.first;
+        int align_shift = sc_dist_result.second;
+
+        ALOG_INFO(MOD, "[ScanContext] Candidate[%d]: sc_idx=%d sc_dist=%.4f align_shift=%d threshold=%.3f",
+                  i, cand_idx, sc_dist, align_shift, sc_dist_threshold_);
+
+        sc_dist_list.push_back({cand_idx, sc_dist});
+
+        if (sc_dist < min_dist) {
+            min_dist = sc_dist;
+        }
+    }
+
+    // 按距离排序，返回通过阈值的候选
+    std::sort(sc_dist_list.begin(), sc_dist_list.end(),
+               [](const auto& a, const auto& b) { return a.second < b.second; });
+
+    ALOG_INFO(MOD, "[ScanContext] After sorting: best_dist=%.4f threshold=%.3f", min_dist, sc_dist_threshold_);
+
+    // 转换为 Candidate 格式
+    // 注意：sc_dist 越小，相似度越高
+    for (const auto& dist_pair : sc_dist_list) {
+        int sc_idx = dist_pair.first;  // SCManager 中的索引
+        double sc_dist = dist_pair.second;
+
+        if (sc_dist >= sc_dist_threshold_) {
+            continue;
+        }
+
+        // 从 db_copy 中找到对应的子图
+        // SCManager 中的索引 sc_idx 对应 db_copy[sc_idx]
+        // 因为每次添加 SubMap 时都会同时添加 ScanContext
+        if (sc_idx >= 0 && sc_idx < (int)db_copy.size()) {
+            const auto& matched_submap = db_copy[sc_idx];
+
+            // 过滤：排除同一子图
+            if (matched_submap->id == submap->id && matched_submap->session_id == submap->session_id) {
+                continue;
+            }
+
+            // 计算相似度分数（距离越小，相似度越高）
+            // clamp 到 [0, 1] 范围
+            float raw_score = 1.0f - static_cast<float>(sc_dist / sc_dist_threshold_);
+            float score = std::max(0.0f, std::min(1.0f, raw_score));
+
+            OverlapTransformerInfer::Candidate cand;
+            cand.submap_id = matched_submap->id;
+            cand.session_id = matched_submap->session_id;
+            cand.score = score;
+            candidates.push_back(cand);
+
+            ALOG_INFO(MOD, "[ScanContext] Candidate: query_id=%d target_id=%d (submap_id=%d) sc_dist=%.4f score=%.3f",
+                      submap->id, sc_idx, matched_submap->id, sc_dist, score);
+        }
+    }
+
+    if (candidates.empty()) {
+        ALOG_INFO(MOD, "[ScanContext][END] No loop candidates found for submap_id=%d (best_dist=%.4f threshold=%.3f)",
+                  submap->id, min_dist, sc_dist_threshold_);
+    } else {
+        ALOG_INFO(MOD, "[ScanContext][END] Found %zu loop candidates for submap_id=%d",
+                  candidates.size(), submap->id);
+    }
+
+    return candidates;
 }
 
 } // namespace automap_pro

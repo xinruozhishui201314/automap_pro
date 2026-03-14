@@ -268,6 +268,10 @@ public:
     int intraSubmapLoopMinKeyframeGap() const {
         return get<int>("loop_closure.intra_submap_min_keyframe_gap", 10);
     }
+    /** 子图内回环检测：关键帧之间最小距离间隔(米)，避免过密假回环 */
+    double intraSubmapLoopMinDistanceGap() const {
+        return get<double>("loop_closure.intra_submap_min_distance_gap_m", 3.0);
+    }
     /** 子图内回环检测：描述子相似度阈值 */
     double intraSubmapLoopOverlapThreshold() const {
         return get<double>("loop_closure.intra_submap_overlap_threshold", 0.3);
@@ -306,6 +310,14 @@ public:
     double teaserMaxRMSE()      const { return get<double>("loop_closure.teaser.max_rmse_m", 0.3); }
     int    teaserMaxPoints()    const { return std::max(500, get<int>("loop_closure.teaser.max_points", 8000)); }
     bool   teaserICPRefine()    const { return get<bool>("loop_closure.teaser.icp_refine", true); }
+
+    // ── ScanContext ────────────────────────────────────────────────────────
+    bool   scancontextEnabled()        const { return get<bool>("loop_closure.scancontext.enabled", true); }
+    double scancontextDistThreshold()  const { return get<double>("loop_closure.scancontext.dist_threshold", 0.13); }
+    int    scancontextNumCandidates()  const { return get<int>("loop_closure.scancontext.num_candidates", 5); }
+    int    scancontextExcludeRecent()  const { return get<int>("loop_closure.scancontext.exclude_recent", 50); }
+    int    scancontextTreeMakingPeriod() const { return get<int>("loop_closure.scancontext.tree_making_period", 50); }
+
     /** 最小安全内点数：TEASER 内点数低于此值会拒绝（防崩溃/误匹配）。弱重叠场景可放宽至 6，需关注误匹配。 */
     int    teaserMinSafeInliers() const {
         int v = get<int>("loop_closure.teaser.min_safe_inliers", 10);

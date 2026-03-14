@@ -345,7 +345,7 @@ void LivoBridge::onGPS(const sensor_msgs::msg::NavSatFix::SharedPtr msg) {
     double lon = msg->longitude;
     double alt = msg->altitude;
 
-    double sigma_h = std::sqrt(std::max(0.0, static_cast<double>(msg->position_covariance[0])));
+    double sigma_h = std::isfinite(msg->position_covariance[0]) ? std::sqrt(std::max(0.0, static_cast<double>(msg->position_covariance[0]))) : 1.0;
     double hdop    = std::max(0.5, sigma_h / 0.3);
     int sats = 0;
 
