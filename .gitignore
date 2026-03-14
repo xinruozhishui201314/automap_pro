@@ -89,6 +89,15 @@ automap_ws/build/
 automap_ws/build_*/
 automap_ws/log/
 
+# ========== 大模型和第三方库（不提交）==========
+automap_pro/thrid_party/libtorch/
+automap_pro/thrid_party/libtorch.zip
+automap_pro/models/
+automap_pro/thrid_party/Sophus/
+automap_pro/thrid_party/ceres-solver/
+automap_pro/thrid_party/gtsam/
+automap_pro/thrid_party/tinyply/
+
 # ========== 子模块工作目录修改 ==========
 docker/deps/Livox-SDK2/
 docker/deps/Open3D/
