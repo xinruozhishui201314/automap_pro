@@ -193,11 +193,52 @@ void IncrementalOptimizer::addSubMapNode(int sm_id, const Pose3d& init_pose, boo
         RCLCPP_WARN(rclcpp::get_logger("automap_system"),
             "[IncrementalOptimizer][LOCK_DIAG] addSubMapNode: rw_mutex wait %.1fms (potential contention)", lock_wait_ms);
     }
+
+    // 🔧 诊断: 记录当前优化器状态
+    RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+        "[IncrementalOptimizer][DIAG] addSubMapNode ENTER: sm_id=%d fixed=%d "
+        "node_exists_ size=%zu pending_values=%zu pending_factors=%zu current_estimate_=%zu "
+        "consecutive_failures=%d",
+        sm_id, fixed, node_exists_.size(), pending_values_.size(),
+        pending_graph_.size(), current_estimate_.size(), consecutive_failures_.load());
+
     if (!prior_noise_) {
         ALOG_DEBUG(MOD, "addSubMapNode: already shutdown (prior_noise_ released), ignore");
         return;
     }
-    if (node_exists_.count(sm_id)) return;
+    if (node_exists_.count(sm_id)) {
+        RCLCPP_WARN(rclcpp::get_logger("automap_system"),
+            "[IncrementalOptimizer][DIAG] addSubMapNode: sm_id=%d already exists in node_exists_",
+            sm_id);
+
+        // 🔧 修复: 添加节点前检查是否需要恢复
+        if (consecutive_failures_.load() >= 3) {
+            RCLCPP_WARN(rclcpp::get_logger("automap_system"),
+                "[IncrementalOptimizer][BACKEND] addSubMapNode: %d consecutive failures, triggering recovery before adding sm_id=%d",
+                consecutive_failures_.load(), sm_id);
+            // 重建 ISAM2
+            pending_graph_.resize(0);
+            pending_values_.clear();
+            current_estimate_.clear();
+            gtsam::ISAM2Params params;
+            params.relinearizeThreshold = ConfigManager::instance().isam2RelinThresh();
+            params.relinearizeSkip = ConfigManager::instance().isam2RelinSkip();
+            params.enableRelinearization = ConfigManager::instance().isam2EnableRelin();
+            params.factorization = gtsam::ISAM2Params::QR;
+            params.cacheLinearizedFactors = true;
+            isam2_ = gtsam::ISAM2(params);
+            node_exists_.clear();
+            node_count_ = 0;
+            factor_count_ = 0;
+            has_prior_ = false;
+            consecutive_failures_ = 0;
+            ALOG_WARN(MOD, "[Health] Auto-recovery triggered before addSubMapNode: reset iSAM2");
+            RCLCPP_WARN(rclcpp::get_logger("automap_system"),
+                "[IncrementalOptimizer][DIAG] addSubMapNode: after recovery - node_exists_ size=%zu",
+                node_exists_.size());
+        }
+        return;
+    }
 
     // 约束合理性：拒绝非法初始位姿，避免后续 update 触发 GTSAM 异常
     const Eigen::Vector3d& t = init_pose.translation();
@@ -337,14 +378,27 @@ void IncrementalOptimizer::addOdomFactor(
         RCLCPP_WARN(rclcpp::get_logger("automap_system"),
             "[IncrementalOptimizer][LOCK_DIAG] addOdomFactor: rw_mutex wait %.1fms from=%d to=%d", lock_wait_ms, from, to);
     }
+
+    // 🔧 诊断: 记录当前状态
+    RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+        "[IncrementalOptimizer][DIAG] addOdomFactor ENTER: from=%d to=%d "
+        "node_exists_ size=%zu current_estimate_=%zu consecutive_failures=%d",
+        from, to, node_exists_.size(), current_estimate_.size(), consecutive_failures_.load());
+
     if (!node_exists_.count(from) || !node_exists_.count(to)) {
+        // 🔧 诊断: 详细记录节点不存在的情况
+        bool from_in_estimate = current_estimate_.exists(SM(from));
+        bool to_in_estimate = current_estimate_.exists(SM(to));
         RCLCPP_WARN(rclcpp::get_logger("automap_system"),
             "[IncrementalOptimizer][BACKEND][ODOM] skip addOdomFactor from=%d to=%d "
-            "(from_exists=%d to_exists=%d node_count=%zu)",
+            "(from_exists=%d to_exists=%d node_count=%zu) "
+            "from_in_estimate=%d to_in_estimate=%d",
             from, to,
             node_exists_.count(from) ? 1 : 0,
             node_exists_.count(to) ? 1 : 0,
-            node_count_);
+            node_count_,
+            from_in_estimate ? 1 : 0,
+            to_in_estimate ? 1 : 0);
         return;
     }
 
@@ -837,6 +891,14 @@ OptimizationResult IncrementalOptimizer::forceUpdate() {
             res.success ? 1 : 0, res.nodes_updated, force_elapsed_ms);
         return res;
     } catch (const std::exception& e) {
+        // 🔧 诊断: forceUpdate 异常时记录详细状态
+        RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+            "[IncrementalOptimizer][DIAG] forceUpdate EXCEPTION: "
+            "node_exists_ size=%zu pending_values=%zu pending_factors=%zu current_estimate_=%zu "
+            "exception='%s'",
+            node_exists_.size(), pending_values_.size(), pending_graph_.size(),
+            current_estimate_.size(), e.what());
+
         RCLCPP_INFO(rclcpp::get_logger("automap_system"),
             "[ISAM2_DIAG][CRASH_TRACE] step=forceUpdate_exception exception=%s (崩溃发生在 commitAndUpdate 内，见上一 TRACE step)",
             e.what());
@@ -845,6 +907,12 @@ OptimizationResult IncrementalOptimizer::forceUpdate() {
             "[IncrementalOptimizer][EXCEPTION] forceUpdate: %s", e.what());
         return OptimizationResult{};
     } catch (...) {
+        // 🔧 诊断: 未知异常
+        RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+            "[IncrementalOptimizer][DIAG] forceUpdate UNKNOWN EXCEPTION: "
+            "node_exists_ size=%zu pending_values=%zu pending_factors=%zu",
+            node_exists_.size(), pending_values_.size(), pending_graph_.size());
+
         RCLCPP_INFO(rclcpp::get_logger("automap_system"),
             "[ISAM2_DIAG][CRASH_TRACE] step=forceUpdate_unknown_exception (崩溃发生在 forceUpdate 内 commitAndUpdate，见上一 TRACE step)");
         ALOG_ERROR(MOD, "forceUpdate: unknown exception");
@@ -997,8 +1065,13 @@ OptimizationResult IncrementalOptimizer::commitAndUpdate() {
         RCLCPP_INFO(rclcpp::get_logger("automap_system"),
             "[CRASH_CONTEXT] step=commitAndUpdate_before_copy pending_factors=%zu pending_values=%zu", pf, pv);
         gtsam::NonlinearFactorGraph graph_copy(pending_graph_);
-        gtsam::Values values_copy(pending_values_);
-        // Incremental path: merge current_estimate_ so loop (and other) factor keys exist for validation and update
+        // ✅ IMPORTANT:
+        // - values_for_update: ONLY contains newly added variables' initial values (pending_values_).
+        //   Passing existing keys again to ISAM2::update triggers "key already exists" (e.g. s0).
+        // - values_for_validation: may merge current_estimate_ so factor-key validation can access all keys.
+        gtsam::Values values_for_update(pending_values_);
+        gtsam::Values values_for_validation(pending_values_);
+        // Incremental path: merge current_estimate_ ONLY for validation (not for isam2_.update)
         if (!is_first_update && !current_estimate_.empty()) {
             gtsam::Values values_merged(current_estimate_);
             // 🔧 诊断: 检查 pending_values_ 中是否有 key 已存在于 current_estimate_
@@ -1036,14 +1109,14 @@ OptimizationResult IncrementalOptimizer::commitAndUpdate() {
                     values_merged = pending_values_;
                 }
             }
-            values_copy = values_merged;
+            values_for_validation = values_merged;
         }
         RCLCPP_INFO(rclcpp::get_logger("automap_system"),
             "[ISAM2_DIAG][TRACE] step=copy_graph_values_done factors=%zu values=%zu (崩溃在此后则与 copy 无关)",
-            graph_copy.size(), values_copy.size());
+            graph_copy.size(), values_for_validation.size());
         RCLCPP_INFO(rclcpp::get_logger("automap_system"),
             "[CRASH_CONTEXT] step=commitAndUpdate_copy_done graph_size=%zu values_size=%zu is_first_update=%d",
-            graph_copy.size(), values_copy.size(), is_first_update ? 1 : 0);
+            graph_copy.size(), values_for_validation.size(), is_first_update ? 1 : 0);
 
         // ═══════════════════════════════════════════════════════════════════════════════
         // ✅ P0 V5 彻底修复：首次 update 完全跳过优化，仅注入 values，保留 factors 到下次 update。
@@ -1059,12 +1132,12 @@ OptimizationResult IncrementalOptimizer::commitAndUpdate() {
                 "[ISAM2_DIAG][V5] first update path=SKIP_OPTIMIZATION (bypass all GTSAM linearize)");
             RCLCPP_INFO(rclcpp::get_logger("automap_system"),
                 "[CRASH_CONTEXT] step=first_update_v5_enter factors=%zu values=%zu",
-                graph_copy.size(), values_copy.size());
+                graph_copy.size(), values_for_update.size());
             // V5 首次 update 前：校验 values 合法，避免注入 nan/inf 或超大平移导致 GTSAM 异常
             bool first_values_ok = true;
-            for (const gtsam::Key k : values_copy.keys()) {
+            for (const gtsam::Key k : values_for_update.keys()) {
                 try {
-                    auto p = values_copy.at<gtsam::Pose3>(k);
+                    auto p = values_for_update.at<gtsam::Pose3>(k);
                     Eigen::Vector3d t = p.translation();
                     Eigen::Matrix3d R = p.rotation().matrix();
                     if (!t.array().isFinite().all() || !R.array().isFinite().all()) {
@@ -1103,9 +1176,9 @@ OptimizationResult IncrementalOptimizer::commitAndUpdate() {
             RCLCPP_INFO(rclcpp::get_logger("automap_system"),
                 "[ISAM2_DIAG][TRACE] step=first_update_v5_pre_update_values");
             RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-                "[CRASH_CONTEXT] step=first_update_v5_pre_update_values nodes=%zu", values_copy.size());
+                "[CRASH_CONTEXT] step=first_update_v5_pre_update_values nodes=%zu", values_for_update.size());
             auto t_first_update = std::chrono::steady_clock::now();
-            isam2_.update(empty_graph, values_copy);
+            isam2_.update(empty_graph, values_for_update);
             double ms_first = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_first_update).count();
             RCLCPP_INFO(rclcpp::get_logger("automap_system"),
                 "[ISAM2_DIAG][TRACE] step=first_update_v5_post_update_values elapsed_ms=%.1f", ms_first);
@@ -1117,21 +1190,21 @@ OptimizationResult IncrementalOptimizer::commitAndUpdate() {
             // pending_graph_ 的清空逻辑在函数末尾会根据 used_first_update_three_phase 跳过
 
             // Step3: 直接用初始值作为当前估计（不做优化）
-            current_estimate_ = values_copy;
+            current_estimate_ = values_for_update;
             RCLCPP_INFO(rclcpp::get_logger("automap_system"),
                 "[ISAM2_DIAG][V5] first update done: injected %zu values, deferred %zu factors to next update",
-                values_copy.size(), graph_copy.size());
+                values_for_update.size(), graph_copy.size());
             RCLCPP_INFO(rclcpp::get_logger("automap_system"),
                 "[CRASH_CONTEXT] step=first_update_v5_done deferred_factors=%zu", graph_copy.size());
         } else {
             // 常规 ISAM2 增量 update：优化前全量约束校验，任一不合理则中止 update 避免触发 GTSAM 崩溃
             RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-                "[ISAM2_DIAG] commitAndUpdate path=incremental (graph_copy.size=%zu values_copy.size=%zu)",
-                graph_copy.size(), values_copy.size());
+                "[ISAM2_DIAG] commitAndUpdate path=incremental (graph_copy.size=%zu values_for_update.size=%zu values_for_validation.size=%zu)",
+                graph_copy.size(), values_for_update.size(), values_for_validation.size());
             RCLCPP_INFO(rclcpp::get_logger("automap_system"),
                 "[CRASH_CONTEXT] step=incremental_constraints_dump_enter");
             ConstraintValidation inc_validation;
-            logAllConstraintsAndValidate(graph_copy, values_copy, "incremental_before_isam2", &inc_validation);
+            logAllConstraintsAndValidate(graph_copy, values_for_validation, "incremental_before_isam2", &inc_validation);
             RCLCPP_INFO(rclcpp::get_logger("automap_system"),
                 "[ISAM2_DIAG][TRACE] step=incremental_constraints_dump_done all_keys_exist=%s all_values_finite=%s all_values_reasonable=%s",
                 inc_validation.all_keys_exist ? "1" : "0", inc_validation.all_values_finite ? "1" : "0",
@@ -1143,6 +1216,36 @@ OptimizationResult IncrementalOptimizer::commitAndUpdate() {
                     "[IncrementalOptimizer][BACKEND][VALIDATION] constraint validation FAILED: %s - aborting iSAM2 update to avoid crash (grep BACKEND VALIDATION)",
                     inc_validation.message.c_str());
                 ALOG_ERROR(MOD, "constraint validation failed: {} - abort update", inc_validation.message);
+
+                // 🔧 修复: 验证失败时同步 node_exists_ 与 current_estimate_ 状态
+                // 问题: 失败后清空了 pending_graph_/pending_values_，但 node_exists_ 没有更新
+                // 导致后续因子检查通过但实际 iSAM2 中没有这些节点
+                RCLCPP_WARN(rclcpp::get_logger("automap_system"),
+                    "[IncrementalOptimizer][BACKEND][VALIDATION] Sync node_exists_ after validation failure: "
+                    "node_exists_ has %zu keys, current_estimate_ has %zu values",
+                    node_exists_.size(), current_estimate_.size());
+
+                // 移除不在 current_estimate_ 中的节点
+                std::vector<int> nodes_to_remove;
+                for (const auto& kv : node_exists_) {
+                    if (!current_estimate_.exists(SM(kv.first))) {
+                        nodes_to_remove.push_back(kv.first);
+                    }
+                }
+                for (int id : nodes_to_remove) {
+                    node_exists_.erase(id);
+                    RCLCPP_WARN(rclcpp::get_logger("automap_system"),
+                        "[IncrementalOptimizer][BACKEND][VALIDATION] Removed stale node_exists_ entry: sm_id=%d", id);
+                }
+
+                // 如果连续失败太多，触发恢复机制
+                if (consecutive_failures_.load() >= 3) {
+                    RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+                        "[IncrementalOptimizer][BACKEND][VALIDATION] Too many consecutive failures (%d), triggering recovery reset",
+                        consecutive_failures_.load());
+                    // 不在验证失败路径调用 resetForRecovery（会死锁），而是标记需要在下一次调用时重置
+                }
+
                 pending_graph_.resize(0);
                 pending_values_.clear();
                 scope.setSuccess(false);
@@ -1152,12 +1255,12 @@ OptimizationResult IncrementalOptimizer::commitAndUpdate() {
             }
 
             RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-                "[CRASH_CONTEXT] step=incremental_pre_update (若崩溃则发生在 isam2_.update(graph_copy, values_copy) 内)");
+                "[CRASH_CONTEXT] step=incremental_pre_update (若崩溃则发生在 isam2_.update(graph_copy, values_for_update) 内)");
             RCLCPP_INFO(rclcpp::get_logger("automap_system"),
                 "[ISAM2_DIAG][TRACE] step=isam2_update_invoke");
             crash_report::setLastStep("incremental_isam2_update");
             auto t_update_begin = std::chrono::steady_clock::now();
-            isam2_.update(graph_copy, values_copy);
+            isam2_.update(graph_copy, values_for_update);
             double ms_update = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_update_begin).count();
             RCLCPP_INFO(rclcpp::get_logger("automap_system"),
                 "[ISAM2_DIAG][TRACE] step=isam2_update_returned elapsed_ms=%.1f (若卡住则上一行为 update_invoke)",
@@ -1202,6 +1305,15 @@ OptimizationResult IncrementalOptimizer::commitAndUpdate() {
     } catch (const std::exception& e) {
         scope.setSuccess(false);
         ALOG_ERROR(MOD, "iSAM2 update FAILED: {}", e.what());
+
+        // 🔧 诊断: 异常时记录详细状态
+        RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+            "[IncrementalOptimizer][DIAG] EXCEPTION in commitAndUpdate: "
+            "node_exists_ size=%zu pending_values=%zu pending_factors=%zu current_estimate_=%zu "
+            "exception='%s'",
+            node_exists_.size(), pending_values_.size(), pending_graph_.size(),
+            current_estimate_.size(), e.what());
+
         RCLCPP_INFO(rclcpp::get_logger("automap_system"),
             "[ISAM2_DIAG][CRASH_TRACE] step=commitAndUpdate_exception exception=%s (崩溃或异常发生在上一 TRACE step 与本次之间)",
             e.what());
@@ -1212,6 +1324,23 @@ OptimizationResult IncrementalOptimizer::commitAndUpdate() {
             "[ISAM2_DIAG] commitAndUpdate done success=0 exception=%s", e.what());
         RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
             "[IncrementalOptimizer][EXCEPTION] iSAM2 update FAILED: %s", e.what());
+
+        // 🔧 修复: 异常时同步 node_exists_ 与 current_estimate_
+        RCLCPP_WARN(rclcpp::get_logger("automap_system"),
+            "[IncrementalOptimizer][DIAG] Sync node_exists_ after exception: "
+            "removing stale entries not in current_estimate_");
+        std::vector<int> nodes_to_remove;
+        for (const auto& kv : node_exists_) {
+            if (!current_estimate_.exists(SM(kv.first))) {
+                nodes_to_remove.push_back(kv.first);
+            }
+        }
+        for (int id : nodes_to_remove) {
+            node_exists_.erase(id);
+            RCLCPP_WARN(rclcpp::get_logger("automap_system"),
+                "[IncrementalOptimizer][DIAG] Removed stale node_exists_ entry after exception: sm_id=%d", id);
+        }
+
         pending_graph_.resize(0);
         pending_values_.clear();
         // ✅ 健康检查：记录优化失败
@@ -1811,6 +1940,16 @@ void IncrementalOptimizer::recordOptimizationFailure(const std::string& error_ms
     failed_optimizations_++;
     last_error_message_ = error_msg;
 
+    // 🔧 诊断: 记录失败时的详细状态
+    RCLCPP_WARN(rclcpp::get_logger("automap_system"),
+        "[IncrementalOptimizer][DIAG] recordOptimizationFailure: "
+        "consecutive_failures=%d total=%d failed=%d "
+        "node_exists_=%zu current_estimate_=%zu pending_values=%zu pending_factors=%zu "
+        "error='%s'",
+        consecutive_failures_.load(), total_optimizations_.load(), failed_optimizations_.load(),
+        node_exists_.size(), current_estimate_.size(), pending_values_.size(), pending_graph_.size(),
+        error_msg.c_str());
+
     ALOG_WARN(MOD, "[Health] Optimization FAILED: consecutive_failures=%d error=%s",
               consecutive_failures_.load(), error_msg.c_str());
     RCLCPP_WARN(rclcpp::get_logger("automap_system"),
@@ -1822,8 +1961,9 @@ void IncrementalOptimizer::recordOptimizationFailure(const std::string& error_ms
         ALOG_ERROR(MOD, "[Health] CRITICAL: %d consecutive optimization failures, consider reset!",
                    consecutive_failures_.load());
         RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
-            "[IncrementalOptimizer][Health] CRITICAL: %d consecutive optimization failures, consider reset!",
-            consecutive_failures_.load());
+            "[IncrementalOptimizer][Health] CRITICAL: %d consecutive optimization failures, consider reset! "
+            "(node_exists_=%zu current_estimate_=%zu)",
+            consecutive_failures_.load(), node_exists_.size(), current_estimate_.size());
     }
 }
 
@@ -1832,12 +1972,29 @@ void IncrementalOptimizer::recordOptimizationSuccess(double elapsed_ms) {
     total_optimizations_++;
     last_success_time_ms_ = elapsed_ms;
 
+    // 🔧 诊断: 记录成功时的状态
+    RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+        "[IncrementalOptimizer][DIAG] Optimization SUCCESS: "
+        "elapsed_ms=%.2f total=%d failed=%d "
+        "node_exists_=%zu current_estimate_=%zu pending_values=%zu pending_factors=%zu",
+        elapsed_ms, total_optimizations_.load(), failed_optimizations_.load(),
+        node_exists_.size(), current_estimate_.size(),
+        pending_values_.size(), pending_graph_.size());
+
     ALOG_DEBUG(MOD, "[Health] Optimization SUCCESS: elapsed_ms=%.2f total=%d failed=%d",
                elapsed_ms, total_optimizations_.load(), failed_optimizations_.load());
 }
 
 void IncrementalOptimizer::resetForRecovery() {
     std::unique_lock<std::shared_mutex> lk(rw_mutex_);
+
+    // 🔧 诊断: 记录恢复前的状态
+    RCLCPP_WARN(rclcpp::get_logger("automap_system"),
+        "[IncrementalOptimizer][DIAG] resetForRecovery ENTER: "
+        "node_exists_ size=%zu current_estimate_=%zu pending_values=%zu pending_factors=%zu "
+        "node_count=%d factor_count=%d consecutive_failures=%d",
+        node_exists_.size(), current_estimate_.size(), pending_values_.size(), pending_graph_.size(),
+        node_count_, factor_count_, consecutive_failures_.load());
 
     ALOG_WARN(MOD, "[Health] Resetting iSAM2 for recovery (was nodes=%d factors=%d)",
               node_count_, factor_count_);

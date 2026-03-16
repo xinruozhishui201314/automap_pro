@@ -341,6 +341,7 @@ void GPSManager::try_align() {
                   result.rmse_m, rmse_accept_thresh_);
         state_ = GPSAlignState::NOT_ALIGNED;
         good_sample_count_ = 0;
+        result.message = "RMSE too high: " + std::to_string(result.rmse_m) + "m > " + std::to_string(rmse_accept_thresh_) + "m";
     }
 }
 
@@ -486,8 +487,12 @@ GPSAlignResult GPSManager::compute_svd_alignment() {
     result.success       = true;
     result.R_gps_lidar   = R;
     result.t_gps_lidar   = t;
+    result.R_enu_to_map  = R;   // R_gps_lidar就是ENU到Map的旋转
+    result.t_enu_to_map  = t;   // t_gps_lidar就是ENU到Map的平移
     result.rmse_m        = rmse;
     result.matched_points = (int)pairs.size();
+    result.used_measurements = pairs.size();
+    result.message = "SVD alignment successful";
     return result;
 }
 

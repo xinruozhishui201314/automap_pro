@@ -22,21 +22,23 @@ float deg2rad(float degrees)
 
 float xy2theta( const float & _x, const float & _y )
 {
-    if ( _x >= 0 & _y >= 0) 
+    if ( _x >= 0 && _y >= 0) 
         return (180/M_PI) * atan(_y / _x);
 
-    if ( _x < 0 & _y >= 0) 
+    if ( _x < 0 && _y >= 0) 
         return 180 - ( (180/M_PI) * atan(_y / (-_x)) );
 
-    if ( _x < 0 & _y < 0) 
+    if ( _x < 0 && _y < 0) 
         return 180 + ( (180/M_PI) * atan(_y / _x) );
 
-    if ( _x >= 0 & _y < 0)
+    if ( _x >= 0 && _y < 0)
         return 360 - ( (180/M_PI) * atan((-_y) / _x) );
+
+    return 0.0f; // default case, should not reach here
 } // xy2theta
 
 
-MatrixXd circshift( MatrixXd &_mat, int _num_shift )
+MatrixXd circshift( const MatrixXd &_mat, int _num_shift )
 {
     // shift columns to right direction 
     assert(_num_shift >= 0);
@@ -75,7 +77,7 @@ double SCManager::distDirectSC ( const MatrixXd &_sc1, const MatrixXd &_sc2 )
         VectorXd col_sc1 = _sc1.col(col_idx);
         VectorXd col_sc2 = _sc2.col(col_idx);
         
-        if( col_sc1.norm() == 0 | col_sc2.norm() == 0 )
+        if( col_sc1.norm() == 0 || col_sc2.norm() == 0 )
             continue; // don't count this sector pair. 
 
         double sector_similarity = col_sc1.dot(col_sc2) / (col_sc1.norm() * col_sc2.norm());

@@ -47,7 +47,20 @@ public:
     void resetLastPose(const Pose3d& pose, double ts);
     int  keyframeCount() const { return kf_count_; }
 
+    /** 判断是否应创建关键帧，如需要则同时创建（组合操作） */
+    bool needNewKeyFrame(double timestamp, const Pose3d& pose, const Mat66d& cov, const CloudXYZIPtr& cloud);
+    
+    /** 获取最后一个关键帧 */
+    KeyFrame::Ptr getLastKeyFrame() const { return last_keyframe_; }
+    
+    /** 添加关键帧到管理器 */
+    void addKeyFrame(KeyFrame::Ptr kf);
+    
+    /** 根据ID获取关键帧 */
+    KeyFrame::Ptr getKeyFrameById(int id) const;
+
 private:
+    KeyFrame::Ptr last_keyframe_;
     double min_translation_  = 0.5;    // 米，与上一关键帧位置变化≥此值即添加
     double min_rotation_deg_ = 10.0;   // 度，与上一关键帧角度变化≥此值即添加
     double max_interval_     = 2.0;    // 秒

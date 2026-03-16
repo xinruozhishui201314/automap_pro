@@ -3,6 +3,7 @@
 #include "automap_pro/core/utils.h"
 #include "automap_pro/core/logger.h"
 
+#include <fmt/format.h>
 #include <rclcpp/rclcpp.hpp>
 #include <cmath>
 #include <string>

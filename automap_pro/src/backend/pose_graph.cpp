@@ -151,8 +151,26 @@ int PoseGraph::addGPSEdge(int node_id, const Eigen::Vector3d& gps_pos, const Eig
     e.measurement = Pose3d::Identity();
     e.measurement.translation() = gps_pos;
     e.information = Mat66d::Identity();
-    Eigen::Matrix3d pos_info = gps_cov.inverse();
-    if (!pos_info.allFinite()) pos_info = Eigen::Matrix3d::Identity() * 1e-3;
+
+    // 使用 CompleteOrthogonalDecomposition 进行数值稳定的伪逆计算
+    Eigen::CompleteOrthogonalDecomposition<Eigen::Matrix3d> cod(gps_cov);
+    Eigen::Matrix3d pos_info;
+
+    if (cod.isInvertible()) {
+        // 矩阵可逆，使用 solve 方法求逆 (A^(-1) = solve(I))
+        pos_info = cod.solve(Eigen::Matrix3d::Identity());
+    } else {
+        // 矩阵奇异或接近奇异，使用伪逆
+        ALOG_WARN("PoseGraph", "GPS covariance matrix is singular or near-singular, using pseudo-inverse");
+        pos_info = cod.pseudoInverse();
+    }
+
+    // 检查求逆结果是否有效
+    if (!pos_info.allFinite()) {
+        ALOG_WARN("PoseGraph", "GPS covariance inverse contains NaN/Inf, using default");
+        pos_info = Eigen::Matrix3d::Identity() * 1e-3;
+    }
+
     e.information.block<3,3>(0,0) = pos_info;
     e.information.block<3,3>(3,3) = Eigen::Matrix3d::Identity() * 1e-6;  // 旋转弱约束
     return addEdge(e);

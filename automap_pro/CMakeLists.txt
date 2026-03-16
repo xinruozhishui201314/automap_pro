@@ -312,7 +312,7 @@ target_link_libraries(automap_submap automap_core automap_frontend ${AUTOMAP_LIB
 ament_target_dependencies(automap_submap ${AUTOMAP_AMENT_DEPS})
 
 # ──────────────────────────────────────────────────────────
-# 库：automap_loop_closure（OverlapTransformer + TEASER++ + ICP）
+# 库：automap_loop_closure（OverlapTransformer + TEASER++ + ICP + ScanContext）
 # ──────────────────────────────────────────────────────────
 add_library(automap_loop_closure SHARED
   src/loop_closure/overlap_transformer_infer.cpp
@@ -320,6 +320,7 @@ add_library(automap_loop_closure SHARED
   src/loop_closure/teaser_matcher.cpp
   src/loop_closure/icp_refiner.cpp
   src/loop_closure/loop_detector.cpp
+  ${CMAKE_SOURCE_DIR}/thrid_party/scancontext_tro/cpp/module/Scancontext/Scancontext.cpp
 )
 
 # ============================================================

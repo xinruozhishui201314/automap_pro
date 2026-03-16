@@ -103,6 +103,12 @@ public:
      */
     void forceFreezeActiveSubmapForFinish();
 
+    /**
+     * 冻结指定的活跃子图（必须是 ACTIVE 状态）
+     * @param sm 要冻结的子图指针
+     */
+    void freezeSubmap(const SubMap::Ptr& sm);
+
 private:
     std::vector<SubMap::Ptr>  submaps_;
     SubMap::Ptr               active_submap_;

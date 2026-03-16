@@ -378,6 +378,10 @@ void SubMapManager::forceFreezeActiveSubmapForFinish() {
     }
 }
 
+void SubMapManager::freezeSubmap(const SubMap::Ptr& sm) {
+    freezeActiveSubmap(sm);
+}
+
 void SubMapManager::freezePostProcessLoop() {
     while (freeze_post_running_.load()) {
         SubMap::Ptr sm;
@@ -538,6 +542,19 @@ void SubMapManager::updateSubmapPose(int submap_id, const Pose3d& new_pose) {
     double max_translation_diff = 0.0;
     double max_rotation_diff = 0.0;
 
+    // ========== [SUBMAP_POSE_UPDATE_DEBUG] 增加详细日志 ==========
+    RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+        "[SubMapMgr][SUBMAP_POSE_UPDATE_DEBUG] =======================================================");
+    RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+        "[SubMapMgr][SUBMAP_POSE_UPDATE_DEBUG] 开始更新子图%d的位姿...", submap_id);
+    RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+        "[SubMapMgr][SUBMAP_POSE_UPDATE_DEBUG] 新锚点位姿: pos=(%.2f, %.2f, %.2f), RPY=(%.1f, %.1f, %.1f)",
+        new_pose.translation().x(), new_pose.translation().y(), new_pose.translation().z(),
+        new_pose.rotation().eulerAngles(2,1,0).x() * 180.0 / M_PI,
+        new_pose.rotation().eulerAngles(2,1,0).y() * 180.0 / M_PI,
+        new_pose.rotation().eulerAngles(2,1,0).z() * 180.0 / M_PI);
+    // ========== [SUBMAP_POSE_UPDATE_DEBUG] 结束 ==========
+
     for (auto& sm : submaps_) {
         if (sm->id != submap_id) continue;
 
@@ -559,7 +576,18 @@ void SubMapManager::updateSubmapPose(int submap_id, const Pose3d& new_pose) {
             continue;
         }
 
+        // ========== [SUBMAP_POSE_UPDATE_DEBUG] 打印原锚点 ==========
         Pose3d old_anchor = sm->pose_w_anchor_optimized;
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[SubMapMgr][SUBMAP_POSE_UPDATE_DEBUG] 子图%d原锚点位姿: pos=(%.2f, %.2f, %.2f), RPY=(%.1f, %.1f, %.1f), 关键帧数=%zu",
+            sm->id,
+            old_anchor.translation().x(), old_anchor.translation().y(), old_anchor.translation().z(),
+            old_anchor.rotation().eulerAngles(2,1,0).x() * 180.0 / M_PI,
+            old_anchor.rotation().eulerAngles(2,1,0).y() * 180.0 / M_PI,
+            old_anchor.rotation().eulerAngles(2,1,0).z() * 180.0 / M_PI,
+            sm->keyframes.size());
+        // ========== [SUBMAP_POSE_UPDATE_DEBUG] 结束 ==========
+        
         sm->pose_w_anchor_optimized = new_pose;
         sm->state = SubMapState::OPTIMIZED;
 
@@ -574,6 +602,12 @@ void SubMapManager::updateSubmapPose(int submap_id, const Pose3d& new_pose) {
         // 记录最大差异的指标
         METRICS_GAUGE_SET(metrics::LOOP_RMSE_METERS, max_translation_diff);
 
+        // ========== [SUBMAP_POSE_UPDATE_DEBUG] 打印位姿变化增量 ==========
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[SubMapMgr][SUBMAP_POSE_UPDATE_DEBUG] 子图%d位姿变化: 平移=%.3fm, 旋转=%.1f度",
+            sm->id, translation_diff, rotation_diff * 180.0 / M_PI);
+        // ========== [SUBMAP_POSE_UPDATE_DEBUG] 结束 ==========
+
         SLOG_DEBUG(MOD, "SM#{} pose updated: trans={:.3f}m rot={:.1f}°",
                      sm->id, translation_diff,
                      rotation_diff * 180.0 / M_PI);
@@ -586,10 +620,48 @@ void SubMapManager::updateSubmapPose(int submap_id, const Pose3d& new_pose) {
         }
 
         // 更新所有关键帧的优化位姿
+        // ========== [SUBMAP_POSE_UPDATE_DEBUG] 打印delta计算 ==========
         Pose3d delta = new_pose * old_anchor.inverse();
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[SubMapMgr][SUBMAP_POSE_UPDATE_DEBUG] 子图%d: delta = new_pose * old_anchor.inverse()", sm->id);
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[SubMapMgr][SUBMAP_POSE_UPDATE_DEBUG] 子图%d: delta平移=(%.2f, %.2f, %.2f), delta旋转RPY=(%.1f, %.1f, %.1f)",
+            sm->id,
+            delta.translation().x(), delta.translation().y(), delta.translation().z(),
+            delta.rotation().eulerAngles(2,1,0).x() * 180.0 / M_PI,
+            delta.rotation().eulerAngles(2,1,0).y() * 180.0 / M_PI,
+            delta.rotation().eulerAngles(2,1,0).z() * 180.0 / M_PI);
+        // ========== [SUBMAP_POSE_UPDATE_DEBUG] 结束 ==========
+        
+        int kf_idx = 0;
         for (auto& kf : sm->keyframes) {
+            // ========== [SUBMAP_POSE_UPDATE_DEBUG] 打印关键帧更新前后 ==========
+            if (kf_idx < 3) {  // 只打印前3个关键帧以避免日志过多
+                RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                    "[SubMapMgr][SUBMAP_POSE_UPDATE_DEBUG] 子图%d关键帧%d: 原T_w_b=(%.2f, %.2f, %.2f)",
+                    sm->id, kf_idx, kf->T_w_b.translation().x(), kf->T_w_b.translation().y(), kf->T_w_b.translation().z());
+            }
+            // ========== [SUBMAP_POSE_UPDATE_DEBUG] 结束 ==========
+            
             kf->T_w_b_optimized = delta * kf->T_w_b;
+            
+            // ========== [SUBMAP_POSE_UPDATE_DEBUG] 打印关键帧更新后 ==========
+            if (kf_idx < 3) {
+                RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                    "[SubMapMgr][SUBMAP_POSE_UPDATE_DEBUG] 子图%d关键帧%d: 新T_w_b_optimized=(%.2f, %.2f, %.2f)",
+                    sm->id, kf_idx, kf->T_w_b_optimized.translation().x(), kf->T_w_b_optimized.translation().y(), kf->T_w_b_optimized.translation().z());
+            }
+            // ========== [SUBMAP_POSE_UPDATE_DEBUG] 结束 ==========
+            kf_idx++;
         }
+        
+        // ========== [SUBMAP_POSE_UPDATE_DEBUG] 总结 ==========
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[SubMapMgr][SUBMAP_POSE_UPDATE_DEBUG] 子图%d位姿更新完成, 共更新%d个关键帧",
+            sm->id, kf_idx);
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[SubMapMgr][SUBMAP_POSE_UPDATE_DEBUG] =======================================================");
+        // ========== [SUBMAP_POSE_UPDATE_DEBUG] 结束 ==========
 
         publishEvent(sm, "OPTIMIZED");
         SLOG_EVENT(MOD, "submap_optimized", 

@@ -282,8 +282,13 @@ struct GPSAlignResult {
     bool   success = false;
     Eigen::Matrix3d R_gps_lidar = Eigen::Matrix3d::Identity();
     Eigen::Vector3d t_gps_lidar = Eigen::Vector3d::Zero();
+    // ENU到Map坐标系的变换（SVD对齐成功后设置）
+    Eigen::Matrix3d R_enu_to_map = Eigen::Matrix3d::Identity();
+    Eigen::Vector3d t_enu_to_map = Eigen::Vector3d::Zero();
     double rmse_m   = 1e6;
     int    matched_points = 0;
+    size_t used_measurements = 0;  // 参与对齐的GPS测量数量
+    std::string message;  // 对齐结果消息
 };
 
 // ─────────────────────────────────────────────────────────────────────────────

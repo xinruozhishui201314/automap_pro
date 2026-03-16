@@ -337,7 +337,7 @@ backend:
     pcd_name_fill_num:       0
     enable_gps_factor:       true
     # 无 hba_api 时是否用 GTSAM fallback 做 HBA。生产建议 false，避免 double free；见 docs/HBA_GTSAM_FALLBACK_DOUBLE_FREE_FIX.md
-    enable_gtsam_fallback:   true
+    enable_gtsam_fallback:   false
   hba_cal_mme:
     file_path:               "/tmp/hba_data"
     thr_num:                 16

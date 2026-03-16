@@ -51,7 +51,7 @@ void coreImportTest ( void );
 
 // sc param-independent helper functions 
 float xy2theta( const float & _x, const float & _y );
-MatrixXd circshift( MatrixXd &_mat, int _num_shift );
+MatrixXd circshift( const MatrixXd &_mat, int _num_shift );
 std::vector<float> eig2stdvec( MatrixXd _eigmat );
 
 
