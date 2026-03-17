@@ -229,6 +229,14 @@ void RvizPublisher::publishOptimizedPath(const std::vector<SubMap::Ptr>& submaps
                   return a.first < b.first;
               });
 
+    if (!sorted_kfs.empty()) {
+        const auto& first_t = sorted_kfs.front().second.translation();
+        const auto& last_t = sorted_kfs.back().second.translation();
+        RCLCPP_INFO(node_->get_logger(),
+            "[GHOSTING_DIAG] optimized_path published kf_count=%zu first_pos=[%.2f,%.2f,%.2f] last_pos=[%.2f,%.2f,%.2f] (与 map 同源则 last_pos 应与 pose_snapshot_taken 一致)",
+            sorted_kfs.size(), first_t.x(), first_t.y(), first_t.z(), last_t.x(), last_t.y(), last_t.z());
+    }
+
     for (const auto& [ts, pose] : sorted_kfs) {
         geometry_msgs::msg::PoseStamped ps;
         ps.header = path.header;

@@ -81,14 +81,56 @@ public:
     void addGPSFactor(int sm_id, const Eigen::Vector3d& pos_map,
                       const Eigen::Matrix3d& cov3x3);
 
+    // ── KeyFrame 级别因子（与 HBA 对齐，增强 GPS 约束） ────────────────────
+
+    /** 添加 keyframe 节点（KF 级别，与 HBA 的 level1 对齐）。
+     * @param is_first_kf_of_submap 若为 true 则强制添加 Prior，避免新子图首帧无约束导致 IndeterminantLinearSystemException */
+    void addKeyFrameNode(int kf_id, const Pose3d& init_pose, bool fixed = false, bool is_first_kf_of_submap = false);
+
+    /** 添加 keyframe 级别的 GPS 因子（KF 级别） */
+    void addGPSFactorForKeyFrame(int kf_id, const Eigen::Vector3d& pos_map,
+                                 const Eigen::Matrix3d& cov3x3);
+
+    /** 获取 keyframe 节点位姿 */
+    Pose3d getKeyFramePose(int kf_id) const;
+
+    /** 检查 keyframe 节点是否存在 */
+    bool keyFrameExists(int kf_id) const;
+
+    /** 批量添加 keyframe GPS 因子 */
+    struct GPSFactorItemKF { int kf_id; Eigen::Vector3d pos; Eigen::Matrix3d cov; };
+    void addGPSFactorsForKeyFramesBatch(const std::vector<GPSFactorItemKF>& factors);
+
     /** 批量添加 GPS 因子并只做一次 commitAndUpdate（由 opt 线程调用，用于避免多次 update 触发 GTSAM 内部竞态） */
     struct GPSFactorItem { int sm_id; Eigen::Vector3d pos; Eigen::Matrix3d cov; };
     void addGPSFactorsBatch(const std::vector<GPSFactorItem>& factors);
 
     // ── 查询当前最优位姿 ─────────────────────────────────────────────────
 
+    /**
+     * @brief 获取子图位姿（不推荐使用，返回 Identity 作为 fallback 会导致假漂移）
+     * @deprecated 请使用 getPoseOptional() 替代
+     */
     Pose3d getPose(int sm_id) const;
+
+    /**
+     * @brief 获取子图位姿的可选版本，明确区分三种状态
+     * @param sm_id 子图 ID
+     * @return std::nullopt_t 如果节点完全不存在于因子图中
+     *         std::nullopt_t 如果节点存在但尚未被 forceUpdate 提交到 current_estimate_
+     *         Pose3d 实际位姿（如果已优化）
+     */
+    std::optional<Pose3d> getPoseOptional(int sm_id) const;
+
     std::unordered_map<int, Pose3d> getAllPoses() const;
+
+    /**
+     * @brief 检查节点是否存在于因子图但不在 current_estimate_ 中
+     * @param sm_id 子图 ID
+     * @return true 表示节点存在但未进入 estimate（需要 forceUpdate）
+     *         false 表示节点要么在 estimate 中，要么完全不存在
+     */
+    bool hasNodePendingEstimate(int sm_id) const;
 
     /** 强制触发完整 iSAM2 update（用于批量 GPS 因子添加后） */
     OptimizationResult forceUpdate();
@@ -183,6 +225,16 @@ public:
     /** 获取当前 pending factors 数量（用于诊断） */
     size_t pendingFactorsCount() const;
 
+    // ── KeyFrame 级别 GPS 因子刷新 ───────────────────────────────────────
+    /** 刷新 pending keyframe GPS 因子（在子图冻结或HBA完成后调用） */
+    int flushPendingGPSFactorsForKeyFrames();
+    
+    /** 刷新 pending keyframe GPS 因子（内部版本，假设锁已由调用者持有） */
+    int flushPendingGPSFactorsForKeyFramesInternal();
+
+    /** 刷新 pending submap-level GPS 因子（在子图冻结成功后调用） */
+    int flushPendingGPSFactors();
+
 private:
     // 健康状态数据
     std::atomic<int> consecutive_failures_{0};
@@ -201,8 +253,15 @@ private:
     /** 仅用于 shutdown 检查与 has_prior_ 语义；Prior 因子改用 prior_var6_ 新建 noise */
     gtsam::noiseModel::Diagonal::shared_ptr prior_noise_;
 
+    /** 锁顺序约定（防死锁）：automap_system 持 keyframe_mutex_ 后调用本类 add*，本类持 rw_mutex_；optLoop 仅持 opt_queue_mutex_ -> rw_mutex_，不持 keyframe_mutex_。禁止在持 rw_mutex_ 时调用会获取 keyframe_mutex_ 的代码。见 BACKEND_POTENTIAL_ISSUES 1.3.3 */
     mutable std::shared_mutex rw_mutex_;
     std::unordered_map<int, bool> node_exists_;
+    // KeyFrame 级别节点跟踪（与 HBA level1 对齐）
+    std::unordered_map<int, bool> keyframe_node_exists_;
+    int keyframe_count_ = 0;
+    /** 上一 keyframe 的 id 与位姿，用于添加 KF(i)->KF(i+1) 的 Between 因子，避免欠定 */
+    int last_keyframe_id_ = -1;
+    Pose3d last_keyframe_pose_;
 
     int    node_count_   = 0;
     int    factor_count_ = 0;
@@ -234,8 +293,12 @@ private:
 
     /** 首节点 defer 时无法加 GPS 因子，缓存待 forceUpdate 成功后补加 */
     std::vector<GPSFactorItem> pending_gps_factors_;
-    /** 在 current_estimate_ 已有节点后，将 pending_gps_factors_ 中可加入的因子加入图；调用时需已持 rw_mutex_；返回本次加入的因子数 */
-    int flushPendingGPSFactors();
+    /** KeyFrame 级别 pending GPS 因子 */
+    std::vector<GPSFactorItemKF> pending_gps_factors_kf_;
+    /** 内部版本：假设锁已由调用者持有（由 public flushPendingGPSFactors 调用） */
+    int flushPendingGPSFactorsInternal();
+    /** 失败路径：将本批 pending 中的 keyframe id 从 keyframe_node_exists_ 移除并回退 keyframe_count_/last_keyframe_id_（调用前由调用方从 pending_values_ 收集 kf_ids）。见 BACKEND_POTENTIAL_ISSUES 1.3.1 */
+    void rollbackKeyframeStateForPendingKeys(const std::vector<int>& kf_ids_in_pending);
 
     // ===== 修复2: 单节点超时强制优化 =====
     /** 记录单节点延迟开始时间（用于超时强制优化） */

@@ -54,7 +54,7 @@ void AutoMapSystem::handleTriggerHBA(
     RCLCPP_INFO(get_logger(), "[AutoMapSystem] Triggered HBA (wait=%d)", req->wait_for_result);
     RCLCPP_INFO(get_logger(), "[AutoMapSystem][PIPELINE] event=trigger_hba_called wait=%d submaps=%zu", req->wait_for_result ? 1 : 0, all.size());
     ensureBackendCompletedAndFlushBeforeHBA();
-    hba_optimizer_.triggerAsync(all, req->wait_for_result);
+                hba_optimizer_.triggerAsync(all, req->wait_for_result, "TriggerHBA_srv");
     res->success = true;
     res->message = "HBA triggered";
 }
@@ -245,7 +245,7 @@ void AutoMapSystem::handleFinishMapping(
             RCLCPP_INFO(get_logger(), "[AutoMapSystem][HBA][TRACE] step=finish_mapping_ensureBackend_done");
             if (ConfigManager::instance().hbaEnabled() && ConfigManager::instance().hbaOnFinish()) {
                 RCLCPP_INFO(get_logger(), "[AutoMapSystem][PIPELINE] event=finish_mapping_final_hba_enter submaps=%zu", all.size());
-                hba_optimizer_.triggerAsync(all, true);
+                hba_optimizer_.triggerAsync(all, true, "finish_mapping");
                 RCLCPP_INFO(get_logger(), "[AutoMapSystem][PIPELINE] event=finish_mapping_final_hba_done");
             }
             std::string out_dir = getOutputDir();

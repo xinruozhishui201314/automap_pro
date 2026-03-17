@@ -245,8 +245,8 @@ public:
     double overlapThreshold()   const { return get<double>("loop_closure.overlap_threshold", 0.3); }
     int    loopTopK()           const { return get<int>("loop_closure.top_k", 5); }
     double loopMinTemporalGap() const { return get<double>("loop_closure.min_temporal_gap_s", 30.0); }
-    /** 最小子图间隔：候选与当前子图索引差至少为此值才作回环。2=更易在短轨迹(少量子图)下产生回环，3=更保守 */
-    int    loopMinSubmapGap()   const { return std::max(1, get<int>("loop_closure.min_submap_gap", 2)); }
+    /** 最小子图间隔：0=不按子图间隔过滤(允许相邻子图回环)；>0=候选与当前子图索引差须大于该值。默认 0 */
+    int    loopMinSubmapGap()   const { return std::max(0, get<int>("loop_closure.min_submap_gap", 0)); }
     double gpsSearchRadius()    const { return get<double>("loop_closure.gps_search_radius_m", 200.0); }
     /** 回环几何距离预筛：两子图锚定位姿距离超过此值(米)的候选将被过滤，抑制重复结构误检。0=关闭。默认 0 */
     double loopGeoPrefilterMaxDistanceM() const {
@@ -279,6 +279,19 @@ public:
     /** 子图内回环：每帧最多对多少候选做 TEASER 配准（避免候选过多导致 10s+ 卡住），≤0 表示不限制 */
     int intraSubmapLoopMaxTeaserCandidates() const {
         return get<int>("loop_closure.intra_submap_max_teaser_candidates", 5);
+    }
+
+    /** 子图间回环是否使用关键帧级（true=关键帧↔关键帧跨子图，false=子图↔子图） */
+    bool interKeyframeLevelEnabled() const {
+        return get<bool>("loop_closure.inter_keyframe_level", true);
+    }
+    /** 子图间关键帧级：query 子图内每隔多少关键帧取一个做检索（1=每帧，5=每5帧，控制计算量） */
+    int interKeyframeSampleStep() const {
+        return std::max(1, get<int>("loop_closure.inter_keyframe_sample_step", 5));
+    }
+    /** 子图间关键帧级：每个候选子图内取 top-K 个关键帧做 TEASER（控制每 query 关键帧的匹配对数） */
+    int interKeyframeTopKPerSubmap() const {
+        return std::max(1, std::min(20, get<int>("loop_closure.inter_keyframe_top_k_per_submap", 3)));
     }
 
     /** 回环描述子队列最大长度，超限丢弃最低优先级，防无界堆积。默认 128 */
@@ -339,6 +352,11 @@ public:
     int backendPublishGlobalMapEveryNProcessed() const {
         int v = get<int>("backend.publish_global_map_every_n_processed", 100);
         return std::max(50, std::min(1000, v));
+    }
+    /** Keyframe 级 pending GPS 因子队列上限，超过时丢弃最旧（FIFO），防长时间失败导致 OOM。默认 1000，范围 100～5000。见 BACKEND_POTENTIAL_ISSUES 1.2.1 */
+    int backendMaxPendingGpsKeyframeFactors() const {
+        int v = get<int>("backend.max_pending_gps_keyframe_factors", 1000);
+        return std::max(100, std::min(5000, v));
     }
 
     // ── 性能优化（performance.*）────────────────────────────────────────────

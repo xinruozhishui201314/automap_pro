@@ -277,7 +277,7 @@ loop_closure:
   overlap_threshold:   0.25      # ⬇️ 降低阈值（从0.30→0.25），在保持准确的前提下检测更多回环
   top_k:               8         # ⬆️ 增加候选数（从5→8），给几何验证更多机会
   min_temporal_gap_s:  30.0
-  min_submap_gap:      2      # 2=短轨迹时也能产生回环候选；3=更保守
+  min_submap_gap:      0      # 0=不按子图间隔过滤(允许相邻子图回环)；>0=要求索引差大于该值
   # ── 子图内回环检测参数 ─────────────────────────────────────────────
   intra_submap_enabled: true
   intra_submap_min_temporal_gap_s: 5.0    # 关键帧之间最小时间间隔（秒）
@@ -285,6 +285,10 @@ loop_closure:
   intra_submap_min_distance_gap_m: 3.0     # 关键帧之间最小距离间隔(米)，避免过密假回环
   intra_submap_overlap_threshold: 0.25     # 描述子相似度阈值
   intra_submap_max_teaser_candidates: 5    # 每帧最多对多少候选做 TEASER 配准
+  # 子图间关键帧级回环（关键帧↔关键帧跨子图，替代子图↔子图）
+  inter_keyframe_level:       true   # true=子图间使用关键帧级检测
+  inter_keyframe_sample_step: 5      # query 子图内每隔多少关键帧取 1 个做检索（控制计算量）
+  inter_keyframe_top_k_per_submap: 3 # 每个候选子图内取 top-K 关键帧做 TEASER
   gps_search_radius_m: 200.0
   geo_prefilter_max_distance_m: 0.0   # 几何距离预筛：0=关闭；>0 时过滤锚定距离超过该值的候选
   worker_threads:      2
@@ -321,6 +325,8 @@ backend:
   process_every_n_frames: 5
   # 每处理多少帧发布一次全局图（增大可减轻 publishGlobalMap 峰值耗时，见 docs/FULL_LOG_PERFORMANCE_ANALYSIS.md）
   publish_global_map_every_n_processed: 100
+  # Keyframe 级 pending GPS 队列上限，超限 FIFO 丢弃最旧。见 docs/BACKEND_POTENTIAL_ISSUES.md 1.2.1
+  max_pending_gps_keyframe_factors: 1000
   isam2:
     relinearize_threshold: 0.01
     relinearize_skip:       10     # 增加到10，减少 TBB 并行触发机会（临时规避）

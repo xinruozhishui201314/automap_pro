@@ -173,6 +173,8 @@ private:
     std::mutex                map_publish_mutex_;
     std::condition_variable   map_publish_cv_;
     std::atomic<bool>         map_publish_pending_{false};
+    /** 从 finish_mapping 进入到 HBA 回调结束期间为 true，避免 map_publish 与 HBA 写回并发导致重影（见 docs/GHOSTING_ROOT_CAUSE_HBA_VS_BACKEND_20260317.md） */
+    std::atomic<bool>         finish_mapping_in_progress_{false};
     void mapPublishLoop();
 
     // 回环 iSAM2 更新异步：match_worker 只入队，本线程取任务执行 addLoopFactor，避免阻塞回环检测（有界队列防堆积/死锁）
@@ -228,6 +230,8 @@ private:
     std::atomic<int> pub_opt_path_count_{0};
     std::atomic<int> pub_map_count_{0};
     std::atomic<int> pub_status_count_{0};
+    /** 是否已打过一次「odom_path 与 global_map 不同系、同屏重影」的 WARN（仅打一次，见 HBA_GHOSTING_ANALYSIS_RUN_20260317_173943） */
+    bool odom_path_ghosting_warned_{false};
 
     // ── V2: 线程心跳监控 ─────────────────────────────────────────────────────
     // 各关键线程上次心跳时间戳（墙钟），用于检测线程是否卡住

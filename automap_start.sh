@@ -225,19 +225,23 @@ source install/setup.bash
 set -u
 log_ok "overlap_transformer_msgs built"
 
-# ── Step 2: vikit (fast_livo 依赖) ────────────────────────────────────────────
+# ── Step 2: vikit (fast_livo 依赖，与 GTSAM 一致：只编译一次，已安装则跳过) ─────
 log_sec "Step 2/6: vikit_common + vikit_ros"
 VIKIT_DIR="${CONTAINER_WS}/src/thrid_party/rpg_vikit_ros2"
 if [[ -d "${VIKIT_DIR}/vikit_common" ]]; then
-    colcon build \
-        --paths "${VIKIT_DIR}/vikit_common" "${VIKIT_DIR}/vikit_ros" \
-        --cmake-args -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" \
-        --event-handlers console_cohesion+ \
-        --parallel-workers "${JOBS}" 2>&1 | tee -a "${CONTAINER_WS}/build.log"
-    set +u
-    source install/setup.bash
-    set -u
-    log_ok "vikit built"
+    if [[ -f "install/share/vikit_common/package.xml" && -f "install/share/vikit_ros/package.xml" ]]; then
+        log_ok "vikit 已安装，跳过"
+    else
+        colcon build \
+            --paths "${VIKIT_DIR}/vikit_common" "${VIKIT_DIR}/vikit_ros" \
+            --cmake-args -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" \
+            --event-handlers console_cohesion+ \
+            --parallel-workers "${JOBS}" 2>&1 | tee -a "${CONTAINER_WS}/build.log"
+        set +u
+        source install/setup.bash
+        set -u
+        log_ok "vikit built"
+    fi
 else
     log_warn "vikit not found at ${VIKIT_DIR}, skipping"
 fi

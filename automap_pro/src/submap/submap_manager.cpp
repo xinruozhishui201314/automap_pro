@@ -10,6 +10,8 @@
 #define MOD "SubMapMgr"
 
 #include <algorithm>
+#include <atomic>
+#include <cstdint>
 #include <rclcpp/rclcpp.hpp>
 #include <automap_pro/msg/sub_map_event_msg.hpp>
 #include <pcl/filters/voxel_grid.h>
@@ -496,11 +498,19 @@ void SubMapManager::mergeCloudToSubmap(SubMap::Ptr& sm, const KeyFrame::Ptr& kf)
         }
     }
 
-    // [GLOBAL_MAP_DIAG] 精准定位：合并时使用的位姿与点数（merged_cloud 始终用 T_w_b，若后续优化未重投影则与轨迹不一致）
+    // [POSE_DIAG] 合并到子图时使用的位姿（始终为 T_w_b 里程计，未优化；HBA 后需 rebuildMergedCloud 用 T_w_b_optimized 重算否则重影）
     const Eigen::Vector3d t = kf->T_w_b.translation();
+    double yaw_deg = std::atan2(kf->T_w_b.rotation()(1, 0), kf->T_w_b.rotation()(0, 0)) * 180.0 / M_PI;
     RCLCPP_DEBUG(rclcpp::get_logger("automap_system"),
         "[GLOBAL_MAP_DIAG] ✓ merge sm_id=%d kf_id=%lu: body_pts=%zu → world_pts=%zu, T_w_b=[%.2f,%.2f,%.2f], merged_total=%zu",
         sm->id, kf->id, kf->cloud_body->size(), world_cloud_size, t.x(), t.y(), t.z(), sm->merged_cloud->size());
+    // 首帧合并到该子图时打 INFO（每子图一条），便于确认 merged_cloud 使用的世界系为 T_w_b
+    const bool is_first_merge = (sm->merged_cloud->size() == world_cloud_size);
+    if (is_first_merge) {
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[SubMapMgr][POSE_DIAG] mergeCloudToSubmap sm_id=%d 首帧 kf_id=%lu T_w_b(odom)=[%.4f,%.4f,%.4f] yaw=%.2fdeg (merged_cloud 用 odom 系，HBA 后需 rebuild)",
+            sm->id, kf->id, t.x(), t.y(), t.z(), yaw_deg);
+    }
 
     // 合并后超过阈值则降采样（使用 utils::voxelDownsample 避免 PCL 整数溢出崩溃）
     if (sm->merged_cloud && sm->merged_cloud->size() > kDownsampleThreshold) {
@@ -681,17 +691,229 @@ void SubMapManager::updateSubmapPose(int submap_id, const Pose3d& new_pose) {
 }
 
 void SubMapManager::updateAllFromHBA(const HBAResult& result) {
-    if (!result.success || result.optimized_poses.empty()) return;
+    if (!result.success || result.optimized_poses.empty()) {
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[SubMapMgr][HBA_GHOSTING] updateAllFromHBA skip: success=%d poses=%zu (无写回则不会产生位姿双轨)",
+            result.success ? 1 : 0, result.optimized_poses.size());
+        return;
+    }
     std::lock_guard<std::mutex> lk(mutex_);
-    // HBA 已按时间序写回各关键帧 T_w_b_optimized，此处仅同步子图锚定位姿
+    const rclcpp::Logger log = rclcpp::get_logger("automap_system");
+    const double diag_ts = (node_ && node_->get_clock()) ? node_->get_clock()->now().seconds() : 0.0;
+    RCLCPP_INFO(log,
+        "[SubMapMgr][GHOSTING_DIAG] updateAllFromHBA enter ts=%.3f optimized_poses=%zu submaps=%zu (HBA 写回全部 KF；若在某次 build 的 enter~exit 之间则可能重影，grep GHOSTING_DIAG 查时间线)",
+        diag_ts, result.optimized_poses.size(), submaps_.size());
+
+    // [GHOSTING_FIX] 持 mutex_ 下按与 collectKeyFramesFromSubmaps 相同顺序写回 KF，与 buildGlobalMapAsync 取快照串行，消除混合快照重影
+    RCLCPP_INFO(log,
+        "[SubMapMgr][GHOSTING_DIAG] HBA writeback_enter ts=%.3f pose_count=%zu (写回 KF 与取快照同锁串行；若重影请核对与 pose_snapshot_taken 时间线)",
+        diag_ts, result.optimized_poses.size());
+    size_t pose_idx = 0;
+    for (auto& sm : submaps_) {
+        if (!sm) continue;
+        for (auto& kf : sm->keyframes) {
+            if (!kf) continue;
+            if (pose_idx >= result.optimized_poses.size()) break;
+            kf->T_w_b_optimized = result.optimized_poses[pose_idx++];
+        }
+        if (pose_idx >= result.optimized_poses.size()) break;
+    }
+    const size_t expected_poses = result.optimized_poses.size();
+    if (pose_idx != expected_poses) {
+        RCLCPP_WARN(log,
+            "[SubMapMgr][GHOSTING_DIAG] HBA writeback MISMATCH written=%zu expected=%zu (顺序或数量不一致可能导致重影，检查 collectKeyFramesFromSubmaps 与 HBA 输出顺序)",
+            pose_idx, expected_poses);
+    }
+    const double done_ts = (node_ && node_->get_clock()) ? node_->get_clock()->now().seconds() : 0.0;
+    if (!result.optimized_poses.empty()) {
+        const auto& first_t = result.optimized_poses.front().translation();
+        const auto& last_t = result.optimized_poses.back().translation();
+        RCLCPP_INFO(log,
+            "[SubMapMgr][GHOSTING_DIAG] HBA writeback_done ts=%.3f written=%zu expected=%zu first_pos=[%.2f,%.2f,%.2f] last_pos=[%.2f,%.2f,%.2f] (与 pose_snapshot_taken 时间线对照可定位重影)",
+            done_ts, pose_idx, expected_poses,
+            first_t.x(), first_t.y(), first_t.z(), last_t.x(), last_t.y(), last_t.z());
+        // [HBA_GHOSTING] 末帧 odom vs optimized 平移差，用于量化「odom_path 与 global_map 同屏」时的重影幅度
+        KeyFrame::Ptr last_kf;
+        for (auto it = submaps_.rbegin(); it != submaps_.rend() && !last_kf; ++it) {
+            if (!*it || (*it)->keyframes.empty()) continue;
+            last_kf = (*it)->keyframes.back();
+        }
+        if (last_kf) {
+            const Eigen::Vector3d odom_last = last_kf->T_w_b.translation();
+            double last_trans_diff = (last_t - odom_last).norm();
+            RCLCPP_INFO(log,
+                "[SubMapMgr][HBA_GHOSTING] last_kf odom=[%.2f,%.2f,%.2f] -> optimized=[%.2f,%.2f,%.2f] trans_diff=%.2fm (odom_path 与该 optimized 系不同，同屏即重影，请隐藏 odom_path)",
+                odom_last.x(), odom_last.y(), odom_last.z(), last_t.x(), last_t.y(), last_t.z(), last_trans_diff);
+        }
+    } else {
+        RCLCPP_INFO(log,
+            "[SubMapMgr][GHOSTING_DIAG] HBA writeback_done ts=%.3f written=%zu expected=%zu",
+            done_ts, pose_idx, expected_poses);
+    }
+
+    // [HBA_DIAG] 增强日志：记录 HBA 写回的关键帧数量和位姿变化
+    int kf_updated = 0;
+    double max_trans_diff = 0.0;
+    double max_rot_diff = 0.0;
+    
+    // 同步子图锚定位姿（KF 已在上方写回）
     for (auto& sm : submaps_) {
         if (!sm || sm->keyframes.empty()) continue;
         KeyFrame::Ptr anchor = sm->keyframes.front();
         if (!anchor) continue;
+        
+        // [HBA_DIAG][POSE_DIAG] 记录子图锚点优化前后的位姿（完整平移+旋转，便于重影定位）
+        Eigen::Vector3d old_trans = sm->pose_w_anchor_optimized.translation();
+        Eigen::Matrix3d old_rot = sm->pose_w_anchor_optimized.rotation();
+        double old_yaw_deg = std::atan2(old_rot(1, 0), old_rot(0, 0)) * 180.0 / M_PI;
+
         sm->pose_w_anchor_optimized = anchor->T_w_b_optimized;
+
+        Eigen::Vector3d new_trans = sm->pose_w_anchor_optimized.translation();
+        Eigen::Matrix3d new_rot = sm->pose_w_anchor_optimized.rotation();
+        double new_yaw_deg = std::atan2(new_rot(1, 0), new_rot(0, 0)) * 180.0 / M_PI;
+
+        double trans_diff = (new_trans - old_trans).norm();
+        Eigen::Matrix3d rot_diff = old_rot.inverse() * new_rot;
+        // 使用旋转角而非欧拉角范数，避免 near-identity 时 eulerAngles 返回 (±π,±π,∓π) 导致 311° 假象（见 docs/HBA_GHOSTING_ANALYSIS_20260317.md）
+        double rot_diff_rad = Eigen::AngleAxisd(rot_diff).angle();
+        double rot_diff_deg = rot_diff_rad * 180.0 / M_PI;
+
+        max_trans_diff = std::max(max_trans_diff, trans_diff);
+        max_rot_diff = std::max(max_rot_diff, rot_diff_deg);
+
+        RCLCPP_INFO(log,
+            "[SubMapMgr][POSE_DIAG] sm_id=%d anchor_kf=%lu 锚点写回: old_trans=[%.4f,%.4f,%.4f] old_yaw_deg=%.2f -> new_trans=[%.4f,%.4f,%.4f] new_yaw_deg=%.2f | trans_diff=%.4fm rot_diff=%.2fdeg",
+            sm->id, anchor->id,
+            old_trans.x(), old_trans.y(), old_trans.z(), old_yaw_deg,
+            new_trans.x(), new_trans.y(), new_trans.z(), new_yaw_deg,
+            trans_diff, rot_diff_deg);
+        RCLCPP_INFO(log,
+            "[SubMapMgr][HBA_DIAG] sm_id=%d anchor_kf=%lu: trans_diff=%.3fm rot_diff=%.2fdeg new_pose=[%.2f,%.2f,%.2f]",
+            sm->id, anchor->id, trans_diff, rot_diff_deg,
+            new_trans.x(), new_trans.y(), new_trans.z());
+
+        // [POSE_DIAG] 每个子图抽样关键帧：完整记录 T_w_b vs T_w_b_optimized（平移+yaw+差值）
+        const size_t kStep = std::max<size_t>(1, sm->keyframes.size() / 4);
+        for (size_t i = 0; i < sm->keyframes.size() && kf_updated < 12; i += kStep) {
+            auto kf = sm->keyframes[i];
+            if (!kf) continue;
+            Eigen::Vector3d topt = kf->T_w_b_optimized.translation();
+            Eigen::Vector3d todom = kf->T_w_b.translation();
+            double tyaw_opt = std::atan2(kf->T_w_b_optimized.rotation()(1, 0), kf->T_w_b_optimized.rotation()(0, 0)) * 180.0 / M_PI;
+            double tyaw_odom = std::atan2(kf->T_w_b.rotation()(1, 0), kf->T_w_b.rotation()(0, 0)) * 180.0 / M_PI;
+            double kf_trans_diff = (topt - todom).norm();
+            double kf_yaw_diff = std::abs(tyaw_opt - tyaw_odom);
+            if (kf_yaw_diff > 180.0) kf_yaw_diff = 360.0 - kf_yaw_diff;
+            RCLCPP_INFO(log,
+                "[SubMapMgr][POSE_DIAG]   kf_id=%lu sm_id=%d idx=%zu: T_w_b(odom)=[%.4f,%.4f,%.4f] yaw=%.2fdeg -> T_w_b_optimized=[%.4f,%.4f,%.4f] yaw=%.2fdeg | trans_diff=%.4fm yaw_diff=%.2fdeg",
+                kf->id, sm->id, i, todom.x(), todom.y(), todom.z(), tyaw_odom, topt.x(), topt.y(), topt.z(), tyaw_opt, kf_trans_diff, kf_yaw_diff);
+            kf_updated++;
+        }
+        
         if (sm->state == SubMapState::FROZEN || sm->state == SubMapState::OPTIMIZED)
             sm->state = SubMapState::OPTIMIZED;
     }
+    
+    RCLCPP_INFO(log, 
+        "[SubMapMgr][HBA_DIAG] updateAllFromHBA done: submaps=%zu max_trans_diff=%.3fm max_rot_diff=%.2fdeg",
+        submaps_.size(), max_trans_diff, max_rot_diff);
+    const double exit_ts = (node_ && node_->get_clock()) ? node_->get_clock()->now().seconds() : 0.0;
+    RCLCPP_INFO(log,
+        "[SubMapMgr][GHOSTING_DIAG] updateAllFromHBA exit ts=%.3f (写回与锚点同步已完成；pose_snapshot_taken 应不落在此 enter~exit 之间，否则存在竞态)",
+        exit_ts);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HBA 完成后重建 merged_cloud：使用优化后的位姿重新构建点云
+// 解决 merged_cloud 使用旧 T_w_b 构建导致的点云重影问题
+// ─────────────────────────────────────────────────────────────────────────────
+void SubMapManager::rebuildMergedCloudFromOptimizedPoses() {
+    std::lock_guard<std::mutex> lk(mutex_);
+    const rclcpp::Logger log = rclcpp::get_logger("automap_system");
+    RCLCPP_INFO(log, "[SubMapMgr][HBA_GHOSTING] rebuildMergedCloudFromOptimizedPoses enter (必须仅用 T_w_b_optimized 变换 cloud_body，与 buildGlobalMap 主路径一致，避免重影)");
+    RCLCPP_INFO(log, "[GHOSTING_SOURCE] merged_cloud rebuild_enter pose_source=T_w_b_optimized (HBA 写回后执行，完成后 fallback_merged_cloud 与主路径一致)");
+    RCLCPP_INFO(log, "[SubMapMgr][REBUILD_MERGE] Starting rebuild merged_cloud with optimized poses...");
+
+    for (auto& sm : submaps_) {
+        if (!sm) continue;
+        
+        // 获取第一个关键帧的优化位姿作为子图锚点
+        if (sm->keyframes.empty()) continue;
+        KeyFrame::Ptr anchor = sm->keyframes.front();
+        if (!anchor) continue;
+
+        // 计算子图锚点的优化偏移
+        Pose3d delta = anchor->T_w_b_optimized * anchor->T_w_b.inverse();
+        double delta_trans_norm = delta.translation().norm();
+        double delta_rot_deg = Eigen::AngleAxisd(delta.rotation()).angle() * 180.0 / M_PI;
+        const Eigen::Vector3d& anchor_t_odom = anchor->T_w_b.translation();
+        const Eigen::Vector3d& anchor_t_opt = anchor->T_w_b_optimized.translation();
+        RCLCPP_INFO(log,
+            "[SubMapMgr][POSE_DIAG] sm_id=%d rebuild 锚点: T_w_b(odom)=[%.4f,%.4f,%.4f] T_w_b_optimized=[%.4f,%.4f,%.4f] delta_trans=%.4fm delta_rot=%.2fdeg",
+            sm->id, anchor_t_odom.x(), anchor_t_odom.y(), anchor_t_odom.z(),
+            anchor_t_opt.x(), anchor_t_opt.y(), anchor_t_opt.z(), delta_trans_norm, delta_rot_deg);
+
+        // 重建 merged_cloud：先清空，然后用优化位姿重投影
+        sm->merged_cloud = std::make_shared<CloudXYZI>();
+
+        size_t kf_log_step = std::max<size_t>(1, sm->keyframes.size() / 3);
+        size_t kf_idx = 0;
+        for (const auto& kf : sm->keyframes) {
+            if (!kf || !kf->cloud_body || kf->cloud_body->empty()) continue;
+
+            // 使用优化后的位姿
+            Eigen::Affine3f T_wf;
+            T_wf.matrix() = kf->T_w_b_optimized.cast<float>().matrix();
+
+            CloudXYZIPtr world_cloud = std::make_shared<CloudXYZI>();
+            try {
+                pcl::transformPointCloud(*kf->cloud_body, *world_cloud, T_wf);
+            } catch (const std::exception& e) {
+                RCLCPP_ERROR(log, "[SubMapMgr][REBUILD_MERGE] kf_id=%lu transform failed: %s", kf->id, e.what());
+                continue;
+            }
+
+            if (world_cloud->empty()) continue;
+
+            // [POSE_DIAG] 抽样：记录用于变换的 T_w_b_optimized
+            if (kf_idx % kf_log_step == 0) {
+                const auto& t = kf->T_w_b_optimized.translation();
+                double yaw_deg = std::atan2(kf->T_w_b_optimized.rotation()(1, 0), kf->T_w_b_optimized.rotation()(0, 0)) * 180.0 / M_PI;
+                RCLCPP_INFO(log,
+                    "[SubMapMgr][POSE_DIAG]   sm_id=%d kf_id=%lu 变换使用 T_w_b_optimized=[%.4f,%.4f,%.4f] yaw=%.2fdeg body_pts=%zu",
+                    sm->id, kf->id, t.x(), t.y(), t.z(), yaw_deg, kf->cloud_body->size());
+            }
+            kf_idx++;
+
+            // 合并点云
+            size_t old_size = sm->merged_cloud->size();
+            sm->merged_cloud->reserve(old_size + world_cloud->size());
+            for (const auto& pt : world_cloud->points) {
+                sm->merged_cloud->push_back(pt);
+            }
+        }
+
+        // 降采样以控制大小
+        if (sm->merged_cloud && sm->merged_cloud->size() > kDownsampleThreshold) {
+            CloudXYZIPtr ds = utils::voxelDownsample(sm->merged_cloud, static_cast<float>(merge_res_));
+            if (ds && !ds->empty()) {
+                sm->merged_cloud->swap(*ds);
+            }
+        }
+
+        RCLCPP_INFO(log, "[SubMapMgr][REBUILD_MERGE] sm_id=%d rebuilt merged_cloud: %zu points (anchor_delta: trans=%.3fm)",
+            sm->id, sm->merged_cloud ? sm->merged_cloud->size() : 0,
+            delta_trans_norm);
+    }
+    
+    RCLCPP_INFO(log, "[SubMapMgr][REBUILD_MERGE] Done rebuilding merged_cloud for all submaps");
+    const double done_ts = (node_ && node_->get_clock()) ? node_->get_clock()->now().seconds() : 0.0;
+    RCLCPP_INFO(log,
+        "[SubMapMgr][GHOSTING_DIAG] rebuildMergedCloudFromOptimizedPoses done ts=%.3f (此后 buildGlobalMap 与 merged_cloud 均基于 T_w_b_optimized；grep GHOSTING_DIAG 查时间线)",
+        done_ts);
+    RCLCPP_INFO(log,
+        "[GHOSTING_SOURCE] merged_cloud rebuild_done (fallback 路径若被使用将与 optimized_path 一致；若 build 在 rebuild_done 之前则可能用过旧 merged_cloud→重影)");
 }
 
 // ── 查询接口实现（头文件声明，此前未实现会导致 undefined symbol）────────────────────
@@ -764,7 +986,7 @@ CloudXYZIPtr SubMapManager::buildGlobalMap(float voxel_size) const {
     // 使用全局 logger 名称，避免 backend 线程中解引用 node_（可能析构顺序导致 use-after-free）
     const rclcpp::Logger log = rclcpp::get_logger("automap_system");
     ALOG_INFO(MOD, "[tid={}] step=buildGlobalMap_enter voxel_size={:.3f}", tid, voxel_size);
-    RCLCPP_INFO(log, "[GLOBAL_MAP_DIAG] buildGlobalMap enter voxel_size=%.3f (grep GLOBAL_MAP_DIAG 可精准定位各环节)", voxel_size);
+    RCLCPP_INFO(log, "[GLOBAL_MAP_DIAG][HBA_GHOSTING] buildGlobalMap enter voxel_size=%.3f 主路径=从 kf->cloud_body 用 T_w_b_optimized 变换；fallback=用 merged_cloud(若未 rebuild 则为 T_w_b，会重影)", voxel_size);
     std::lock_guard<std::mutex> lk(mutex_);
     const size_t num_submaps = submaps_.size();
     ALOG_INFO(MOD, "[tid={}] step=buildGlobalMap_locked submaps={}", tid, num_submaps);
@@ -780,6 +1002,15 @@ CloudXYZIPtr SubMapManager::buildGlobalMap(float voxel_size) const {
     size_t kf_fallback_unopt = 0;
     int subs_with_kf = 0;
     size_t total_pts_before_transform = 0;
+    
+    // [GLOBAL_MAP_DIAG] 增强：记录各子图锚点的优化位姿状态
+    for (const auto& sm : submaps_) {
+        if (!sm) continue;
+        const auto& anchor_pose = sm->pose_w_anchor_optimized;
+        RCLCPP_INFO(log, "[SubMapMgr][GLOBAL_MAP_DIAG] SM#%d anchor_pose: trans=[%.2f,%.2f,%.2f] state=%d kfs=%zu",
+            sm->id, anchor_pose.translation().x(), anchor_pose.translation().y(), anchor_pose.translation().z(),
+            static_cast<int>(sm->state), sm->keyframes.size());
+    }
     
     RCLCPP_INFO(log, "[GLOBAL_MAP_DIAG] ┌─ 主路径: 从关键帧重算（使用 T_w_b_optimized）");
     
@@ -825,58 +1056,77 @@ CloudXYZIPtr SubMapManager::buildGlobalMap(float voxel_size) const {
             // 【关键】选择位姿：优先用优化位姿，若未初始化则用原始位姿
             Pose3d T_w_b = kf->T_w_b_optimized;
             bool using_optimized = true;
-            
+
             // 检测是否为 Identity 且原始位姿非 Identity
-            if (T_w_b.matrix().isApprox(Eigen::Matrix4d::Identity(), 1e-6) && 
+            if (T_w_b.matrix().isApprox(Eigen::Matrix4d::Identity(), 1e-6) &&
                 !kf->T_w_b.matrix().isApprox(Eigen::Matrix4d::Identity(), 1e-6)) {
                 T_w_b = kf->T_w_b;
                 using_optimized = false;
                 kf_fallback_unopt++;
-                
+
                 RCLCPP_WARN(log,
-                    "[GLOBAL_MAP_DIAG] │ │ kf_id=%lu sm_id=%d T_w_b_optimized=Identity → using T_w_b (unoptimized)", 
+                    "[SubMapMgr][HBA_GHOSTING] kf_id=%lu sm_id=%d T_w_b_optimized=Identity → using T_w_b (unoptimized)，该帧可能产生重影",
+                    kf->id, sm->id);
+                RCLCPP_INFO(log,
+                    "[GHOSTING_SOURCE] buildGlobalMap_sync kf_id=%lu sm_id=%d pose_source=T_w_b_fallback (T_w_b_optimized=Identity，该帧与优化轨迹错位→重影)",
                     kf->id, sm->id);
             }
-            
+
+            // [POSE_DIAG] 主路径位姿使用：每子图首帧 + 每 20 帧抽样，记录使用的位姿来源与数值
+            const bool log_pose = (sm_kf_valid == 1) || (sm_kf_valid % 20 == 0);
+            if (log_pose) {
+                const auto& t_used = T_w_b.translation();
+                double yaw_used = std::atan2(T_w_b.rotation()(1, 0), T_w_b.rotation()(0, 0)) * 180.0 / M_PI;
+                const auto& t_odom = kf->T_w_b.translation();
+                const auto& t_opt = kf->T_w_b_optimized.translation();
+                double diff_odom_used = (t_used - t_odom).norm();
+                double diff_opt_used = (t_used - t_opt).norm();
+                RCLCPP_INFO(log,
+                    "[SubMapMgr][POSE_DIAG] buildGlobalMap kf_id=%lu sm_id=%d pose_source=%s trans_used=[%.4f,%.4f,%.4f] yaw_used=%.2fdeg | T_w_b_odom=[%.4f,%.4f,%.4f] T_w_b_opt=[%.4f,%.4f,%.4f] diff_to_odom=%.4fm diff_to_opt=%.4fm",
+                    kf->id, sm->id, using_optimized ? "T_w_b_optimized" : "T_w_b_fallback",
+                    t_used.x(), t_used.y(), t_used.z(), yaw_used,
+                    t_odom.x(), t_odom.y(), t_odom.z(), t_opt.x(), t_opt.y(), t_opt.z(), diff_odom_used, diff_opt_used);
+            }
+
             // 变换点云到世界系
             Eigen::Affine3f T_wf;
             T_wf.matrix() = T_w_b.cast<float>().matrix();
             world_tmp->clear();
-            
+
             try {
                 pcl::transformPointCloud(*kf->cloud_body, *world_tmp, T_wf);
             } catch (const std::exception& e) {
                 RCLCPP_ERROR(log, "[GLOBAL_MAP_DIAG] │ │ kf_id=%lu transform failed: %s", kf->id, e.what());
                 continue;
             }
-            
+
             if (world_tmp->empty()) {
                 RCLCPP_DEBUG(log, "[GLOBAL_MAP_DIAG] │ │ kf_id=%lu transform resulted in empty cloud", kf->id);
                 continue;
             }
-            
+
             size_t add_size = world_tmp->size();
             total_pts_before_transform += kf->cloud_body->size();
-            
+
             // 检查是否会超过点数上限
             if (combined->size() + add_size > kMaxCombinedPoints) {
-                ALOG_WARN(MOD, "buildGlobalMap: combined would exceed {} pts, stop adding (current={}, trying to add={})", 
+                ALOG_WARN(MOD, "buildGlobalMap: combined would exceed {} pts, stop adding (current={}, trying to add={})",
                     kMaxCombinedPoints, combined->size(), add_size);
                 RCLCPP_WARN(log, "[GLOBAL_MAP_DIAG] │ │ ⚠️  LIMIT: combined %zu + %zu > %zu, stop here",
                     combined->size(), add_size, kMaxCombinedPoints);
                 hit_limit = true;
                 break;
             }
-            
+
             // 合并到全局点云
             combined->reserve(combined->size() + add_size);
             for (const auto& pt : world_tmp->points) {
                 combined->push_back(pt);
             }
-            
+
             sm_pts += add_size;
             kf_used_total++;
-            
+
             // DEBUG：每个关键帧的贡献
             RCLCPP_DEBUG(log, "[GLOBAL_MAP_DIAG] │ │ ✓ kf_id=%lu body_pts=%zu → world_pts=%zu [opt=%d] t=[%.2f,%.2f,%.2f]",
                 kf->id, kf->cloud_body->size(), add_size, using_optimized ? 1 : 0,
@@ -925,6 +1175,8 @@ CloudXYZIPtr SubMapManager::buildGlobalMap(float voxel_size) const {
         }
 
         used_fallback_path = true;  // 供 [GLOBAL_MAP_BLUR] 汇总判断
+        RCLCPP_WARN(log, "[GHOSTING_SOURCE] buildGlobalMap path=fallback_merged_cloud (主路径 combined 为空；merged_cloud 若未在 HBA 后 rebuild 则为 T_w_b 系→与 optimized_path 重影，grep REBUILD_MERGE 查是否已重建)");
+        RCLCPP_WARN(log, "[SubMapMgr][HBA_GHOSTING] buildGlobalMap 使用 fallback_merged_cloud：主路径 combined 为空，用各子图 merged_cloud 拼接；若 merged_cloud 未经 rebuildMergedCloudFromOptimizedPoses 则仍为 T_w_b 世界系，与轨迹重影");
         RCLCPP_WARN(log, "[GLOBAL_MAP_DIAG] ┌─ 回退路径: 拼接 merged_cloud (旧世界系，可能不准确)");
         RCLCPP_INFO(log, "[GLOBAL_MAP_DIAG] path=fallback_merged_cloud (⚠️  if shown, global_map may be misaligned with optimized trajectory)");
         
@@ -959,6 +1211,10 @@ CloudXYZIPtr SubMapManager::buildGlobalMap(float voxel_size) const {
         }
         
         RCLCPP_INFO(log, "[GLOBAL_MAP_DIAG] └─ 回退完成: combined_pts=%zu", combined->size());
+    } else if (!combined->empty()) {
+        RCLCPP_INFO(log,
+            "[SubMapMgr][GHOSTING_DIAG] buildGlobalMap sync path=main combined_pts=%zu (位姿=现场读 T_w_b_optimized，与 optimized_path 同系；grep GHOSTING_DIAG)",
+            combined->size());
     }
     ALOG_INFO(MOD, "[tid={}] step=buildGlobalMap_merge_done combined={}", tid, combined->size());
     
@@ -1231,36 +1487,89 @@ void SubMapManager::publishErrorEvent(int submap_id, const ErrorDetail& error) {
                error.message());
 }
 
-// ── 异步构建实现（P0 优化）──────────────────────────────────────────
+// ── 异步构建实现（P0 优化 + 重影修复：位姿快照）────────────────────────────
+
+namespace {
+// 全局构建 ID，用于 GHOSTING_DIAG 串联同一次 build 的 snapshot/enter/exit，便于重影排查
+std::atomic<uint64_t> g_build_global_map_id{0};
+}  // namespace
 
 std::future<CloudXYZIPtr> SubMapManager::buildGlobalMapAsync(float voxel_size) const {
     return std::async(std::launch::async, [this, voxel_size]() {
-        std::vector<SubMap::Ptr> submaps_copy;
+        const uint64_t build_id = ++g_build_global_map_id;
+        // 持锁下快照 (cloud_body, pose)，避免异步任务中访问 sm->keyframes / kf->cloud_body 与后端并发修改导致 SIGSEGV（见 run full.log Thread automap_mappub SIGSEGV in buildGlobalMapInternal）
+        std::vector<std::pair<CloudXYZIPtr, Pose3d>> cloud_pose_snapshot;
+        size_t snapshot_fallback_count = 0;
         {
             std::lock_guard<std::mutex> lk(mutex_);
-            submaps_copy = submaps_;
+            cloud_pose_snapshot.reserve(512);
+            for (const auto& sm : submaps_) {
+                if (!sm) continue;
+                for (const auto& kf : sm->keyframes) {
+                    if (!kf || !kf->cloud_body || kf->cloud_body->empty()) continue;
+                    Pose3d T = kf->T_w_b_optimized;
+                    if (T.matrix().isApprox(Eigen::Matrix4d::Identity(), 1e-6) &&
+                        !kf->T_w_b.matrix().isApprox(Eigen::Matrix4d::Identity(), 1e-6)) {
+                        T = kf->T_w_b;
+                        snapshot_fallback_count++;
+                        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                            "[GHOSTING_SOURCE] snapshot_kf_fallback build_id=%llu kf_id=%lu sm_id=%d pose_source=T_w_b(odom) (T_w_b_optimized=Identity，该帧点云与优化轨迹错位→重影)",
+                            static_cast<unsigned long long>(build_id), kf->id, sm->id);
+                    }
+                    cloud_pose_snapshot.emplace_back(kf->cloud_body, T);
+                }
+            }
         }
-        return buildGlobalMapInternal(submaps_copy, voxel_size);
+        const rclcpp::Logger log = rclcpp::get_logger("automap_system");
+        const double snap_ts = (node_ && node_->get_clock()) ? node_->get_clock()->now().seconds() : 0.0;
+        if (!cloud_pose_snapshot.empty()) {
+            const auto& first = cloud_pose_snapshot.front().second.translation();
+            const auto& last = cloud_pose_snapshot.back().second.translation();
+            RCLCPP_INFO(log,
+                "[SubMapMgr][GHOSTING_DIAG] pose_snapshot_taken build_id=%llu ts=%.3f kf_count=%zu first_pos=[%.2f,%.2f,%.2f] last_pos=[%.2f,%.2f,%.2f] (与 writeback_enter/writeback_done 时间线对照；若重影且 snapshot 落在 writeback 之间则异常)",
+                static_cast<unsigned long long>(build_id), snap_ts, cloud_pose_snapshot.size(),
+                first.x(), first.y(), first.z(), last.x(), last.y(), last.z());
+            RCLCPP_INFO(log,
+                "[GHOSTING_SOURCE] buildGlobalMap snapshot build_id=%llu kf_count=%zu snapshot_fallback_count=%zu pose_source=%s (fallback>0 表示部分 KF 用 odom 导致重影)",
+                static_cast<unsigned long long>(build_id), cloud_pose_snapshot.size(), snapshot_fallback_count,
+                snapshot_fallback_count > 0u ? "T_w_b_optimized+fallback_T_w_b" : "T_w_b_optimized");
+        }
+        return buildGlobalMapInternalFromSnapshot(cloud_pose_snapshot, voxel_size, build_id);
     });
 }
 
 CloudXYZIPtr SubMapManager::buildGlobalMapInternal(
-    const std::vector<SubMap::Ptr>& submaps_copy, float voxel_size) const {
+    const std::vector<SubMap::Ptr>& submaps_copy,
+    float voxel_size,
+    const std::vector<Pose3d>* poses_snapshot,
+    uint64_t build_id) const {
     const unsigned tid = automap_pro::logThreadId();
     const rclcpp::Logger log = rclcpp::get_logger("automap_system");
-    ALOG_INFO(MOD, "[tid={}] step=buildGlobalMapInternal_enter voxel_size={:.3f}", tid, voxel_size);
+    const bool use_snapshot = poses_snapshot && !poses_snapshot->empty();
+    ALOG_INFO(MOD, "[tid={}] step=buildGlobalMapInternal_enter voxel_size={:.3f} use_snapshot={}", tid, voxel_size, use_snapshot ? "yes" : "no");
+    if (build_id != 0) {
+        RCLCPP_INFO(log,
+            "[SubMapMgr][GHOSTING_DIAG] buildGlobalMapInternal_enter build_id=%llu use_snapshot=%s (grep GHOSTING_DIAG for timeline)",
+            static_cast<unsigned long long>(build_id), use_snapshot ? "yes" : "no");
+    }
 
     CloudXYZIPtr combined = std::make_shared<CloudXYZI>();
     CloudXYZIPtr world_tmp = std::make_shared<CloudXYZI>();
+    size_t pose_idx = 0;
 
     for (const auto& sm : submaps_copy) {
         if (!sm) continue;
         for (const auto& kf : sm->keyframes) {
             if (!kf || !kf->cloud_body || kf->cloud_body->empty()) continue;
-            Pose3d T_w_b = kf->T_w_b_optimized;
-            if (T_w_b.matrix().isApprox(Eigen::Matrix4d::Identity(), 1e-6) &&
-                !kf->T_w_b.matrix().isApprox(Eigen::Matrix4d::Identity(), 1e-6)) {
-                T_w_b = kf->T_w_b;
+            Pose3d T_w_b;
+            if (poses_snapshot && pose_idx < poses_snapshot->size()) {
+                T_w_b = (*poses_snapshot)[pose_idx++];
+            } else {
+                T_w_b = kf->T_w_b_optimized;
+                if (T_w_b.matrix().isApprox(Eigen::Matrix4d::Identity(), 1e-6) &&
+                    !kf->T_w_b.matrix().isApprox(Eigen::Matrix4d::Identity(), 1e-6)) {
+                    T_w_b = kf->T_w_b;
+                }
             }
             Eigen::Affine3f T_wf;
             T_wf.matrix() = T_w_b.cast<float>().matrix();
@@ -1281,7 +1590,80 @@ CloudXYZIPtr SubMapManager::buildGlobalMapInternal(
     if (voxel_size <= 0.0f) return combined;
 
     CloudXYZIPtr out = utils::voxelDownsampleChunked(combined, vs, 50.0f);
-    ALOG_INFO(MOD, "[tid={}] step=buildGlobalMapInternal_exit out={}", tid, out ? out->size() : 0u);
+    const size_t out_pts = out ? out->size() : combined->size();
+    ALOG_INFO(MOD, "[tid={}] step=buildGlobalMapInternal_exit out={}", tid, out_pts);
+    if (build_id != 0) {
+        if (use_snapshot && poses_snapshot) {
+            if (pose_idx != poses_snapshot->size()) {
+                RCLCPP_WARN(log,
+                    "[SubMapMgr][GHOSTING_DIAG] buildGlobalMapInternal_exit build_id=%llu snapshot_consumed=%zu snapshot_size=%zu MISMATCH (possible ghosting or bug)",
+                    static_cast<unsigned long long>(build_id), pose_idx, poses_snapshot->size());
+            } else {
+                RCLCPP_INFO(log,
+                    "[SubMapMgr][GHOSTING_DIAG] buildGlobalMapInternal_exit build_id=%llu pts=%zu snapshot_consumed=%zu snapshot_size=%zu (grep GHOSTING_DIAG for timeline)",
+                    static_cast<unsigned long long>(build_id), out_pts, pose_idx, poses_snapshot->size());
+            }
+        } else {
+            RCLCPP_INFO(log,
+                "[SubMapMgr][GHOSTING_DIAG] buildGlobalMapInternal_exit build_id=%llu pts=%zu use_snapshot=no",
+                static_cast<unsigned long long>(build_id), out_pts);
+        }
+    }
+    return out ? out : combined;
+}
+
+CloudXYZIPtr SubMapManager::buildGlobalMapInternalFromSnapshot(
+    const std::vector<std::pair<CloudXYZIPtr, Pose3d>>& cloud_pose_snapshot,
+    float voxel_size,
+    uint64_t build_id) const {
+    const unsigned tid = automap_pro::logThreadId();
+    const rclcpp::Logger log = rclcpp::get_logger("automap_system");
+    ALOG_INFO(MOD, "[tid={}] step=buildGlobalMapInternalFromSnapshot_enter voxel_size={:.3f} snapshot_size={}", tid, voxel_size, cloud_pose_snapshot.size());
+    if (build_id != 0) {
+        RCLCPP_INFO(log,
+            "[SubMapMgr][GHOSTING_DIAG] buildGlobalMapInternal_enter build_id=%llu use_snapshot=yes (from cloud_pose_snapshot)",
+            static_cast<unsigned long long>(build_id));
+    }
+
+    CloudXYZIPtr combined = std::make_shared<CloudXYZI>();
+    CloudXYZIPtr world_tmp = std::make_shared<CloudXYZI>();
+
+    for (const auto& cp : cloud_pose_snapshot) {
+        const CloudXYZIPtr& cloud_body = cp.first;
+        if (!cloud_body || cloud_body->empty()) continue;
+        const Pose3d& T_w_b = cp.second;
+        Eigen::Affine3f T_wf;
+        T_wf.matrix() = T_w_b.cast<float>().matrix();
+        world_tmp->clear();
+        try {
+            pcl::transformPointCloud(*cloud_body, *world_tmp, T_wf);
+        } catch (...) { continue; }
+        if (world_tmp->empty()) continue;
+        if (combined->size() + world_tmp->size() > kMaxCombinedPoints) break;
+        combined->reserve(combined->size() + world_tmp->size());
+        for (const auto& pt : world_tmp->points)
+            combined->push_back(pt);
+    }
+
+    if (combined->empty()) return combined;
+    float vs = std::max(voxel_size, utils::kMinVoxelLeafSize);
+    if (voxel_size <= 0.0f) return combined;
+
+    CloudXYZIPtr out = utils::voxelDownsampleChunked(combined, vs, 50.0f);
+    const size_t out_pts = out ? out->size() : combined->size();
+    ALOG_INFO(MOD, "[tid={}] step=buildGlobalMapInternal_exit out={}", tid, out_pts);
+    if (build_id != 0) {
+        if (!cloud_pose_snapshot.empty()) {
+            const auto& map_last = cloud_pose_snapshot.back().second.translation();
+            RCLCPP_INFO(log,
+                "[SubMapMgr][GHOSTING_DIAG] buildGlobalMapInternal_exit build_id=%llu pts=%zu snapshot_size=%zu map_last_pos=[%.2f,%.2f,%.2f] (与 optimized_path last_pos 应一致)",
+                static_cast<unsigned long long>(build_id), out_pts, cloud_pose_snapshot.size(), map_last.x(), map_last.y(), map_last.z());
+        } else {
+            RCLCPP_INFO(log,
+                "[SubMapMgr][GHOSTING_DIAG] buildGlobalMapInternal_exit build_id=%llu pts=%zu snapshot_consumed=%zu snapshot_size=%zu (grep GHOSTING_DIAG for timeline)",
+                static_cast<unsigned long long>(build_id), out_pts, cloud_pose_snapshot.size(), cloud_pose_snapshot.size());
+        }
+    }
     return out ? out : combined;
 }
 

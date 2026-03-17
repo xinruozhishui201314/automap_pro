@@ -10,7 +10,7 @@ export CMAKE_BUILD_PARALLEL_LEVEL="${PARALLEL_JOBS}"
 COLCON_PARALLEL="--parallel-workers ${PARALLEL_JOBS}"
 echo "[INFO] 并行编译: 每包 ${PARALLEL_JOBS} 线程, colcon --parallel-workers ${PARALLEL_JOBS}"
 
-# 第三方库安装到 install_deps，--clean 时不删除，编译一次后续跳过
+# 第三方库（GTSAM/TEASER++/vikit）安装到 install_deps，--clean 时不删除，编译一次后续跳过
 INSTALL_DEPS="/root/automap_ws/install_deps"
 mkdir -p "${INSTALL_DEPS}"
 
@@ -163,16 +163,22 @@ if [ -n "${TEASER_SRC}" ]; then
   cd /root/automap_ws
 fi
 
-# vikit_common / vikit_ros（安装到 install_deps，已安装则跳过）
+# vikit_common / vikit_ros（与 GTSAM 一致：安装到 install_deps，只编译一次，已安装则跳过）
 if [ -d src/thrid_party/rpg_vikit_ros2 ]; then
-  if [ -f "${INSTALL_DEPS}/share/vikit_common/package.xml" ] || [ -f "${INSTALL_DEPS}/lib/libvikit_common.so" ]; then
-    echo "[INFO] vikit 已安装于 install_deps，跳过"
-  else
+  NEED_VIKIT_BUILD=true
+  if [ -f "${INSTALL_DEPS}/share/vikit_common/package.xml" ] && [ -f "${INSTALL_DEPS}/share/vikit_ros/package.xml" ]; then
+    NEED_VIKIT_BUILD=false
+  elif [ -f "${INSTALL_DEPS}/lib/libvikit_common.so" ]; then
+    NEED_VIKIT_BUILD=false
+  fi
+  if [ "$NEED_VIKIT_BUILD" = true ]; then
     echo '========================================'
     echo '编译 vikit'
     echo '========================================'
     colcon build ${COLCON_PARALLEL} --install-base "${INSTALL_DEPS}" --paths src/thrid_party/rpg_vikit_ros2/vikit_common src/thrid_party/rpg_vikit_ros2/vikit_ros --cmake-args -DCMAKE_BUILD_TYPE=Release
     echo "[INFO] vikit 已安装于 install_deps"
+  else
+    echo "[INFO] vikit 已安装于 install_deps，跳过"
   fi
 fi
 

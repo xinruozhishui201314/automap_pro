@@ -207,8 +207,10 @@ struct SubMap {
     std::vector<KeyFrame::Ptr> keyframes;
 
     // ========== 子图内回环检测：关键帧描述子数据库 ==========
-    // 每个关键帧的 256 维 OverlapTransformer 描述子，用于子图内回环检测
+    // 每个关键帧的 256 维 OverlapTransformer 描述子（仅当未启用 ScanContext 时使用）
     std::vector<Eigen::VectorXf> keyframe_descriptors;
+    // 每个关键帧的 ScanContext 描述子（当 loop_closure.scancontext.enabled 时用于子图内回环，替代 fallback）
+    std::vector<Eigen::MatrixXd> keyframe_scancontexts_;
     // 关键帧下采样点云（用于子图内配准）
     std::vector<CloudXYZIPtr> keyframe_clouds_ds;
 

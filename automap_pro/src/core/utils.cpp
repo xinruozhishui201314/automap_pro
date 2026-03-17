@@ -1,6 +1,7 @@
 #include "automap_pro/core/utils.h"
 #include "automap_pro/core/config_manager.h"
 #include "automap_pro/core/logger.h"
+#include "automap_pro/core/metrics.h"
 #include <filesystem>
 #include <Eigen/Geometry>
 #include <system_error>
@@ -27,6 +28,13 @@ namespace {
 constexpr int kIntMaxCubeRoot = 1290;  // (1290^3 ≈ 2.15e9 >= INT_MAX)
 constexpr float kMaxVoxelAxisIndex = static_cast<float>(kIntMaxCubeRoot);
 constexpr float kDefaultMaxAbsCoord = 1e6f;
+
+/** 根据 leaf_size 计算保证不溢出的单块最大边长（米）。块内体素格数 = chunk_size/leaf <= 安全上限。 */
+inline float safeChunkSizeForLeaf(float leaf_size) {
+    if (leaf_size <= 0.f) return 50.f;
+    float safe = leaf_size * (kMaxVoxelAxisIndex * 0.5f);  // 留余量
+    return std::max(leaf_size * 2.f, std::min(safe, 200.f));  // 至少 2*leaf，最大 200m
+}
 
 // 体素网格键：用于无 PCL 的体素下采样，避免 PCL VoxelGrid::filter 写越界导致析构时 SIGSEGV。
 using VoxelKey = std::tuple<int64_t, int64_t, int64_t>;
@@ -153,16 +161,10 @@ CloudXYZIPtr voxelDownsample(const CloudXYZIPtr& cloud, float leaf_size) {
             min_y = std::min(min_y, p.y); max_y = std::max(max_y, p.y);
             min_z = std::min(min_z, p.z); max_z = std::max(max_z, p.z);
         }
-        for (int attempt = 0; attempt < 8; ++attempt) {
-            if (!voxelGridWouldOverflow(min_x, max_x, min_y, max_y, min_z, max_z, leaf)) break;
-            leaf *= 2.0f;
-            if (attempt == 0) {
-                ALOG_WARN("Utils", "voxelDownsample: overflow risk with leaf={:.4f}, retrying with larger leaf", leaf_size);
-            }
-        }
+        // 若单次体素网格会溢出，改用分块下采样（保持 leaf 不变，避免分辨率退化）
         if (voxelGridWouldOverflow(min_x, max_x, min_y, max_y, min_z, max_z, leaf)) {
-            ALOG_WARN("Utils", "voxelDownsample: still overflow risk after enlarging leaf, returning copy without voxel filter");
-            return input;
+            ALOG_INFO("Utils", "voxelDownsample: overflow risk with leaf={:.4f}, using chunked downsample (leaf unchanged)", leaf_size);
+            return voxelDownsampleChunked(input, leaf, 0.f);  // 0 = 自动块大小
         }
         // 使用无 PCL 的体素下采样；performance.parallel_voxel_downsample 为 true 时走 OpenMP 并行路径。
         CloudXYZIPtr out = ConfigManager::instance().parallelVoxelDownsample()
@@ -252,15 +254,36 @@ CloudXYZIPtr voxelDownsampleWithTimeout(const CloudXYZIPtr& cloud, float leaf_si
 // 点云点数低于此值时直接单次体素滤波，不走分块循环，避免 PCL 在部分 chunk 上 SIGSEGV
 static constexpr size_t kVoxelChunkedSizeThreshold = 250000u;
 
+CloudXYZIPtr voxelDownsampleSafe(const CloudXYZIPtr& cloud, float leaf_size, float chunk_size_m) {
+    if (!cloud || cloud->empty()) return cloud;
+    float leaf = std::max(leaf_size, kMinVoxelLeafSize);
+    CloudXYZIPtr input = sanitizePointCloudForVoxel(cloud, kDefaultMaxAbsCoord);
+    if (!input || input->empty()) return cloud;
+    float min_x = 1e9f, max_x = -1e9f, min_y = 1e9f, max_y = -1e9f, min_z = 1e9f, max_z = -1e9f;
+    for (const auto& p : input->points) {
+        min_x = std::min(min_x, p.x); max_x = std::max(max_x, p.x);
+        min_y = std::min(min_y, p.y); max_y = std::max(max_y, p.y);
+        min_z = std::min(min_z, p.z); max_z = std::max(max_z, p.z);
+    }
+    bool overflow = voxelGridWouldOverflow(min_x, max_x, min_y, max_y, min_z, max_z, leaf);
+    if (!overflow && input->size() <= kVoxelChunkedSizeThreshold) {
+        return voxelDownsample(cloud, leaf);
+    }
+    if (chunk_size_m <= 0.f) chunk_size_m = safeChunkSizeForLeaf(leaf);
+    return voxelDownsampleChunked(input, leaf, chunk_size_m);
+}
+
 CloudXYZIPtr voxelDownsampleChunked(const CloudXYZIPtr& cloud, float leaf_size, float chunk_size_m) {
     const unsigned tid = automap_pro::logThreadId();
     if (!cloud || cloud->empty()) return cloud;
-    ALOG_INFO("Utils", "[tid={}] [MAP] voxelDownsampleChunked step=enter in={} leaf={:.3f} chunk_m={:.1f}",
-              tid, cloud->size(), leaf_size, chunk_size_m);
     float leaf = std::max(leaf_size, kMinVoxelLeafSize);
     if (chunk_size_m <= 0.f) {
-        return voxelDownsample(cloud, leaf);
+        chunk_size_m = safeChunkSizeForLeaf(leaf);
+        ALOG_INFO("Utils", "[tid={}] voxelDownsampleChunked auto chunk_size_m={:.1f} (leaf={:.3f})",
+                  tid, chunk_size_m, leaf);
     }
+    ALOG_INFO("Utils", "[tid={}] [MAP] voxelDownsampleChunked step=enter in={} leaf={:.3f} chunk_m={:.1f}",
+              tid, cloud->size(), leaf, chunk_size_m);
     try {
         CloudXYZIPtr input = sanitizePointCloudForVoxel(cloud, kDefaultMaxAbsCoord);
         if (!input || input->empty()) return cloud;

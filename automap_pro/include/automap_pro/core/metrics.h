@@ -290,6 +290,12 @@ inline constexpr const char* ISAM2_QUEUE_DEPTH = "isam2_queue_depth";
 inline constexpr const char* ISAM2_TASK_DROPPED = "isam2_task_dropped";
 // 可观测性：上次优化是否成功 1=成功 0=失败（V2）
 inline constexpr const char* ISAM2_LAST_SUCCESS = "isam2_last_success";
+/** Keyframe 级 pending GPS 因子队列长度（观测无界增长）。见 BACKEND_POTENTIAL_ISSUES 1.4.2 */
+inline constexpr const char* ISAM2_PENDING_GPS_KF = "isam2_pending_gps_kf";
+/** 体素下采样因 overflow 最终未滤波即返回的次数。见 BACKEND_POTENTIAL_ISSUES 1.2.3 / 1.4.2 */
+inline constexpr const char* VOXEL_OVERFLOW_DROPPED = "voxel_overflow_dropped";
+/** 60s 卡死触发的强制 ISAM2 reset 次数。见 BACKEND_POTENTIAL_ISSUES 1.3.4 */
+inline constexpr const char* ISAM2_FORCED_RESET = "isam2_forced_reset";
 
 inline constexpr const char* MAP_EXPORTS = "map_exports";
 inline constexpr const char* ERRORS_TOTAL = "errors_total";
@@ -553,6 +559,9 @@ private:
         registerCounter(metrics::ISAM2_TASK_DROPPED, "iSAM2 optimization tasks dropped (queue full)");
         registerGauge(metrics::ISAM2_QUEUE_DEPTH, "iSAM2 optimization queue depth");
         registerGauge(metrics::ISAM2_LAST_SUCCESS, "iSAM2 last update success (1=ok 0=fail)");
+        registerGauge(metrics::ISAM2_PENDING_GPS_KF, "iSAM2 pending GPS keyframe factors count");
+        registerCounter(metrics::VOXEL_OVERFLOW_DROPPED, "Voxel downsample overflow (returned without filter)");
+        registerCounter(metrics::ISAM2_FORCED_RESET, "iSAM2 forced reset (stuck >60s)");
         registerCounter(metrics::MAP_EXPORTS, "Map exports");
         registerCounter(metrics::ERRORS_TOTAL, "Total errors");
         registerCounter(metrics::WARNINGS_TOTAL, "Total warnings");

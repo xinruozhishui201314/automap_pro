@@ -4,6 +4,9 @@
 #include "automap_pro/core/logger.h"
 #include "automap_pro/core/metrics.h"
 #define MOD "HBAOptimizer"
+/** 建图后端每步计算日志：与 incremental_optimizer 统一 tag [BACKEND_STEP]，便于 grep 定位 */
+#define BACKEND_STEP(fmt, ...) \
+    RCLCPP_INFO(rclcpp::get_logger("automap_system"), "[BACKEND_STEP] " fmt, ##__VA_ARGS__)
 
 #include <rclcpp/rclcpp.hpp>
 #include <chrono>
@@ -67,6 +70,8 @@ void HBAOptimizer::stop() {
 }
 
 void HBAOptimizer::onSubmapFrozen(const SubMap::Ptr& submap) {
+    BACKEND_STEP("step=HBA_onSubmapFrozen_enter sm_id=%d frozen_count=%d kf_count=%zu",
+        submap->id, frozen_count_ + 1, submap->keyframes.size());
     const auto& cfg = ConfigManager::instance();
     frozen_count_++;
 
@@ -77,6 +82,8 @@ void HBAOptimizer::onSubmapFrozen(const SubMap::Ptr& submap) {
         ConfigManager::instance().hbaEnabled() ? 1 : 0, gps_aligned_ ? 1 : 0);
 
     if (frozen_count_ % cfg.hbaTriggerSubmaps() != 0) {
+        BACKEND_STEP("step=HBA_onSubmapFrozen_skip sm_id=%d reason=trigger_mod frozen_count=%d mod=%d",
+            submap->id, frozen_count_, cfg.hbaTriggerSubmaps());
         RCLCPP_INFO(rclcpp::get_logger("automap_system"),
             "[HBA][CHECK] skip: frozen_count=%d mod %d != 0",
             frozen_count_, cfg.hbaTriggerSubmaps());
@@ -84,6 +91,7 @@ void HBAOptimizer::onSubmapFrozen(const SubMap::Ptr& submap) {
     }
 
     if (!cfg.hbaOnLoop()) {
+        BACKEND_STEP("step=HBA_onSubmapFrozen_skip sm_id=%d reason=hbaOnLoop_false", submap->id);
         RCLCPP_INFO(rclcpp::get_logger("automap_system"),
             "[HBA][CHECK] skip: hbaOnLoop=false");
         return;
@@ -102,6 +110,8 @@ void HBAOptimizer::onSubmapFrozen(const SubMap::Ptr& submap) {
         pending_queue_.push(std::move(task));
         queue_cv_.notify_one();
         trigger_count_++;
+        BACKEND_STEP("step=HBA_onSubmapFrozen_trigger sm_id=%d kf_count=%zu queue_depth=%zu result=ok",
+            submap->id, kf_count, qdepth);
         RCLCPP_INFO(rclcpp::get_logger("automap_system"),
             "[HBA][TRIGGER] onSubmapFrozen: sm_id=%d kf_count=%zu queue_depth=%zu trigger_count=%d gps_aligned=%d",
             submap->id, kf_count, qdepth, trigger_count_, gps_aligned_ ? 1 : 0);
@@ -111,7 +121,8 @@ void HBAOptimizer::onSubmapFrozen(const SubMap::Ptr& submap) {
 
 void HBAOptimizer::triggerAsync(
     const std::vector<SubMap::Ptr>& all_submaps,
-    bool wait)
+    bool wait,
+    const char* trigger_source)
 {
     auto kfs = collectKeyFramesFromSubmaps(all_submaps);
     if (kfs.empty()) return;
@@ -129,11 +140,12 @@ void HBAOptimizer::triggerAsync(
     }
     size_t queue_depth = 0;
     { std::lock_guard<std::mutex> lk(queue_mutex_); queue_depth = pending_queue_.size(); }
+    const char* src = trigger_source ? trigger_source : "unknown";
     RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-        "[HBA][STATE] enqueue submaps=%zu keyframes=%zu gps=%d trigger_count=%d queue_depth=%zu",
-        sm_count, kf_count, gps_aligned_ ? 1 : 0, trigger_count_, queue_depth);
-    ALOG_INFO(MOD, "HBA triggerAsync: submaps={} keyframes={} gps={} trigger_count={} queue_depth={}",
-              sm_count, kf_count, gps_aligned_ ? 1 : 0, trigger_count_, queue_depth);
+        "[HBA][STATE] enqueue source=%s submaps=%zu keyframes=%zu gps=%d trigger_count=%d queue_depth=%zu (重影诊断: 同一轮建图内 trigger_count>1 表示被多次触发)",
+        src, sm_count, kf_count, gps_aligned_ ? 1 : 0, trigger_count_, queue_depth);
+    ALOG_INFO(MOD, "HBA triggerAsync: source={} submaps={} keyframes={} gps={} trigger_count={} queue_depth={}",
+              src, sm_count, kf_count, gps_aligned_ ? 1 : 0, trigger_count_, queue_depth);
 
     if (wait) {
         // 设置合理超时：最多等待5分钟，避免永久阻塞导致析构卡死
@@ -181,7 +193,7 @@ void HBAOptimizer::onGPSAligned(
 
     // GPS 对齐后立即触发一次全局优化（backend.hba.enabled=false 时跳过，仅 ISAM2+GPS）
     if (ConfigManager::instance().hbaEnabled())
-        triggerAsync(all_submaps, false);
+        triggerAsync(all_submaps, false, "onGPSAligned");
 }
 
 void HBAOptimizer::setGPSAlignedState(const GPSAlignResult& align_result) {
@@ -215,6 +227,7 @@ void HBAOptimizer::workerLoop() {
         }
 
         hba_running_ = true;
+        BACKEND_STEP("step=HBA_workerLoop_start keyframes=%zu gps=%d", task.keyframes.size(), task.enable_gps ? 1 : 0);
         RCLCPP_INFO(rclcpp::get_logger("automap_system"),
             "[HBA][STATE] optimization start keyframes=%zu gps=%d (running=1)",
             task.keyframes.size(), task.enable_gps ? 1 : 0);
@@ -222,29 +235,36 @@ void HBAOptimizer::workerLoop() {
                   task.keyframes.size(), task.enable_gps);
         AUTOMAP_TIMED_SCOPE(MOD, "HBA full optimize", 60000.0);
         HBAResult result = runHBA(task);
-        hba_running_ = false;
 
         if (result.success) {
+            BACKEND_STEP("step=HBA_workerLoop_done success=1 MME=%.4f elapsed_ms=%.1f poses=%zu",
+                result.final_mme, result.elapsed_ms, result.optimized_poses.size());
             RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-                "[HBA][STATE] optimization done success=1 MME=%.4f elapsed=%.1fms poses=%zu (running=0)",
+                "[HBA][STATE] optimization done success=1 MME=%.4f elapsed=%.1fms poses=%zu (running=1 until callbacks done)",
                 result.final_mme, result.elapsed_ms, result.optimized_poses.size());
             ALOG_INFO(MOD, "HBA done: MME={:.4f} elapsed={:.1f}ms kf={}",
                       result.final_mme, result.elapsed_ms, result.optimized_poses.size());
         } else {
+            BACKEND_STEP("step=HBA_workerLoop_done success=0 elapsed_ms=%.1f", result.elapsed_ms);
             RCLCPP_WARN(rclcpp::get_logger("automap_system"),
-                "[HBA][STATE] optimization done success=0 elapsed=%.1fms (running=0)", result.elapsed_ms);
+                "[HBA][STATE] optimization done success=0 elapsed=%.1fms (running=1 until callbacks done)", result.elapsed_ms);
             ALOG_ERROR(MOD, "HBA failed after {:.1f}ms", result.elapsed_ms);
         }
+        // 先执行回调（含 updateAllFromHBA + rebuildMergedCloudFromOptimizedPoses），再置 idle，
+        // 保证 finish 线程的 waitUntilIdleFor() 在 rebuild 完成后才返回，避免 save 与 rebuild 竞态导致重影（见 docs/HBA_GHOSTING_ROOT_CAUSE_20260317.md）
         for (auto& cb : done_cbs_) cb(result);
+        hba_running_ = false;
     }
 }
 
 HBAResult HBAOptimizer::runHBA(const PendingTask& task) {
+    BACKEND_STEP("step=HBA_runHBA_enter keyframes=%zu gps=%d", task.keyframes.size(), task.enable_gps ? 1 : 0);
     HBAResult result;
     result.success = false;
 
     // ========== 数据验证 ==========
     if (task.keyframes.empty()) {
+        BACKEND_STEP("step=HBA_runHBA_skip reason=no_keyframes");
         RCLCPP_WARN(rclcpp::get_logger("automap_system"),
             "[HBA][VALIDATION] No keyframes provided, skipping optimization");
         ALOG_WARN(MOD, "HBA aborted: no keyframes in task");
@@ -298,6 +318,8 @@ HBAResult HBAOptimizer::runHBA(const PendingTask& task) {
             "[HBA][VALIDATION] Unusual time span: %.1f hours (>2h), proceeding anyway", time_span / 3600.0);
     }
 
+    BACKEND_STEP("step=HBA_runHBA_validation_done valid_kf=%d time_span=%.1fs gps=%d",
+        valid_kf_count, time_span, task.enable_gps ? 1 : 0);
     RCLCPP_INFO(rclcpp::get_logger("automap_system"),
         "[HBA][DATA] valid_keyframes=%d time_span=%.1fs gps=%d",
         valid_kf_count, time_span, task.enable_gps ? 1 : 0);
@@ -367,15 +389,19 @@ HBAResult HBAOptimizer::runHBA(const PendingTask& task) {
     scope.setSuccess(api_result.success);
 
     if (api_result.success) {
-        // 将优化结果写回关键帧
-        for (size_t i = 0; i < sorted_kfs.size() && i < api_result.optimized_poses.size(); ++i) {
-            sorted_kfs[i]->T_w_b_optimized = api_result.optimized_poses[i];
-        }
+        BACKEND_STEP("step=HBA_runHBA_done backend=api success=1 MME=%.4f elapsed_ms=%.1f poses=%zu",
+            api_result.final_mme, api_result.elapsed_ms, api_result.optimized_poses.size());
+        // 不在此处写回 KF，由 updateAllFromHBA 持 SubMapManager::mutex_ 统一写回，避免与 buildGlobalMapAsync 取快照并发导致重影（见 GHOSTING 根因分析）
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[HBA][GHOSTING_DIAG] runHBA API path no KF write here poses=%zu (writeback in updateAllFromHBA under mutex)",
+            api_result.optimized_poses.size());
         result.success         = true;
         result.final_mme       = api_result.final_mme;
         result.elapsed_ms      = api_result.elapsed_ms;
         result.optimized_poses = api_result.optimized_poses;
     } else {
+        BACKEND_STEP("step=HBA_runHBA_done backend=api success=0 elapsed_ms=%.1f error=%s",
+            api_result.elapsed_ms, api_result.error_msg.c_str());
         result.success = false;
         RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
             "[HBA][BACKEND][EXCEPTION] HBA API failed: %s (grep HBA BACKEND EXCEPTION)", api_result.error_msg.c_str());
@@ -389,6 +415,7 @@ HBAResult HBAOptimizer::runHBA(const PendingTask& task) {
         "[HBA][CONFIG] backend.hba.enable_gtsam_fallback=%d (1=run GTSAM fallback, 0=skip; verify config file has enable_gtsam_fallback: true)",
         ConfigManager::instance().hbaGtsamFallbackEnabled() ? 1 : 0);
     if (!ConfigManager::instance().hbaGtsamFallbackEnabled()) {
+        BACKEND_STEP("step=HBA_runHBA_skip reason=gtsam_fallback_disabled");
         RCLCPP_WARN(rclcpp::get_logger("automap_system"),
             "[HBA][BACKEND] GTSAM fallback disabled (backend.hba.enable_gtsam_fallback=false), skipping HBA");
         ALOG_WARN(MOD, "HBA: GTSAM fallback disabled by config, skip");
@@ -397,6 +424,7 @@ HBAResult HBAOptimizer::runHBA(const PendingTask& task) {
         result = runGTSAMFallback(task);
     }
 #else
+    BACKEND_STEP("step=HBA_runHBA_skip reason=hba_api_not_available");
     result.success = false;
     RCLCPP_WARN(rclcpp::get_logger("automap_system"),
         "[HBA][BACKEND] hba_api not available, skipping optimization (no changes applied)");
@@ -408,9 +436,11 @@ HBAResult HBAOptimizer::runHBA(const PendingTask& task) {
 
 #ifdef USE_GTSAM_FALLBACK
 HBAResult HBAOptimizer::runGTSAMFallback(const PendingTask& task) {
+    BACKEND_STEP("step=HBA_runGTSAMFallback_enter keyframes=%zu gps=%d", task.keyframes.size(), task.enable_gps ? 1 : 0);
     HBAResult result;
     result.success = false;
     if (task.keyframes.empty()) {
+        BACKEND_STEP("step=HBA_runGTSAMFallback_skip reason=no_keyframes");
         RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
             "[HBA][BACKEND][VALIDATION] GTSAM fallback: no keyframes, abort");
         return result;
@@ -493,6 +523,24 @@ HBAResult HBAOptimizer::runGTSAMFallback(const PendingTask& task) {
                 auto between_noise = gtsam::noiseModel::Diagonal::Variances(between_var6);
                 graph.add(gtsam::BetweenFactor<gtsam::Pose3>(KF(i - 1), KF(i), toGtsamPose3(rel), between_noise));
                 factor_type_log.push_back("Between(k" + std::to_string(i - 1) + "-k" + std::to_string(i) + ")");
+            }
+        }
+
+        // [POSE_DIAG] HBA 初始值：首/中/尾关键帧记录使用的位姿来源及数值
+        {
+            const size_t n_kf_init = sorted_kfs.size();
+            for (size_t idx : {static_cast<size_t>(0), n_kf_init / 2, n_kf_init - 1}) {
+                if (idx >= n_kf_init) continue;
+                const auto& kf = sorted_kfs[idx];
+                Pose3d p_init = poseForInitial(kf);
+                const auto& to = kf->T_w_b_optimized.translation();
+                const auto& td = kf->T_w_b.translation();
+                bool used_opt = (p_init.translation() - to).norm() < 1e-9;
+                RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                    "[HBA][POSE_DIAG] initial idx=%zu kf_id=%lu source=%s trans=[%.4f,%.4f,%.4f] | T_w_b_odom=[%.4f,%.4f,%.4f] T_w_b_opt=[%.4f,%.4f,%.4f]",
+                    idx, kf->id, used_opt ? "T_w_b_optimized" : "T_w_b",
+                    p_init.translation().x(), p_init.translation().y(), p_init.translation().z(),
+                    td.x(), td.y(), td.z(), to.x(), to.y(), to.z());
             }
         }
 
@@ -639,25 +687,61 @@ HBAResult HBAOptimizer::runGTSAMFallback(const PendingTask& task) {
         RCLCPP_INFO(rclcpp::get_logger("automap_system"),
             "[HBA][GTSAM] LM optimize() exit iterations done");
 
+        // [GHOSTING_DIAG] 写回前抽样记录 T_w_b vs 即将写回的 T_w_b_optimized，便于定位重影是否来自写回不一致
+        const size_t kSampleStep = std::max<size_t>(1, sorted_kfs.size() / 8);
         for (size_t i = 0; i < sorted_kfs.size(); ++i) {
-            if (optimized.exists(KF(i))) {
-                sorted_kfs[i]->T_w_b_optimized = fromGtsamPose3(optimized.at<gtsam::Pose3>(KF(i)));
-                result.optimized_poses.push_back(sorted_kfs[i]->T_w_b_optimized);
+            if (i % kSampleStep == 0 && optimized.exists(KF(i))) {
+                const auto& kf = sorted_kfs[i];
+                Pose3d new_pose = fromGtsamPose3(optimized.at<gtsam::Pose3>(KF(i)));
+                double trans_diff = (new_pose.translation() - kf->T_w_b.translation()).norm();
+                RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                    "[HBA][GHOSTING_DIAG] pre_writeback kf_id=%lu idx=%zu: T_w_b=[%.2f,%.2f,%.2f] -> T_w_b_optimized=[%.2f,%.2f,%.2f] trans_diff=%.3fm",
+                    kf->id, i,
+                    kf->T_w_b.translation().x(), kf->T_w_b.translation().y(), kf->T_w_b.translation().z(),
+                    new_pose.translation().x(), new_pose.translation().y(), new_pose.translation().z(),
+                    trans_diff);
             }
         }
+
+        const size_t n_kf = sorted_kfs.size();
+        for (size_t i = 0; i < n_kf; ++i) {
+            if (optimized.exists(KF(i))) {
+                Pose3d new_pose = fromGtsamPose3(optimized.at<gtsam::Pose3>(KF(i)));
+                result.optimized_poses.push_back(new_pose);
+            }
+        }
+        // [POSE_DIAG] 写回由 updateAllFromHBA 持锁统一执行；此处用 result.optimized_poses 打首/中/尾与 T_w_b 的差值
+        for (size_t idx : {static_cast<size_t>(0), n_kf / 2, n_kf - 1}) {
+            if (idx >= n_kf || idx >= result.optimized_poses.size()) continue;
+            const auto& kf = sorted_kfs[idx];
+            const auto& t_new = result.optimized_poses[idx].translation();
+            const auto& t_odom = kf->T_w_b.translation();
+            double trans_diff = (t_new - t_odom).norm();
+            double yaw_new = std::atan2(result.optimized_poses[idx].rotation()(1, 0), result.optimized_poses[idx].rotation()(0, 0)) * 180.0 / M_PI;
+            double yaw_odom = std::atan2(kf->T_w_b.rotation()(1, 0), kf->T_w_b.rotation()(0, 0)) * 180.0 / M_PI;
+            RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                "[HBA][POSE_DIAG] writeback idx=%zu kf_id=%lu T_w_b_optimized=[%.4f,%.4f,%.4f] yaw=%.2fdeg | T_w_b_odom=[%.4f,%.4f,%.4f] yaw=%.2fdeg trans_diff=%.4fm",
+                idx, kf->id, t_new.x(), t_new.y(), t_new.z(), yaw_new, t_odom.x(), t_odom.y(), t_odom.z(), yaw_odom, trans_diff);
+        }
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[HBA][GHOSTING_DIAG] runHBA no KF write here poses=%zu (writeback in updateAllFromHBA under mutex；若重影请 grep GHOSTING_DIAG 核对 writeback_enter/done 与 pose_snapshot_taken 时间线)",
+            result.optimized_poses.size());
         result.success = true;
         result.elapsed_ms = 0.0;
         result.final_mme = 0.0;
         scope.setSuccess(true);
+        BACKEND_STEP("step=HBA_runHBA_done backend=GTSAM_fallback success=1 poses=%zu", result.optimized_poses.size());
         RCLCPP_INFO(rclcpp::get_logger("automap_system"),
             "[HBA][BACKEND] GTSAM fallback done: poses=%zu", result.optimized_poses.size());
         ALOG_INFO(MOD, "HBA GTSAM fallback done: optimized_poses={}", result.optimized_poses.size());
     } catch (const std::exception& e) {
+        BACKEND_STEP("step=HBA_runHBA_done backend=GTSAM_fallback success=0 exception=%s", e.what());
         RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
             "[HBA][BACKEND][EXCEPTION] GTSAM fallback failed: %s (grep HBA BACKEND EXCEPTION)", e.what());
         ALOG_ERROR(MOD, "HBA GTSAM fallback exception: {}", e.what());
         fprintf(stderr, "[HBAOptimizer] GTSAM fallback exception: %s\n", e.what());
     } catch (...) {
+        BACKEND_STEP("step=HBA_runHBA_done backend=GTSAM_fallback success=0 exception=unknown");
         RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
             "[HBA][BACKEND][EXCEPTION] GTSAM fallback unknown exception (若为 double free，检查 FIX_GPS_BATCH_SIGSEGV 与 pre-LM 日志，grep HBA BACKEND EXCEPTION)");
         ALOG_ERROR(MOD, "HBA GTSAM fallback: unknown exception");

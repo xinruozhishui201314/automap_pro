@@ -5,6 +5,8 @@
 #define MOD "TeaserMatcher"
 #include "automap_pro/loop_closure/fpfh_extractor.h"
 
+#include <mutex>
+#include <rclcpp/rclcpp.hpp>
 #include <iostream>
 #include <memory>
 #include <new>
@@ -29,6 +31,10 @@ inline long getLwpForLog() {
 }  // namespace
 
 TeaserMatcher::TeaserMatcher() {
+    applyConfig();
+}
+
+void TeaserMatcher::applyConfig() {
     const auto& cfg = ConfigManager::instance();
     noise_bound_       = cfg.teaserNoiseBound();
     cbar2_             = cfg.teaserCbar2();
@@ -100,9 +106,19 @@ TeaserMatcher::Result TeaserMatcher::match(
     const CloudXYZIPtr& tgt_cloud,
     const Pose3d& /*initial_guess*/) const
 {
+    // 首次 match 时打印实际使用的参数到 ROS 日志，便于 full.log 验证 YAML 是否生效
+    static std::once_flag once_verify;
+    std::call_once(once_verify, [this]() {
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[TeaserMatcher][VERIFY] first match params in use: min_safe_inliers=%d min_inlier_ratio=%.2f max_rmse=%.2f (grep VERIFY 验证与 CONFIG 一致)",
+            min_safe_inliers_, min_inlier_ratio_, max_rmse_);
+    });
+
     const unsigned tid = automap_pro::logThreadId();
     const size_t src_pts = src_cloud ? src_cloud->size() : 0u;
     const size_t tgt_pts = tgt_cloud ? tgt_cloud->size() : 0u;
+    ALOG_INFO(MOD, "[LOOP_STEP][TEASER] match_enter src_pts={} tgt_pts={} params: voxel_size={:.3f} max_points={} min_safe_inliers={} min_inlier_ratio={:.3f} max_rmse={:.3f}m (拒绝条件: inliers<min_safe_inliers 或 ratio<min_inlier_ratio 或 rmse>max_rmse)",
+              src_pts, tgt_pts, voxel_size_, max_points_, min_safe_inliers_, min_inlier_ratio_, max_rmse_);
     ALOG_INFO(MOD, "[LOOP_COMPUTE][TEASER] match_enter src_pts={} tgt_pts={} (精准优化: 后续见 fpfh_done/teaser_solve_enter/teaser_done)",
               src_pts, tgt_pts);
     ALOG_INFO(MOD, "[tid={}] step=match_enter src_ptr={} src_use_count={} src_pts={} tgt_ptr={} tgt_use_count={} tgt_pts={}",
@@ -373,10 +389,20 @@ TeaserMatcher::Result TeaserMatcher::match(
         const auto max_clique = solver->getInlierMaxClique();
         const int inliers = static_cast<int>(max_clique.size());
         const float ratio = corrs.empty() ? 0.f : static_cast<float>(inliers) / static_cast<float>(corrs.size());
+        const int valid = (inliers >= min_safe_inliers_ && ratio >= min_inlier_ratio_) ? 1 : 0;
         ALOG_INFO(MOD, "[LOOP_COMPUTE][TEASER] teaser_done inliers={} corrs={} ratio={:.3f} valid={} (精准优化: inliers<min_safe_inliers 会拒绝，可调 loop_closure.teaser.min_safe_inliers)",
-                  inliers, static_cast<int>(corrs.size()), ratio, (inliers >= min_safe_inliers_ && ratio >= min_inlier_ratio_) ? 1 : 0);
+                  inliers, static_cast<int>(corrs.size()), ratio, valid);
         ALOG_INFO(MOD, "[tid={}] step=teaser_inlier_computed inliers={}/{} ratio={:.2f} thresh={}",
                  tid, inliers, corrs.size(), ratio, min_inlier_ratio_);
+        ALOG_INFO(MOD, "[TEASER_DIAG] inliers={} corrs={} ratio={:.4f} min_safe_inliers={} min_ratio={:.3f} (valid={})",
+                  inliers, static_cast<int>(corrs.size()), ratio, min_safe_inliers_, min_inlier_ratio_, valid);
+        // 子图间几何诊断：TEASER 估计的 T_tgt_src（target 系下 source 位姿），便于与 odom 相对位姿对比
+        {
+            const double teaser_trans_m = solution.translation.norm();
+            const double teaser_rot_deg = Eigen::AngleAxisd(solution.rotation).angle() * 180.0 / M_PI;
+            ALOG_INFO(MOD, "[TEASER_DIAG] estimated_pose T_tgt_src: trans_norm_m={:.3f} rot_deg={:.2f} (与 INTER_KF GEOM_DIAG 中 odom rel_trans/rel_rot 对比；差异大则误匹配或 FPFH 对应点差)",
+                      teaser_trans_m, teaser_rot_deg);
+        }
 
         // 【TEASER_DIAG】使用 solution 的位姿计算内点 RMSE 和距离分布（result.T_tgt_src 尚未赋值）
         if (inliers > 0) {
@@ -551,11 +577,20 @@ TeaserMatcher::Result TeaserMatcher::match(
                  result.T_tgt_src.translation().x(),
                  result.T_tgt_src.translation().y(),
                  result.T_tgt_src.translation().z());
+        ALOG_INFO(MOD, "[TEASER_RESULT] PASS inliers≈{} corrs={} ratio={:.4f} rmse={:.4f}m (min_safe={} min_ratio={:.2f} max_rmse={:.2f}m)",
+                  static_cast<int>(result.inlier_ratio * std::max(0, result.num_correspondences)),
+                  result.num_correspondences, result.inlier_ratio, result.rmse,
+                  min_safe_inliers_, min_inlier_ratio_, max_rmse_);
     } else {
         ALOG_WARN(MOD, "[tid={}] step=match_failed inlier={:.2f} corrs={} rmse={:.3f}m",
                  tid, result.inlier_ratio, result.num_correspondences, result.rmse);
         ALOG_INFO(MOD, "[TRACE] step=loop_match result=fail reason=rmse_too_high tid={} rmse={:.4f} max_rmse={} (精准定位: 匹配 RMSE 超阈值)", tid, result.rmse, max_rmse_);
+        ALOG_INFO(MOD, "[TEASER_RESULT] FAIL reason=rmse_or_final_check inlier_ratio={:.4f} corrs={} rmse={:.4f}m max_rmse={:.2f}m",
+                  result.inlier_ratio, result.num_correspondences, result.rmse, max_rmse_);
     }
+    ALOG_INFO(MOD, "[TEASER_EXIT] result=%s success=%d inlier_ratio=%.4f rmse=%.4fm corrs=%d (若 FAIL 见上方 [LOOP_COMPUTE][TEASER] reason= 或 [TEASER_RESULT] FAIL)",
+              result.success ? "PASS" : "FAIL", result.success ? 1 : 0,
+              result.inlier_ratio, result.rmse, result.num_correspondences);
     ALOG_DEBUG(MOD, "[tid={}] step=match_exit", tid);
     return result;
 } catch (const std::bad_alloc& e) {

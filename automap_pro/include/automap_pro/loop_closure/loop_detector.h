@@ -85,6 +85,12 @@ public:
     /** 为子图内回环检测准备描述子数据库（首次调用时计算所有关键帧描述子） */
     void prepareIntraSubmapDescriptors(const SubMap::Ptr& submap);
 
+    /**
+     * 增量确保子图内描述子/下采样点云到指定索引（含），只计算缺失的尾部，避免每帧全量 prepare。
+     * 用于每帧触发子图内回环时仅追加当前关键帧描述子。
+     */
+    void ensureIntraSubmapDescriptorsUpTo(const SubMap::Ptr& submap, int up_to_index_inclusive);
+
     // ── 状态查询 ──────────────────────────────────────────────────────────
     size_t dbSize()    const;
     size_t queueSize() const;
@@ -111,10 +117,20 @@ private:
 
     // 几何验证队列（Stage 2，子图已有描述子后提交）
     // query_cloud：入队时深拷贝，避免 worker 读 SubMap::downsampled_cloud 与主线程并发导致 use-after-free
+    /** 子图间关键帧级候选：(submap_id, keyframe_idx, score) */
+    struct InterKfCandidate {
+        int submap_id = -1;
+        int keyframe_idx = -1;
+        float score = 0.f;
+    };
     struct MatchTask {
         SubMap::Ptr query;
-        CloudXYZIPtr query_cloud;  // 入队时拷贝，worker 仅用此指针
+        CloudXYZIPtr query_cloud;  // 子图级=downsampled_cloud；关键帧级=该关键帧下采样点云
         std::vector<OverlapTransformerInfer::Candidate> candidates;
+        /** 关键帧级子图间：query 关键帧索引，-1 表示子图级匹配 */
+        int query_kf_idx = -1;
+        /** 关键帧级子图间：候选 (target_submap_id, target_keyframe_idx, score)，非空时走关键帧级 TEASER */
+        std::vector<InterKfCandidate> candidates_kf;
     };
     std::queue<MatchTask> match_queue_;
     std::mutex            match_mutex_;
@@ -123,6 +139,10 @@ private:
     // 描述子数据库
     std::vector<SubMap::Ptr>  db_submaps_;
     mutable std::shared_mutex db_mutex_;
+
+    /** 保护子图内描述子准备：keyframe_scancontexts_/keyframe_descriptors/keyframe_clouds_ds 的并发写。
+     *  避免 prepareIntraSubmapDescriptors 与 addToDatabase/onDescriptorReady 多线程同时执行导致 double-free。 */
+    std::mutex intra_prepare_mutex_;
 
     // ── 算法组件 ─────────────────────────────────────────────────────────
     OverlapTransformerInfer overlap_infer_;
@@ -158,7 +178,7 @@ private:
     double overlap_threshold_  = 0.3;
     int    top_k_              = 5;
     double min_temporal_gap_   = 30.0;
-    int    min_submap_gap_     = 2;
+    int    min_submap_gap_     = 0;   // 0=不按子图间隔过滤(允许相邻子图回环)
     double gps_search_radius_  = 200.0;
     /** 几何距离预筛：候选与 query 子图锚定位置距离 > 此值(米)则过滤。0=关闭 */
     double geo_prefilter_max_distance_m_ = 0.0;
@@ -182,6 +202,13 @@ private:
     double intra_submap_overlap_threshold_ = 0.3;
     /** 子图内回环：每帧最多对多少候选做 TEASER（≤0 不限制），避免单帧 10s+ */
     int intra_submap_max_teaser_candidates_ = 5;
+
+    /** 子图间回环使用关键帧级（true=关键帧↔关键帧） */
+    bool inter_keyframe_level_enabled_ = true;
+    /** 子图间关键帧级：query 子图内采样步长（每 step 个关键帧取 1 个） */
+    int inter_keyframe_sample_step_ = 5;
+    /** 子图间关键帧级：每个候选子图内取 top-K 关键帧 */
+    int inter_keyframe_top_k_per_submap_ = 3;
 
     // ── 私有方法 ──────────────────────────────────────────────────────────
     void descWorkerLoop();

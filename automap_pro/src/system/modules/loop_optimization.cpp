@@ -59,6 +59,9 @@ void AutoMapSystem::onLoopDetected(const LoopConstraint::Ptr& lc) {
             task.loop_constraint = lc;
             opt_task_queue_.push_back(task);
             opt_task_cv_.notify_one();
+            RCLCPP_INFO(get_logger(),
+                "[LOOP_ACCEPTED] onLoopDetected enqueue sm_i=%d sm_j=%d (将入因子图，减轻结构重影；grep LOOP_ACCEPTED)",
+                lc->submap_i, lc->submap_j);
         } else {
             RCLCPP_WARN(get_logger(), "[AutoMapSystem][LOOP] opt_task_queue full, dropping loop sm_i=%d sm_j=%d", lc->submap_i, lc->submap_j);
         }

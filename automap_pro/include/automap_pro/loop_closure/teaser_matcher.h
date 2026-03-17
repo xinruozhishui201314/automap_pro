@@ -19,6 +19,9 @@ public:
     };
 
     explicit TeaserMatcher();
+    /** 从 ConfigManager 重新加载 TEASER 参数（在 config load 之后调用，解决构造早于 load 导致默认值生效的问题） */
+    void applyConfig();
+
     Result match(const CloudXYZIPtr& src, const CloudXYZIPtr& tgt,
                  const Pose3d& initial_guess = Pose3d::Identity()) const;
 

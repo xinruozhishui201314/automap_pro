@@ -66,7 +66,7 @@ bool OverlapTransformerInfer::loadModel(const std::string& model_path, bool use_
     (void)model_path;
     (void)use_cuda;
     model_loaded_ = false;
-    printf("[OT] LibTorch not available – using fallback descriptor\n");
+    printf("[OT] LibTorch not available; use loop_closure.scancontext.enabled=true for ScanContext-only loop closure.\n");
     return false;
 #endif
 }

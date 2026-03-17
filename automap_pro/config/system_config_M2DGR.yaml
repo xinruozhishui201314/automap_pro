@@ -273,19 +273,23 @@ gps:
     pitch_roll_base_var:        0.01
     yaw_var_velocity_scale:     0.1
 
-# ── 3.3 回环检测 ───────────────────────────────────────────────────────────
+# ── 3.3 回环检测（已放宽：更多候选 + 更松几何接受，减轻点云结构重影）────────────────
 loop_closure:
-  overlap_threshold:   0.20      # ⬇️ 降低阈值（0.25→0.20），更容易检测到回环
-  top_k:               10        # ⬆️ 增加候选数（8→10），给几何验证更多机会
-  min_temporal_gap_s: 20.0      # ⬇️ 降低时间阈值（30→20），更容易触发回环检测
-  min_submap_gap:      1         # 1=允许相邻子图之间产生回环候选
+  overlap_threshold:   0.15      # ⬇️ 再放宽（0.20→0.15），更多描述子候选进入几何验证
+  top_k:               15        # ⬆️ 增加候选数（10→15），给 TEASER 更多机会
+  min_temporal_gap_s: 15.0      # ⬇️ 再放宽（20→15），更早/更多触发回环检测
+  min_submap_gap:      0         # 0=不按子图间隔过滤(允许相邻子图回环)
 
-  # ── 子图内回环检测参数（新增）──────────────────────────────────────────────
+  # ── 子图内回环检测参数 ─────────────────────────────────────────────────────
   intra_submap_enabled: true
-  intra_submap_min_temporal_gap_s: 3.0    # 降低时间阈值（5.0→3.0）
-  intra_submap_min_keyframe_gap: 10
-  intra_submap_min_distance_gap_m: 3.0
-  intra_submap_overlap_threshold: 0.20     # ⬇️ 降低阈值（0.25→0.20）
+  intra_submap_min_temporal_gap_s: 2.0    # ⬇️ 再放宽（3.0→2.0）
+  intra_submap_min_keyframe_gap: 8        # ⬇️ 放宽（10→8）
+  intra_submap_min_distance_gap_m: 2.0    # ⬇️ 放宽（3.0→2.0）
+  intra_submap_overlap_threshold: 0.15    # ⬇️ 再放宽（0.20→0.15）
+  # 子图间关键帧级回环
+  inter_keyframe_level:       true
+  inter_keyframe_sample_step: 5
+  inter_keyframe_top_k_per_submap: 5      # ⬆️ 放宽（3→5），每子图更多候选
 
   gps_search_radius_m: 200.0
   geo_prefilter_max_distance_m: 0.0
@@ -305,19 +309,19 @@ loop_closure:
     cbar2:            1.0
     voxel_size:       0.4
     max_points:       8000
-    min_inlier_ratio: 0.12   # ⬇️ 降低阈值（0.15→0.12），更容易接受回环匹配
-    min_safe_inliers: 4       # ⬇️ 降低阈值（5→4）
-    max_rmse_m:       0.4    # ⬆️ 提高阈值（0.3→0.4）
-    min_relative_translation_m: 0.03  # ⬇️ 降低阈值（0.05→0.03）
+    min_inlier_ratio: 0.08   # ⬇️ 再放宽（0.12→0.08），接受更 noisy 的匹配
+    min_safe_inliers: 3       # ⬇️ 再放宽（4→3），最少内点数要求降低
+    max_rmse_m:       0.55   # ⬆️ 再放宽（0.4→0.55），允许更大几何残差
+    min_relative_translation_m: 0.02  # ⬇️ 再放宽（0.03→0.02），小位移回环也入图
     icp_refine:       true
   # ── ScanContext 回环粗匹配 ───────────────────────────────────────────
   scancontext:
     enabled:           true
-    dist_threshold:    0.18    # ⬆️ 提高阈值（0.13→0.18），更容易找到候选
-    num_candidates:   10      # ⬆️ 增加候选数（5→10）
-    exclude_recent:   20      # ⬇️ 降低阈值（50→20），允许更多历史帧
-    tree_making_period: 30    # ⬇️ 降低（50→30），更频繁更新KD-Tree
-    min_history_for_search: 3  # 新增：最小历史帧数
+    dist_threshold:    0.22   # ⬆️ 再放宽（0.18→0.22），更多 ScanContext 候选
+    num_candidates:   15      # ⬆️ 再放宽（10→15）
+    exclude_recent:   3       # 保持：让 ScanContext 更早开始工作
+    tree_making_period: 30
+    min_history_for_search: 3
 
 # ── 3.4 后端优化（ISAM2、HBA）────────────────────────────────────────────────
 # HBA 键与 params_from_system_config.get_hba_params / get_hba_cal_mme_params / get_hba_visualize_params 一致
@@ -327,6 +331,7 @@ backend:
   process_every_n_frames: 5
   # 每处理多少帧发布一次全局图
   publish_global_map_every_n_processed: 150
+  max_pending_gps_keyframe_factors: 1000
   isam2:
     relinearize_threshold: 0.1
     relinearize_skip:       20

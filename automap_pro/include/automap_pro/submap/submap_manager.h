@@ -53,6 +53,9 @@ public:
     /** 批量更新子图位姿（来自 HBA 结果） */
     void updateAllFromHBA(const HBAResult& result);
 
+    /** HBA 完成后重建 merged_cloud（使用优化后的位姿） */
+    void rebuildMergedCloudFromOptimizedPoses();
+
     /**
      * 启动新会话（增量建图）
      * @param session_id  新 session ID（由 SessionManager 分配）
@@ -190,8 +193,25 @@ private:
     void freezePostProcessLoop();
 
     // ── 私有方法 ──────────────────────────────────────────────────────────
-    /** 内部实现：不持锁的地图构建（供异步版本使用） */
-    CloudXYZIPtr buildGlobalMapInternal(const std::vector<SubMap::Ptr>& submaps_copy, float voxel_size) const;
+    /**
+     * 内部实现：不持锁的地图构建（供同步 buildGlobalMap 使用，持锁调用）。
+     * @param poses_snapshot 若非空，则使用此快照中的位姿（与 submaps_copy 的 KF 迭代顺序一致），
+     *                       避免与 onPoseUpdated/updateAllFromHBA 并发写导致的重影（见 GHOSTING_DEEP_ANALYSIS）。
+     * @param build_id 非 0 时用于 GHOSTING_DIAG 日志串联（同一 build 的 snapshot/enter/exit 使用相同 build_id）。
+     */
+    CloudXYZIPtr buildGlobalMapInternal(
+        const std::vector<SubMap::Ptr>& submaps_copy,
+        float voxel_size,
+        const std::vector<Pose3d>* poses_snapshot = nullptr,
+        uint64_t build_id = 0) const;
+
+    /**
+     * 从 (cloud, pose) 快照构建全局图，不访问 SubMap/KeyFrame，供异步 buildGlobalMapAsync 使用以消除与后端的并发访问导致的 SIGSEGV。
+     */
+    CloudXYZIPtr buildGlobalMapInternalFromSnapshot(
+        const std::vector<std::pair<CloudXYZIPtr, Pose3d>>& cloud_pose_snapshot,
+        float voxel_size,
+        uint64_t build_id = 0) const;
     
     SubMap::Ptr createNewSubmap(const KeyFrame::Ptr& first_kf);
     /** 无参版本仅用于兼容；实际冻结请用传入 submap 的版本，且须在未持 mutex_ 时调用，避免回调内 getFrozenSubmaps 死锁 */

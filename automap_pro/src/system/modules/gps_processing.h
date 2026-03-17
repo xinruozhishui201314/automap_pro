@@ -12,6 +12,7 @@ void AutoMapSystem::onGPSAligned(const GPSAlignResult& result);
 void AutoMapSystem::transformAllPosesAfterGPSAlign(const GPSAlignResult& result);
 void AutoMapSystem::addBatchGPSFactors();
 void AutoMapSystem::ensureBackendCompletedAndFlushBeforeHBA();
+void AutoMapSystem::addGPSFactorsToActiveSubmapOnAlign(const GPSAlignResult& result);
 
 }  // namespace automap_pro
 

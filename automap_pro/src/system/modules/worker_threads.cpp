@@ -123,7 +123,7 @@ void AutoMapSystem::backendWorkerLoop() {
                                     auto all = submap_manager_.getAllSubmaps();
                                     RCLCPP_INFO(get_logger(), "[AutoMapSystem][PIPELINE][HBA] event=sensor_idle_final_hba_enter submaps=%zu", all.size());
                                     ensureBackendCompletedAndFlushBeforeHBA();
-                                    hba_optimizer_.triggerAsync(all, true);
+                                    hba_optimizer_.triggerAsync(all, true, "sensor_idle");
                                     RCLCPP_INFO(get_logger(), "[AutoMapSystem][PIPELINE][HBA] event=sensor_idle_final_hba_done");
                                 }
                                 std::string out_dir = getOutputDir();
@@ -143,8 +143,10 @@ void AutoMapSystem::backendWorkerLoop() {
                         break;
                     }
                 }
+                // [GHOSTING_FIX] finish 已触发时不再由 frontend_idle 触发 HBA，避免双次写回导致重影
                 const double idle_trigger_sec = ConfigManager::instance().hbaFrontendIdleTriggerSec();
                 if (idle_trigger_sec > 0 && ConfigManager::instance().hbaEnabled() &&
+                    !sensor_idle_finish_triggered_.load(std::memory_order_acquire) &&
                     first_cloud_logged_.load(std::memory_order_acquire) && submap_manager_.submapCount() > 0) {
                     auto now_idle = std::chrono::steady_clock::now();
                     double frontend_idle_sec = std::chrono::duration<double>(now_idle - last_sensor_data_wall_time_).count();
@@ -155,7 +157,7 @@ void AutoMapSystem::backendWorkerLoop() {
                                         frontend_idle_sec, submap_manager_.submapCount());
                             ensureBackendCompletedAndFlushBeforeHBA();
                             auto all = submap_manager_.getAllSubmaps();
-                            hba_optimizer_.triggerAsync(all, false);
+                            hba_optimizer_.triggerAsync(all, false, "frontend_idle");
                             continue;
                         }
                     }

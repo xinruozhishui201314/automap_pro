@@ -47,9 +47,10 @@ public:
     /** 子图冻结时调用（自动触发条件检查） */
     void onSubmapFrozen(const SubMap::Ptr& submap);
 
-    /** 强制异步触发 HBA（建图结束时调用） */
+    /** 强制异步触发 HBA（建图结束时调用）。trigger_source 仅用于日志，便于定位重影时是否被多次触发（如 finish_mapping / frontend_idle）。 */
     void triggerAsync(const std::vector<SubMap::Ptr>& all_submaps,
-                      bool wait = false);
+                      bool wait = false,
+                      const char* trigger_source = nullptr);
 
     /** 等待队列清空且当前无 HBA 运行，最多等待 timeout_ms 毫秒（用于关闭时限时等待） */
     void waitUntilIdleFor(std::chrono::milliseconds timeout_ms);
@@ -63,6 +64,8 @@ public:
 
     // ── 状态查询 ──────────────────────────────────────────────────────────
     bool isRunning() const { return hba_running_.load(); }
+    /** 队列空且当前无 HBA 运行（用于 map_publish 在 HBA 期间跳过发布，见 docs/GHOSTING_ROOT_CAUSE_HBA_VS_BACKEND_20260317.md） */
+    bool isIdle() const;
     int  triggerCount() const { return trigger_count_; }
     /** 当前待处理任务数（含正在执行的一轮） */
     size_t queueDepth() const;
@@ -101,8 +104,6 @@ private:
 #endif
     std::vector<KeyFrame::Ptr> collectKeyFramesFromSubmaps(
         const std::vector<SubMap::Ptr>& submaps) const;
-    /** 在 queue_mutex_ 下检查是否空闲 */
-    bool isIdle() const;
 };
 
 } // namespace automap_pro

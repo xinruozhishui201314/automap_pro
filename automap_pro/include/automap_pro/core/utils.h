@@ -34,8 +34,16 @@ CloudXYZIPtr voxelDownsampleWithTimeout(const CloudXYZIPtr& cloud, float leaf_si
                                          int timeout_ms = 5000, bool* timed_out = nullptr);
 
 /** 分块体素滤波：按空间网格分块，每块单独滤波再合并，避免大范围点云单次滤波导致 PCL 溢出/崩溃。
- *  chunk_size_m 为每块边长（米），建议 40～80；若 <=0 则退化为单次 voxelDownsample。 */
+ *  chunk_size_m 为每块边长（米），建议 40～80；若 <=0 则按 leaf 自动计算安全块大小。 */
 CloudXYZIPtr voxelDownsampleChunked(const CloudXYZIPtr& cloud, float leaf_size, float chunk_size_m = 50.0f);
+
+/** 安全体素下采样（推荐）：保证不出现 overflow，且不放大 leaf、保持分辨率。
+ *  内部在可能溢出时走分块流程：分割 → 每块降采样 → 拼接；chunk_size_m<=0 时自动计算块大小。
+ *  @param cloud 输入点云
+ *  @param leaf_size 体素边长（米）
+ *  @param chunk_size_m 分块边长（米），<=0 表示自动
+ *  @return 降采样后的点云 */
+CloudXYZIPtr voxelDownsampleSafe(const CloudXYZIPtr& cloud, float leaf_size, float chunk_size_m = 0.0f);
 
 /** @return true if path exists (file or directory). */
 bool fileExists(const std::string& path);
