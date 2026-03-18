@@ -285,6 +285,14 @@ public:
     int intraSubmapLoopMaxTeaserCandidates() const {
         return get<int>("loop_closure.intra_submap_max_teaser_candidates", 5);
     }
+    /** 子图内回环单次检测最大耗时(秒)，超时则本帧跳过添加回环因子，避免后端阻塞；≤0 表示不限制（同步执行） */
+    double intraSubmapLoopMaxDurationSec() const {
+        return get<double>("loop_closure.intra_submap_max_duration_sec", 8.0);
+    }
+    /** 子图内回环是否与主线程异步：true=仅投递任务到 intra_loop_worker，主线程不等待；false=在当前线程执行（可配合 max_duration_sec 超时） */
+    bool intraSubmapLoopAsync() const {
+        return get<bool>("loop_closure.intra_submap_async", true);
+    }
 
     /** 子图间回环是否使用关键帧级（true=关键帧↔关键帧跨子图，false=子图↔子图） */
     bool interKeyframeLevelEnabled() const {
@@ -368,10 +376,18 @@ public:
         int v = get<int>("backend.process_every_n_frames", 5);
         return std::max(1, std::min(100, v));
     }
+    /** 单帧处理耗时超过此值(秒)时打 WARN 便于诊断卡点；≤0 表示不告警。默认 15.0 */
+    double backendSingleFrameWarnDurationSec() const {
+        return get<double>("backend.single_frame_warn_duration_sec", 15.0);
+    }
     /** 每处理多少帧发布一次全局图（buildGlobalMap+voxel 下采样，耗时随地图增大；增大可减轻后端峰值阻塞，默认 100） */
     int backendPublishGlobalMapEveryNProcessed() const {
         int v = get<int>("backend.publish_global_map_every_n_processed", 100);
         return std::max(50, std::min(1000, v));
+    }
+    /** 子图冻结时合并 forceUpdate：先 flush 所有 pending GPS 再统一一次 forceUpdate，减少 ISAM2 调用次数（默认 false 保持原 3 次）。见 BACKEND_FURTHER_OPTIMIZATION_OPPORTUNITIES.md */
+    bool backendForceUpdateCoalesceOnSubmapFreeze() const {
+        return get<bool>("backend.force_update_coalesce_on_submap_freeze", false);
     }
     /** Keyframe 级 pending GPS 因子队列上限，超过时丢弃最旧（FIFO），防长时间失败导致 OOM。默认 1000，范围 100～5000。见 BACKEND_POTENTIAL_ISSUES 1.2.1 */
     int backendMaxPendingGpsKeyframeFactors() const {
@@ -414,6 +430,10 @@ public:
     double hbaFrontendIdleTriggerSec() const {
         double v = get<double>("backend.hba.frontend_idle_trigger_sec", 10.0);
         return v < 0.0 ? 0.0 : v;
+    }
+    /** frontend_idle 触发 HBA 时至少需要的子图数，避免「第一个子图刚建完就 HBA」。≤0 表示仅要求 >0；默认 2。若期望共 N 个子图再优化可设为 N（如 5）。 */
+    int hbaFrontendIdleMinSubmaps() const {
+        return get<int>("backend.hba.frontend_idle_min_submaps", 2);
     }
 
     // ── 地图（东北天 ENU 统一坐标系）──────────────────────────────────────

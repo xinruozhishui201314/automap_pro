@@ -1622,8 +1622,8 @@ OptimizationResult IncrementalOptimizer::commitAndUpdate() {
     if (single_prior_only || all_factors_same_key) {
         // 检查是否超时
         if (pending_duration_ms > kSingleNodePendingTimeoutMs) {
-            RCLCPP_WARN(rclcpp::get_logger("automap_system"),
-                "[ISAM2_DIAG][CRITICAL] FORCE UPDATE due to timeout: pending_duration=%.1fms > threshold=%dms (factors=%zu values=%zu types=[%s])",
+            RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+                "[ISAM2_DIAG][TIMEOUT] FORCE UPDATE due to timeout: pending_duration=%.1fms > threshold=%dms (factors=%zu values=%zu types=[%s]) (建图时请重点关注)",
                 pending_duration_ms, kSingleNodePendingTimeoutMs, pf, pv, factor_types_str.c_str());
             force_update_due_to_timeout = true;
         } else {
@@ -1664,8 +1664,8 @@ OptimizationResult IncrementalOptimizer::commitAndUpdate() {
 
     // 如果是超时强制执行，跳过延迟检查，更新超时计时器
     if (force_update_due_to_timeout) {
-        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-            "[IncrementalOptimizer][BACKEND][TIMEOUT] Force update after timeout: pending_duration=%.1fms",
+        RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+            "[IncrementalOptimizer][BACKEND][TIMEOUT] Force update after timeout: pending_duration=%.1fms (建图时请重点关注)",
             pending_duration_ms);
     }
 
@@ -2757,8 +2757,8 @@ void IncrementalOptimizer::waitForPendingTasks() {
     if (final_depth > 0 || still_busy) {
         ALOG_WARN(MOD, "[ISAM2_QUEUE] waitForPendingTasks timeout after {}ms queue_depth={} opt_busy={} (backend continues)",
                   kMaxWaitMs, final_depth, still_busy ? 1 : 0);
-        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-            "[IncrementalOptimizer][BACKEND][PIPELINE] event=wait_pending_timeout waited_ms=%d queue_depth=%zu opt_busy=%d (grep BACKEND PIPELINE 定位)",
+        RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+            "[IncrementalOptimizer][BACKEND][TIMEOUT] waitForPendingTasks timeout after %dms queue_depth=%zu opt_busy=%d (建图时请重点关注, grep BACKEND PIPELINE 定位)",
             waited_ms, final_depth, still_busy ? 1 : 0);
     } else {
         ALOG_INFO(MOD, "[ISAM2_QUEUE] waitForPendingTasks done waited_ms={} (queue empty and no commitAndUpdate in progress)",

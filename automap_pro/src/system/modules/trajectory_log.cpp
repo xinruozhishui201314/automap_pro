@@ -338,11 +338,10 @@ void AutoMapSystem::onGPSMeasurementForLog(double ts, const Eigen::Vector3d& pos
     auto m_opt = gps_manager_.queryByTimestampForLog(ts, 0.1);
     if (!m_opt) return;
     const GPSMeasurement& m = *m_opt;
-    Eigen::Vector3d pos = m.position_enu;
-    const char* frame = gps_manager_.isAligned() ? "map" : "enu";
+    auto [pos, frame_str] = gps_manager_.enu_to_map_with_frame(m.position_enu);
     const AttitudeEstimate& att = m.attitude;
     trajectory_gps_file_ << std::fixed << std::setprecision(6)
-        << m.timestamp << "," << pos.x() << "," << pos.y() << "," << pos.z() << "," << frame << ","
+        << m.timestamp << "," << pos.x() << "," << pos.y() << "," << pos.z() << "," << frame_str << ","
         << att.pitch << "," << att.roll << "," << att.yaw << ","
         << static_cast<int>(att.source) << "," << att.velocity_horizontal << ","
         << (att.is_valid ? "1" : "0") << "\n";

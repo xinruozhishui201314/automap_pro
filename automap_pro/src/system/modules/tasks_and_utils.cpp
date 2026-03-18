@@ -236,6 +236,7 @@ void AutoMapSystem::checkThreadHeartbeats() {
     check_thread("GPSWorker", gps_worker_heartbeat_ts_ms_, kHeartbeatWarnThresholdMs, kHeartbeatErrorThresholdMs);
     check_thread("OptWorker", opt_worker_heartbeat_ts_ms_, kHeartbeatWarnThresholdMs, kHeartbeatErrorThresholdMs);
     check_thread("LoopTrigger", loop_trigger_heartbeat_ts_ms_, kHeartbeatWarnThresholdMs, kHeartbeatErrorThresholdMs);
+    check_thread("IntraLoopWorker", intra_loop_worker_heartbeat_ts_ms_, kHeartbeatWarnThresholdMs, kHeartbeatErrorThresholdMs);
     check_thread("GPSAlign", gps_align_heartbeat_ts_ms_, kHeartbeatWarnThresholdMs, kHeartbeatErrorThresholdMs);
     // Viz 已删除
     check_thread("StatusPub", status_pub_heartbeat_ts_ms_, kHeartbeatWarnThresholdMs, kHeartbeatErrorThresholdMs);

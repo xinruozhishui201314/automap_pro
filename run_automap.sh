@@ -116,6 +116,8 @@ AutoMap-Pro 一键编译和运行脚本
     - 日志目录: 默认 ${SCRIPT_DIR}/logs/run_YYYYMMDD_HHMMSS/（宿主机，每次运行独立目录）；--log-dir 可指定固定目录
         automap.log  全程总日志  build.log  编译  full.log  运行  clean.log  清理  image.log  镜像加载/构建
 
+编译加速:
+    - 默认使用宿主机 CPU 核数并行编译，并启用 Ninja 生成器；可设置环境变量覆盖线程数，例如: AUTOMAP_BUILD_JOBS=16 bash run_automap.sh --build-only --clean
 故障排查:
     - 第三方库（GTSAM/TEASER++/vikit）安装在 automap_ws/install_deps，--clean 不会删除；需强制重编第三方时请手动: rm -rf automap_ws/install_deps
     - 若编译报「CMakeCache.txt directory ... is different than ...」：脚本已自动检测并清理含 /workspace/ 的缓存；仍失败时请加 --clean 后重跑
@@ -418,8 +420,9 @@ build_project() {
     fi
 
     print_info "开始编译项目..."
-    print_info "使用 $(nproc) 个线程并行编译"
-    print_info "预计编译时间: 5-10 分钟"
+    BUILD_JOBS="${AUTOMAP_BUILD_JOBS:-$(nproc)}"
+    print_info "并行编译: ${BUILD_JOBS} 线程（可通过环境变量 AUTOMAP_BUILD_JOBS 覆盖，如 AUTOMAP_BUILD_JOBS=16）"
+    print_info "预计编译时间: 5-10 分钟（使用 Ninja 时更快）"
 
     # 挂载仓库根目录，供容器内链入四项目并编译
     MAPPING_MOUNT="-v ${SCRIPT_DIR}:/root/mapping:ro"
@@ -449,6 +452,8 @@ build_project() {
         --gpus all \
         --net=host \
         -e DISPLAY=$DISPLAY \
+        -e HOST_NPROC=$(nproc) \
+        -e AUTOMAP_BUILD_JOBS="${AUTOMAP_BUILD_JOBS:-$(nproc)}" \
         -e OMP_NUM_THREADS=1 \
         -e EIGEN_NUM_THREADS=1 \
         -e MKL_NUM_THREADS=1 \

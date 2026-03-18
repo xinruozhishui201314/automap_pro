@@ -95,6 +95,10 @@ else()
   FetchContent_MakeAvailable(nlohmann_json)
 endif()
 
+# Boost（lockfree SPSC 队列，用于 ingress/frame 热路径无锁）
+find_package(Boost 1.48 REQUIRED)
+message(STATUS "[automap_pro] Boost found: ${Boost_VERSION} (lockfree spsc_queue for ingress/frame queues)")
+
 # GTSAM（iSAM2）
 find_package(GTSAM REQUIRED)
 message(STATUS "[automap_pro] GTSAM found (startup double free in lago? see docs/FIX_GTSAM_LAGO_STATIC_INIT_DOUBLE_FREE.md)")
@@ -515,6 +519,7 @@ target_link_libraries(automap_system_component
   automap_core automap_frontend automap_submap
   automap_loop_closure automap_backend automap_map
   automap_visualization
+  Boost::boost
   ${AUTOMAP_LIBS}
 )
 ament_target_dependencies(automap_system_component ${AUTOMAP_AMENT_DEPS} ament_index_cpp)

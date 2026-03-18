@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <rclcpp/rclcpp.hpp>
@@ -113,6 +114,9 @@ void SubMapManager::addKeyFrame(const KeyFrame::Ptr& kf) {
     std::unique_lock<std::mutex> lk(mutex_);
 
     METRIC_TIMED_SCOPE(metrics::POINTCLOUD_PROCESS_TIME_MS);
+    RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+        "[SubMapMgr][STEP] step=addKeyFrame_enter kf_id=%lu file=%s line=%d",
+        kf->id, __FILE__, __LINE__);
 
     try {
         kf->id         = kf_id_counter_++;
@@ -161,12 +165,16 @@ void SubMapManager::addKeyFrame(const KeyFrame::Ptr& kf) {
             updateGPSGravityCenter(kf);
         }
 
-        // 合并点云（带内存检查）
-        RCLCPP_DEBUG(rclcpp::get_logger("automap_system"),
-            "[SubMapMgr][ADD_KF_STEP] before mergeCloudToSubmap kf_id=%lu pts=%zu", kf->id, kf->cloud_body ? kf->cloud_body->size() : 0u);
+        // 合并点云（带内存检查）；每步打 [SubMapMgr][STEP] 便于精确定位卡住位置（grep SubMapMgr STEP）
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[SubMapMgr][STEP] step=mergeCloudToSubmap_enter kf_id=%lu sm_id=%d body_pts=%zu file=%s line=%d",
+            kf->id, active_submap_->id, kf->cloud_body ? kf->cloud_body->size() : 0u, __FILE__, __LINE__);
+        auto t_merge_begin = std::chrono::steady_clock::now();
         mergeCloudToSubmap(active_submap_, kf);
-        RCLCPP_DEBUG(rclcpp::get_logger("automap_system"),
-            "[SubMapMgr][ADD_KF_STEP] after mergeCloudToSubmap sm_id=%d merged_pts=%zu", active_submap_->id, active_submap_->merged_cloud ? active_submap_->merged_cloud->size() : 0u);
+        double ms_merge = 1e-3 * std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t_merge_begin).count();
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[SubMapMgr][STEP] step=mergeCloudToSubmap_exit kf_id=%lu sm_id=%d duration_ms=%.1f merged_pts=%zu file=%s line=%d",
+            kf->id, active_submap_->id, ms_merge, active_submap_->merged_cloud ? active_submap_->merged_cloud->size() : 0u, __FILE__, __LINE__);
 
         // 更新空间范围（最近帧到锚定帧的最大距离）
         double dist = (kf->T_w_b.translation() -
@@ -188,6 +196,9 @@ void SubMapManager::addKeyFrame(const KeyFrame::Ptr& kf) {
             HEALTH_UPDATE_QUEUE("submap", frozen_count);
         }
 
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[SubMapMgr][STEP] step=addKeyFrame_before_freeze_check sm_id=%d kf_count=%zu file=%s line=%d",
+            active_submap_->id, active_submap_->keyframes.size(), __FILE__, __LINE__);
         if (isFull(active_submap_)) {
             const int sm_id = active_submap_->id;
             const size_t kf_count = active_submap_->keyframes.size();
@@ -198,11 +209,16 @@ void SubMapManager::addKeyFrame(const KeyFrame::Ptr& kf) {
             SLOG_INFO(MOD, "SubMap FULL: id={}, kf={}, dist={:.1f}m → freezing",
                        sm_id, kf_count, dist);
             RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                "[SubMapMgr][STEP] step=freeze_enter sm_id=%d kf_count=%zu file=%s line=%d",
+                sm_id, kf_count, __FILE__, __LINE__);
+            RCLCPP_INFO(rclcpp::get_logger("automap_system"),
                 "[SubMapMgr][ADD_KF_STEP] isFull=true sm_id=%d kf_count=%zu → unlock before freeze (avoid deadlock)", sm_id, kf_count);
 
             lk.unlock();
             try {
                 freezeActiveSubmap(to_freeze);
+                RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                    "[SubMapMgr][STEP] step=freeze_exit sm_id=%d file=%s line=%d", sm_id, __FILE__, __LINE__);
             } catch (const std::exception& e) {
                 auto err = ErrorDetail::fromException(e, errors::SUBMAP_STATE_INVALID);
                 SLOG_ERROR_CODE(MOD, static_cast<uint32_t>(err.code()),
@@ -214,6 +230,9 @@ void SubMapManager::addKeyFrame(const KeyFrame::Ptr& kf) {
             lk.lock();
         }
 
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[SubMapMgr][STEP] step=addKeyFrame_exit kf_id=%lu sm_id=%d file=%s line=%d",
+            kf->id, active_submap_ ? active_submap_->id : -1, __FILE__, __LINE__);
     } catch (const std::exception& e) {
         // 使用错误码系统
         auto err = ErrorDetail::fromException(e, errors::SUBMAP_MERGE_FAILED);
@@ -446,6 +465,8 @@ constexpr size_t kDownsampleThreshold = 200000;
 }
 
 void SubMapManager::mergeCloudToSubmap(SubMap::Ptr& sm, const KeyFrame::Ptr& kf) const {
+    using Clock = std::chrono::steady_clock;
+    constexpr int kMergeVoxelTimeoutMs = 15000;  // 子图合并体素超时，超时必记 [SubMapMgr][TIMEOUT]
     if (!kf->cloud_body || kf->cloud_body->empty()) {
         RCLCPP_DEBUG(rclcpp::get_logger("automap_system"),
             "[GLOBAL_MAP_DIAG] mergeCloudToSubmap: kf_id=%lu has null/empty cloud_body, skip merge", 
@@ -453,10 +474,28 @@ void SubMapManager::mergeCloudToSubmap(SubMap::Ptr& sm, const KeyFrame::Ptr& kf)
         return;
     }
 
-    // 合并前先检查是否需要降采样（避免累积；使用 utils::voxelDownsample 避免 PCL 整数溢出崩溃）
+    // 合并前先检查是否需要降采样（带超时；每步打 STEP+file+line 精确定位到行）
     if (sm->merged_cloud && sm->merged_cloud->size() > kDownsampleThreshold) {
         size_t old_pts = sm->merged_cloud->size();
-        CloudXYZIPtr temp = utils::voxelDownsample(sm->merged_cloud, static_cast<float>(merge_res_));
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[SubMapMgr][STEP] step=merge_pre_voxel_enter sm_id=%d kf_id=%lu pts=%zu file=%s line=%d",
+            sm->id, kf->id, old_pts, __FILE__, __LINE__);
+        auto t_pre = Clock::now();
+        bool timed_out = false;
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[SubMapMgr][STEP] step=merge_pre_voxel_call_enter (下一行即 voxelDownsampleChunkedWithTimeout) file=%s line=%d", __FILE__, __LINE__);
+        const float kMergeChunkSizeM = 50.0f;
+        CloudXYZIPtr temp = utils::voxelDownsampleChunkedWithTimeout(
+            sm->merged_cloud, static_cast<float>(merge_res_), kMergeChunkSizeM, kMergeVoxelTimeoutMs, &timed_out);
+        double ms_pre = 1e-3 * std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - t_pre).count();
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[SubMapMgr][STEP] step=merge_pre_voxel_exit sm_id=%d duration_ms=%.1f timed_out=%d file=%s line=%d",
+            sm->id, ms_pre, timed_out ? 1 : 0, __FILE__, __LINE__);
+        if (timed_out) {
+            RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+                "[SubMapMgr][TIMEOUT] pre-merge voxelDownsample timed out sm_id=%d pts=%zu limit_ms=%d (建图时请重点关注)",
+                sm->id, old_pts, kMergeVoxelTimeoutMs);
+        }
         if (temp && !temp->empty()) {
             size_t new_pts = temp->size();
             sm->merged_cloud.swap(temp);
@@ -467,11 +506,16 @@ void SubMapManager::mergeCloudToSubmap(SubMap::Ptr& sm, const KeyFrame::Ptr& kf)
         }
     }
 
-    // 将 body 系点云变换到世界系（注意：此处始终使用 T_w_b，未优化位姿；优化后 buildGlobalMap 主路径用 T_w_b_optimized 从 cloud_body 重算）
+    // 将 body 系点云变换到世界系
+    RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+        "[SubMapMgr][STEP] step=merge_transform_enter kf_id=%lu body_pts=%zu file=%s line=%d",
+        kf->id, kf->cloud_body->size(), __FILE__, __LINE__);
+    auto t_tf = Clock::now();
     CloudXYZIPtr world_cloud = getCloudFromPool();
     Eigen::Affine3f T_wf;
     T_wf.matrix() = kf->T_w_b.cast<float>().matrix();
-    
+    RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+        "[SubMapMgr][STEP] step=merge_transform_pcl_enter (下一行即 pcl::transformPointCloud) file=%s line=%d", __FILE__, __LINE__);
     try {
         pcl::transformPointCloud(*kf->cloud_body, *world_cloud, T_wf);
     } catch (const std::exception& e) {
@@ -479,6 +523,10 @@ void SubMapManager::mergeCloudToSubmap(SubMap::Ptr& sm, const KeyFrame::Ptr& kf)
             "[GLOBAL_MAP_DIAG] mergeCloudToSubmap: kf_id=%lu transform failed: %s", kf->id, e.what());
         return;
     }
+    double ms_tf = 1e-3 * std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - t_tf).count();
+    RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+        "[SubMapMgr][STEP] step=merge_transform_exit kf_id=%lu duration_ms=%.1f world_pts=%zu file=%s line=%d",
+        kf->id, ms_tf, world_cloud->size(), __FILE__, __LINE__);
 
     if (world_cloud->empty()) {
         RCLCPP_DEBUG(rclcpp::get_logger("automap_system"),
@@ -488,16 +536,27 @@ void SubMapManager::mergeCloudToSubmap(SubMap::Ptr& sm, const KeyFrame::Ptr& kf)
 
     size_t world_cloud_size = world_cloud->size();
 
-    // 合并点云
+    // 合并点云（append）
+    RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+        "[SubMapMgr][STEP] step=merge_append_enter kf_id=%lu sm_id=%d merged_before=%zu world_pts=%zu file=%s line=%d",
+        kf->id, sm->id, sm->merged_cloud ? sm->merged_cloud->size() : 0u, world_cloud_size, __FILE__, __LINE__);
+    auto t_append = Clock::now();
     if (!sm->merged_cloud || sm->merged_cloud->empty()) {
         sm->merged_cloud = std::make_shared<CloudXYZI>(*world_cloud);
     } else {
         size_t old_size = sm->merged_cloud->size();
         sm->merged_cloud->reserve(old_size + world_cloud->size());
-        for (const auto& pt : world_cloud->points) {
-            sm->merged_cloud->push_back(pt);
-        }
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[SubMapMgr][STEP] step=merge_append_loop_enter count=%zu file=%s line=%d", world_cloud->size(), __FILE__, __LINE__);
+        sm->merged_cloud->points.insert(sm->merged_cloud->points.end(),
+                                        world_cloud->points.begin(), world_cloud->points.end());
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[SubMapMgr][STEP] step=merge_append_loop_exit file=%s line=%d", __FILE__, __LINE__);
     }
+    double ms_append = 1e-3 * std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - t_append).count();
+    RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+        "[SubMapMgr][STEP] step=merge_append_exit kf_id=%lu duration_ms=%.1f merged_total=%zu file=%s line=%d",
+        kf->id, ms_append, sm->merged_cloud->size(), __FILE__, __LINE__);
 
     // [POSE_DIAG] 合并到子图时使用的位姿（始终为 T_w_b 里程计，未优化；HBA 后需 rebuildMergedCloud 用 T_w_b_optimized 重算否则重影）
     const Eigen::Vector3d t = kf->T_w_b.translation();
@@ -513,10 +572,28 @@ void SubMapManager::mergeCloudToSubmap(SubMap::Ptr& sm, const KeyFrame::Ptr& kf)
             sm->id, kf->id, t.x(), t.y(), t.z(), yaw_deg);
     }
 
-    // 合并后超过阈值则降采样（使用 utils::voxelDownsample 避免 PCL 整数溢出崩溃）
+    // 合并后超过阈值则降采样（带超时；打 STEP+file+line 精确定位到行）
     if (sm->merged_cloud && sm->merged_cloud->size() > kDownsampleThreshold) {
         size_t before_downsample = sm->merged_cloud->size();
-        CloudXYZIPtr temp = utils::voxelDownsample(sm->merged_cloud, static_cast<float>(merge_res_));
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[SubMapMgr][STEP] step=merge_post_voxel_enter sm_id=%d kf_id=%lu pts=%zu file=%s line=%d",
+            sm->id, kf->id, before_downsample, __FILE__, __LINE__);
+        auto t_post = Clock::now();
+        bool timed_out = false;
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[SubMapMgr][STEP] step=merge_post_voxel_call_enter (下一行即 voxelDownsampleChunkedWithTimeout) file=%s line=%d", __FILE__, __LINE__);
+        const float kMergeChunkSizeM = 50.0f;
+        CloudXYZIPtr temp = utils::voxelDownsampleChunkedWithTimeout(
+            sm->merged_cloud, static_cast<float>(merge_res_), kMergeChunkSizeM, kMergeVoxelTimeoutMs, &timed_out);
+        double ms_post = 1e-3 * std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - t_post).count();
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[SubMapMgr][STEP] step=merge_post_voxel_exit sm_id=%d kf_id=%lu duration_ms=%.1f timed_out=%d file=%s line=%d",
+            sm->id, kf->id, ms_post, timed_out ? 1 : 0, __FILE__, __LINE__);
+        if (timed_out) {
+            RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+                "[SubMapMgr][TIMEOUT] post-merge voxelDownsample timed out sm_id=%d kf_id=%lu pts=%zu limit_ms=%d (建图时请重点关注)",
+                sm->id, kf->id, before_downsample, kMergeVoxelTimeoutMs);
+        }
         if (temp && !temp->empty()) {
             size_t after_downsample = temp->size();
             // ✅ 修复：检查降采样后点数，防止降采样失败或点数仍然过大

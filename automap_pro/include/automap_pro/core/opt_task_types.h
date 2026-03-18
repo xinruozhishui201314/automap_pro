@@ -15,13 +15,13 @@ namespace automap_pro {
  * 后端优化任务类型
  */
 struct OptTaskItem {
-    enum class Type { 
-        LOOP_FACTOR, GPS_FACTOR, SUBMAP_NODE, ODOM_FACTOR, REBUILD, 
+    enum class Type {
+        LOOP_FACTOR, GPS_FACTOR, SUBMAP_NODE, ODOM_FACTOR, REBUILD,
         GPS_ALIGN_COMPLETE, RESET,
-        // 新增：关键帧和子图管理任务（解耦backend_worker与其他模块）
         KEYFRAME_CREATE,
-        // 新增：强制更新任务（用于 handleTriggerOptimize 服务，统一由 opt_worker 处理）
-        FORCE_UPDATE
+        FORCE_UPDATE,
+        // 子图内回环批量：由 intra_loop_worker 投递，opt_worker 执行 addSubMapNode + addLoopFactorDeferred + forceUpdate，与主线程完全异步
+        INTRA_LOOP_BATCH
     } type;
     int from_id = 0;
     int to_id = 0;
@@ -44,6 +44,10 @@ struct OptTaskItem {
     bool gps_aligned = false;
     Eigen::Matrix3d gps_transform_R;
     Eigen::Vector3d gps_transform_t;
+
+    // INTRA_LOOP_BATCH：子图内回环检测结果，由 intra_loop_worker 投递
+    SubMap::Ptr intra_loop_submap;
+    std::vector<LoopConstraint::Ptr> intra_loop_constraints;
 };
 
 }  // namespace automap_pro

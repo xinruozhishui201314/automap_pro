@@ -21,10 +21,10 @@ void AutoMapSystem::feederLoop() {
     frame_processor_.start();
     RCLCPP_INFO(get_logger(), "[AutoMapSystem][FEEDER] frame_processor_ started, waiting for shutdown");
 
-    // 等待 shutdown 信号
-    while (!shutdown_requested_.load(std::memory_order_acquire)) {
-        feeder_heartbeat_ts_ms_.store(nowMs(), std::memory_order_release);
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    // 无数据时阻塞在 cv 上，不空转；析构时 status_pub_cv_.notify_all() 会唤醒本线程
+    {
+        std::unique_lock<std::mutex> lock(status_pub_mutex_);
+        status_pub_cv_.wait(lock, [this] { return shutdown_requested_.load(std::memory_order_acquire); });
     }
 
     RCLCPP_INFO(get_logger(), "[AutoMapSystem][FEEDER] shutdown requested, stopping frame_processor_");
@@ -144,17 +144,21 @@ void AutoMapSystem::backendWorkerLoop() {
                     }
                 }
                 // [GHOSTING_FIX] finish 已触发时不再由 frontend_idle 触发 HBA，避免双次写回导致重影
+                // 需满足 frontend_idle_min_submaps，避免第一个子图刚建完就 HBA
                 const double idle_trigger_sec = ConfigManager::instance().hbaFrontendIdleTriggerSec();
+                const int idle_min_submaps = ConfigManager::instance().hbaFrontendIdleMinSubmaps();
+                const int sm_count = submap_manager_.submapCount();
+                const bool idle_submaps_ok = (idle_min_submaps <= 0) ? (sm_count > 0) : (sm_count >= idle_min_submaps);
                 if (idle_trigger_sec > 0 && ConfigManager::instance().hbaEnabled() &&
                     !sensor_idle_finish_triggered_.load(std::memory_order_acquire) &&
-                    first_cloud_logged_.load(std::memory_order_acquire) && submap_manager_.submapCount() > 0) {
+                    first_cloud_logged_.load(std::memory_order_acquire) && idle_submaps_ok) {
                     auto now_idle = std::chrono::steady_clock::now();
                     double frontend_idle_sec = std::chrono::duration<double>(now_idle - last_sensor_data_wall_time_).count();
                     if (frontend_idle_sec >= idle_trigger_sec && !hba_triggered_by_frontend_idle_.exchange(true)) {
                         const size_t ingress_sz = frame_processor_.ingressQueueSize();
                         if (ingress_sz == 0) {
-                            RCLCPP_INFO(get_logger(), "[AutoMapSystem][PIPELINE][HBA] event=hba_triggered_by_frontend_idle frontend_idle_sec=%.1f submaps=%d",
-                                        frontend_idle_sec, submap_manager_.submapCount());
+                            RCLCPP_INFO(get_logger(), "[AutoMapSystem][PIPELINE][HBA] event=hba_triggered_by_frontend_idle frontend_idle_sec=%.1f submaps=%d (min_submaps=%d)",
+                                        frontend_idle_sec, submap_manager_.submapCount(), idle_min_submaps);
                             ensureBackendCompletedAndFlushBeforeHBA();
                             auto all = submap_manager_.getAllSubmaps();
                             hba_optimizer_.triggerAsync(all, false, "frontend_idle");
@@ -264,7 +268,7 @@ void AutoMapSystem::backendWorkerLoop() {
             const auto t0 = Clock::now();
             RCLCPP_INFO(get_logger(), "[AutoMapSystem][BACKEND][STEP] step=tryCreateKeyFrame_enter processed_no=%d ts=%.3f", processed_no, f.ts);
             try {
-                std::lock_guard<std::mutex> lk(keyframe_mutex_);
+                // keyframe_mutex_ 改在 tryCreateKeyFrame 内仅包住 createKeyFrame+addKeyFrame，避免持锁做 intra_loop/ISAM2 导致阻塞（DESIGN_AVOID_BACKEND_BLOCKING.md）
                 tryCreateKeyFrame(f.ts, pose, cov, cloud_for_kf, &kfinfo_copy,
                     (f.cloud_ds && !f.cloud_ds->empty()) ? &f.cloud_ds : nullptr);
             } catch (const std::exception& e) {
@@ -454,6 +458,63 @@ void AutoMapSystem::loopTriggerThreadLoop() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// 子图内回环 worker：与主线程完全异步，后端只投递任务，本线程执行 detectIntraSubmapLoop 并投递 INTRA_LOOP_BATCH 到 opt_worker
+// ─────────────────────────────────────────────────────────────────────────────
+void AutoMapSystem::intraLoopWorkerLoop() {
+#ifdef __linux__
+    pthread_setname_np(pthread_self(), "automap_intra_loop");
+#endif
+    intra_loop_worker_heartbeat_ts_ms_.store(nowMs(), std::memory_order_release);
+    RCLCPP_INFO(get_logger(), "[AutoMapSystem][INTRA_LOOP_WORKER] thread started (async from backend)");
+
+    const auto wait_timeout = std::chrono::milliseconds(500);
+
+    while (!shutdown_requested_.load(std::memory_order_acquire)) {
+        intra_loop_worker_heartbeat_ts_ms_.store(nowMs(), std::memory_order_release);
+
+        IntraLoopTask task;
+        bool has_task = false;
+        {
+            std::unique_lock<std::mutex> lock(intra_loop_task_mutex_);
+            const bool has_data = intra_loop_task_cv_.wait_for(lock, wait_timeout, [this] {
+                return shutdown_requested_.load(std::memory_order_acquire) || !intra_loop_task_queue_.empty();
+            });
+            if (shutdown_requested_.load(std::memory_order_acquire)) break;
+            if (!has_data || intra_loop_task_queue_.empty()) continue;
+            task = std::move(intra_loop_task_queue_.front());
+            intra_loop_task_queue_.pop_front();
+            has_task = true;
+        }
+
+        if (!has_task || !task.submap || task.query_idx < 0) continue;
+
+        auto loops = loop_detector_.detectIntraSubmapLoop(task.submap, task.query_idx);
+        if (loops.empty()) continue;
+
+        const size_t num_loops = loops.size();
+        RCLCPP_INFO(get_logger(),
+            "[INTRA_LOOP][ASYNC] submap_id=%d query_idx=%d detected=%zu loops (enqueue INTRA_LOOP_BATCH to opt_worker)",
+            task.submap->id, task.query_idx, num_loops);
+
+        {
+            std::lock_guard<std::mutex> lk(opt_task_mutex_);
+            if (opt_task_queue_.size() < kMaxOptTaskQueueSize) {
+                OptTaskItem batch;
+                batch.type = OptTaskItem::Type::INTRA_LOOP_BATCH;
+                batch.intra_loop_submap = task.submap;
+                batch.intra_loop_constraints = std::move(loops);
+                opt_task_queue_.push_back(std::move(batch));
+                opt_task_cv_.notify_one();
+            } else {
+                RCLCPP_WARN(get_logger(), "[AutoMapSystem][INTRA_LOOP_WORKER] opt_task_queue full, drop %zu intra loops", num_loops);
+            }
+        }
+    }
+
+    RCLCPP_INFO(get_logger(), "[AutoMapSystem][INTRA_LOOP_WORKER] thread exiting");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // GPS对齐处理线程：从gps_align_queue取出对齐结果并处理完整流程
 // ─────────────────────────────────────────────────────────────────────────────
 void AutoMapSystem::gpsAlignWorkerLoop() {
@@ -627,6 +688,28 @@ void AutoMapSystem::optWorkerLoop() {
                         auto result = isam2_optimizer_.forceUpdate();
                         RCLCPP_INFO(get_logger(), "[AutoMapSystem][OPT_WORKER] FORCE_UPDATE done: success=%d nodes=%d elapsed_ms=%.1f",
                                     result.success ? 1 : 0, result.nodes_updated, result.elapsed_ms);
+                        break;
+                    }
+                    case OptTaskItem::Type::INTRA_LOOP_BATCH: {
+                        task_type_name = "INTRA_LOOP_BATCH";
+                        static constexpr int MAX_KF_PER_SUBMAP = 100000;
+                        if (!task.intra_loop_submap || task.intra_loop_constraints.empty()) break;
+                        const auto& sm = task.intra_loop_submap;
+                        for (const auto& lc : task.intra_loop_constraints) {
+                            if (!lc) continue;
+                            int node_i = lc->submap_i * MAX_KF_PER_SUBMAP + lc->keyframe_i;
+                            int node_j = lc->submap_j * MAX_KF_PER_SUBMAP + lc->keyframe_j;
+                            const auto& kf_i = sm->keyframes[lc->keyframe_i];
+                            const auto& kf_j = sm->keyframes[lc->keyframe_j];
+                            if (kf_i && kf_j) {
+                                isam2_optimizer_.addSubMapNode(node_i, kf_i->T_w_b, false);
+                                isam2_optimizer_.addSubMapNode(node_j, kf_j->T_w_b, false);
+                                isam2_optimizer_.addLoopFactorDeferred(node_i, node_j, lc->delta_T, lc->information);
+                            }
+                        }
+                        isam2_optimizer_.forceUpdate();
+                        RCLCPP_INFO(get_logger(), "[AutoMapSystem][OPT_WORKER] INTRA_LOOP_BATCH done submap_id=%d loops=%zu",
+                                    sm->id, task.intra_loop_constraints.size());
                         break;
                     }
                     case OptTaskItem::Type::KEYFRAME_CREATE: {

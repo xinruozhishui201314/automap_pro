@@ -142,6 +142,27 @@ public:
      */
     std::vector<std::pair<double, Eigen::Vector3d>> getGpsPositionsInMapFrame() const;
 
+    /** 窗口快照类型（供 .cpp 实现使用；getSnapshot() 为 private） */
+    struct GpsWindowSnapshot {
+        struct Record {
+            double timestamp = 0.0;
+            Eigen::Vector3d pos_enu = Eigen::Vector3d::Zero();
+            GPSQuality quality = GPSQuality::INVALID;
+            double hdop = 0.0;
+        };
+        std::vector<Record> window;
+        bool is_aligned = false;
+        Eigen::Matrix3d R_gps_lidar = Eigen::Matrix3d::Identity();
+        Eigen::Vector3d t_gps_lidar = Eigen::Vector3d::Zero();
+        double keyframe_match_window_s = 1.0;
+        double max_interp_gap_s = 2.0;
+        double extrapolation_margin_s = 0.5;
+        double extrapolation_uncertainty_scale = 2.0;
+        double velocity_estimation_window_s = 2.0;
+        double keyframe_max_hdop = 15.0;
+        int good_sample_count = 0;
+    };
+
     // ── 回调注册 ──────────────────────────────────────────────────────────
 
     /** 对齐成功回调（触发一次 GPS 约束批量添加） */
@@ -185,6 +206,9 @@ public:
     void applyConfig();
 
 private:
+    /** 地图系 → ENU（保证 query 返回的 position_enu 恒为 ENU，如外推路径） */
+    Eigen::Vector3d map_to_enu(const Eigen::Vector3d& map_pos) const;
+
     // ENU 原点（第一个有效GPS点确定，call_once 避免多线程竞态）
     double enu_origin_lat_ = 0.0, enu_origin_lon_ = 0.0, enu_origin_alt_ = 0.0;
     std::atomic<bool> enu_origin_set_{false};
@@ -223,7 +247,7 @@ private:
     std::vector<AlignedGPS> aligned_gps_buffer_;
     double last_gps_factor_dist_ = -1e9;  // 上次添加GPS因子时的距离
 
-    mutable std::mutex mutex_;
+    mutable std::recursive_mutex mutex_;
 
     std::vector<AlignCallback>         align_cbs_;
     std::vector<GpsFactorCallback>     gps_factor_cbs_;
@@ -234,6 +258,9 @@ private:
     std::atomic<bool> pending_align_{false};
 
     std::shared_ptr<AttitudeEstimator> attitude_estimator_;
+
+    /** 持 mutex_ 仅做最小拷贝后返回，供只读 query 在锁外使用 */
+    GpsWindowSnapshot getSnapshot() const;
 
     // ── 私有方法 ──────────────────────────────────────────────────────────
     Eigen::Vector3d wgs84_to_enu(double lat, double lon, double alt) const;

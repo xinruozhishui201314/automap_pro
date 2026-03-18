@@ -37,6 +37,11 @@ CloudXYZIPtr voxelDownsampleWithTimeout(const CloudXYZIPtr& cloud, float leaf_si
  *  chunk_size_m 为每块边长（米），建议 40～80；若 <=0 则按 leaf 自动计算安全块大小。 */
 CloudXYZIPtr voxelDownsampleChunked(const CloudXYZIPtr& cloud, float leaf_size, float chunk_size_m = 50.0f);
 
+/** 带超时的分块体素：大点云时在异步任务中执行 voxelDownsampleChunked（内部 OpenMP 并行），超时返回 sanitized 副本。
+ *  用于 merge 等路径，兼顾并行加速与超时保护。chunk_size_m<=0 表示自动。 */
+CloudXYZIPtr voxelDownsampleChunkedWithTimeout(const CloudXYZIPtr& cloud, float leaf_size, float chunk_size_m,
+                                                int timeout_ms = 15000, bool* timed_out = nullptr);
+
 /** 安全体素下采样（推荐）：保证不出现 overflow，且不放大 leaf、保持分辨率。
  *  内部在可能溢出时走分块流程：分割 → 每块降采样 → 拼接；chunk_size_m<=0 时自动计算块大小。
  *  @param cloud 输入点云

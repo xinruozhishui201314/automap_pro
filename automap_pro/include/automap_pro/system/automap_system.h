@@ -36,8 +36,10 @@
 #include <queue>
 #include <deque>
 #include <condition_variable>
+#include <boost/lockfree/spsc_queue.hpp>
 #include <chrono>
 #include <fstream>
+#include <future>
 
 namespace automap_pro {
 
@@ -115,6 +117,7 @@ private:
     std::atomic<bool> shutdown_requested_{false};
 
     // 入口缓冲：订阅回调只写入 ingress，快速返回；feeder 线程将 ingress → frame_queue_，背压在 feeder 内，不阻塞 Executor
+    // ingress 保留 mutex 队列：回调在满时需“强制丢帧”即 pop，SPSC 仅允许 consumer(feeder) pop，故不改为无锁
     size_t max_ingress_queue_size_ = 16;
     std::queue<FrameToProcess> ingress_queue_;
     std::mutex                 ingress_mutex_;
@@ -123,10 +126,12 @@ private:
     std::thread                feeder_thread_;
     void feederLoop();
 
-    // 后端帧队列：只存 (ts, cloud)，worker 按 ts 从 odom/kfinfo 缓存对齐；长度由配置 frame_queue_max_size 决定
-    // 队列满时背压在 feeder 线程内等待，不丢帧
+    // 后端帧队列：feeder(单生产者)→backend(单消费者)，SPSC 无锁；热路径 push/pop 无锁，仅 wait 时用 mutex+cv（见 BACKEND_FURTHER_OPTIMIZATION_OPPORTUNITIES.md）
+    static constexpr size_t kFrameQueueCapacity = 8192;
+    using FrameQueueSPSC = boost::lockfree::spsc_queue<FrameToProcess, boost::lockfree::capacity<kFrameQueueCapacity>>;
     size_t max_frame_queue_size_ = 500;
-    std::queue<FrameToProcess> frame_queue_;
+    FrameQueueSPSC frame_queue_;
+    std::atomic<size_t>        frame_queue_size_{0};     // 供任意线程读的当前长度（feeder push +1, backend pop -1）
     std::mutex                frame_queue_mutex_;
     std::condition_variable   frame_queue_cv_;           // 有数据时唤醒 worker
     std::condition_variable   frame_queue_not_full_cv_; // 有空间时唤醒 feeder（背压）
@@ -185,6 +190,15 @@ private:
     std::thread               loop_opt_thread_;
     void loopOptThreadLoop();
 
+    // 子图内回环与主线程完全异步：后端只投递 (submap, query_idx)，本线程执行 detectIntraSubmapLoop 并投递 INTRA_LOOP_BATCH 到 opt_worker
+    struct IntraLoopTask { SubMap::Ptr submap; int query_idx = -1; };
+    static constexpr size_t   kMaxIntraLoopTaskQueueSize = 8;
+    std::deque<IntraLoopTask> intra_loop_task_queue_;
+    std::mutex                intra_loop_task_mutex_;
+    std::condition_variable   intra_loop_task_cv_;
+    std::thread               intra_loop_worker_thread_;
+    void intraLoopWorkerLoop();
+
     // 可视化与状态发布迁出后端：仅投递不阻塞
     static constexpr size_t   kVizQueueMaxSize = 2;
     std::queue<CloudXYZIPtr>  viz_cloud_queue_;
@@ -199,6 +213,10 @@ private:
     std::condition_variable   status_pub_cv_;
     std::thread               status_publisher_thread_;
     void statusPublisherLoop();
+
+    // 里程计与优化轨迹保护锁（避免 MultiThreadedExecutor 下 onOdometry 等回调并发修改导致的 vector 损坏与 hang）
+    mutable std::mutex        odom_path_mutex_;
+    mutable std::mutex        opt_path_mutex_;
 
     // 地图体素大小（init 时从 ConfigManager 缓存，避免 publishGlobalMap 回调中访问单例导致析构顺序 SIGSEGV）
     float map_voxel_size_ = 0.2f;
@@ -244,6 +262,7 @@ private:
     std::atomic<int64_t> backend_heartbeat_ts_ms_{0};      // backend worker 线程心跳
     std::atomic<int64_t> map_pub_heartbeat_ts_ms_{0};      // map publish 线程心跳
     std::atomic<int64_t> loop_opt_heartbeat_ts_ms_{0};     // loop optimization 线程心跳
+    std::atomic<int64_t> intra_loop_worker_heartbeat_ts_ms_{0};  // 子图内回环 worker 心跳
     std::atomic<int64_t> viz_heartbeat_ts_ms_{0};          // visualization 线程心跳
     std::atomic<int64_t> status_pub_heartbeat_ts_ms_{0};   // status publisher 线程心跳
     
@@ -262,8 +281,13 @@ private:
         BACKEND_STEP_COUNT
     };
     std::atomic<int> last_backend_step_id_{BACKEND_STEP_IDLE};
+    /** 单帧 >60s 触发 ISAM2 强制 reset 后置位；为 true 时拒绝新 KF 直至 load_session 或重启 */
+    std::atomic<bool> session_invalid_after_isam2_reset_{false};
     /** 将 BackendStepId 转为可读字符串，供 STUCK_DIAG/心跳日志使用 */
     const char* backendStepName(int id) const;
+
+    /** 子图内回环异步结果（带超时防阻塞）；仅后端线程访问 */
+    std::future<std::vector<LoopConstraint::Ptr>> intra_loop_future_;
 
     // 心跳监控定时器
     rclcpp::TimerBase::SharedPtr heartbeat_monitor_timer_;

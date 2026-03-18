@@ -4,11 +4,18 @@ set -e
 source /opt/ros/humble/setup.bash
 cd /root/automap_ws
 
-# 尽可能并行编译：包内多核编译 + 多包并行
-PARALLEL_JOBS=$(nproc)
+# 充分发挥宿主机性能：优先使用宿主机传入的核数（AUTOMAP_BUILD_JOBS 或 HOST_NPROC），否则容器内 nproc
+PARALLEL_JOBS="${AUTOMAP_BUILD_JOBS:-${HOST_NPROC:-$(nproc)}}"
 export CMAKE_BUILD_PARALLEL_LEVEL="${PARALLEL_JOBS}"
 COLCON_PARALLEL="--parallel-workers ${PARALLEL_JOBS}"
 echo "[INFO] 并行编译: 每包 ${PARALLEL_JOBS} 线程, colcon --parallel-workers ${PARALLEL_JOBS}"
+
+# 使用 Ninja 生成器可显著加速编译（镜像已装 ninja-build）
+NINJA_CMAKE_ARG=""
+if command -v ninja >/dev/null 2>&1; then
+  NINJA_CMAKE_ARG="-G Ninja"
+  echo "[INFO] 使用 Ninja 生成器以加速编译"
+fi
 
 # 第三方库（GTSAM/TEASER++/vikit）安装到 install_deps，--clean 时不删除，编译一次后续跳过
 INSTALL_DEPS="/root/automap_ws/install_deps"
@@ -41,14 +48,14 @@ if [ -d src/overlap_transformer_msgs ]; then
   echo '========================================'
   echo '编译 overlap_transformer_msgs'
   echo '========================================'
-  colcon build ${COLCON_PARALLEL} --packages-select overlap_transformer_msgs --cmake-args -DCMAKE_BUILD_TYPE=Release
+  colcon build ${COLCON_PARALLEL} --packages-select overlap_transformer_msgs --cmake-args ${NINJA_CMAKE_ARG} -DCMAKE_BUILD_TYPE=Release
 fi
 
 if [ -d src/overlap_transformer_ros2 ]; then
   echo '========================================'
   echo '编译 overlap_transformer_ros2'
   echo '========================================'
-  colcon build ${COLCON_PARALLEL} --packages-select overlap_transformer_ros2 --cmake-args -DCMAKE_BUILD_TYPE=Release
+  colcon build ${COLCON_PARALLEL} --packages-select overlap_transformer_ros2 --cmake-args ${NINJA_CMAKE_ARG} -DCMAKE_BUILD_TYPE=Release
 fi
 
 if [ -d src/hba ]; then
@@ -82,6 +89,7 @@ if [ -d src/hba ]; then
       mkdir -p /root/automap_ws/build_gtsam_no_tbb
       cd /root/automap_ws/build_gtsam_no_tbb
       cmake /root/automap_ws/src/automap_pro/thrid_party/gtsam \
+          ${NINJA_CMAKE_ARG} \
           -DCMAKE_BUILD_TYPE=Release \
           -DCMAKE_INSTALL_PREFIX=${GTSAM_INSTALL_DIR} \
           -DGTSAM_WITH_TBB=OFF \
@@ -90,8 +98,7 @@ if [ -d src/hba ]; then
           -DBUILD_TESTS=OFF \
           -DBUILD_EXAMPLES=OFF \
           -DBUILD_PYTHON=OFF
-      make -j$(nproc)
-      make install
+      if [ -n "${NINJA_CMAKE_ARG}" ]; then ninja -j${PARALLEL_JOBS}; ninja install; else make -j${PARALLEL_JOBS}; make install; fi
       mkdir -p ${GTSAM_INSTALL_DIR}/share/gtsam
       echo '<?xml version="1.0"?>' > ${GTSAM_INSTALL_DIR}/share/gtsam/package.xml
       echo '<package format="3">' >> ${GTSAM_INSTALL_DIR}/share/gtsam/package.xml
@@ -124,7 +131,7 @@ if [ -d src/hba ]; then
   echo '========================================'
   echo '编译 hba (HBA-main)'
   echo '========================================'
-  colcon build ${COLCON_PARALLEL} --packages-select hba --cmake-args -DCMAKE_BUILD_TYPE=Release
+  colcon build ${COLCON_PARALLEL} --packages-select hba --cmake-args ${NINJA_CMAKE_ARG} -DCMAKE_BUILD_TYPE=Release
 fi
 
 # TEASER++ 源码（安装到 install_deps，已安装则跳过）
@@ -149,6 +156,7 @@ if [ -n "${TEASER_SRC}" ]; then
     TEASER_CMAKE_EXTRA=""
     [ -d "${MAP_THRID}/spectra" ] && TEASER_CMAKE_EXTRA="-DFETCHCONTENT_SOURCE_DIR_SPECTRA=${MAP_THRID}/spectra"
     cmake "${TEASER_SRC}" \
+        ${NINJA_CMAKE_ARG} \
         -DCMAKE_INSTALL_PREFIX="${TEASER_INSTALL_DIR}" \
         -DCMAKE_BUILD_TYPE=Release \
         -DPMC_SOURCE_DIR="${MAP_THRID}/pmc-master" \
@@ -156,8 +164,7 @@ if [ -n "${TEASER_SRC}" ]; then
         -DFETCHCONTENT_SOURCE_DIR_PMC="${MAP_THRID}/pmc-master" \
         -DFETCHCONTENT_SOURCE_DIR_TINYPLY="${MAP_THRID}/tinyply" \
         ${TEASER_CMAKE_EXTRA}
-    make -j$(nproc)
-    make install
+    if [ -n "${NINJA_CMAKE_ARG}" ]; then ninja -j${PARALLEL_JOBS}; ninja install; else make -j${PARALLEL_JOBS}; make install; fi
     echo "[INFO] TEASER++ 已安装于 install_deps"
   fi
   cd /root/automap_ws
@@ -175,7 +182,7 @@ if [ -d src/thrid_party/rpg_vikit_ros2 ]; then
     echo '========================================'
     echo '编译 vikit'
     echo '========================================'
-    colcon build ${COLCON_PARALLEL} --install-base "${INSTALL_DEPS}" --paths src/thrid_party/rpg_vikit_ros2/vikit_common src/thrid_party/rpg_vikit_ros2/vikit_ros --cmake-args -DCMAKE_BUILD_TYPE=Release
+    colcon build ${COLCON_PARALLEL} --install-base "${INSTALL_DEPS}" --paths src/thrid_party/rpg_vikit_ros2/vikit_common src/thrid_party/rpg_vikit_ros2/vikit_ros --cmake-args ${NINJA_CMAKE_ARG} -DCMAKE_BUILD_TYPE=Release
     echo "[INFO] vikit 已安装于 install_deps"
   else
     echo "[INFO] vikit 已安装于 install_deps，跳过"
@@ -244,7 +251,7 @@ if [ -n "${FAST_LIVO_PATH}" ]; then
   echo '编译 fast_livo'
   echo '========================================'
   echo "[INFO] 使用路径: ${FAST_LIVO_PATH}（避免 symlink 导致 colcon 0 packages）"
-  colcon build ${COLCON_PARALLEL} --paths "${FAST_LIVO_PATH}" --cmake-args -DCMAKE_BUILD_TYPE=Release
+  colcon build ${COLCON_PARALLEL} --paths "${FAST_LIVO_PATH}" --cmake-args ${NINJA_CMAKE_ARG} -DCMAKE_BUILD_TYPE=Release
   if [ ! -f install/fast_livo/share/fast_livo/package.xml ]; then
     echo "[ERROR] fast_livo 编译后未找到 install/fast_livo，请检查上方 colcon 输出是否有报错"
     exit 1
@@ -383,7 +390,7 @@ fi
 echo ""
 echo "[INFO] 开始编译 automap_pro..."
 
-colcon build ${COLCON_PARALLEL} --packages-select automap_pro --cmake-args -DCMAKE_BUILD_TYPE=Release -DNLOHMANN_JSON_LOCAL=/root/automap_ws/src/thrid_party/nlohmann-json3 -DSCANCONTEXT_ROOT=/root/automap_ws/automap_pro_thrid_party_scancontext --event-handlers console_direct+ 2>&1 | tee /tmp/automap_build.log
+colcon build ${COLCON_PARALLEL} --packages-select automap_pro --cmake-args ${NINJA_CMAKE_ARG} -DCMAKE_BUILD_TYPE=Release -DNLOHMANN_JSON_LOCAL=/root/automap_ws/src/thrid_party/nlohmann-json3 -DSCANCONTEXT_ROOT=/root/automap_ws/automap_pro_thrid_party_scancontext --event-handlers console_direct+ 2>&1 | tee /tmp/automap_build.log
 
 BUILD_EXIT_CODE=${PIPESTATUS[0]}
 echo ""

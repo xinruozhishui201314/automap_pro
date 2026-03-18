@@ -78,10 +78,11 @@ AutoMapSystem::AutoMapSystem(const rclcpp::NodeOptions& options)
     gps_worker_thread_ = std::thread(&AutoMapSystem::gpsWorkerLoop, this);
     opt_worker_thread_ = std::thread(&AutoMapSystem::optWorkerLoop, this);
     loop_trigger_thread_ = std::thread(&AutoMapSystem::loopTriggerThreadLoop, this);
+    intra_loop_worker_thread_ = std::thread(&AutoMapSystem::intraLoopWorkerLoop, this);
     gps_align_thread_ = std::thread(&AutoMapSystem::gpsAlignWorkerLoop, this);
     // 注意：viz_thread_ 已删除
     status_publisher_thread_ = std::thread(&AutoMapSystem::statusPublisherLoop, this);
-    RCLCPP_INFO(get_logger(), "[AutoMapSystem][INIT] Step 7: feeder + backend + map_publish + gps_worker + opt_worker + loop_trigger + gps_align + status_pub threads started (note: loop_opt and viz threads removed)");
+    RCLCPP_INFO(get_logger(), "[AutoMapSystem][INIT] Step 7: feeder + backend + map_publish + gps_worker + opt_worker + loop_trigger + intra_loop_worker + gps_align + status_pub threads started (note: loop_opt and viz threads removed)");
 }
 
 AutoMapSystem::~AutoMapSystem() {
@@ -116,6 +117,11 @@ AutoMapSystem::~AutoMapSystem() {
     if (loop_trigger_thread_.joinable()) {
         loop_trigger_thread_.join();
         RCLCPP_INFO(get_logger(), "[AutoMapSystem][SHUTDOWN][step=2h] loop_trigger thread joined");
+    }
+    intra_loop_task_cv_.notify_all();
+    if (intra_loop_worker_thread_.joinable()) {
+        intra_loop_worker_thread_.join();
+        RCLCPP_INFO(get_logger(), "[AutoMapSystem][SHUTDOWN][step=2h2] intra_loop_worker thread joined");
     }
     gps_align_cv_.notify_all();
     if (gps_align_thread_.joinable()) {

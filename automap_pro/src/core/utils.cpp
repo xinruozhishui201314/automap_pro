@@ -238,15 +238,63 @@ CloudXYZIPtr voxelDownsampleWithTimeout(const CloudXYZIPtr& cloud, float leaf_si
         return result;
     }
     
-    // 超时
+    // 超时（凡计算超时均打 [COMPUTE_TIMEOUT]，便于 grep 统一检索）
     const auto t_end = std::chrono::steady_clock::now();
     double elapsed_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
-    ALOG_WARN("Utils", "[tid={}] voxelDownsampleWithTimeout: TIMEOUT after {:.1f}ms (limit={}ms), returning raw copy for {} pts",
-              tid, elapsed_ms, timeout_ms, cloud->size());
+    ALOG_WARN("Utils", "[COMPUTE_TIMEOUT] voxelDownsampleWithTimeout: TIMEOUT after {:.1f}ms (limit={}ms), returning raw copy for {} pts",
+              elapsed_ms, timeout_ms, cloud->size());
     
     if (timed_out) *timed_out = true;
     
     // 返回原始点云的副本（经过 sanitize）
+    CloudXYZIPtr result = sanitizePointCloudForVoxel(cloud, kDefaultMaxAbsCoord);
+    return result ? result : cloud;
+}
+
+// ============================================================================
+// 带超时的分块体素（merge 等大点云路径：OpenMP 分块并行 + 超时保护）
+// ============================================================================
+
+CloudXYZIPtr voxelDownsampleChunkedWithTimeout(const CloudXYZIPtr& cloud, float leaf_size, float chunk_size_m,
+                                                int timeout_ms, bool* timed_out) {
+    const unsigned tid = automap_pro::logThreadId();
+    const auto t_start = std::chrono::steady_clock::now();
+    if (timed_out) *timed_out = false;
+    if (!cloud || cloud->empty()) return cloud;
+    float leaf = std::max(leaf_size, kMinVoxelLeafSize);
+    float chunk_m = (chunk_size_m > 0.f) ? chunk_size_m : 0.f;
+
+    if (cloud->size() < 50000u) {
+        try {
+            return voxelDownsample(cloud, leaf);
+        } catch (...) {
+            return cloud;
+        }
+    }
+
+    std::future<CloudXYZIPtr> future = std::async(std::launch::async, [cloud, leaf, chunk_m, tid]() -> CloudXYZIPtr {
+        try {
+            return voxelDownsampleChunked(cloud, leaf, chunk_m);
+        } catch (const std::exception& e) {
+            ALOG_ERROR("Utils", "[tid={}] voxelDownsampleChunkedWithTimeout async exception: {}", tid, e.what());
+            return cloud;
+        } catch (...) {
+            return cloud;
+        }
+    });
+
+    std::future_status status = future.wait_for(std::chrono::milliseconds(timeout_ms));
+    if (status == std::future_status::ready) {
+        auto result = future.get();
+        double elapsed_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_start).count();
+        ALOG_DEBUG("Utils", "[tid={}] voxelDownsampleChunkedWithTimeout: completed in {:.1f}ms", tid, elapsed_ms);
+        return result;
+    }
+
+    double elapsed_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_start).count();
+    ALOG_WARN("Utils", "[COMPUTE_TIMEOUT] voxelDownsampleChunkedWithTimeout: TIMEOUT after {:.1f}ms (limit={}ms), returning raw copy for {} pts",
+              elapsed_ms, timeout_ms, cloud->size());
+    if (timed_out) *timed_out = true;
     CloudXYZIPtr result = sanitizePointCloudForVoxel(cloud, kDefaultMaxAbsCoord);
     return result ? result : cloud;
 }

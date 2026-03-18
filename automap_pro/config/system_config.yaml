@@ -279,12 +279,14 @@ loop_closure:
   min_temporal_gap_s:  30.0
   min_submap_gap:      0      # 0=不按子图间隔过滤(允许相邻子图回环)；>0=要求索引差大于该值
   # ── 子图内回环检测参数 ─────────────────────────────────────────────
-  intra_submap_enabled: true
+  intra_submap_enabled: false   # true=开启子图内回环；false=暂时关闭
   intra_submap_min_temporal_gap_s: 5.0    # 关键帧之间最小时间间隔（秒）
   intra_submap_min_keyframe_gap: 10        # 关键帧之间最小索引间隔（避免相邻帧假回环）
   intra_submap_min_distance_gap_m: 3.0     # 关键帧之间最小距离间隔(米)，避免过密假回环
   intra_submap_overlap_threshold: 0.25     # 描述子相似度阈值
   intra_submap_max_teaser_candidates: 5    # 每帧最多对多少候选做 TEASER 配准
+  intra_submap_max_duration_sec: 8.0       # 单次子图内回环检测最大耗时(秒)，超时则本帧跳过（仅当 intra_submap_async=false 时生效）
+  intra_submap_async: true                 # true=子图内回环与主线程完全异步，由 intra_loop_worker 执行，主线程不阻塞
   # 子图间关键帧级回环（关键帧↔关键帧跨子图，替代子图↔子图）
   inter_keyframe_level:       true   # true=子图间使用关键帧级检测
   inter_keyframe_sample_step: 5      # query 子图内每隔多少关键帧取 1 个做检索（控制计算量）
@@ -327,6 +329,8 @@ backend:
   publish_global_map_every_n_processed: 100
   # Keyframe 级 pending GPS 队列上限，超限 FIFO 丢弃最旧。见 docs/BACKEND_POTENTIAL_ISSUES.md 1.2.1
   max_pending_gps_keyframe_factors: 1000
+  # 子图冻结时合并 forceUpdate：true=先 flush 所有 pending GPS 再统一一次 forceUpdate（减少 ISAM2 调用），false=保持原 3 次
+  force_update_coalesce_on_submap_freeze: false
   isam2:
     relinearize_threshold: 0.01
     relinearize_skip:       10     # 增加到10，减少 TBB 并行触发机会（临时规避）
@@ -339,6 +343,9 @@ backend:
     trigger_every_n_submaps: 10
     trigger_on_loop:         false
     trigger_on_finish:       true
+    # 前端空闲 N 秒且队列空时触发一次 HBA（不结束建图）。≤0 不触发。需同时满足 frontend_idle_min_submaps
+    frontend_idle_trigger_sec: 10.0
+    frontend_idle_min_submaps: 2    # 至少几个子图时才因空闲触发，避免「第一个子图刚建完就 HBA」；共 N 个子图可设为 N
     data_path:               "/tmp/hba_data"
     pcd_name_fill_num:       0
     enable_gps_factor:       true

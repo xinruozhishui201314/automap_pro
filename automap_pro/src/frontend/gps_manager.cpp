@@ -14,6 +14,107 @@
 
 namespace automap_pro {
 
+namespace {
+    // 取两者中较差的 GPS 质量（用于插值结果的质量与 is_valid 判定）
+    GPSQuality worseQuality(GPSQuality a, GPSQuality b) {
+        return static_cast<int>(a) <= static_cast<int>(b) ? a : b;
+    }
+
+    // 快照内 enu→map 变换（仅用快照的 R/t，不持锁）
+    Eigen::Vector3d enu_to_map_from_snapshot(const Eigen::Vector3d& enu,
+                                             const GPSManager::GpsWindowSnapshot& snap) {
+        if (!snap.is_aligned) return enu;
+        return snap.R_gps_lidar * enu + snap.t_gps_lidar;
+    }
+    Eigen::Vector3d map_to_enu_from_snapshot(const Eigen::Vector3d& map_pos,
+                                             const GPSManager::GpsWindowSnapshot& snap) {
+        if (!snap.is_aligned) return map_pos;
+        return snap.R_gps_lidar.transpose() * (map_pos - snap.t_gps_lidar);
+    }
+
+    std::optional<GPSMeasurement> queryByTimestampOnSnapshot(double ts,
+                                                             const GPSManager::GpsWindowSnapshot& snap) {
+        ALOG_DEBUG(MOD, "[GPS_QUERY] queryByTimestampOnSnapshot enter ts={:.3f} window_size={}", ts, snap.window.size());
+        const double max_dt = snap.keyframe_match_window_s;
+        const double max_interp_gap_s = snap.max_interp_gap_s;
+        const auto& w = snap.window;
+        const GPSManager::GpsWindowSnapshot::Record* r_before = nullptr;
+        const GPSManager::GpsWindowSnapshot::Record* r_after = nullptr;
+        for (const auto& r : w) {
+            if (r.timestamp <= ts) r_before = &r;
+            if (r.timestamp >= ts && r_after == nullptr) r_after = &r;
+        }
+        if (r_before && r_after && r_before != r_after) {
+            const double t0 = r_before->timestamp;
+            const double t1 = r_after->timestamp;
+            if (t1 > t0 && (t1 - t0) <= max_interp_gap_s) {
+                const double alpha = (ts - t0) / (t1 - t0);
+                GPSMeasurement m;
+                m.timestamp = ts;
+                m.position_enu = (1.0 - alpha) * r_before->pos_enu + alpha * r_after->pos_enu;
+                m.hdop = (1.0 - alpha) * r_before->hdop + alpha * r_after->hdop;
+                m.quality = worseQuality(r_before->quality, r_after->quality);
+                m.is_valid = (m.hdop <= snap.keyframe_max_hdop);
+                ALOG_DEBUG(MOD, "[GPS_QUERY] queryByTimestampOnSnapshot exit mode=interp t0={:.3f} t1={:.3f} is_valid={}", t0, t1, m.is_valid ? 1 : 0);
+                return m;
+            }
+        }
+        double best_dt = max_dt + 1.0;
+        const GPSManager::GpsWindowSnapshot::Record* best = nullptr;
+        for (const auto& r : w) {
+            double dt = std::abs(r.timestamp - ts);
+            if (dt <= max_dt && (best == nullptr || dt < best_dt)) {
+                best_dt = dt;
+                best = &r;
+            }
+        }
+        if (!best) {
+            ALOG_DEBUG(MOD, "[GPS_QUERY] queryByTimestampOnSnapshot exit mode=not_found ts={:.3f} max_dt={:.3f}", ts, max_dt);
+            return std::nullopt;
+        }
+        GPSMeasurement m;
+        m.timestamp = best->timestamp;
+        m.position_enu = best->pos_enu;
+        m.quality = best->quality;
+        m.hdop = best->hdop;
+        m.is_valid = (best->hdop <= snap.keyframe_max_hdop);
+        ALOG_DEBUG(MOD, "[GPS_QUERY] queryByTimestampOnSnapshot exit mode=nearest best_dt={:.3f} gps_ts={:.3f} is_valid={}", best_dt, best->timestamp, m.is_valid ? 1 : 0);
+        return m;
+    }
+
+    std::optional<Eigen::Vector3d> estimateVelocityOnSnapshot(double ts,
+                                                             const GPSManager::GpsWindowSnapshot& snap) {
+        ALOG_DEBUG(MOD, "[GPS_QUERY] estimateVelocityOnSnapshot enter ts={:.3f} window_size={} half_win={:.3f}", ts, snap.window.size(), snap.velocity_estimation_window_s * 0.5);
+        const double half = snap.velocity_estimation_window_s * 0.5;
+        std::vector<std::pair<double, Eigen::Vector3d>> pts;
+        for (const auto& r : snap.window) {
+            if (r.timestamp >= ts - half && r.timestamp <= ts + half && r.quality >= GPSQuality::MEDIUM) {
+                pts.push_back({r.timestamp, snap.is_aligned ? enu_to_map_from_snapshot(r.pos_enu, snap) : r.pos_enu});
+            }
+        }
+        if (pts.size() < 2) {
+            ALOG_DEBUG(MOD, "[GPS_QUERY] estimateVelocityOnSnapshot exit pts_size={} (need>=2)", pts.size());
+            return std::nullopt;
+        }
+        std::sort(pts.begin(), pts.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+        Eigen::Vector3d sum_vel = Eigen::Vector3d::Zero();
+        double sum_dt = 0.0;
+        for (size_t i = 1; i < pts.size(); ++i) {
+            double dt = pts[i].first - pts[i - 1].first;
+            if (dt > 0.01 && dt < snap.velocity_estimation_window_s) {
+                sum_vel += (pts[i].second - pts[i - 1].second) / dt;
+                sum_dt += 1.0;
+            }
+        }
+        if (sum_dt < 0.5) {
+            ALOG_DEBUG(MOD, "[GPS_QUERY] estimateVelocityOnSnapshot exit sum_dt={:.3f} (need>=0.5)", sum_dt);
+            return std::nullopt;
+        }
+        ALOG_DEBUG(MOD, "[GPS_QUERY] estimateVelocityOnSnapshot exit ok pts={} sum_dt={:.3f}", pts.size(), sum_dt);
+        return sum_vel / sum_dt;
+    }
+} // namespace
+
 GPSManager::GPSManager() {
     const auto& cfg = ConfigManager::instance();
     min_align_points_       = cfg.gpsAlignMinPoints();
@@ -97,7 +198,7 @@ void GPSManager::addGPSMeasurement(
     std::vector<MeasurementLogCallback> log_cbs;
 
     {
-        std::lock_guard<std::mutex> lk(mutex_);
+        std::lock_guard<std::recursive_mutex> lk(mutex_);
 
         pos_enu = wgs84_to_enu(latitude, longitude, altitude);
         quality = hdop_to_quality(hdop);
@@ -148,7 +249,7 @@ void GPSManager::addGPSMeasurement(
     std::vector<GpsFactorCallback> factor_cbs;
 
     {
-        std::lock_guard<std::mutex> lk(mutex_);
+        std::lock_guard<std::recursive_mutex> lk(mutex_);
 
     // 统计连续高质量帧
     // 【修复】放宽质量要求：MEDIUM+ (HDOP≤5.0) 也计入good_sample，而非仅HIGH+ (HDOP≤2.0)
@@ -255,7 +356,7 @@ void GPSManager::addGPSMeasurement(
 }
 
 void GPSManager::addKeyFramePose(double timestamp, const Pose3d& T_w_b) {
-    std::lock_guard<std::mutex> lk(mutex_);
+    std::lock_guard<std::recursive_mutex> lk(mutex_);
     kf_window_.push_back({timestamp, T_w_b});
     const size_t max_kf_window = ConfigManager::instance().gpsMaxWindowSize();
     while (kf_window_.size() > max_kf_window) kf_window_.pop_front();
@@ -276,7 +377,7 @@ void GPSManager::runScheduledAlignment() {
 }
 
 void GPSManager::try_align() {
-    std::unique_lock<std::mutex> lk(mutex_);
+    std::unique_lock<std::recursive_mutex> lk(mutex_);
 
     const size_t kf_sz = kf_window_.size();
     const size_t gps_sz = gps_window_.size();
@@ -528,22 +629,34 @@ Eigen::Vector3d GPSManager::wgs84_to_enu(double lat, double lon, double alt) con
 Eigen::Vector3d GPSManager::enu_to_map(const Eigen::Vector3d& enu) const {
     if (state_ != GPSAlignState::ALIGNED && state_ != GPSAlignState::DEGRADED)
         return enu;
+    std::lock_guard<std::recursive_mutex> lk(mutex_);
     return align_result_.R_gps_lidar * enu + align_result_.t_gps_lidar;
+}
+
+Eigen::Vector3d GPSManager::map_to_enu(const Eigen::Vector3d& map_pos) const {
+    if (state_ != GPSAlignState::ALIGNED && state_ != GPSAlignState::DEGRADED)
+        return map_pos;
+    std::lock_guard<std::recursive_mutex> lk(mutex_);
+    return align_result_.R_gps_lidar.transpose() * (map_pos - align_result_.t_gps_lidar);
 }
 
 std::pair<Eigen::Vector3d, std::string> GPSManager::enu_to_map_with_frame(const Eigen::Vector3d& enu) const {
     if (state_ != GPSAlignState::ALIGNED && state_ != GPSAlignState::DEGRADED)
         return {enu, "enu"};
+    std::lock_guard<std::recursive_mutex> lk(mutex_);
     return {align_result_.R_gps_lidar * enu + align_result_.t_gps_lidar, "map"};
 }
 
 int GPSManager::getGoodSampleCount() const {
-    std::lock_guard<std::mutex> lk(mutex_);
-    return good_sample_count_;
+    ALOG_DEBUG(MOD, "[GPS_QUERY] getGoodSampleCount enter");
+    GpsWindowSnapshot snap = getSnapshot();
+    int n = snap.good_sample_count;
+    ALOG_DEBUG(MOD, "[GPS_QUERY] getGoodSampleCount exit good_sample_count={}", n);
+    return n;
 }
 
 double GPSManager::getAccumulatedDistM() const {
-    std::lock_guard<std::mutex> lk(mutex_);
+    std::lock_guard<std::recursive_mutex> lk(mutex_);
     double total_dist = 0.0;
     for (size_t i = 1; i < kf_window_.size(); ++i) {
         total_dist += (kf_window_[i].second.translation() - kf_window_[i - 1].second.translation()).norm();
@@ -552,13 +665,18 @@ double GPSManager::getAccumulatedDistM() const {
 }
 
 std::vector<std::pair<double, Eigen::Vector3d>> GPSManager::getGpsPositionsInMapFrame() const {
-    std::lock_guard<std::mutex> lk(mutex_);
+    ALOG_DEBUG(MOD, "[GPS_QUERY] getGpsPositionsInMapFrame enter");
+    GpsWindowSnapshot snap = getSnapshot();
+    ALOG_DEBUG(MOD, "[GPS_QUERY] getGpsPositionsInMapFrame got_snapshot window_size={} is_aligned={}", snap.window.size(), snap.is_aligned ? 1 : 0);
     std::vector<std::pair<double, Eigen::Vector3d>> out;
-    if (state_ != GPSAlignState::ALIGNED && state_ != GPSAlignState::DEGRADED)
+    if (!snap.is_aligned) {
+        ALOG_DEBUG(MOD, "[GPS_QUERY] getGpsPositionsInMapFrame exit reason=not_aligned out_size=0");
         return out;
-    out.reserve(gps_window_.size());
-    for (const auto& r : gps_window_)
-        out.emplace_back(r.timestamp, enu_to_map(r.pos_enu));
+    }
+    out.reserve(snap.window.size());
+    for (const auto& r : snap.window)
+        out.emplace_back(r.timestamp, enu_to_map_from_snapshot(r.pos_enu, snap));
+    ALOG_DEBUG(MOD, "[GPS_QUERY] getGpsPositionsInMapFrame exit out_size={}", out.size());
     return out;
 }
 
@@ -578,149 +696,132 @@ GPSAlignState GPSManager::state() const {
 }
 
 GPSQuality GPSManager::currentQuality() const {
-    std::lock_guard<std::mutex> lk(mutex_);
-    if (gps_window_.empty()) return GPSQuality::INVALID;
-    return gps_window_.back().quality;
+    ALOG_DEBUG(MOD, "[GPS_QUERY] currentQuality enter");
+    GpsWindowSnapshot snap = getSnapshot();
+    GPSQuality q = snap.window.empty() ? GPSQuality::INVALID : snap.window.back().quality;
+    ALOG_DEBUG(MOD, "[GPS_QUERY] currentQuality exit empty={} quality={}", snap.window.empty() ? 1 : 0, static_cast<int>(q));
+    return q;
 }
 
 std::optional<Eigen::Vector3d> GPSManager::getLatestPositionENU() const {
-    std::lock_guard<std::mutex> lk(mutex_);
-    for (auto it = gps_window_.rbegin(); it != gps_window_.rend(); ++it) {
+    ALOG_DEBUG(MOD, "[GPS_QUERY] getLatestPositionENU enter");
+    GpsWindowSnapshot snap = getSnapshot();
+    ALOG_DEBUG(MOD, "[GPS_QUERY] getLatestPositionENU got_snapshot window_size={} is_aligned={}", snap.window.size(), snap.is_aligned ? 1 : 0);
+    for (auto it = snap.window.rbegin(); it != snap.window.rend(); ++it) {
         if (it->quality >= GPSQuality::MEDIUM) {
-            if (isAligned()) return enu_to_map(it->pos_enu);
-            return it->pos_enu;
+            Eigen::Vector3d pos = snap.is_aligned ? enu_to_map_from_snapshot(it->pos_enu, snap) : it->pos_enu;
+            ALOG_DEBUG(MOD, "[GPS_QUERY] getLatestPositionENU exit found quality={} ts={:.3f}", static_cast<int>(it->quality), it->timestamp);
+            return pos;
         }
     }
+    ALOG_DEBUG(MOD, "[GPS_QUERY] getLatestPositionENU exit not_found (no MEDIUM+ in window)");
     return std::nullopt;
 }
 
-namespace {
-    // 取两者中较差的 GPS 质量（用于插值结果的质量与 is_valid 判定）
-    GPSQuality worseQuality(GPSQuality a, GPSQuality b) {
-        return static_cast<int>(a) <= static_cast<int>(b) ? a : b;
-    }
-} // namespace
-
-std::optional<GPSMeasurement> GPSManager::queryByTimestamp(double ts) const {
-    std::lock_guard<std::mutex> lk(mutex_);
-    const double max_dt = keyframe_match_window_s_;
-    const double max_interp_gap_s = max_interp_gap_s_;
-
-    const GPSRecord* r_before = nullptr;  // 最后一个 timestamp <= ts
-    const GPSRecord* r_after  = nullptr;  // 第一个 timestamp >= ts
+GPSManager::GpsWindowSnapshot GPSManager::getSnapshot() const {
+    ALOG_DEBUG(MOD, "[GPS_SNAPSHOT] getSnapshot enter (about to lock)");
+    std::lock_guard<std::recursive_mutex> lk(mutex_);
+    ALOG_DEBUG(MOD, "[GPS_SNAPSHOT] getSnapshot lock_held copying window size={}", gps_window_.size());
+    GpsWindowSnapshot snap;
+    snap.window.reserve(gps_window_.size());
     for (const auto& r : gps_window_) {
-        if (r.timestamp <= ts) r_before = &r;
-        if (r.timestamp >= ts && r_after == nullptr) r_after = &r;
+        GpsWindowSnapshot::Record rec;
+        rec.timestamp = r.timestamp;
+        rec.pos_enu = r.pos_enu;
+        rec.quality = r.quality;
+        rec.hdop = r.hdop;
+        snap.window.push_back(rec);
     }
-
-    // 双样本线性插值：位置线性插值；姿态由里程计/前端提供，GPS 仅约束位置。
-    // 若未来接入双天线 GNSS 朝向，可对四元数做球面插值(slerp)：q = slerp(q0, q1, alpha)。
-    if (r_before && r_after && r_before != r_after) {
-        const double t0 = r_before->timestamp;
-        const double t1 = r_after->timestamp;
-        if (t1 > t0 && (t1 - t0) <= max_interp_gap_s) {
-            const double alpha = (ts - t0) / (t1 - t0);
-            const Eigen::Vector3d p0 = isAligned() ? enu_to_map(r_before->pos_enu) : r_before->pos_enu;
-            const Eigen::Vector3d p1 = isAligned() ? enu_to_map(r_after->pos_enu)  : r_after->pos_enu;
-            GPSMeasurement m;
-            m.timestamp    = ts;
-            m.position_enu = (1.0 - alpha) * p0 + alpha * p1;
-            m.hdop         = (1.0 - alpha) * r_before->hdop + alpha * r_after->hdop;
-            m.quality     = worseQuality(r_before->quality, r_after->quality);
-            // 【增强】使用 HDOP 阈值判定有效性，放宽 M2DGR 等弱 GPS 场景
-            m.is_valid    = (m.hdop <= keyframe_max_hdop_);
-            // 【诊断日志】
-            ALOG_DEBUG(MOD, "[queryByTimestamp] ts={:.3f} mode=interp dt_before={:.3f} dt_after={:.3f} "
-                      "interp_hdop={:.2f} interp_quality={} is_valid={} keyframe_max_hdop={:.1f}",
-                      ts, ts - t0, t1 - ts, m.hdop, static_cast<int>(m.quality), m.is_valid, keyframe_max_hdop_);
-            return m;
-        }
-    }
-
-    // 单样本或间隔过大：退化为时间窗内最近邻
-    double best_dt = max_dt + 1.0;
-    const GPSRecord* best = nullptr;
-    for (const auto& r : gps_window_) {
-        double dt = std::abs(r.timestamp - ts);
-        if (dt <= max_dt && (best == nullptr || dt < best_dt)) { best_dt = dt; best = &r; }
-    }
-    if (!best) {
-        // 【精准分析】未命中时输出窗口时间范围，便于判断是“无数据”还是“ts 落在窗口外”
-        double win_min = 0.0, win_max = 0.0;
-        if (!gps_window_.empty()) {
-            win_min = win_max = gps_window_.front().timestamp;
-            for (const auto& r : gps_window_) {
-                if (r.timestamp < win_min) win_min = r.timestamp;
-                if (r.timestamp > win_max) win_max = r.timestamp;
-            }
-        }
-        ALOG_WARN(MOD, "[queryByTimestamp] ts={:.3f} result=not_found window_size={} max_dt_s={:.2f} "
-                  "window_ts=[{:.3f}, {:.3f}] (odom_ts outside GPS window or min_dt_to_nearest>max_dt; consider keyframe_match_window_s>={:.2f})",
-                  ts, gps_window_.size(), max_dt, win_min, win_max, max_dt);
-        return std::nullopt;
-    }
-    GPSMeasurement m;
-    m.timestamp    = best->timestamp;
-    m.position_enu = isAligned() ? enu_to_map(best->pos_enu) : best->pos_enu;
-    m.quality      = best->quality;
-    m.hdop         = best->hdop;
-    // 【增强】使用 HDOP 阈值判定有效性，放宽 M2DGR 等弱 GPS 场景
-    m.is_valid     = (best->hdop <= keyframe_max_hdop_);
-    // 【诊断日志】
-    ALOG_DEBUG(MOD, "[queryByTimestamp] ts={:.3f} mode=nearest dt={:.3f} gps_ts={:.3f} "
-              "hdop={:.2f} quality={} is_valid={} keyframe_max_hdop={:.1f}",
-              ts, best_dt, best->timestamp, best->hdop, static_cast<int>(best->quality), m.is_valid, keyframe_max_hdop_);
-    return m;
+    snap.is_aligned = (state_ == GPSAlignState::ALIGNED || state_ == GPSAlignState::DEGRADED);
+    snap.R_gps_lidar = align_result_.R_gps_lidar;
+    snap.t_gps_lidar = align_result_.t_gps_lidar;
+    snap.keyframe_match_window_s = keyframe_match_window_s_;
+    snap.max_interp_gap_s = max_interp_gap_s_;
+    snap.extrapolation_margin_s = extrapolation_margin_s_;
+    snap.extrapolation_uncertainty_scale = extrapolation_uncertainty_scale_;
+    snap.velocity_estimation_window_s = velocity_estimation_window_s_;
+    snap.keyframe_max_hdop = keyframe_max_hdop_;
+    snap.good_sample_count = good_sample_count_;
+    ALOG_DEBUG(MOD, "[GPS_SNAPSHOT] getSnapshot exit (lock released) window_size={} is_aligned={} good_sample_count={}", snap.window.size(), snap.is_aligned ? 1 : 0, snap.good_sample_count);
+    ALOG_INFO(MOD, "[GPS_SNAPSHOT] getSnapshot done window_size={} is_aligned={} (grep GPS_SNAPSHOT 可定位卡在等锁或拷贝)", snap.window.size(), snap.is_aligned ? 1 : 0);
+    return snap;
 }
 
+std::optional<GPSMeasurement> GPSManager::queryByTimestamp(double ts) const {
+    ALOG_DEBUG(MOD, "[GPS_QUERY] queryByTimestamp enter ts={:.3f}", ts);
+    GpsWindowSnapshot snap = getSnapshot();
+    ALOG_DEBUG(MOD, "[GPS_QUERY] queryByTimestamp got_snapshot window_size={} is_aligned={}", snap.window.size(), snap.is_aligned ? 1 : 0);
+    auto m_opt = queryByTimestampOnSnapshot(ts, snap);
+    if (!m_opt && !snap.window.empty()) {
+        double win_min = snap.window.front().timestamp, win_max = win_min;
+        for (const auto& r : snap.window) {
+            if (r.timestamp < win_min) win_min = r.timestamp;
+            if (r.timestamp > win_max) win_max = r.timestamp;
+        }
+        ALOG_WARN(MOD, "[GPS_QUERY] queryByTimestamp result=not_found ts={:.3f} window_size={} max_dt_s={:.2f} window_ts=[{:.3f},{:.3f}]",
+                  ts, snap.window.size(), snap.keyframe_match_window_s, win_min, win_max);
+    }
+    ALOG_DEBUG(MOD, "[GPS_QUERY] queryByTimestamp exit ts={:.3f} has_result={}", ts, m_opt ? 1 : 0);
+    return m_opt;
+}
+
+
 std::optional<GPSMeasurement> GPSManager::queryByNearestPosition(const Eigen::Vector3d& position_map) const {
-    // 仅在对齐后使用，保证 GPS 与 keyframe 同在 map 系
-    if (state_ != GPSAlignState::ALIGNED && state_ != GPSAlignState::DEGRADED) {
-        ALOG_DEBUG(MOD, "[queryByNearestPosition] skipped: not aligned, fallback to time-based");
+    ALOG_DEBUG(MOD, "[GPS_QUERY] queryByNearestPosition enter position_map=({:.2f},{:.2f},{:.2f})", position_map.x(), position_map.y(), position_map.z());
+    GpsWindowSnapshot snap = getSnapshot();
+    ALOG_DEBUG(MOD, "[GPS_QUERY] queryByNearestPosition got_snapshot window_size={} is_aligned={}", snap.window.size(), snap.is_aligned ? 1 : 0);
+    if (!snap.is_aligned) {
+        ALOG_DEBUG(MOD, "[GPS_QUERY] queryByNearestPosition exit reason=not_aligned (fallback to time-based)");
         return std::nullopt;
     }
+    if (snap.window.empty()) {
+        ALOG_DEBUG(MOD, "[GPS_QUERY] queryByNearestPosition exit reason=window_empty");
+        return std::nullopt;
+    }
+    double best_sq = std::numeric_limits<double>::max();
     double nearest_ts = 0.0;
-    {
-        std::lock_guard<std::mutex> lk(mutex_);
-        if (gps_window_.empty()) return std::nullopt;
-        double best_sq = std::numeric_limits<double>::max();
-        for (const auto& r : gps_window_) {
-            Eigen::Vector3d pos_map = enu_to_map(r.pos_enu);
-            double sq = (pos_map - position_map).squaredNorm();
-            if (sq < best_sq) {
-                best_sq = sq;
-                nearest_ts = r.timestamp;
-            }
+    for (const auto& r : snap.window) {
+        Eigen::Vector3d pos_map = enu_to_map_from_snapshot(r.pos_enu, snap);
+        double sq = (pos_map - position_map).squaredNorm();
+        if (sq < best_sq) {
+            best_sq = sq;
+            nearest_ts = r.timestamp;
         }
     }
-    // 用最近位置对应的时间戳做插值
-    auto m_opt = queryByTimestamp(nearest_ts);
+    ALOG_DEBUG(MOD, "[GPS_QUERY] queryByNearestPosition nearest_ts={:.3f} best_sq={:.4f}", nearest_ts, best_sq);
+    auto m_opt = queryByTimestampOnSnapshot(nearest_ts, snap);
     if (m_opt) {
-        ALOG_DEBUG(MOD, "[queryByNearestPosition] position_map=[{:.2f},{:.2f},{:.2f}] nearest_ts={:.3f} found",
-                  position_map.x(), position_map.y(), position_map.z(), nearest_ts);
+        ALOG_DEBUG(MOD, "[GPS_QUERY] queryByNearestPosition exit found position_map=({:.2f},{:.2f},{:.2f}) nearest_ts={:.3f}", position_map.x(), position_map.y(), position_map.z(), nearest_ts);
+    } else {
+        ALOG_DEBUG(MOD, "[GPS_QUERY] queryByNearestPosition exit not_found nearest_ts={:.3f}", nearest_ts);
     }
     return m_opt;
 }
 
 std::optional<GPSMeasurement> GPSManager::queryByTimestampForLog(double ts, double max_dt_s) const {
-    std::lock_guard<std::mutex> lk(mutex_);
-    // 在 [0, max_dt_s] 内选最近的 GPS（含边界），避免 1Hz GPS + 10Hz odom 时边界 dt=0.5 漏匹配导致 CSV 每 5 行无 GPS
+    ALOG_DEBUG(MOD, "[GPS_QUERY] queryByTimestampForLog enter ts={:.3f} max_dt_s={:.3f}", ts, max_dt_s);
+    GpsWindowSnapshot snap = getSnapshot();
+    ALOG_DEBUG(MOD, "[GPS_QUERY] queryByTimestampForLog got_snapshot window_size={}", snap.window.size());
     double best_dt = max_dt_s + 1.0;
-    const GPSRecord* best = nullptr;
-    for (const auto& r : gps_window_) {
+    const GpsWindowSnapshot::Record* best = nullptr;
+    for (const auto& r : snap.window) {
         double dt = std::abs(r.timestamp - ts);
         if (dt <= max_dt_s && (best == nullptr || dt < best_dt)) {
             best_dt = dt;
             best = &r;
         }
     }
-    if (!best) return std::nullopt;
+    if (!best) {
+        ALOG_DEBUG(MOD, "[GPS_QUERY] queryByTimestampForLog exit not_found ts={:.3f}", ts);
+        return std::nullopt;
+    }
     GPSMeasurement m;
     m.timestamp    = best->timestamp;
-    m.position_enu = isAligned() ? enu_to_map(best->pos_enu) : best->pos_enu;
+    m.position_enu = best->pos_enu;
     m.quality      = best->quality;
     m.hdop         = best->hdop;
     m.is_valid     = (best->quality >= GPSQuality::MEDIUM);
+    ALOG_DEBUG(MOD, "[GPS_QUERY] queryByTimestampForLog exit found ts={:.3f} best_dt={:.3f} gps_ts={:.3f} is_valid={}", ts, best_dt, best->timestamp, m.is_valid ? 1 : 0);
     return m;
 }
 
@@ -748,93 +849,125 @@ std::optional<Eigen::Vector3d> GPSManager::estimateGpsVelocityLocked(double ts) 
 }
 
 std::optional<Eigen::Vector3d> GPSManager::estimateGpsVelocity(double ts) const {
-    std::lock_guard<std::mutex> lk(mutex_);
-    return estimateGpsVelocityLocked(ts);
+    ALOG_DEBUG(MOD, "[GPS_QUERY] estimateGpsVelocity enter ts={:.3f}", ts);
+    GpsWindowSnapshot snap = getSnapshot();
+    ALOG_DEBUG(MOD, "[GPS_QUERY] estimateGpsVelocity got_snapshot window_size={}", snap.window.size());
+    auto vel_opt = estimateVelocityOnSnapshot(ts, snap);
+    ALOG_DEBUG(MOD, "[GPS_QUERY] estimateGpsVelocity exit ts={:.3f} has_vel={}", ts, vel_opt ? 1 : 0);
+    return vel_opt;
 }
 
 std::optional<GPSMeasurement> GPSManager::queryByTimestampEnhanced(double ts) const {
-    auto m_opt = queryByTimestamp(ts);
-    if (m_opt) return m_opt;
-
-    std::lock_guard<std::mutex> lk(mutex_);
-    if (gps_window_.size() < 2) return std::nullopt;
-
-    double win_min = gps_window_.front().timestamp;
-    double win_max = win_min;
-    for (const auto& r : gps_window_) {
-        if (r.timestamp < win_min) win_min = r.timestamp;
-        if (r.timestamp > win_max) win_max = r.timestamp;
+    ALOG_DEBUG(MOD, "[GPS_QUERY] queryByTimestampEnhanced enter ts={:.3f}", ts);
+    GpsWindowSnapshot snap = getSnapshot();
+    ALOG_DEBUG(MOD, "[GPS_QUERY] queryByTimestampEnhanced got_snapshot window_size={} is_aligned={}", snap.window.size(), snap.is_aligned ? 1 : 0);
+    auto m_opt = queryByTimestampOnSnapshot(ts, snap);
+    if (m_opt) {
+        ALOG_DEBUG(MOD, "[GPS_QUERY] queryByTimestampEnhanced exit ts={:.3f} mode=interp_or_nearest", ts);
+        return m_opt;
     }
-    const double margin = extrapolation_margin_s_;
-    const GPSRecord* anchor = nullptr;
-    double dt_extrap = 0.0;
-    if (ts < win_min && (win_min - ts) <= margin) {
-        anchor = &gps_window_.front();
-        dt_extrap = ts - anchor->timestamp;
-    } else if (ts > win_max && (ts - win_max) <= margin) {
-        anchor = &gps_window_.back();
-        dt_extrap = ts - anchor->timestamp;
-    } else {
+
+    if (snap.window.size() < 2) {
+        ALOG_DEBUG(MOD, "[GPS_QUERY] queryByTimestampEnhanced exit ts={:.3f} reason=window_size<2 size={}", ts, snap.window.size());
         return std::nullopt;
     }
 
-    auto vel_opt = estimateGpsVelocityLocked(anchor->timestamp);
-    if (!vel_opt) return std::nullopt;
+    double win_min = snap.window.front().timestamp, win_max = win_min;
+    for (const auto& r : snap.window) {
+        if (r.timestamp < win_min) win_min = r.timestamp;
+        if (r.timestamp > win_max) win_max = r.timestamp;
+    }
+    ALOG_DEBUG(MOD, "[GPS_QUERY] queryByTimestampEnhanced win_ts=[{:.3f},{:.3f}] margin={:.3f}", win_min, win_max, snap.extrapolation_margin_s);
+    const double margin = snap.extrapolation_margin_s;
+    const GpsWindowSnapshot::Record* anchor = nullptr;
+    double dt_extrap = 0.0;
+    if (ts < win_min && (win_min - ts) <= margin) {
+        anchor = &snap.window.front();
+        dt_extrap = ts - anchor->timestamp;
+        ALOG_DEBUG(MOD, "[GPS_QUERY] queryByTimestampEnhanced extrapolate_before anchor_ts={:.3f} dt_extrap={:.3f}", anchor->timestamp, dt_extrap);
+    } else if (ts > win_max && (ts - win_max) <= margin) {
+        anchor = &snap.window.back();
+        dt_extrap = ts - anchor->timestamp;
+        ALOG_DEBUG(MOD, "[GPS_QUERY] queryByTimestampEnhanced extrapolate_after anchor_ts={:.3f} dt_extrap={:.3f}", anchor->timestamp, dt_extrap);
+    } else {
+        ALOG_DEBUG(MOD, "[GPS_QUERY] queryByTimestampEnhanced exit ts={:.3f} reason=ts_outside_margin win=[{:.3f},{:.3f}]", ts, win_min, win_max);
+        return std::nullopt;
+    }
 
-    Eigen::Vector3d pos = (isAligned() ? enu_to_map(anchor->pos_enu) : anchor->pos_enu) + (*vel_opt) * dt_extrap;
+    auto vel_opt = estimateVelocityOnSnapshot(anchor->timestamp, snap);
+    if (!vel_opt) {
+        ALOG_DEBUG(MOD, "[GPS_QUERY] queryByTimestampEnhanced exit ts={:.3f} reason=vel_est_failed anchor_ts={:.3f}", ts, anchor->timestamp);
+        return std::nullopt;
+    }
+
+    Eigen::Vector3d pos_map = enu_to_map_from_snapshot(anchor->pos_enu, snap) + (*vel_opt) * dt_extrap;
+    Eigen::Vector3d pos_enu = snap.is_aligned ? map_to_enu_from_snapshot(pos_map, snap) : pos_map;
     double hdop_safe = std::max(anchor->hdop, 0.1);
-    double sigma_h = hdop_safe * 0.5 * std::sqrt(extrapolation_uncertainty_scale_);
-    double sigma_v = hdop_safe * 1.0 * std::sqrt(extrapolation_uncertainty_scale_);
+    double sigma_h = hdop_safe * 0.5 * std::sqrt(snap.extrapolation_uncertainty_scale);
+    double sigma_v = hdop_safe * 1.0 * std::sqrt(snap.extrapolation_uncertainty_scale);
 
     GPSMeasurement m;
     m.timestamp    = ts;
-    m.position_enu = pos;
+    m.position_enu = pos_enu;
     m.quality      = anchor->quality;
     m.hdop         = anchor->hdop;
-    m.is_valid     = (anchor->hdop <= keyframe_max_hdop_);
+    m.is_valid     = (anchor->hdop <= snap.keyframe_max_hdop);
     m.covariance   = Eigen::Matrix3d::Zero();
     m.covariance(0, 0) = sigma_h * sigma_h;
     m.covariance(1, 1) = sigma_h * sigma_h;
     m.covariance(2, 2) = sigma_v * sigma_v;
-    ALOG_DEBUG(MOD, "[queryByTimestampEnhanced] ts={:.3f} mode=extrapolate dt={:.3f} anchor_ts={:.3f}",
-              ts, dt_extrap, anchor->timestamp);
+    ALOG_DEBUG(MOD, "[GPS_QUERY] queryByTimestampEnhanced exit ts={:.3f} mode=extrapolate anchor_ts={:.3f} dt_extrap={:.3f} is_valid={}", ts, anchor->timestamp, dt_extrap, m.is_valid ? 1 : 0);
     return m;
 }
 
 size_t GPSManager::getGpsWindowSize() const {
-    std::lock_guard<std::mutex> lk(mutex_);
-    return gps_window_.size();
+    ALOG_DEBUG(MOD, "[GPS_QUERY] getGpsWindowSize enter");
+    GpsWindowSnapshot snap = getSnapshot();
+    size_t n = snap.window.size();
+    ALOG_DEBUG(MOD, "[GPS_QUERY] getGpsWindowSize exit size={}", n);
+    return n;
 }
 
 bool GPSManager::getGpsWindowTimeRange(double* out_min_ts, double* out_max_ts) const {
-    if (!out_min_ts || !out_max_ts) return false;
-    std::lock_guard<std::mutex> lk(mutex_);
-    if (gps_window_.empty()) return false;
-    double min_t = gps_window_.front().timestamp;
-    double max_t = min_t;
-    for (const auto& r : gps_window_) {
+    ALOG_DEBUG(MOD, "[GPS_QUERY] getGpsWindowTimeRange enter");
+    if (!out_min_ts || !out_max_ts) {
+        ALOG_DEBUG(MOD, "[GPS_QUERY] getGpsWindowTimeRange exit reason=null_ptr");
+        return false;
+    }
+    GpsWindowSnapshot snap = getSnapshot();
+    if (snap.window.empty()) {
+        ALOG_DEBUG(MOD, "[GPS_QUERY] getGpsWindowTimeRange exit reason=window_empty");
+        return false;
+    }
+    double min_t = snap.window.front().timestamp, max_t = min_t;
+    for (const auto& r : snap.window) {
         if (r.timestamp < min_t) min_t = r.timestamp;
         if (r.timestamp > max_t) max_t = r.timestamp;
     }
     *out_min_ts = min_t;
     *out_max_ts = max_t;
+    ALOG_DEBUG(MOD, "[GPS_QUERY] getGpsWindowTimeRange exit ok min_ts={:.3f} max_ts={:.3f}", min_t, max_t);
     return true;
 }
 
 double GPSManager::getFirstGpsTimestamp() const {
-    std::lock_guard<std::mutex> lk(mutex_);
-    if (gps_window_.empty()) return 0.0;
-    return gps_window_.front().timestamp;
+    ALOG_DEBUG(MOD, "[GPS_QUERY] getFirstGpsTimestamp enter");
+    GpsWindowSnapshot snap = getSnapshot();
+    double t = snap.window.empty() ? 0.0 : snap.window.front().timestamp;
+    ALOG_DEBUG(MOD, "[GPS_QUERY] getFirstGpsTimestamp exit empty={} first_ts={:.3f}", snap.window.empty() ? 1 : 0, t);
+    return t;
 }
 
 double GPSManager::getLastGpsTimestamp() const {
-    std::lock_guard<std::mutex> lk(mutex_);
-    if (gps_window_.empty()) return 0.0;
-    return gps_window_.back().timestamp;
+    ALOG_DEBUG(MOD, "[GPS_QUERY] getLastGpsTimestamp enter");
+    GpsWindowSnapshot snap = getSnapshot();
+    double t = snap.window.empty() ? 0.0 : snap.window.back().timestamp;
+    ALOG_DEBUG(MOD, "[GPS_QUERY] getLastGpsTimestamp exit empty={} last_ts={:.3f}", snap.window.empty() ? 1 : 0, t);
+    return t;
 }
 
 void GPSManager::triggerRealign() {
-    std::lock_guard<std::mutex> lk(mutex_);
+    std::lock_guard<std::recursive_mutex> lk(mutex_);
     ALOG_INFO(MOD, "[GPS_STATE] *→NOT_ALIGNED reason=trigger_realign");
     state_ = GPSAlignState::NOT_ALIGNED;
     good_sample_count_ = 0;
@@ -851,7 +984,7 @@ Eigen::Vector3d GPSManager::estimateGpsPositionByOdom(
      * 估算速度（使用最近几个里程计位姿） */
     Eigen::Vector3d avg_velocity = Eigen::Vector3d::Zero();
     {
-        std::lock_guard<std::mutex> lk(mutex_);
+        std::lock_guard<std::recursive_mutex> lk(mutex_);
         if (kf_window_.size() < 2) {
             return Eigen::Vector3d::Zero();
         }
@@ -884,21 +1017,15 @@ Eigen::Vector3d GPSManager::estimateGpsPositionByOdom(
 void GPSManager::onlineCalibrate(
     double /*gps_ts*/, const Eigen::Vector3d& gps_enu,
     double /*odom_ts*/, const Pose3d& odom_pose) {
-    /* 在线校准：持续校准GPS-里程计偏差 */
-    if (state_ != GPSAlignState::ALIGNED) {
-        return;  // 仅在已对齐状态下进行在线校准
-    }
-    /* 计算GPS-里程计偏差 */
-    Eigen::Vector3d odom_enu = enu_to_map(odom_pose.translation());
-    Eigen::Vector3d offset = gps_enu - odom_enu;
-    /* 使用指数移动平均滤波偏差 */
-    double alpha = 0.05;  // 平滑因子
+    /* 在线校准：gps_enu 与 odom_pose.translation() 均应为 ENU，同系求差后累积偏差 */
+    if (state_ != GPSAlignState::ALIGNED) return;
+    Eigen::Vector3d offset = gps_enu - odom_pose.translation();
+    double alpha = 0.05;
     accumulated_offset_ = accumulated_offset_ * (1.0 - alpha) + offset * alpha;
     int count = calib_count_.fetch_add(1) + 1;
     calib_count_.store(count);
-    /* 定期更新对齐结果 */
     if (count % 10 == 0) {
-        /* 应用累积偏差到对齐变换 */
+        std::lock_guard<std::recursive_mutex> lk(mutex_);
         align_result_.t_gps_lidar += accumulated_offset_;
         ALOG_DEBUG(MOD, "[GPS_ALIGN] Online calibration: offset=({:.2f},{:.2f},{:.2f}) samples={}",
                   accumulated_offset_.x(), accumulated_offset_.y(), accumulated_offset_.z(), count);
@@ -906,7 +1033,7 @@ void GPSManager::onlineCalibrate(
 }
 
 std::optional<std::pair<double, Pose3d>> GPSManager::findNearestOdomPose(double ts) const {
-    std::lock_guard<std::mutex> lk(mutex_);
+    std::lock_guard<std::recursive_mutex> lk(mutex_);
 
     // 在缓存的所有里程计位姿中查找最近的
     const std::pair<double, Pose3d>* best = nullptr;

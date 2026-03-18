@@ -158,6 +158,10 @@ void FrameProcessor::feederLoop() {
                 total_voxel_time_ms.fetch_add(static_cast<int64_t>(voxel_ms));
                 processed_count.fetch_add(1);
 
+                if (timed_out) {
+                    ALOG_ERROR("FrameProcessor", "[COMPUTE_TIMEOUT] voxelDownsampleWithTimeout timed out seq=%d pts=%zu limit_ms=%d (建图时请重点关注)",
+                               frame_seq, f.cloud->size(), voxel_timeout_ms);
+                }
                 if (frame_seq <= 5 || frame_seq % 100 == 0 || voxel_ms > 100.0 || timed_out) {
                     const int64_t avg_voxel = processed_count.load() > 0 ? total_voxel_time_ms.load() / processed_count.load() : 0;
                     ALOG_INFO("FrameProcessor", "[%d] voxel: pts=%zu->%zu ms=%.1f avg=%ldms timeout=%d queue_i=%zu q=%zu",
