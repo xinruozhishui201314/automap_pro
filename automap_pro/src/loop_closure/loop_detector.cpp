@@ -28,6 +28,7 @@ LoopDetector::LoopDetector() {
     min_submap_gap_    = cfg.loopMinSubmapGap();
     gps_search_radius_ = cfg.gpsSearchRadius();
     geo_prefilter_max_distance_m_ = cfg.loopGeoPrefilterMaxDistanceM();
+    geo_prefilter_skip_above_score_ = cfg.loopGeoPrefilterSkipAboveScore();
     min_inlier_ratio_  = cfg.teaserMinInlierRatio();
     max_rmse_          = cfg.teaserMaxRMSE();
     use_icp_refine_    = cfg.teaserICPRefine();
@@ -67,6 +68,7 @@ void LoopDetector::init(rclcpp::Node::SharedPtr node) {
     min_submap_gap_    = cfg.loopMinSubmapGap();
     gps_search_radius_ = cfg.gpsSearchRadius();
     geo_prefilter_max_distance_m_ = cfg.loopGeoPrefilterMaxDistanceM();
+    geo_prefilter_skip_above_score_ = cfg.loopGeoPrefilterSkipAboveScore();
     min_inlier_ratio_  = cfg.teaserMinInlierRatio();
     max_rmse_          = cfg.teaserMaxRMSE();
     use_icp_refine_    = cfg.teaserICPRefine();
@@ -95,16 +97,27 @@ void LoopDetector::init(rclcpp::Node::SharedPtr node) {
         "[LoopDetector][CONFIG] retrieve params from YAML: overlap_threshold=%.2f top_k=%d sc_dist_threshold=%.3f min_temporal_gap_s=%.1f (grep CONFIG 验证)",
         overlap_threshold_, top_k_, sc_dist_threshold_, min_temporal_gap_);
     RCLCPP_INFO(node_->get_logger(),
-        "[LoopDetector][CONFIG] 运行验证: grep CONFIG 查 TEASER/retrieve 参数; grep INTRA_LOOP 查子图内 SUMMARY/DETECTED; grep LOOP_ACCEPTED 或 addLoopFactor 或 loop_intra 查回环入图");
+        "[LoopDetector][CONFIG] 运行验证: grep CONFIG 查 TEASER/retrieve/geo_prefilter 参数; grep INTRA_LOOP 查子图内 SUMMARY/DETECTED; grep LOOP_ACCEPTED 或 addLoopFactor 或 loop_intra 查回环入图");
 
     RCLCPP_INFO(node_->get_logger(),
         "[LoopDetector][CONFIG] min_submap_gap=%d (0=allow adjacent submaps; intra-submap candidates not filtered by gap)",
         min_submap_gap_);
+    RCLCPP_INFO(node_->get_logger(),
+        "[LoopDetector][CONFIG] geo_prefilter: max_distance_m=%.1f skip_above_score=%.2f (0=off; grep CONFIG 验证)",
+        geo_prefilter_max_distance_m_, geo_prefilter_skip_above_score_);
 
     // 加载 OverlapTransformer 模型（LibTorch Level 1）
     std::string model_path = cfg.overlapModelPath();
+    RCLCPP_INFO(node_->get_logger(),
+        "[OT] overlap_transformer.model_path (resolved)=%s (empty=use ScanContext only; grep [OT] for load/inference state)",
+        model_path.empty() ? "(empty)" : model_path.c_str());
     if (!model_path.empty()) {
-        overlap_infer_.loadModel(model_path, true);
+        bool loaded = overlap_infer_.loadModel(model_path, true);
+        RCLCPP_INFO(node_->get_logger(),
+            "[OT] load result: %s (from %s); loop closure descriptor=%s",
+            loaded ? "OK" : "FAIL_or_SKIP",
+            model_path.c_str(),
+            loaded ? "LibTorch (overlapTransformer.pt)" : (use_scancontext_ ? "ScanContext" : "fallback"));
     }
 
     // 可选：外部 Python Service（Level 2，仅在 LibTorch 不可用时）
@@ -130,6 +143,9 @@ void LoopDetector::init(rclcpp::Node::SharedPtr node) {
         "/automap/loop_constraint", 100);
     RCLCPP_INFO(node->get_logger(), "[LoopDetector][TOPIC] publish: /automap/loop_constraint");
 
+    RCLCPP_INFO(node->get_logger(),
+        "[LoopDetector][LibTorch] compile-time USE_TORCH=%d (1=can load .pt, 0=fallback only; see build.log for CMake status)",
+        OverlapTransformerInfer::builtWithTorch() ? 1 : 0);
     RCLCPP_INFO(node->get_logger(),
         "[LoopDetector] Initialized (workers=%d, OT=%s, TEASER=%s)",
         worker_thread_num_,
@@ -243,10 +259,15 @@ void LoopDetector::descWorkerLoop() {
         submap->has_descriptor = true;
         onDescriptorReady(submap);
     } else {
+        size_t pts = submap->downsampled_cloud ? submap->downsampled_cloud->size() : 0u;
+        ALOG_INFO(MOD, "[LOOP_DESC][SUBMAP] phase=compute_enter submap_id={} pts={} (开始计算子图 OT 描述子)",
+                  submap->id, pts);
         submap->overlap_descriptor = overlap_infer_.computeDescriptor(
             submap->downsampled_cloud);
         submap->overlap_descriptor_norm = submap->overlap_descriptor.norm();
         submap->has_descriptor = true;
+        ALOG_INFO(MOD, "[LOOP_DESC][SUBMAP] phase=compute_done submap_id={} desc_norm={:.4f} (子图描述子就绪)",
+                  submap->id, submap->overlap_descriptor_norm);
         onDescriptorReady(submap);
     }
     }
@@ -264,9 +285,15 @@ void LoopDetector::computeDescriptorAsync(const SubMap::Ptr& submap) {
 
     // Level 1: LibTorch 进程内推理
     if (overlap_infer_.isModelLoaded()) {
+        size_t pts = submap->downsampled_cloud ? submap->downsampled_cloud->size() : 0u;
+        ALOG_INFO(MOD, "[LOOP_DESC][SUBMAP] phase=compute_enter submap_id={} pts={} (异步计算子图 OT 描述子)",
+                  submap->id, pts);
         submap->overlap_descriptor = overlap_infer_.computeDescriptor(
             submap->downsampled_cloud);
+        submap->overlap_descriptor_norm = submap->overlap_descriptor.norm();
         submap->has_descriptor = true;
+        ALOG_INFO(MOD, "[LOOP_DESC][SUBMAP] phase=compute_done submap_id={} desc_norm={:.4f}",
+                  submap->id, submap->overlap_descriptor_norm);
         onDescriptorReady(submap);
         return;
     }
@@ -308,9 +335,15 @@ void LoopDetector::computeDescriptorAsync(const SubMap::Ptr& submap) {
 #endif
 
     // Level 3: fallback（直方图）
+    size_t pts = submap->downsampled_cloud ? submap->downsampled_cloud->size() : 0u;
+    ALOG_INFO(MOD, "[LOOP_DESC][SUBMAP] phase=compute_enter submap_id={} pts={} (fallback 描述子)",
+              submap->id, pts);
     submap->overlap_descriptor = overlap_infer_.computeDescriptor(
         submap->downsampled_cloud);
+    submap->overlap_descriptor_norm = submap->overlap_descriptor.norm();
     submap->has_descriptor = true;
+    ALOG_INFO(MOD, "[LOOP_DESC][SUBMAP] phase=compute_done submap_id={} desc_norm={:.4f}",
+              submap->id, submap->overlap_descriptor_norm);
     onDescriptorReady(submap);
 }
 
@@ -342,6 +375,15 @@ void LoopDetector::onDescriptorReady(const SubMap::Ptr& submap) {
         std::shared_lock<std::shared_mutex> lk(db_mutex_);
         db_copy = db_submaps_;
     }
+    // 诊断：db_size<=1 时不可能有子图间候选
+    if (db_copy.size() <= 1u) {
+        ALOG_INFO(MOD, "[LOOP_PHASE] stage=inter_submap_opportunity query_id={} db_size={} → 无子图间机会(db_size<=1)，仅子图内/自匹配",
+                  submap->id, db_copy.size());
+        if (node_) {
+            RCLCPP_INFO(node_->get_logger(), "[LOOP_PHASE] stage=inter_submap_opportunity query_id=%d db_size=%zu (no inter-submap: db_size<=1)",
+                        submap->id, db_copy.size());
+        }
+    }
 
     ALOG_INFO(MOD, "[LOOP_STEP] stage=retrieve_enter submap_id={} db_size={} overlap_threshold={:.3f} top_k={} min_submap_gap={} min_temporal_gap_s={:.1f}",
               submap->id, db_copy.size(), overlap_threshold_, top_k_, min_submap_gap_, min_temporal_gap_);
@@ -353,13 +395,20 @@ void LoopDetector::onDescriptorReady(const SubMap::Ptr& submap) {
     auto t_retrieve_start = std::chrono::steady_clock::now();
     std::vector<OverlapTransformerInfer::Candidate> candidates;
 
-    // 根据配置选择候选检索方法
+    // 根据配置选择候选检索方法（日志便于确认当前使用的描述子与推理状态）
     if (use_scancontext_) {
-        // 使用 ScanContext 检索候选（需要加锁保护）
+        if (node_) {
+            RCLCPP_INFO(node_->get_logger(), "[OT] retrieve: method=ScanContext submap_id=%d db_size=%zu top_k=%d",
+                        submap->id, db_copy.size(), top_k_);
+        }
         std::lock_guard<std::mutex> lk(sc_mutex_);
         candidates = retrieveUsingScanContext(submap, db_copy);
     } else {
-        // 使用 OverlapTransformer 检索候选
+        if (node_) {
+            RCLCPP_INFO(node_->get_logger(), "[OT] retrieve: method=%s submap_id=%d db_size=%zu top_k=%d",
+                        overlap_infer_.isModelLoaded() ? "LibTorch(overlapTransformer.pt)" : "fallback_descriptor",
+                        submap->id, db_copy.size(), top_k_);
+        }
         candidates = overlap_infer_.retrieve(
             submap->overlap_descriptor,
             db_copy,
@@ -378,9 +427,13 @@ void LoopDetector::onDescriptorReady(const SubMap::Ptr& submap) {
     if (candidates.empty()) {
         ALOG_INFO(MOD, "[LOOP_STEP] stage=retrieve_result NO_CAND query_id={} db_size={} overlap_threshold={:.3f} top_k={} retrieve_ms={:.1f} (若轨迹有闭环可尝试降低 loop_closure.overlap_threshold 或检查 ScanContext dist_threshold)",
                   submap->id, db_copy.size(), overlap_threshold_, top_k_, retrieve_ms);
+        ALOG_INFO(MOD, "[LOOP_PHASE] stage=inter_submap_opportunity query_id={} db_size={} → 检索无过阈值候选，子图间=0 (grep LOOP_PHASE 统计)",
+                  submap->id, db_copy.size());
         if (node_) {
             RCLCPP_INFO(node_->get_logger(), "[LOOP_STEP] stage=retrieve_result NO_CAND query_id=%d db_size=%zu overlap_threshold=%.3f top_k=%d",
                         submap->id, db_copy.size(), overlap_threshold_, top_k_);
+            RCLCPP_INFO(node_->get_logger(), "[LOOP_PHASE] stage=inter_submap_opportunity query_id=%d NO_CAND (inter_submap=0)",
+                        submap->id);
         }
         return;
     }
@@ -472,6 +525,13 @@ void LoopDetector::onDescriptorReady(const SubMap::Ptr& submap) {
             ALOG_INFO(MOD, "[LOOP_CAND] query_id={} target_id={} score={:.3f} geo_dist=N/A (target not in db_copy)",
                       submap->id, cand.submap_id, cand.score);
         }
+        // 高置信度绕过：描述子 score≥阈值时跳过几何预筛（参考 OverlapTransformer/SeqOT：高 overlap 即可靠，闭环时锚点距离可能很大）
+        if (geo_prefilter_skip_above_score_ > 0.0 && cand.score >= geo_prefilter_skip_above_score_) {
+            geo_filtered_candidates.push_back(cand);
+            ALOG_INFO(MOD, "[LOOP_CAND] query_id={} target_id={} score={:.3f} geo_dist={:.1f}m BYPASS (score>={:.2f})",
+                      submap->id, cand.submap_id, cand.score, geo_dist_m, geo_prefilter_skip_above_score_);
+            continue;
+        }
         if (geo_prefilter_max_distance_m_ > 0.0 && geo_dist_m >= 0.0 && geo_dist_m > geo_prefilter_max_distance_m_) {
             filtered_by_geo++;
             ALOG_DEBUG(MOD, "[LoopDetector][GEO_PREFILTER] query_id={} target_id={} geo_dist={:.1f}m > max={:.1f}m → 过滤",
@@ -504,13 +564,17 @@ void LoopDetector::onDescriptorReady(const SubMap::Ptr& submap) {
     auto t_end = std::chrono::steady_clock::now();
     double total_stage1_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
     
+    // 子图间候选数（用于诊断“为何子图间回环少”：是没候选还是被过滤）
+    int inter_submap_in_geo = 0;
+    for (const auto& c : geo_filtered_candidates)
+        if (c.submap_id != submap->id) inter_submap_in_geo++;
     ALOG_INFO(MOD, "[LoopDetector][CAND] query_id={} db={} candidates={} scores=[{}] retrieve_ms={:.1f} → TEASER++",
               submap->id, db_copy.size(), geo_filtered_candidates.size(), score_str, retrieve_ms);
-    ALOG_INFO(MOD, "[LOOP_PHASE] stage=candidates_retrieved query_id={} candidate_count={} retrieve_ms={:.1f} (精准优化: 若无候选可调 overlap_threshold/min_submap_gap/geo_prefilter)",
-              submap->id, geo_filtered_candidates.size(), retrieve_ms);
+    ALOG_INFO(MOD, "[LOOP_PHASE] stage=candidates_retrieved query_id={} candidate_count={} inter_submap_candidates={} retrieve_ms={:.1f} (inter_submap=0 表示无子图间候选；grep LOOP_PHASE 统计)",
+              submap->id, geo_filtered_candidates.size(), inter_submap_in_geo, retrieve_ms);
     if (node_) {
-        RCLCPP_INFO(node_->get_logger(), "[LOOP_PHASE] stage=candidates_retrieved query_id=%d candidate_count=%zu retrieve_ms=%.1f",
-                    submap->id, geo_filtered_candidates.size(), retrieve_ms);
+        RCLCPP_INFO(node_->get_logger(), "[LOOP_PHASE] stage=candidates_retrieved query_id=%d candidate_count=%zu inter_submap_candidates=%d retrieve_ms=%.1f",
+                    submap->id, geo_filtered_candidates.size(), inter_submap_in_geo, retrieve_ms);
     }
     // ── 子图间关键帧级：为每个采样关键帧检索跨子图关键帧候选并入队 ──
     if (inter_keyframe_level_enabled_ && use_scancontext_ && !geo_filtered_candidates.empty() &&
@@ -571,6 +635,85 @@ void LoopDetector::onDescriptorReady(const SubMap::Ptr& submap) {
                         submap->id, tasks_enqueued);
         }
         return;
+    }
+
+    // ── 子图间关键帧级（OverlapTransformer）：query 关键帧描述子 vs 候选子图内关键帧描述子（参考 SeqOT/EINet 关键帧级匹配）
+    if (inter_keyframe_level_enabled_ && !use_scancontext_ && overlap_infer_.isModelLoaded() &&
+        !geo_filtered_candidates.empty() && submap->keyframes.size() > 0) {
+        prepareIntraSubmapDescriptors(submap);
+        if (submap->keyframe_descriptors.size() != submap->keyframes.size() ||
+            submap->keyframe_clouds_ds.size() != submap->keyframes.size()) {
+            ALOG_WARN(MOD, "[LOOP_PHASE] INTER_KEYFRAME_OT query_id={} keyframe_descriptors size mismatch, fallback to submap-level",
+                      submap->id);
+        } else {
+            for (const auto& gc : geo_filtered_candidates) {
+                if (gc.submap_id == submap->id) continue;
+                SubMap::Ptr tsm;
+                for (const auto& sm : db_copy) {
+                    if (sm && sm->id == gc.submap_id) { tsm = sm; break; }
+                }
+                if (tsm) prepareIntraSubmapDescriptors(tsm);
+            }
+            const int step = inter_keyframe_sample_step_;
+            const int top_k_per_sm = inter_keyframe_top_k_per_submap_;
+            const float threshold = static_cast<float>(overlap_threshold_);
+            int tasks_enqueued = 0;
+            int total_candidates_kf = 0;
+            std::lock_guard<std::mutex> lk(match_mutex_);
+            const size_t max_match = ConfigManager::instance().loopMaxMatchQueueSize();
+            for (size_t qkf = 0; qkf < submap->keyframes.size(); qkf += step) {
+                if (qkf >= submap->keyframe_descriptors.size() || qkf >= submap->keyframe_clouds_ds.size()) break;
+                const auto& query_desc = submap->keyframe_descriptors[qkf];
+                CloudXYZIPtr query_kf_cloud = submap->keyframe_clouds_ds[qkf];
+                if (!query_kf_cloud || query_kf_cloud->empty()) continue;
+                float query_norm = query_desc.norm();
+                if (query_norm < 1e-6f) continue;
+
+                std::vector<InterKfCandidate> kf_cands;
+                for (const auto& gc : geo_filtered_candidates) {
+                    if (gc.submap_id == submap->id) continue;
+                    SubMap::Ptr tsm;
+                    for (const auto& sm : db_copy) {
+                        if (sm && sm->id == gc.submap_id) { tsm = sm; break; }
+                    }
+                    if (!tsm || tsm->keyframe_descriptors.size() != tsm->keyframes.size()) continue;
+                    std::vector<std::pair<int, float>> scored;
+                    for (size_t tkf = 0; tkf < tsm->keyframe_descriptors.size(); ++tkf) {
+                        float sim = query_desc.dot(tsm->keyframe_descriptors[tkf]) /
+                            (query_norm * (tsm->keyframe_descriptors[tkf].norm() + 1e-8f));
+                        if (sim >= threshold) scored.push_back({static_cast<int>(tkf), sim});
+                    }
+                    std::partial_sort(scored.begin(),
+                        scored.begin() + std::min(top_k_per_sm, static_cast<int>(scored.size())),
+                        scored.end(),
+                        [](const auto& a, const auto& b) { return a.second > b.second; });
+                    for (int i = 0; i < top_k_per_sm && i < static_cast<int>(scored.size()); ++i)
+                        kf_cands.push_back({tsm->id, scored[i].first, scored[i].second});
+                }
+                if (kf_cands.empty()) continue;
+                total_candidates_kf += static_cast<int>(kf_cands.size());
+                while (match_queue_.size() >= max_match) match_queue_.pop();
+                CloudXYZIPtr kf_cloud_copy = std::make_shared<CloudXYZI>();
+                *kf_cloud_copy = *query_kf_cloud;
+                MatchTask kf_task;
+                kf_task.query = submap;
+                kf_task.query_cloud = kf_cloud_copy;
+                kf_task.query_kf_idx = static_cast<int>(qkf);
+                kf_task.candidates_kf = std::move(kf_cands);
+                match_queue_.push(std::move(kf_task));
+                tasks_enqueued++;
+            }
+            match_cv_.notify_one();
+            if (tasks_enqueued > 0) {
+                ALOG_INFO(MOD, "[LOOP_PHASE] stage=match_enqueue INTER_KEYFRAME_OT query_id={} tasks={} total_candidates_kf={} (共 {} 次子图间关键帧对待 TEASER；grep LOOP_PHASE 统计)",
+                          submap->id, tasks_enqueued, total_candidates_kf, total_candidates_kf);
+                if (node_) {
+                    RCLCPP_INFO(node_->get_logger(), "[LOOP_PHASE] stage=match_enqueue INTER_KEYFRAME_OT query_id=%d tasks=%d total_candidates_kf=%d",
+                                submap->id, tasks_enqueued, total_candidates_kf);
+                }
+                return;
+            }
+        }
     }
 
     // 子图级入队（当未启用关键帧级或无候选时）
@@ -652,6 +795,11 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
             ALOG_DEBUG(MOD, "[tid=%u] INTER_KF task query_cloud empty query_id=%d kf_idx=%d", tid, task.query->id, task.query_kf_idx);
             return;
         }
+        int inter_kf_tried = 0;
+        int inter_kf_teaser_fail = 0;
+        int inter_kf_reject_inconsistent = 0;
+        int inter_kf_reject_pose_anomaly = 0;
+        int inter_kf_published = 0;
         IcpRefiner icp;
         // 几何诊断：query 关键帧位姿（世界系）
         const KeyFrame::Ptr query_kf = (task.query_kf_idx >= 0 && task.query_kf_idx < static_cast<int>(task.query->keyframes.size()))
@@ -675,6 +823,7 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
             }
             if (!target_cloud || target_cloud->empty()) continue;
 
+            inter_kf_tried++;
             // ── 子图间几何诊断：两关键帧在世界系下的距离与相对位姿（精准定位几何一致性差）──
             const KeyFrame::Ptr target_kf = (target && kfc.keyframe_idx >= 0 && kfc.keyframe_idx < static_cast<int>(target->keyframes.size()))
                 ? target->keyframes[kfc.keyframe_idx] : nullptr;
@@ -700,7 +849,7 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
             TeaserMatcher::Result res;
             try {
                 res = teaser_matcher_.match(query_cloud, tgt_copy, Pose3d::Identity());
-            } catch (...) { continue; }
+            } catch (...) { inter_kf_teaser_fail++; continue; }
 
             // 几何诊断：TEASER 估计的相对位姿 vs 里程计相对位姿（若差异大则 FPFH/对应点或误匹配）
             const double teaser_trans_m = res.T_tgt_src.translation().norm();
@@ -716,7 +865,77 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
                     "[INTER_KF][GEOM_DIAG] after TEASER sm_j=%d kf_j=%d sm_i=%d kf_i=%d odom_rel_trans=%.3f teaser_trans=%.3f trans_diff_m=%.3f inlier_ratio=%.4f",
                     task.query->id, task.query_kf_idx, kfc.submap_id, kfc.keyframe_idx, rel_trans_m, teaser_trans_m, trans_diff_m, res.inlier_ratio);
             }
-            if (!res.success || res.inlier_ratio < min_inlier_ratio_ || res.rmse > max_rmse_) continue;
+            if (!res.success || res.inlier_ratio < min_inlier_ratio_ || res.rmse > max_rmse_) {
+                inter_kf_teaser_fail++;
+                continue;
+            }
+
+            // 子图间几何一致性：odom 相距很远但 TEASER 平移接近 0 → 假阳性，不发布（避免后端 trivial 过滤前先污染日志）
+            constexpr double kInterOdomFarThresh = 5.0;   // odom 距离 > 5m 视为“非同一位置”
+            constexpr double kInterTeaserNearThresh = 1.0; // TEASER 平移 < 1m 视为“接近单位阵”
+            if (dist_world_m > kInterOdomFarThresh && teaser_trans_m < kInterTeaserNearThresh) {
+                inter_kf_reject_inconsistent++;
+                ALOG_WARN(MOD, "[INTER_KF][REJECT] odom_teaser_inconsistent sm_i=%d kf_i=%d sm_j=%d kf_j=%d dist_world=%.1fm teaser_trans=%.3fm (false positive, skip publish)",
+                          kfc.submap_id, kfc.keyframe_idx, task.query->id, task.query_kf_idx, dist_world_m, teaser_trans_m);
+                if (node_) {
+                    RCLCPP_WARN(node_->get_logger(),
+                        "[INTER_KF][REJECT] odom_teaser_inconsistent sm_i=%d sm_j=%d dist_world=%.1fm teaser_trans=%.3fm (skip)",
+                        kfc.submap_id, task.query->id, dist_world_m, teaser_trans_m);
+                }
+                continue;
+            }
+
+            // 回环位姿一致性：TEASER 与 odom 相对位姿差异超过阈值视为异常（回环应是微调）。trans_diff/rot_diff 已涵盖反向运动（约180°方向差+平移偏移）：平移用向量差模、旋转用相对旋转角 [0,180]°。
+            const double max_trans_diff = ConfigManager::instance().loopPoseConsistencyMaxTransDiffM();
+            const double max_rot_diff_deg_cfg = ConfigManager::instance().loopPoseConsistencyMaxRotDiffDeg();
+            if (max_trans_diff > 0.0 || max_rot_diff_deg_cfg > 0.0) {
+                const Eigen::Matrix3d R_teaser = res.T_tgt_src.linear();
+                const Eigen::Matrix3d R_odom = T_tgt_src_odom.linear();
+                const Eigen::Matrix3d R_diff = R_teaser * R_odom.transpose();
+                const double trace_r = R_diff.trace();
+                const double angle_rad = std::acos(std::max(-1.0, std::min(1.0, (trace_r - 1.0) * 0.5)));
+                const double rot_diff_deg = angle_rad * 180.0 / M_PI;
+                const bool trans_anomaly = (max_trans_diff > 0.0 && trans_diff_m > max_trans_diff);
+                const bool rot_anomaly = (max_rot_diff_deg_cfg > 0.0 && rot_diff_deg > max_rot_diff_deg_cfg);
+                if (trans_anomaly || rot_anomaly) {
+                    inter_kf_reject_pose_anomaly++;
+                    const Eigen::Vector3d t_odom = T_tgt_src_odom.translation();
+                    const Eigen::Vector3d t_teaser = res.T_tgt_src.translation();
+                    const Eigen::Vector3d t_diff = t_teaser - t_odom;
+                    const double odom_rot_deg = Eigen::AngleAxisd(T_tgt_src_odom.linear()).angle() * 180.0 / M_PI;
+                    const double teaser_rot_deg = Eigen::AngleAxisd(res.T_tgt_src.linear()).angle() * 180.0 / M_PI;
+                    const KeyFrame::Ptr target_kf_log = (target && kfc.keyframe_idx >= 0 && kfc.keyframe_idx < static_cast<int>(target->keyframes.size()))
+                        ? target->keyframes[kfc.keyframe_idx] : nullptr;
+                    const int kf_id_target = target_kf_log ? target_kf_log->id : -1;
+                    const int kf_id_query = query_kf ? query_kf->id : -1;
+                    const double ts_target = target_kf_log ? target_kf_log->timestamp : 0.0;
+                    const double ts_query = query_kf ? query_kf->timestamp : 0.0;
+                    ALOG_WARN(MOD,
+                        "[INTER_KF][REJECT] pose_anomaly: sm_i=%d kf_i=%d sm_j=%d kf_j=%d kf_id_tgt=%d kf_id_query=%d ts_tgt=%.3f ts_query=%.3f",
+                        kfc.submap_id, kfc.keyframe_idx, task.query->id, task.query_kf_idx, kf_id_target, kf_id_query, ts_target, ts_query);
+                    ALOG_WARN(MOD,
+                        "[INTER_KF][REJECT] pose_anomaly ODOM_rel:  trans_xyz=[%.4f,%.4f,%.4f] trans_norm=%.4fm rot_deg=%.2f",
+                        t_odom.x(), t_odom.y(), t_odom.z(), t_odom.norm(), odom_rot_deg);
+                    ALOG_WARN(MOD,
+                        "[INTER_KF][REJECT] pose_anomaly TEASER_rel: trans_xyz=[%.4f,%.4f,%.4f] trans_norm=%.4fm rot_deg=%.2f inlier=%.4f rmse=%.4f",
+                        t_teaser.x(), t_teaser.y(), t_teaser.z(), t_teaser.norm(), teaser_rot_deg, res.inlier_ratio, res.rmse);
+                    ALOG_WARN(MOD,
+                        "[INTER_KF][REJECT] pose_anomaly DIFF: trans_diff_xyz=[%.4f,%.4f,%.4f] trans_diff_norm=%.4fm rot_diff_deg=%.2f | thresholds trans=%.1fm rot=%.1fdeg (高精建图不应出现大变化，可能为计算/逻辑错误)",
+                        t_diff.x(), t_diff.y(), t_diff.z(), trans_diff_m, rot_diff_deg, max_trans_diff, max_rot_diff_deg_cfg);
+                    ALOG_WARN(MOD,
+                        "[INTER_KF][REJECT] pose_anomaly WORLD: dist_world=%.3fm pos_tgt=[%.3f,%.3f,%.3f] pos_query=[%.3f,%.3f,%.3f]",
+                        dist_world_m,
+                        pos_w_target.x(), pos_w_target.y(), pos_w_target.z(),
+                        pos_w_query.x(), pos_w_query.y(), pos_w_query.z());
+                    if (node_) {
+                        RCLCPP_WARN(node_->get_logger(),
+                            "[INTER_KF][REJECT] pose_anomaly sm_i=%d kf_i=%d sm_j=%d kf_j=%d kf_id_tgt=%d kf_id_query=%d trans_diff=%.3fm rot_diff=%.2fdeg (详见 ODOM_rel/TEASER_rel/DIFF/WORLD；grep INTER_KF REJECT)",
+                            kfc.submap_id, kfc.keyframe_idx, task.query->id, task.query_kf_idx, kf_id_target, kf_id_query, trans_diff_m, rot_diff_deg);
+                    }
+                    continue;
+                }
+            }
+
             auto lc = std::make_shared<LoopConstraint>();
             lc->submap_i = kfc.submap_id;
             lc->submap_j = task.query->id;
@@ -737,7 +956,16 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
                       lc->submap_i, lc->keyframe_i, lc->submap_j, lc->keyframe_j, lc->overlap_score, lc->inlier_ratio, lc->rmse);
             publishLoopConstraint(lc);
             loop_detected_count_++;
+            inter_kf_published++;
             for (auto& cb : loop_cbs_) { try { cb(lc); } catch (...) {} }
+        }
+        ALOG_INFO(MOD, "[INTER_KF][SUMMARY] query_id={} kf_j={} candidates_kf={} tried={} teaser_fail={} reject_inconsistent={} reject_pose_anomaly={} published={} (grep INTER_KF SUMMARY 统计子图间过滤)",
+                  task.query->id, task.query_kf_idx, static_cast<int>(task.candidates_kf.size()),
+                  inter_kf_tried, inter_kf_teaser_fail, inter_kf_reject_inconsistent, inter_kf_reject_pose_anomaly, inter_kf_published);
+        if (node_) {
+            RCLCPP_INFO(node_->get_logger(), "[INTER_KF][SUMMARY] query_id=%d kf_j=%d candidates_kf=%zu tried=%d teaser_fail=%d reject_inconsistent=%d reject_pose_anomaly=%d published=%d",
+                        task.query->id, task.query_kf_idx, task.candidates_kf.size(),
+                        inter_kf_tried, inter_kf_teaser_fail, inter_kf_reject_inconsistent, inter_kf_reject_pose_anomaly, inter_kf_published);
         }
         return;
     }
@@ -1354,10 +1582,16 @@ void LoopDetector::ensureIntraSubmapDescriptorsUpTo(const SubMap::Ptr& submap, i
             submap->keyframe_scancontexts_.push_back(sc_manager_.makeScancontext(*cloud_ds));
             submap->keyframe_descriptors.push_back(Eigen::VectorXf::Zero(256));
         } else {
+            ALOG_INFO(MOD, "[OT_CRASH_LOC] step=intra_about_to_compute submap_id={} kf_idx={} pts={} tid={} lwp={} (崩溃时本条为当前关键帧)",
+                     submap->id, static_cast<int>(i), cloud_ds ? cloud_ds->size() : 0u,
+                     automap_pro::logThreadId(), automap_pro::logLwp());
             submap->keyframe_descriptors.push_back(overlap_infer_.computeDescriptor(cloud_ds));
         }
         submap->keyframe_clouds_ds.push_back(cloud_ds);
     }
+    ALOG_INFO(MOD, "[LOOP_DESC][INTRA] ensureIntraSubmapDescriptorsUpTo done submap_id={} from_idx={} to_idx={} desc_count={} (子图内关键帧描述子补齐)",
+              submap->id, static_cast<int>(start), up_to_index_inclusive,
+              use_sc ? static_cast<int>(submap->keyframe_scancontexts_.size()) : static_cast<int>(submap->keyframe_descriptors.size()));
 }
 
 std::vector<LoopConstraint::Ptr> LoopDetector::detectIntraSubmapLoop(
@@ -1376,11 +1610,11 @@ std::vector<LoopConstraint::Ptr> LoopDetector::detectIntraSubmapLoop(
     // ═══════════════════════════════════════════════════════════════════════════
     ALOG_INFO(MOD,
         "[INTRA_LOOP][DEBUG] ====== detectIntraSubmapLoop START ====== "
-        "submap_id=%d query_idx=%d kf_count=%zu "
-        "min_temporal_gap=%.1fs min_keyframe_gap=%d min_dist_gap=%.1fm overlap_thresh=%.3f "
-        "min_inlier_ratio=%.3f max_rmse=%.3f",
+        "submap_id={} query_idx={} kf_count={} "
+        "min_temporal_gap={:.1f}s min_keyframe_gap={} min_dist_gap={:.1f}m overlap_thresh={:.3f} "
+        "min_inlier_ratio={:.3f} max_rmse={:.3f}",
         submap ? submap->id : -1, query_keyframe_idx,
-        submap ? submap->keyframes.size() : 0,
+        submap ? submap->keyframes.size() : 0u,
         intra_submap_min_temporal_gap_, intra_submap_min_keyframe_gap_,
         intra_submap_min_distance_gap_,
         intra_submap_overlap_threshold_,
@@ -1412,9 +1646,9 @@ std::vector<LoopConstraint::Ptr> LoopDetector::detectIntraSubmapLoop(
     }
 
     ALOG_INFO(MOD,
-        "[INTRA_LOOP][DEBUG] descriptor_db_status: stored_size=%zu sc_size=%zu expected_size=%zu use_scancontext=%d",
+        "[INTRA_LOOP][DEBUG] descriptor_db_status: stored_size={} sc_size={} expected_size={} use_scancontext={}",
         submap->keyframe_descriptors.size(), submap->keyframe_scancontexts_.size(),
-        submap->keyframes.size(), use_scancontext_);
+        submap->keyframes.size(), use_scancontext_ ? 1 : 0);
 
     int last_idx = static_cast<int>(submap->keyframes.size()) - 1;
     if (last_idx >= 0) {
@@ -1472,8 +1706,8 @@ std::vector<LoopConstraint::Ptr> LoopDetector::detectIntraSubmapLoop(
     // [INTRA_LOOP][INFO] 开始检索历史关键帧
     // ═══════════════════════════════════════════════════════════════════════════
     ALOG_INFO(MOD,
-        "[INTRA_LOOP][INFO] START_SEARCH: submap_id=%d query_kf_idx=%d query_ts=%.6f "
-        "query_pos=[%.2f,%.2f,%.2f] history_kf_count=%zu",
+        "[INTRA_LOOP][INFO] START_SEARCH: submap_id={} query_kf_idx={} query_ts={:.6f} "
+        "query_pos=[{:.2f},{:.2f},{:.2f}] history_kf_count={}",
         submap->id, query_keyframe_idx, query_kf->timestamp,
         query_kf->T_w_b.translation().x(),
         query_kf->T_w_b.translation().y(),
@@ -1491,6 +1725,7 @@ std::vector<LoopConstraint::Ptr> LoopDetector::detectIntraSubmapLoop(
     int teaser_failed = 0;
     int teaser_rejected_inlier = 0;
     int teaser_rejected_rmse = 0;
+    int teaser_rejected_pose_anomaly = 0;
     int teaser_invoked = 0;  // 本帧已调用 TEASER 次数，超过上限则停止（避免 10s+ 卡住）
 
     for (int i = 0; i < query_keyframe_idx; ++i) {
@@ -1668,6 +1903,61 @@ std::vector<LoopConstraint::Ptr> LoopDetector::detectIntraSubmapLoop(
             continue;
         }
 
+        // ── 回环位姿一致性检查：TEASER 结果应与里程计相对位姿接近（回环应是微调，不应出现巨大变化）──
+        // 平移差 trans_diff_m = ||t_teaser - t_odom||：反向运动时两向量相反，差向量模约 2*|t|，会超阈值；
+        // 旋转差 rot_diff_deg = angle(R_teaser * R_odom^T) ∈ [0,180]°：方向差约 180° 时相对旋转角≈180°，会超阈值。故反向运动（含平移偏移）会被正确拒绝。
+        const double max_trans_diff = ConfigManager::instance().loopPoseConsistencyMaxTransDiffM();
+        const double max_rot_diff_deg = ConfigManager::instance().loopPoseConsistencyMaxRotDiffDeg();
+        if (max_trans_diff > 0.0 || max_rot_diff_deg > 0.0) {
+            const KeyFrame::Ptr& cand_kf = submap->keyframes[i];
+            if (cand_kf) {
+                const Pose3d T_w_cand = cand_kf->T_w_b;
+                const Pose3d T_w_query = query_kf->T_w_b;
+                const Pose3d T_tgt_src_odom = T_w_cand.inverse() * T_w_query;
+                const double trans_diff_m = (teaser_res.T_tgt_src.translation() - T_tgt_src_odom.translation()).norm();
+                const Eigen::Matrix3d R_teaser = teaser_res.T_tgt_src.linear();
+                const Eigen::Matrix3d R_odom = T_tgt_src_odom.linear();
+                const Eigen::Matrix3d R_diff = R_teaser * R_odom.transpose();
+                const double trace_r = R_diff.trace();
+                const double angle_rad = std::acos(std::max(-1.0, std::min(1.0, (trace_r - 1.0) * 0.5)));
+                const double rot_diff_deg = angle_rad * 180.0 / M_PI;
+                const bool trans_anomaly = (max_trans_diff > 0.0 && trans_diff_m > max_trans_diff);
+                const bool rot_anomaly = (max_rot_diff_deg > 0.0 && rot_diff_deg > max_rot_diff_deg);
+                if (trans_anomaly || rot_anomaly) {
+                    teaser_rejected_pose_anomaly++;
+                    const Eigen::Vector3d t_odom = T_tgt_src_odom.translation();
+                    const Eigen::Vector3d t_teaser = teaser_res.T_tgt_src.translation();
+                    const Eigen::Vector3d t_diff = t_teaser - t_odom;
+                    const double odom_rot_deg = Eigen::AngleAxisd(R_odom).angle() * 180.0 / M_PI;
+                    const double teaser_rot_deg = Eigen::AngleAxisd(R_teaser).angle() * 180.0 / M_PI;
+                    ALOG_WARN(MOD,
+                        "[INTRA_LOOP][REJECT] pose_anomaly: submap_id=%d kf_i=%d kf_j=%d kf_id_cand=%d kf_id_query=%d ts_cand=%.3f ts_query=%.3f",
+                        submap->id, i, query_keyframe_idx, cand_kf->id, query_kf->id, cand_kf->timestamp, query_kf->timestamp);
+                    ALOG_WARN(MOD,
+                        "[INTRA_LOOP][REJECT] pose_anomaly ODOM_rel:  trans_xyz=[%.4f,%.4f,%.4f] trans_norm=%.4fm rot_deg=%.2f",
+                        t_odom.x(), t_odom.y(), t_odom.z(), t_odom.norm(), odom_rot_deg);
+                    ALOG_WARN(MOD,
+                        "[INTRA_LOOP][REJECT] pose_anomaly TEASER_rel: trans_xyz=[%.4f,%.4f,%.4f] trans_norm=%.4fm rot_deg=%.2f inlier=%.4f rmse=%.4f",
+                        t_teaser.x(), t_teaser.y(), t_teaser.z(), t_teaser.norm(), teaser_rot_deg,
+                        teaser_res.inlier_ratio, teaser_res.rmse);
+                    ALOG_WARN(MOD,
+                        "[INTRA_LOOP][REJECT] pose_anomaly DIFF: trans_diff_xyz=[%.4f,%.4f,%.4f] trans_diff_norm=%.4fm rot_diff_deg=%.2f | thresholds trans=%.1fm rot=%.1fdeg (高精建图不应出现大变化，可能为计算/逻辑错误)",
+                        t_diff.x(), t_diff.y(), t_diff.z(), trans_diff_m, rot_diff_deg, max_trans_diff, max_rot_diff_deg);
+                    ALOG_WARN(MOD,
+                        "[INTRA_LOOP][REJECT] pose_anomaly WORLD: cand_pos=[%.3f,%.3f,%.3f] query_pos=[%.3f,%.3f,%.3f] dist_world=%.3fm",
+                        T_w_cand.translation().x(), T_w_cand.translation().y(), T_w_cand.translation().z(),
+                        T_w_query.translation().x(), T_w_query.translation().y(), T_w_query.translation().z(),
+                        (T_w_query.translation() - T_w_cand.translation()).norm());
+                    if (node_) {
+                        RCLCPP_WARN(node_->get_logger(),
+                            "[INTRA_LOOP][REJECT] pose_anomaly submap_id=%d kf_i=%d kf_j=%d kf_id_cand=%d kf_id_query=%d trans_diff=%.3fm rot_diff=%.2fdeg (详见上方 ODOM_rel/TEASER_rel/DIFF/WORLD；grep INTRA_LOOP REJECT)",
+                            submap->id, i, query_keyframe_idx, cand_kf->id, query_kf->id, trans_diff_m, rot_diff_deg);
+                    }
+                    continue;
+                }
+            }
+        }
+
         // ═══════════════════════════════════════════════════════════════════════
         // [INTRA_LOOP][INFO] 检测到回环！
         // ═══════════════════════════════════════════════════════════════════════
@@ -1736,23 +2026,23 @@ std::vector<LoopConstraint::Ptr> LoopDetector::detectIntraSubmapLoop(
     // ═══════════════════════════════════════════════════════════════════════════
     ALOG_INFO(MOD,
         "[INTRA_LOOP][SUMMARY] ====== detectIntraSubmapLoop END ====== "
-        "submap_id=%d query_kf_idx=%d total_history_kf=%zu "
-        "candidates_found=%d "
-        "filtered: null=%d temporal=%d index=%d dist=%d desc=%d empty_cloud=%d "
-        "teaser_invoked=%d teaser_failed=%d reject_inlier=%d reject_rmse=%d "
-        "FINAL_detected=%zu",
+        "submap_id={} query_kf_idx={} total_history_kf={} "
+        "candidates_found={} "
+        "filtered: null={} temporal={} index={} dist={} desc={} empty_cloud={} "
+        "teaser_invoked={} teaser_failed={} reject_inlier={} reject_rmse={} reject_pose_anomaly={} "
+        "FINAL_detected={}",
         submap->id, query_keyframe_idx, submap->keyframes.size(),
         candidates_found,
         null_cand_skipped, temporal_filtered, index_filtered, distance_filtered, desc_filtered, empty_cloud_skipped,
-        teaser_invoked, teaser_failed, teaser_rejected_inlier, teaser_rejected_rmse,
+        teaser_invoked, teaser_failed, teaser_rejected_inlier, teaser_rejected_rmse, teaser_rejected_pose_anomaly,
         results.size());
     if (node_) {
         RCLCPP_INFO(node_->get_logger(),
             "[INTRA_LOOP][SUMMARY] submap_id=%d query_kf_idx=%d history_kf=%zu candidates_found=%d "
-            "filtered: temporal=%d index=%d dist=%d desc=%d teaser_invoked=%d failed=%d reject_inlier=%d reject_rmse=%d FINAL_detected=%zu (grep INTRA_LOOP)",
+            "filtered: temporal=%d index=%d dist=%d desc=%d teaser_invoked=%d failed=%d reject_inlier=%d reject_rmse=%d reject_pose_anomaly=%d FINAL_detected=%zu (grep INTRA_LOOP)",
             submap->id, query_keyframe_idx, submap->keyframes.size(), candidates_found,
             temporal_filtered, index_filtered, distance_filtered, desc_filtered,
-            teaser_invoked, teaser_failed, teaser_rejected_inlier, teaser_rejected_rmse,
+            teaser_invoked, teaser_failed, teaser_rejected_inlier, teaser_rejected_rmse, teaser_rejected_pose_anomaly,
             static_cast<size_t>(results.size()));
     }
 

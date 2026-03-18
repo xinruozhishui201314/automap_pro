@@ -1,0 +1,45 @@
+# 回环参数：树木/植被为主、少结构化建筑场景覆盖
+# 用法：
+#   1) 单 config 时：把本文件中的 loop_closure 整段复制到 system_config_*.yaml 中替换原 loop_closure 段；
+#   2) 或合并：python3 -c "
+#        import yaml
+#        a=yaml.safe_load(open('config/system_config_M2DGR.yaml'))
+#        b=yaml.safe_load(open('config/loop_closure_vegetation_override.yaml'))
+#        a.update(b); yaml.dump(a, open('/tmp/system_config_vegetation.yaml','w'), allow_unicode=True, default_flow_style=False)
+#      "
+#   然后 launch 时 config:=/tmp/system_config_vegetation.yaml
+# 详见 docs/LOOP_CLOSURE_WHY_NONE_AND_VEGETATION_OPTIMIZATION.md
+
+loop_closure:
+  overlap_threshold:   0.18      # 略收紧，减少误候选
+  top_k:               10
+  min_temporal_gap_s:  15.0
+  min_submap_gap:      0
+
+  intra_submap_enabled: true
+  intra_submap_overlap_threshold: 0.18
+  inter_keyframe_sample_step: 5
+  inter_keyframe_top_k_per_submap: 5
+
+  # 只对锚点距离 < 此值的候选做 TEASER（米），0=关闭。可减少明显非闭环的 TEASER 调用
+  geo_prefilter_max_distance_m: 50.0
+
+  teaser:
+    noise_bound:      0.15      # 略放宽，适应树木点云噪声
+    voxel_size:       0.5       # 略大，减轻树叶噪声
+    max_points:       8000
+    min_inlier_ratio: 0.04      # 树木场景放宽（配合 fpfh_corr_max_distance_m 收紧）
+    min_safe_inliers: 3
+    max_rmse_m:       0.60
+    min_relative_translation_m: 0.02
+    icp_refine:       true
+    # 关键：只保留距离 < 5m 的 FPFH 对应点送 TEASER，过滤树木场景大量误匹配
+    fpfh_corr_max_distance_m: 5.0
+
+  scancontext:
+    enabled:           true
+    dist_threshold:    0.20     # 略收紧，提高候选质量
+    num_candidates:   10
+    exclude_recent:   3
+    tree_making_period: 30
+    min_history_for_search: 3

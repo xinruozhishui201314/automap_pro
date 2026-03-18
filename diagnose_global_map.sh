@@ -78,11 +78,12 @@ echo -e "\n${MAGENTA}【2】关键帧处理统计${NC}"
 
 KF_SKIPPED_NULL=$(grep -oP 'kf_skipped_null=\K\d+' "$DIAG_LOG" | tail -1)
 KF_SKIPPED_EMPTY=$(grep -oP 'kf_skipped_empty=\K\d+' "$DIAG_LOG" | tail -1)
-KF_FALLBACK_UNOPT=$(grep -oP 'kf_fallback_unopt=\K\d+' "$DIAG_LOG" | tail -1)
+KF_SKIPPED_UNOPT=$(grep -oP 'kf_skipped_unoptimized=\K\d+' "$DIAG_LOG" | tail -1)
+T_W_B_UNOPT_ABORT=$(grep -c "T_w_b_optimized_UNOPT" "$DIAG_LOG" 2>/dev/null || true)
 
 if [ -z "$KF_SKIPPED_NULL" ]; then KF_SKIPPED_NULL="N/A"; fi
 if [ -z "$KF_SKIPPED_EMPTY" ]; then KF_SKIPPED_EMPTY="N/A"; fi
-if [ -z "$KF_FALLBACK_UNOPT" ]; then KF_FALLBACK_UNOPT="N/A"; fi
+if [ -z "$KF_SKIPPED_UNOPT" ]; then KF_SKIPPED_UNOPT="N/A"; fi
 
 echo -e "   关键帧为null的数量: $KF_SKIPPED_NULL"
 if [ "$KF_SKIPPED_NULL" != "N/A" ] && [ "$KF_SKIPPED_NULL" -gt 0 ]; then
@@ -94,9 +95,9 @@ if [ "$KF_SKIPPED_EMPTY" != "N/A" ] && [ "$KF_SKIPPED_EMPTY" -gt 5 ]; then
     echo -e "   ${YELLOW}⚠️  如果 retain_cloud_body=true 但仍有很多点云被清空，说明内存压力严重${NC}"
 fi
 
-echo -e "   未被优化的关键帧数: $KF_FALLBACK_UNOPT"
-if [ "$KF_FALLBACK_UNOPT" != "N/A" ] && [ "$KF_FALLBACK_UNOPT" -gt 5 ]; then
-    echo -e "   ${YELLOW}⚠️  多个关键帧未被优化，可能影响全局图精度${NC}"
+echo -e "   T_w_b_optimized 未优化导致退出: $([ -n "$T_W_B_UNOPT_ABORT" ] && [ "$T_W_B_UNOPT_ABORT" -gt 0 ] && echo "是 (进程已 abort)" || echo "否")"
+if [ -n "$T_W_B_UNOPT_ABORT" ] && [ "$T_W_B_UNOPT_ABORT" -gt 0 ]; then
+    echo -e "   ${RED}❌ 严重错误: 存在关键帧未优化出结果，程序已退出；grep T_w_b_optimized_UNOPT 查看详情${NC}"
 fi
 
 # 3. 点云统计

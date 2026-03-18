@@ -192,6 +192,7 @@ void AutoMapSystem::loadConfigAndInit() {
     declare_parameter("trajectory_log_enable", true);
     declare_parameter("trajectory_log_after_mapping_only", true);
     declare_parameter("trajectory_log_dir", std::string(""));
+    declare_parameter("vtk_viewer_after_hba", true);
     std::string config_path = get_parameter("config_file").as_string();
     output_dir_override_ = get_parameter("output_dir").as_string();
     while (!output_dir_override_.empty() && output_dir_override_.back() == '/') output_dir_override_.pop_back();
@@ -224,12 +225,13 @@ void AutoMapSystem::loadConfigAndInit() {
     trajectory_log_enabled_ = get_parameter("trajectory_log_enable").as_bool();
     trajectory_log_after_mapping_only_ = get_parameter("trajectory_log_after_mapping_only").as_bool();
     trajectory_log_dir_    = get_parameter("trajectory_log_dir").as_string();
+    vtk_viewer_after_hba_ = get_parameter("vtk_viewer_after_hba").as_bool();
     if (trajectory_log_dir_.empty()) {
         const char* env_dir = std::getenv("AUTOMAP_LOG_DIR");
         trajectory_log_dir_ = env_dir ? env_dir : "logs";
     }
-    RCLCPP_INFO(get_logger(), "[AutoMapSystem][CONFIG] trajectory_log_enable=%d trajectory_log_after_mapping_only=%d trajectory_log_dir=%s",
-                trajectory_log_enabled_ ? 1 : 0, trajectory_log_after_mapping_only_ ? 1 : 0, trajectory_log_dir_.c_str());
+    RCLCPP_INFO(get_logger(), "[AutoMapSystem][CONFIG] trajectory_log_enable=%d trajectory_log_after_mapping_only=%d trajectory_log_dir=%s vtk_viewer_after_hba=%d",
+                trajectory_log_enabled_ ? 1 : 0, trajectory_log_after_mapping_only_ ? 1 : 0, trajectory_log_dir_.c_str(), vtk_viewer_after_hba_ ? 1 : 0);
     if (trajectory_log_enabled_ && trajectory_log_after_mapping_only_) {
         RCLCPP_INFO(get_logger(),
             "[AutoMapSystem][CONFIG] trajectory_odom will be written only at save (keyframe+GPS, map frame); use the CSV in save output_dir for trajectory-GPS comparison.");

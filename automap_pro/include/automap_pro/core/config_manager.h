@@ -253,6 +253,11 @@ public:
         double v = get<double>("loop_closure.geo_prefilter_max_distance_m", 0.0);
         return std::max(0.0, v);
     }
+    /** 高置信度绕过几何预筛：描述子相似度≥此值时不做距离过滤，直接进入 TEASER（参考 OverlapTransformer/SeqOT 高 overlap 即可靠）。0=关闭。建议 0.90~0.95 */
+    double loopGeoPrefilterSkipAboveScore() const {
+        double v = get<double>("loop_closure.geo_prefilter_skip_above_score", 0.0);
+        return std::max(0.0, std::min(1.0, v));
+    }
     int    loopWorkerThreads()  const { return get<int>("loop_closure.worker_threads", 2); }
 
     // ── 子图内回环检测配置 ─────────────────────────────────────────────────
@@ -336,10 +341,25 @@ public:
         int v = get<int>("loop_closure.teaser.min_safe_inliers", 10);
         return std::max(1, std::min(50, v));
     }
+    /** FPFH 对应点几何过滤：仅保留距离小于此值(米)的对应点再送 TEASER。树木/植被场景建议 3～5，结构化场景可用 10。0=禁用过滤。 */
+    double teaserFpfhCorrMaxDistanceM() const {
+        double v = get<double>("loop_closure.teaser.fpfh_corr_max_distance_m", 10.0);
+        return std::max(0.0, std::min(100.0, v));
+    }
     /** 回环最小相对平移(米)：低于此值的回环视为 trivial 不加入图，提高回环质量。默认 0.05 */
     double loopMinRelativeTranslationM() const {
         double v = get<double>("loop_closure.teaser.min_relative_translation_m", 0.05);
         return std::max(0.0, std::min(10.0, v));
+    }
+    /** 回环位姿一致性：TEASER 相对位姿与里程计相对位姿的平移差异超过此值(米)视为异常，拒绝该回环（理论上回环应是微调）。默认 2.0，0=关闭检查 */
+    double loopPoseConsistencyMaxTransDiffM() const {
+        double v = get<double>("loop_closure.pose_consistency_max_trans_diff_m", 2.0);
+        return std::max(0.0, std::min(50.0, v));
+    }
+    /** 回环位姿一致性：TEASER 与 odom 相对旋转差异超过此值(度)视为异常，拒绝。默认 25.0，0=关闭检查 */
+    double loopPoseConsistencyMaxRotDiffDeg() const {
+        double v = get<double>("loop_closure.pose_consistency_max_rot_diff_deg", 25.0);
+        return std::max(0.0, std::min(180.0, v));
     }
 
     // ── 后端帧率控制（前端每帧都发，后端可每隔 N 帧处理一帧以减轻负载）────────────────

@@ -8,6 +8,7 @@
 #include <stdexcept>
 #include <algorithm>
 #include <vector>
+#include <filesystem>
 
 namespace automap_pro {
 
@@ -177,7 +178,7 @@ void ConfigManager::load(const std::string& yaml_path) {
                 sensor_imu_topic_value_ = it_im->second;
                 sensor_imu_topic_cached_ = true;
             }
-            // overlap_transformer.model_path：展开 ${CMAKE_CURRENT_SOURCE_DIR} 为配置所在包根目录
+            // overlap_transformer.model_path：展开 ${CMAKE_CURRENT_SOURCE_DIR} 为配置所在包根目录，并规范为绝对路径
             auto it_mp = flat_params_cache_.find("loop_closure.overlap_transformer.model_path");
             if (it_mp != flat_params_cache_.end() && !it_mp->second.empty()) {
                 std::string path = it_mp->second;
@@ -192,6 +193,14 @@ void ConfigManager::load(const std::string& yaml_path) {
                     }
                     path.replace(pos, var.size(), cfg_dir.empty() ? "." : cfg_dir);
                 }
+                // 若为相对路径，转为基于当前工作目录的绝对路径，避免 CWD 变化导致找不到 .pt
+                try {
+                    std::filesystem::path p(path);
+                    if (p.is_relative()) {
+                        p = std::filesystem::absolute(p);
+                        path = p.lexically_normal().string();
+                    }
+                } catch (const std::exception&) { /* 保持原 path */ }
                 overlap_model_path_expanded_ = path;
             }
         } catch (const std::exception& e) {
@@ -427,8 +436,12 @@ void ConfigManager::load(const std::string& yaml_path) {
                 submapMaxKF(), submapMatchRes());
             RCLCPP_INFO(L, "[ConfigManager][CONFIG_READ_BACK] loop_closure.overlap_threshold=%.2f loop_closure.top_k=%d loop_closure.min_submap_gap=%d loop_closure.min_temporal_gap_s=%.1f",
                 overlapThreshold(), loopTopK(), loopMinSubmapGap(), loopMinTemporalGap());
+            RCLCPP_INFO(L, "[ConfigManager][CONFIG_READ_BACK] loop_closure.geo_prefilter_max_distance_m=%.1f loop_closure.geo_prefilter_skip_above_score=%.2f (skip_above: 0=off)",
+                loopGeoPrefilterMaxDistanceM(), loopGeoPrefilterSkipAboveScore());
             RCLCPP_INFO(L, "[ConfigManager][CONFIG_READ_BACK] loop_closure.teaser: noise_bound=%.2f voxel_size=%.2f max_points=%d min_inlier_ratio=%.2f min_safe_inliers=%d max_rmse_m=%.2f icp_refine=%s",
                 teaserNoiseBound(), teaserVoxelSize(), teaserMaxPoints(), teaserMinInlierRatio(), teaserMinSafeInliers(), teaserMaxRMSE(), teaserICPRefine() ? "true" : "false");
+            RCLCPP_INFO(L, "[ConfigManager][CONFIG_READ_BACK] loop_closure.pose_consistency: max_trans_diff_m=%.1f max_rot_diff_deg=%.1f (0=off)",
+                loopPoseConsistencyMaxTransDiffM(), loopPoseConsistencyMaxRotDiffDeg());
             RCLCPP_INFO(L, "[ConfigManager][CONFIG_READ_BACK] backend.process_every_n=%d backend.publish_global_map_every_n=%d backend.hba.enabled=%s backend.hba.on_finish=%s backend.hba.frontend_idle_trigger_sec=%.1f backend.hba.enable_gtsam_fallback=%s",
                 backendProcessEveryNFrames(), backendPublishGlobalMapEveryNProcessed(), hbaEnabled() ? "true" : "false", hbaOnFinish() ? "true" : "false", hbaFrontendIdleTriggerSec(), hbaGtsamFallbackEnabled() ? "true" : "false");
             RCLCPP_INFO(L, "[ConfigManager][CONFIG_READ_BACK] backend.isam2.relin_thresh=%.4f backend.isam2.relinearize_skip=%d backend.isam2.prior_variance=%.0e",

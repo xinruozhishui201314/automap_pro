@@ -550,6 +550,9 @@ OptimizationResult IncrementalOptimizer::addLoopFactor(
         RCLCPP_INFO(rclcpp::get_logger("automap_system"),
             "[LOOP_ACCEPTED] addLoopFactor success from=%d to=%d (点云重影排查：无此条=零回环=结构重影；grep LOOP_ACCEPTED)",
             from, to);
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[POSE_JUMP_CAUSE] 子图间回环约束已入图 from=%d to=%d → 即将 commitAndUpdate，位姿更新后 RViz 会跳变；查跳变: grep POSE_JUMP",
+            from, to);
         // 回环因子立即触发 iSAM2 update
         OptimizationResult res = commitAndUpdate();
         BACKEND_STEP("step=addLoopFactor_done from=%d to=%d commit_success=%d nodes_updated=%d elapsed_ms=%.1f",
@@ -618,6 +621,9 @@ void IncrementalOptimizer::addLoopFactorDeferred(int from, int to,
             from, to);
         RCLCPP_INFO(rclcpp::get_logger("automap_system"),
             "[LOOP_ACCEPTED] addLoopFactorDeferred success from=%d to=%d (点云重影排查：无此条=零子图内回环；grep LOOP_ACCEPTED)",
+            from, to);
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[POSE_JUMP_CAUSE] 回环约束已入图 from=%d to=%d → 后续 iSAM2 优化将更新位姿，RViz 可能出现 [POSE_JUMP][SUBMAP]/[POSE_JUMP][KF]；查跳变: grep POSE_JUMP",
             from, to);
     } catch (const std::exception& e) {
         CONSTRAINT_LOG("step=loop_intra from=%d to=%d result=skip reason=exception %s", from, to, e.what());
@@ -1379,6 +1385,11 @@ OptimizationResult IncrementalOptimizer::forceUpdate() {
         RCLCPP_INFO(rclcpp::get_logger("automap_system"),
             "[ISAM2_DIAG][TRACE] step=forceUpdate_exit success=%d nodes=%d elapsed_ms=%.1f",
             res.success ? 1 : 0, res.nodes_updated, force_elapsed_ms);
+        if (force_elapsed_ms > 2000.0) {
+            RCLCPP_WARN(rclcpp::get_logger("automap_system"),
+                "[AutoMapSystem][STUCK_DIAG] forceUpdate slow: elapsed_ms=%.1f nodes=%d had_pending=%d (grep STUCK_DIAG 精准分析卡住)",
+                force_elapsed_ms, res.nodes_updated, had_pending ? 1 : 0);
+        }
         return res;
     } catch (const std::exception& e) {
         // 🔧 诊断: forceUpdate 异常时记录详细状态
@@ -2109,6 +2120,11 @@ OptimizationResult IncrementalOptimizer::commitAndUpdate() {
         RCLCPP_INFO(rclcpp::get_logger("automap_system"),
             "[PRECISION][OPT] iSAM2_update path=%s nodes_updated=%d elapsed_ms=%.1f factor_count=%d",
             path_str, res.nodes_updated, res.elapsed_ms, factor_count_);
+        if (res.elapsed_ms > 2000.0) {
+            RCLCPP_WARN(rclcpp::get_logger("automap_system"),
+                "[AutoMapSystem][STUCK_DIAG] ISAM2 slow: commitAndUpdate path=%s elapsed_ms=%.1f nodes=%d factor_count=%d (后端阻塞主因；可调 relinearize_skip/threshold 或启用 async_isam2_update)",
+                path_str, res.elapsed_ms, res.nodes_updated, factor_count_);
+        }
         RCLCPP_INFO(rclcpp::get_logger("automap_system"),
             "[ISAM2_GHOSTING_DIAG] notifyPoseUpdate_enter poses=%zu (回调 onPoseUpdated 将写回 SubMap/KF 位姿；与 map_publish/buildGlobalMap 时序对照可排查重影)",
             poses.size());

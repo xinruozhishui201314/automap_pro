@@ -53,11 +53,17 @@ void RvizPublisher::init(rclcpp::Node::SharedPtr node) {
     convergence_pub_      = node->create_publisher<visualization_msgs::msg::MarkerArray>("/automap/convergence", reliable_qos);
     convergence_residual_pub_ = node->create_publisher<std_msgs::msg::Float64MultiArray>("/automap/convergence_residual", reliable_qos);
 
-    // Path
+    // Path（optimized_path / gps_keyframe_path 使用 TransientLocal，供 HBA 后自动启动的 VTK 查看器收最后一次发布）
+    auto path_qos_latched = rclcpp::QoS(rclcpp::KeepLast(100)).reliable()
+        .durability(rclcpp::DurabilityPolicy::TransientLocal);
     odom_path_pub_        = node->create_publisher<nav_msgs::msg::Path>("/automap/odom_path", path_qos);
-    opt_path_pub_         = node->create_publisher<nav_msgs::msg::Path>("/automap/optimized_path", path_qos);
+    opt_path_pub_         = node->create_publisher<nav_msgs::msg::Path>("/automap/optimized_path", path_qos_latched);
     gps_raw_path_pub_     = node->create_publisher<nav_msgs::msg::Path>("/automap/gps_raw_path", path_qos);
     gps_aligned_path_pub_ = node->create_publisher<nav_msgs::msg::Path>("/automap/gps_aligned_path", path_qos);
+    gps_keyframe_path_pub_= node->create_publisher<nav_msgs::msg::Path>("/automap/gps_keyframe_path", path_qos_latched);
+    hba_gps_deviation_pub_= node->create_publisher<visualization_msgs::msg::MarkerArray>("/automap/hba_gps_deviation", reliable_qos);
+    hba_trajectory_cloud_pub_ = node->create_publisher<sensor_msgs::msg::PointCloud2>("/automap/hba_trajectory_points", map_qos);
+    gps_trajectory_cloud_pub_ = node->create_publisher<sensor_msgs::msg::PointCloud2>("/automap/gps_trajectory_points", map_qos);
 
     kf_pose_array_pub_    = node->create_publisher<geometry_msgs::msg::PoseArray>("/automap/keyframe_poses", reliable_qos);
 
@@ -67,7 +73,7 @@ void RvizPublisher::init(rclcpp::Node::SharedPtr node) {
         "/automap/submap_bboxes, /automap/submap_graph, /automap/covariance_ellipses, /automap/factor_graph, /automap/gps_quality, /automap/gps_positions_map, "
         "/automap/module_status, /automap/coordinate_frames, /automap/active_region, /automap/degeneration_regions, /automap/hba_result, "
         "/automap/convergence, /automap/convergence_residual, /automap/odom_path, /automap/optimized_path, /automap/gps_raw_path, "
-        "/automap/gps_aligned_path, /automap/keyframe_poses");
+        "/automap/gps_aligned_path, /automap/gps_keyframe_path, /automap/hba_gps_deviation, /automap/hba_trajectory_points, /automap/gps_trajectory_points, /automap/keyframe_poses");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -325,6 +331,98 @@ void RvizPublisher::publishTrajectoryComparison(
         path.poses.push_back(ps);
     }
     opt_path_pub_->publish(path);
+}
+
+void RvizPublisher::publishGpsKeyframePath(const std::vector<Eigen::Vector3d>& gps_positions_map) {
+    if (!node_ || !gps_keyframe_path_pub_ || gps_positions_map.empty()) return;
+    nav_msgs::msg::Path path;
+    path.header.stamp = node_->now();
+    path.header.frame_id = frame_id_;
+    for (const auto& p : gps_positions_map) {
+        geometry_msgs::msg::PoseStamped ps;
+        ps.header = path.header;
+        ps.pose.position.x = p.x(); ps.pose.position.y = p.y(); ps.pose.position.z = p.z();
+        ps.pose.orientation.w = 1.0;
+        path.poses.push_back(ps);
+    }
+    gps_keyframe_path_pub_->publish(path);
+}
+
+void RvizPublisher::publishHbaGpsDeviationMarkers(const std::vector<Eigen::Vector3d>& hba_positions,
+                                                  const std::vector<Eigen::Vector3d>& gps_positions_map) {
+    if (!node_ || !hba_gps_deviation_pub_ || hba_positions.size() != gps_positions_map.size() || hba_positions.empty()) return;
+    visualization_msgs::msg::MarkerArray markers;
+    visualization_msgs::msg::Marker line;
+    line.header.frame_id = frame_id_;
+    line.header.stamp = node_->now();
+    line.ns = "hba_gps_deviation";
+    line.id = 0;
+    line.type = visualization_msgs::msg::Marker::LINE_LIST;
+    line.action = visualization_msgs::msg::Marker::ADD;
+    line.scale.x = 0.08;
+    line.color = makeColor(1.0f, 0.2f, 0.2f, 0.9f);
+    for (size_t i = 0; i < hba_positions.size(); ++i) {
+        geometry_msgs::msg::Point pa, pb;
+        pa.x = hba_positions[i].x(); pa.y = hba_positions[i].y(); pa.z = hba_positions[i].z();
+        pb.x = gps_positions_map[i].x(); pb.y = gps_positions_map[i].y(); pb.z = gps_positions_map[i].z();
+        line.points.push_back(pa);
+        line.points.push_back(pb);
+    }
+    markers.markers.push_back(line);
+    hba_gps_deviation_pub_->publish(markers);
+}
+
+void RvizPublisher::publishHbaGpsTrajectoryClouds(const std::vector<Eigen::Vector3d>& hba_positions,
+                                                  const std::vector<Eigen::Vector3d>& gps_positions_map) {
+    if (!node_ || !hba_trajectory_cloud_pub_ || !gps_trajectory_cloud_pub_) return;
+    if (hba_positions.empty() && gps_positions_map.empty()) return;
+
+    const auto stamp = node_->now();
+    const std::string frame_id = frame_id_;
+
+    // HBA 轨迹点云（绿色）
+    pcl::PointCloud<pcl::PointXYZRGB>::Ptr hba_cloud(new pcl::PointCloud<pcl::PointXYZRGB>);
+    hba_cloud->header.frame_id = frame_id;
+    hba_cloud->reserve(hba_positions.size());
+    for (const auto& p : hba_positions) {
+        pcl::PointXYZRGB pt;
+        pt.x = static_cast<float>(p.x());
+        pt.y = static_cast<float>(p.y());
+        pt.z = static_cast<float>(p.z());
+        pt.r = 0;
+        pt.g = 255;
+        pt.b = 0;
+        hba_cloud->push_back(pt);
+    }
+    if (!hba_cloud->empty()) {
+        sensor_msgs::msg::PointCloud2 msg;
+        pcl::toROSMsg(*hba_cloud, msg);
+        msg.header.stamp = stamp;
+        msg.header.frame_id = frame_id;
+        hba_trajectory_cloud_pub_->publish(msg);
+    }
+
+    // GPS 轨迹点云（蓝色）
+    pcl::PointCloud<pcl::PointXYZRGB>::Ptr gps_cloud(new pcl::PointCloud<pcl::PointXYZRGB>);
+    gps_cloud->header.frame_id = frame_id;
+    gps_cloud->reserve(gps_positions_map.size());
+    for (const auto& p : gps_positions_map) {
+        pcl::PointXYZRGB pt;
+        pt.x = static_cast<float>(p.x());
+        pt.y = static_cast<float>(p.y());
+        pt.z = static_cast<float>(p.z());
+        pt.r = 0;
+        pt.g = 0;
+        pt.b = 255;
+        gps_cloud->push_back(pt);
+    }
+    if (!gps_cloud->empty()) {
+        sensor_msgs::msg::PointCloud2 msg;
+        pcl::toROSMsg(*gps_cloud, msg);
+        msg.header.stamp = stamp;
+        msg.header.frame_id = frame_id;
+        gps_trajectory_cloud_pub_->publish(msg);
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

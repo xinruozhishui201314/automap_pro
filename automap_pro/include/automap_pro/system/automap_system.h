@@ -202,6 +202,9 @@ private:
 
     // 地图体素大小（init 时从 ConfigManager 缓存，避免 publishGlobalMap 回调中访问单例导致析构顺序 SIGSEGV）
     float map_voxel_size_ = 0.2f;
+    /** HBA 完成后构建一次的全局图缓存，供发布与保存共用，避免 save 与 map_publish 两路 build 导致 PCD 重影（见 docs/PCD_GHOSTING_VS_RVIZ_ANALYSIS_20260317_2137.md） */
+    CloudXYZIPtr last_hba_global_map_;
+    std::mutex    last_hba_global_map_mutex_;
     // launch 传入的 output_dir，非空时优先于 system.output_dir，使前后端保存到同一目录
     std::string output_dir_override_;
     // GPS 配置：在 loadConfigAndInit 中一次性读取并传入 LivoBridge，避免 LivoBridge 再读 ConfigManager 时不一致
@@ -232,6 +235,8 @@ private:
     std::atomic<int> pub_status_count_{0};
     /** 是否已打过一次「odom_path 与 global_map 不同系、同屏重影」的 WARN（仅打一次，见 HBA_GHOSTING_ANALYSIS_RUN_20260317_173943） */
     bool odom_path_ghosting_warned_{false};
+    /** HBA 完成后置 true：不再向 odom_path 追加、并已发布空 Path 清空 RViz 显示，避免与 global_map 同屏重影 */
+    std::atomic<bool> odom_path_stopped_after_hba_{false};
 
     // ── V2: 线程心跳监控 ─────────────────────────────────────────────────────
     // 各关键线程上次心跳时间戳（墙钟），用于检测线程是否卡住
@@ -245,7 +250,21 @@ private:
     // 心跳阈值（毫秒）：超过此时间未更新视为异常
     static constexpr int64_t kHeartbeatWarnThresholdMs = 10000;   // 10秒未心跳警告
     static constexpr int64_t kHeartbeatErrorThresholdMs = 30000;  // 30秒未心跳报错
-    
+
+    /** 后端当前步骤 ID（卡住时 HEARTBEAT 会打印 last_backend_step，便于精准定位） */
+    enum BackendStepId : int {
+        BACKEND_STEP_IDLE = 0,
+        BACKEND_STEP_TRY_CREATE_KF_ENTER,
+        BACKEND_STEP_ADD_KEYFRAME_ENTER,
+        BACKEND_STEP_INTRA_LOOP_ENTER,
+        BACKEND_STEP_GPS_FACTOR_ENTER,
+        BACKEND_STEP_FORCE_UPDATE,
+        BACKEND_STEP_COUNT
+    };
+    std::atomic<int> last_backend_step_id_{BACKEND_STEP_IDLE};
+    /** 将 BackendStepId 转为可读字符串，供 STUCK_DIAG/心跳日志使用 */
+    const char* backendStepName(int id) const;
+
     // 心跳监控定时器
     rclcpp::TimerBase::SharedPtr heartbeat_monitor_timer_;
     void checkThreadHeartbeats();  // 检查各线程心跳状态
@@ -336,6 +355,8 @@ private:
     bool trajectory_log_enabled_ = true;
     /** true=仅建图完成后写 trajectory_odom CSV（关键帧+最终GPS）；false=边建图边写（调试用，轨迹与GPS可能不重合） */
     bool trajectory_log_after_mapping_only_ = true;
+    /** true=HBA 优化完成后自动启动 VTK 轨迹查看器并显示两条曲线与偏差曲线 */
+    bool vtk_viewer_after_hba_ = true;
     std::string trajectory_log_dir_;
     std::ofstream trajectory_odom_file_;
     std::ofstream trajectory_gps_file_;
@@ -345,6 +366,8 @@ private:
     void writeTrajectoryOdom(double ts, const Pose3d& pose, const Mat66d& cov);
     /** 建图完成后写：关键帧位姿 + 最终地图系下 GPS，保证轨迹与 GPS 在同一坐标系下可对比 */
     void writeTrajectoryOdomAfterMapping(const std::string& output_dir);
+    /** HBA 完成后写：HBA 优化后的关键帧位姿 + GPS（map/ENU），便于建图精度分析（trajectory_hba_poses_*.csv） */
+    void writeHbaPosesAndGpsForAccuracy();
     void onGPSMeasurementForLog(double ts, const Eigen::Vector3d& pos_enu);
 
     // ── 工具 ─────────────────────────────────────────────────────────────

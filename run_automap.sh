@@ -723,6 +723,10 @@ except Exception as e:
             if [ -d install_deps/teaserpp/lib ]; then
               export LD_LIBRARY_PATH=\"install_deps/teaserpp/lib:\$LD_LIBRARY_PATH\"
             fi
+            # LibTorch（OverlapTransformer）：与 GTSAM 一致，使用 install_deps 下预装库，避免每次编译
+            if [ -d install_deps/libtorch/lib ]; then
+              export LD_LIBRARY_PATH=\"install_deps/libtorch/lib:\$LD_LIBRARY_PATH\"
+            fi
             if [ \"\${AUTOMAP_USE_INSTALL_DEPS_GTSAM:-0}\" = \"1\" ] && [ -d install_deps/gtsam/lib ]; then
               export LD_LIBRARY_PATH=\"install_deps/gtsam/lib:\$LD_LIBRARY_PATH\"
               echo \"[WARN] AUTOMAP_USE_INSTALL_DEPS_GTSAM=1: forcing LD_LIBRARY_PATH prepend install_deps/gtsam/lib\" 1>&2

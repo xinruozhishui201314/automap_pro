@@ -240,6 +240,7 @@ bool DelayedGPSCompensator::compensateSubmap(int sm_id) {
     ALOG_INFO(MOD, "[GPS_COMPENSATE] Submap {} compensated: pos=[{:.2f},{:.2f},{:.2f}] quality={}",
               sm_id, pos_map.x(), pos_map.y(), pos_map.z(),
               static_cast<int>(gps_meas->quality));
+    ALOG_INFO(MOD, "[POSE_JUMP_CAUSE] GPS 延迟补偿已为子图 {} 添加 GPS 因子 → 下次后端优化会更新位姿，RViz 可能跳变；查跳变: grep POSE_JUMP", sm_id);
     
     return true;
 }

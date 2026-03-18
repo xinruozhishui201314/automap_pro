@@ -112,6 +112,8 @@ void AutoMapSystem::transformAllPosesAfterGPSAlign(const GPSAlignResult& result)
     // 使用 submap_update_mutex_ 保护，与 onPoseUpdated 一致，避免数据竞争
     std::lock_guard<std::mutex> lk(submap_update_mutex_);
     
+    RCLCPP_INFO(get_logger(),
+        "[POSE_JUMP_CAUSE] GPS 对齐：即将对所有子图/关键帧应用 ENU→map 变换 → RViz 轨迹与 GPS 显示将整体跳变（预期行为）；查跳变: grep POSE_JUMP");
     auto all_submaps = submap_manager_.getAllSubmaps();
     RCLCPP_INFO(get_logger(), "[AutoMapSystem][GPS_TRANSFORM] transforming %zu submaps", all_submaps.size());
 

@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <rclcpp/rclcpp.hpp>
 #include <automap_pro/msg/sub_map_event_msg.hpp>
 #include <pcl/filters/voxel_grid.h>
@@ -621,8 +622,20 @@ void SubMapManager::updateSubmapPose(int submap_id, const Pose3d& new_pose) {
         SLOG_DEBUG(MOD, "SM#{} pose updated: trans={:.3f}m rot={:.1f}°",
                      sm->id, translation_diff,
                      rotation_diff * 180.0 / M_PI);
-        // 大增量时打 trace 便于定位优化/回环导致的大幅位姿更新
+        // 位姿跳变检测：超过阈值时打出 [POSE_JUMP] 便于一眼定位 RViz 跳变原因
         const double rot_deg = rotation_diff * 180.0 / M_PI;
+        const double kPoseJumpThresholdTransM = 0.3;
+        const double kPoseJumpThresholdRotDeg = 3.0;
+        const bool is_jump = (translation_diff > kPoseJumpThresholdTransM || rot_deg > kPoseJumpThresholdRotDeg);
+        if (is_jump) {
+            RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                "[POSE_JUMP][SUBMAP] sm_id=%d 检测到位姿明显跳变: trans_delta=%.3fm rot_delta=%.2fdeg | old_pos=[%.3f,%.3f,%.3f] new_pos=[%.3f,%.3f,%.3f]",
+                sm->id, translation_diff, rot_deg,
+                old_anchor.translation().x(), old_anchor.translation().y(), old_anchor.translation().z(),
+                new_pose.translation().x(), new_pose.translation().y(), new_pose.translation().z());
+            RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                "[POSE_JUMP][SUBMAP] 原因: 回环/GPS补偿/GPS对齐导致后端优化写回；RViz 轨迹与 GPS 显示会跳变。查触发源: grep POSE_JUMP_CAUSE 或 LOOP_ACCEPTED 或 GPS_COMPENSATE 或 GPS_TRANSFORM");
+        }
         if (translation_diff > 0.5 || rot_deg > 5.0) {
             RCLCPP_INFO(rclcpp::get_logger("automap_system"),
                 "[SubMapMgr][BACKEND][POSE_UPDATE] sm_id=%d large_delta trans=%.3fm rot=%.1fdeg (grep BACKEND POSE_UPDATE 定位)",
@@ -690,6 +703,37 @@ void SubMapManager::updateSubmapPose(int submap_id, const Pose3d& new_pose) {
     SLOG_END_SPAN();
 }
 
+std::vector<KeyFrame::Ptr> SubMapManager::collectKeyframesInHBAOrder() const {
+    // 与 HBAOptimizer::collectKeyFramesFromSubmaps 完全一致：过滤 + 按 timestamp 排序 + 按 timestamp 去重，
+    // 保证 updateAllFromHBA 写回时 result.optimized_poses[i] 对应第 i 个关键帧，避免顺序错位导致 PCD 严重重影。
+    std::vector<KeyFrame::Ptr> kfs;
+    for (const auto& sm : submaps_) {
+        if (!sm || sm->keyframes.empty()) continue;
+        for (const auto& kf : sm->keyframes) {
+            if (!kf) continue;
+            if (!kf->cloud_body || kf->cloud_body->empty()) continue;
+            const auto& t = kf->T_w_b.translation();
+            const auto& R = kf->T_w_b.rotation();
+            if (!t.allFinite() || !R.allFinite()) continue;
+            kfs.push_back(kf);
+        }
+    }
+    std::sort(kfs.begin(), kfs.end(),
+              [](const KeyFrame::Ptr& a, const KeyFrame::Ptr& b) {
+                  return a->timestamp < b->timestamp;
+              });
+    if (kfs.size() > 1) {
+        std::vector<KeyFrame::Ptr> unique_kfs;
+        unique_kfs.push_back(kfs[0]);
+        for (size_t i = 1; i < kfs.size(); ++i) {
+            if (std::abs(kfs[i]->timestamp - unique_kfs.back()->timestamp) > 0.001)
+                unique_kfs.push_back(kfs[i]);
+        }
+        kfs.swap(unique_kfs);
+    }
+    return kfs;
+}
+
 void SubMapManager::updateAllFromHBA(const HBAResult& result) {
     if (!result.success || result.optimized_poses.empty()) {
         RCLCPP_INFO(rclcpp::get_logger("automap_system"),
@@ -704,25 +748,55 @@ void SubMapManager::updateAllFromHBA(const HBAResult& result) {
         "[SubMapMgr][GHOSTING_DIAG] updateAllFromHBA enter ts=%.3f optimized_poses=%zu submaps=%zu (HBA 写回全部 KF；若在某次 build 的 enter~exit 之间则可能重影，grep GHOSTING_DIAG 查时间线)",
         diag_ts, result.optimized_poses.size(), submaps_.size());
 
-    // [GHOSTING_FIX] 持 mutex_ 下按与 collectKeyFramesFromSubmaps 相同顺序写回 KF，与 buildGlobalMapAsync 取快照串行，消除混合快照重影
+    // [PCD_GHOSTING_FIX] 按与 HBA 完全相同的顺序写回：HBA 使用 filter+sort(timestamp)+dedupe，此处用 collectKeyframesInHBAOrder 得到相同顺序，避免位姿与关键帧错位导致保存的 global_map.pcd 严重重影（见 docs/PCD_GHOSTING_VS_RVIZ_ANALYSIS）
+    std::vector<KeyFrame::Ptr> kfs_in_hba_order = collectKeyframesInHBAOrder();
     RCLCPP_INFO(log,
-        "[SubMapMgr][GHOSTING_DIAG] HBA writeback_enter ts=%.3f pose_count=%zu (写回 KF 与取快照同锁串行；若重影请核对与 pose_snapshot_taken 时间线)",
-        diag_ts, result.optimized_poses.size());
-    size_t pose_idx = 0;
-    for (auto& sm : submaps_) {
-        if (!sm) continue;
-        for (auto& kf : sm->keyframes) {
-            if (!kf) continue;
-            if (pose_idx >= result.optimized_poses.size()) break;
-            kf->T_w_b_optimized = result.optimized_poses[pose_idx++];
-        }
-        if (pose_idx >= result.optimized_poses.size()) break;
+        "[SubMapMgr][GHOSTING_DIAG] HBA writeback_enter ts=%.3f pose_count=%zu kfs_in_hba_order=%zu (写回顺序与 HBA 输出一致)",
+        diag_ts, result.optimized_poses.size(), kfs_in_hba_order.size());
+    // [PCD_GHOSTING_VERIFY] 写回顺序首尾：与 HBA_INPUT_ORDER 应对齐（first/last kf_id+ts 一致）；若不一致则写回错位，grep WRITEBACK_ORDER HBA_INPUT_ORDER 对照
+    if (!kfs_in_hba_order.empty()) {
+        const auto& wf = kfs_in_hba_order.front();
+        const auto& wb = kfs_in_hba_order.back();
+        RCLCPP_INFO(log,
+            "[WRITEBACK_ORDER] first kf_id=%lu sm_id=%d ts=%.3f last kf_id=%lu sm_id=%d ts=%.3f count=%zu (与 HBA_INPUT_ORDER 应对齐)",
+            wf->id, wf->submap_id, wf->timestamp, wb->id, wb->submap_id, wb->timestamp, kfs_in_hba_order.size());
     }
-    const size_t expected_poses = result.optimized_poses.size();
-    if (pose_idx != expected_poses) {
-        RCLCPP_WARN(log,
-            "[SubMapMgr][GHOSTING_DIAG] HBA writeback MISMATCH written=%zu expected=%zu (顺序或数量不一致可能导致重影，检查 collectKeyFramesFromSubmaps 与 HBA 输出顺序)",
-            pose_idx, expected_poses);
+    const size_t n_poses = result.optimized_poses.size();
+    const size_t n_kfs = kfs_in_hba_order.size();
+    if (n_kfs != n_poses) {
+        RCLCPP_ERROR(log,
+            "[HBA_WRITEBACK_MISMATCH] 严重错误: kfs_in_hba_order=%zu optimized_poses=%zu 数量不一致，正常建图不应出现，程序即将退出",
+            n_kfs, n_poses);
+        std::abort();
+    }
+    const size_t to_write = n_poses;
+    for (size_t i = 0; i < to_write; ++i)
+        kfs_in_hba_order[i]->T_w_b_optimized = result.optimized_poses[i];
+
+    // [PCD_GHOSTING_VERIFY] 写回后校验：pose[i] 应与 kfs_in_hba_order[i] 一致；若 match=0 表示顺序错位或写回逻辑被改坏（grep VERIFY_WRITEBACK）
+    constexpr double kPoseMatchTol = 1e-5;
+    bool verify_first = (to_write > 0 && kfs_in_hba_order[0]->T_w_b_optimized.matrix().isApprox(result.optimized_poses[0].matrix(), kPoseMatchTol));
+    bool verify_last  = (to_write > 0 && to_write <= kfs_in_hba_order.size() && kfs_in_hba_order[to_write - 1]->T_w_b_optimized.matrix().isApprox(result.optimized_poses[to_write - 1].matrix(), kPoseMatchTol));
+    RCLCPP_INFO(log,
+        "[VERIFY_WRITEBACK] first kf_id=%lu match=%d last kf_id=%lu match=%d (若 match=0 则写回顺序错位，PCD 将重影；grep VERIFY_WRITEBACK)",
+        to_write > 0 ? kfs_in_hba_order[0]->id : 0UL, verify_first ? 1 : 0,
+        to_write > 0 ? kfs_in_hba_order[to_write - 1]->id : 0UL, verify_last ? 1 : 0);
+    if (!verify_first || !verify_last) {
+        RCLCPP_ERROR(log,
+            "[VERIFY_WRITEBACK] FAIL first_match=%d last_match=%d 写回顺序与 HBA 不一致，正常建图不应出现，程序即将退出",
+            verify_first ? 1 : 0, verify_last ? 1 : 0);
+        std::abort();
+    }
+    // [WRITEBACK_SAMPLE] 采样首/中/末：便于重影时核对 pose 是否写对关键帧（idx, kf_id, sm_id, ts, trans）
+    if (to_write > 0) {
+        for (size_t idx : {static_cast<size_t>(0), to_write / 2, to_write - 1}) {
+            if (idx >= to_write) continue;
+            const auto& kf = kfs_in_hba_order[idx];
+            const auto& t = result.optimized_poses[idx].translation();
+            RCLCPP_INFO(log,
+                "[WRITEBACK_SAMPLE] idx=%zu kf_id=%lu sm_id=%d ts=%.3f trans=[%.3f,%.3f,%.3f]",
+                idx, kf->id, kf->submap_id, kf->timestamp, t.x(), t.y(), t.z());
+        }
     }
     const double done_ts = (node_ && node_->get_clock()) ? node_->get_clock()->now().seconds() : 0.0;
     if (!result.optimized_poses.empty()) {
@@ -730,13 +804,15 @@ void SubMapManager::updateAllFromHBA(const HBAResult& result) {
         const auto& last_t = result.optimized_poses.back().translation();
         RCLCPP_INFO(log,
             "[SubMapMgr][GHOSTING_DIAG] HBA writeback_done ts=%.3f written=%zu expected=%zu first_pos=[%.2f,%.2f,%.2f] last_pos=[%.2f,%.2f,%.2f] (与 pose_snapshot_taken 时间线对照可定位重影)",
-            done_ts, pose_idx, expected_poses,
+            done_ts, to_write, n_poses,
             first_t.x(), first_t.y(), first_t.z(), last_t.x(), last_t.y(), last_t.z());
-        // [HBA_GHOSTING] 末帧 odom vs optimized 平移差，用于量化「odom_path 与 global_map 同屏」时的重影幅度
-        KeyFrame::Ptr last_kf;
-        for (auto it = submaps_.rbegin(); it != submaps_.rend() && !last_kf; ++it) {
-            if (!*it || (*it)->keyframes.empty()) continue;
-            last_kf = (*it)->keyframes.back();
+        // [HBA_GHOSTING] 末帧 odom vs optimized 平移差，用于量化「odom_path 与 global_map 同屏」时的重影幅度（用 HBA 顺序的最后一帧）
+        KeyFrame::Ptr last_kf = (to_write > 0 && to_write <= kfs_in_hba_order.size()) ? kfs_in_hba_order[to_write - 1] : nullptr;
+        if (!last_kf) {
+            for (auto it = submaps_.rbegin(); it != submaps_.rend() && !last_kf; ++it) {
+                if (!*it || (*it)->keyframes.empty()) continue;
+                last_kf = (*it)->keyframes.back();
+            }
         }
         if (last_kf) {
             const Eigen::Vector3d odom_last = last_kf->T_w_b.translation();
@@ -748,7 +824,7 @@ void SubMapManager::updateAllFromHBA(const HBAResult& result) {
     } else {
         RCLCPP_INFO(log,
             "[SubMapMgr][GHOSTING_DIAG] HBA writeback_done ts=%.3f written=%zu expected=%zu",
-            done_ts, pose_idx, expected_poses);
+            done_ts, to_write, n_poses);
     }
 
     // [HBA_DIAG] 增强日志：记录 HBA 写回的关键帧数量和位姿变化
@@ -986,7 +1062,7 @@ CloudXYZIPtr SubMapManager::buildGlobalMap(float voxel_size) const {
     // 使用全局 logger 名称，避免 backend 线程中解引用 node_（可能析构顺序导致 use-after-free）
     const rclcpp::Logger log = rclcpp::get_logger("automap_system");
     ALOG_INFO(MOD, "[tid={}] step=buildGlobalMap_enter voxel_size={:.3f}", tid, voxel_size);
-    RCLCPP_INFO(log, "[GLOBAL_MAP_DIAG][HBA_GHOSTING] buildGlobalMap enter voxel_size=%.3f 主路径=从 kf->cloud_body 用 T_w_b_optimized 变换；fallback=用 merged_cloud(若未 rebuild 则为 T_w_b，会重影)", voxel_size);
+    RCLCPP_INFO(log, "[GLOBAL_MAP_DIAG][HBA_GHOSTING] buildGlobalMap enter voxel_size=%.3f 主路径=从 kf->cloud_body 用 T_w_b_optimized 变换；T_w_b_optimized 未优化时直接退出程序（正常建图不应出现）", voxel_size);
     std::lock_guard<std::mutex> lk(mutex_);
     const size_t num_submaps = submaps_.size();
     ALOG_INFO(MOD, "[tid={}] step=buildGlobalMap_locked submaps={}", tid, num_submaps);
@@ -999,7 +1075,7 @@ CloudXYZIPtr SubMapManager::buildGlobalMap(float voxel_size) const {
     size_t kf_used_total = 0;
     size_t kf_skipped_null = 0;
     size_t kf_skipped_empty = 0;
-    size_t kf_fallback_unopt = 0;
+    // T_w_b_optimized 未优化时已 std::abort()，不会产生「跳过」统计
     int subs_with_kf = 0;
     size_t total_pts_before_transform = 0;
     
@@ -1053,26 +1129,18 @@ CloudXYZIPtr SubMapManager::buildGlobalMap(float voxel_size) const {
             }
             
             sm_kf_valid++;
-            // 【关键】选择位姿：优先用优化位姿，若未初始化则用原始位姿
+            // 【关键】T_w_b_optimized 未优化出结果时：正常建图不应出现，直接报严重错误并退出程序（不回退 T_w_b）
             Pose3d T_w_b = kf->T_w_b_optimized;
-            bool using_optimized = true;
-
-            // 检测是否为 Identity 且原始位姿非 Identity
             if (T_w_b.matrix().isApprox(Eigen::Matrix4d::Identity(), 1e-6) &&
                 !kf->T_w_b.matrix().isApprox(Eigen::Matrix4d::Identity(), 1e-6)) {
-                T_w_b = kf->T_w_b;
-                using_optimized = false;
-                kf_fallback_unopt++;
-
-                RCLCPP_WARN(log,
-                    "[SubMapMgr][HBA_GHOSTING] kf_id=%lu sm_id=%d T_w_b_optimized=Identity → using T_w_b (unoptimized)，该帧可能产生重影",
+                RCLCPP_ERROR(log,
+                    "[T_w_b_optimized_UNOPT] 严重错误: kf_id=%lu sm_id=%d T_w_b_optimized=Identity 未优化出结果，正常建图不应出现，程序即将退出（请检查 HBA/写回是否覆盖该关键帧）",
                     kf->id, sm->id);
-                RCLCPP_INFO(log,
-                    "[GHOSTING_SOURCE] buildGlobalMap_sync kf_id=%lu sm_id=%d pose_source=T_w_b_fallback (T_w_b_optimized=Identity，该帧与优化轨迹错位→重影)",
-                    kf->id, sm->id);
+                std::abort();
             }
 
             // [POSE_DIAG] 主路径位姿使用：每子图首帧 + 每 20 帧抽样，记录使用的位姿来源与数值
+            const bool using_optimized = true;
             const bool log_pose = (sm_kf_valid == 1) || (sm_kf_valid % 20 == 0);
             if (log_pose) {
                 const auto& t_used = T_w_b.translation();
@@ -1143,8 +1211,8 @@ CloudXYZIPtr SubMapManager::buildGlobalMap(float voxel_size) const {
     RCLCPP_INFO(log, "[GLOBAL_MAP_DIAG] └─ 主路径完成：");
     RCLCPP_INFO(log, "[GLOBAL_MAP_DIAG] path=from_kf submaps_with_kf=%d kf_used=%zu combined_pts=%zu",
         subs_with_kf, kf_used_total, combined->size());
-    RCLCPP_INFO(log, "[GLOBAL_MAP_DIAG]   • 统计: kf_skipped_null=%zu, kf_skipped_empty=%zu, kf_fallback_unopt=%zu",
-        kf_skipped_null, kf_skipped_empty, kf_fallback_unopt);
+    RCLCPP_INFO(log, "[GLOBAL_MAP_DIAG]   • 统计: kf_skipped_null=%zu, kf_skipped_empty=%zu (未优化 KF 会直接 abort 不统计)",
+        kf_skipped_null, kf_skipped_empty);
     RCLCPP_INFO(log, "[GLOBAL_MAP_DIAG]   • 输入点数 (body系): %zu, 输出点数 (world系): %zu",
         total_pts_before_transform, combined->size());
     // 若主路径无关键帧点云，记录警告并尝试回退
@@ -1175,6 +1243,7 @@ CloudXYZIPtr SubMapManager::buildGlobalMap(float voxel_size) const {
         }
 
         used_fallback_path = true;  // 供 [GLOBAL_MAP_BLUR] 汇总判断
+        RCLCPP_WARN(log, "[GHOSTING_RISK] buildGlobalMap_sync path=fallback_merged_cloud (主路径 combined 为空；merged_cloud 若未在 HBA 后 rebuild 则为 T_w_b 系→重影；grep REBUILD_MERGE)");
         RCLCPP_WARN(log, "[GHOSTING_SOURCE] buildGlobalMap path=fallback_merged_cloud (主路径 combined 为空；merged_cloud 若未在 HBA 后 rebuild 则为 T_w_b 系→与 optimized_path 重影，grep REBUILD_MERGE 查是否已重建)");
         RCLCPP_WARN(log, "[SubMapMgr][HBA_GHOSTING] buildGlobalMap 使用 fallback_merged_cloud：主路径 combined 为空，用各子图 merged_cloud 拼接；若 merged_cloud 未经 rebuildMergedCloudFromOptimizedPoses 则仍为 T_w_b 世界系，与轨迹重影");
         RCLCPP_WARN(log, "[GLOBAL_MAP_DIAG] ┌─ 回退路径: 拼接 merged_cloud (旧世界系，可能不准确)");
@@ -1272,17 +1341,22 @@ CloudXYZIPtr SubMapManager::buildGlobalMap(float voxel_size) const {
             // 精准定位模糊问题：单行汇总，grep GLOBAL_MAP_BLUR 即可
             {
                 const double comp_pct = (combined->empty()) ? 0.0 : (100.0 * static_cast<double>(out->size()) / static_cast<double>(combined->size()));
-                const bool blur_risk = used_fallback_path || (kf_fallback_unopt > 0u) || (comp_pct < 5.0) || (vs > 0.3f);
-                RCLCPP_INFO(log, "[GLOBAL_MAP_BLUR] path=%s kf_unopt=%zu voxel=%.3f combined=%zu out=%zu comp_pct=%.1f%% blur_risk=%s",
-                    used_fallback_path ? "fallback" : "from_kf", kf_fallback_unopt, vs, combined->size(), out->size(), comp_pct, blur_risk ? "yes" : "no");
+                const bool blur_risk = used_fallback_path || (comp_pct < 5.0) || (vs > 0.3f);
+                RCLCPP_INFO(log, "[GLOBAL_MAP_BLUR] path=%s voxel=%.3f combined=%zu out=%zu comp_pct=%.1f%% blur_risk=%s",
+                    used_fallback_path ? "fallback" : "from_kf", vs, combined->size(), out->size(), comp_pct, blur_risk ? "yes" : "no");
                 if (blur_risk) {
                     RCLCPP_WARN(log,
-                        "[GLOBAL_MAP_BLUR] 存在模糊风险: %s%s%s%s → 见 docs/GLOBAL_MAP_BLUR_ANALYSIS.md",
+                        "[GLOBAL_MAP_BLUR] 存在模糊风险: %s%s%s → 见 docs/GLOBAL_MAP_BLUR_ANALYSIS.md",
                         used_fallback_path ? "path=fallback " : "",
-                        (kf_fallback_unopt > 0u) ? "未优化位姿 " : "",
                         (comp_pct < 5.0) ? "下采样过狠 " : "",
                         (vs > 0.3f) ? "体素过大 " : "");
                 }
+            }
+            // [GHOSTING_RISK] 重影风险单行汇总（未优化 KF 会直接 abort，此处仅 path 风险）
+            if (used_fallback_path) {
+                RCLCPP_WARN(log, "[GHOSTING_RISK] buildGlobalMap_sync path=fallback_merged_cloud (grep GHOSTING_RISK)");
+            } else {
+                RCLCPP_INFO(log, "[GHOSTING_RISK] buildGlobalMap_sync path=from_kf (无重影风险)");
             }
             return out;
         } else if (out && out->empty()) {
@@ -1499,7 +1573,6 @@ std::future<CloudXYZIPtr> SubMapManager::buildGlobalMapAsync(float voxel_size) c
         const uint64_t build_id = ++g_build_global_map_id;
         // 持锁下快照 (cloud_body, pose)，避免异步任务中访问 sm->keyframes / kf->cloud_body 与后端并发修改导致 SIGSEGV（见 run full.log Thread automap_mappub SIGSEGV in buildGlobalMapInternal）
         std::vector<std::pair<CloudXYZIPtr, Pose3d>> cloud_pose_snapshot;
-        size_t snapshot_fallback_count = 0;
         {
             std::lock_guard<std::mutex> lk(mutex_);
             cloud_pose_snapshot.reserve(512);
@@ -1507,14 +1580,13 @@ std::future<CloudXYZIPtr> SubMapManager::buildGlobalMapAsync(float voxel_size) c
                 if (!sm) continue;
                 for (const auto& kf : sm->keyframes) {
                     if (!kf || !kf->cloud_body || kf->cloud_body->empty()) continue;
-                    Pose3d T = kf->T_w_b_optimized;
+                    const Pose3d& T = kf->T_w_b_optimized;
                     if (T.matrix().isApprox(Eigen::Matrix4d::Identity(), 1e-6) &&
                         !kf->T_w_b.matrix().isApprox(Eigen::Matrix4d::Identity(), 1e-6)) {
-                        T = kf->T_w_b;
-                        snapshot_fallback_count++;
-                        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-                            "[GHOSTING_SOURCE] snapshot_kf_fallback build_id=%llu kf_id=%lu sm_id=%d pose_source=T_w_b(odom) (T_w_b_optimized=Identity，该帧点云与优化轨迹错位→重影)",
+                        RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+                            "[T_w_b_optimized_UNOPT] 严重错误: build_id=%llu kf_id=%lu sm_id=%d T_w_b_optimized=Identity 未优化出结果，正常建图不应出现，程序即将退出（请检查 HBA/写回是否覆盖该关键帧）",
                             static_cast<unsigned long long>(build_id), kf->id, sm->id);
+                        std::abort();
                     }
                     cloud_pose_snapshot.emplace_back(kf->cloud_body, T);
                 }
@@ -1526,13 +1598,11 @@ std::future<CloudXYZIPtr> SubMapManager::buildGlobalMapAsync(float voxel_size) c
             const auto& first = cloud_pose_snapshot.front().second.translation();
             const auto& last = cloud_pose_snapshot.back().second.translation();
             RCLCPP_INFO(log,
-                "[SubMapMgr][GHOSTING_DIAG] pose_snapshot_taken build_id=%llu ts=%.3f kf_count=%zu first_pos=[%.2f,%.2f,%.2f] last_pos=[%.2f,%.2f,%.2f] (与 writeback_enter/writeback_done 时间线对照；若重影且 snapshot 落在 writeback 之间则异常)",
+                "[SubMapMgr][GHOSTING_DIAG] pose_snapshot_taken build_id=%llu ts=%.3f kf_count=%zu first_pos=[%.2f,%.2f,%.2f] last_pos=[%.2f,%.2f,%.2f]",
                 static_cast<unsigned long long>(build_id), snap_ts, cloud_pose_snapshot.size(),
                 first.x(), first.y(), first.z(), last.x(), last.y(), last.z());
-            RCLCPP_INFO(log,
-                "[GHOSTING_SOURCE] buildGlobalMap snapshot build_id=%llu kf_count=%zu snapshot_fallback_count=%zu pose_source=%s (fallback>0 表示部分 KF 用 odom 导致重影)",
-                static_cast<unsigned long long>(build_id), cloud_pose_snapshot.size(), snapshot_fallback_count,
-                snapshot_fallback_count > 0u ? "T_w_b_optimized+fallback_T_w_b" : "T_w_b_optimized");
+            RCLCPP_INFO(log, "[GHOSTING_RISK] buildGlobalMap_async build_id=%llu path=snapshot pose_source=T_w_b_optimized_only (无重影风险)",
+                static_cast<unsigned long long>(build_id));
         }
         return buildGlobalMapInternalFromSnapshot(cloud_pose_snapshot, voxel_size, build_id);
     });

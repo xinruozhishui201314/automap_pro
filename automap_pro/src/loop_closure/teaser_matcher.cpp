@@ -231,6 +231,7 @@ TeaserMatcher::Result TeaserMatcher::match(
         ALOG_INFO(MOD, "[tid={}] step=fpfh_match_done correspondences={}", tid, result.num_correspondences);
 
         // 【FPFH_DIAG】统计对应点距离分布，诊断误匹配
+        const double fpfh_corr_max_dist = ConfigManager::instance().teaserFpfhCorrMaxDistanceM();
         if (!corrs.empty()) {
             std::vector<double> distances;
             distances.reserve(corrs.size());
@@ -250,19 +251,8 @@ TeaserMatcher::Result TeaserMatcher::match(
                       "(p90>>5m 表示存在大量误匹配)",
                       tid, corrs.size(), p10, p50, p90);
 
-            // ========== 修复：如果 p90 过大（>10m），过滤掉距离过大的对应点 ==========
-            // 问题根因：FPFH 匹配找到"语义相似"但"空间距离极远"的点对（如相似墙角）
-            // 解决方案：使用 p50 估计初始变换，然后过滤距离异常的点
-            const double kGeoFilterThreshold = 10.0;  // 超过 10m 的对应点视为误匹配
-            if (p90 > kGeoFilterThreshold && !distances.empty()) {
-                ALOG_WARN(MOD, "[FPFH_GEO_FILTER] tid={} p90={:.2f}m > threshold={:.2f}m, applying geometric filter",
-                          tid, p90, kGeoFilterThreshold);
-
-                // 使用距离中位数作为"初始估计"
-                const double median_dist = p50;
-                const double filter_margin = median_dist * 2.0;  // 允许 2 倍中位数范围
-                const double abs_threshold = std::max(median_dist + filter_margin, kGeoFilterThreshold);
-
+            // FPFH 对应点几何过滤：仅保留距离 <= fpfh_corr_max_dist 的对应点再送 TEASER（树木场景建议 3～5m）
+            if (fpfh_corr_max_dist > 0 && !corrs.empty()) {
                 std::vector<std::pair<int, int>> filtered_corrs;
                 filtered_corrs.reserve(corrs.size());
                 for (const auto& [si, ti] : corrs) {
@@ -271,22 +261,36 @@ TeaserMatcher::Result TeaserMatcher::match(
                     double d = std::sqrt((sp.x - tp.x) * (sp.x - tp.x) +
                                         (sp.y - tp.y) * (sp.y - tp.y) +
                                         (sp.z - tp.z) * (sp.z - tp.z));
-                    if (d <= abs_threshold) {
+                    if (d <= fpfh_corr_max_dist) {
                         filtered_corrs.emplace_back(si, ti);
                     }
                 }
-
-                ALOG_WARN(MOD, "[FPFH_GEO_FILTER] tid={} filtered_corrs={}/{} ({:.1f}%) median_dist={:.2f}m threshold={:.2f}m",
-                          tid, filtered_corrs.size(), corrs.size(),
-                          100.0 * filtered_corrs.size() / corrs.size(),
-                          median_dist, abs_threshold);
-
                 if (filtered_corrs.size() >= 10) {
+                    ALOG_INFO(MOD, "[FPFH_GEO_FILTER] tid={} filtered_corrs={}/{} ({:.1f}%) max_dist={:.2f}m (loop_closure.teaser.fpfh_corr_max_distance_m)",
+                              tid, filtered_corrs.size(), corrs.size(),
+                              100.0 * filtered_corrs.size() / corrs.size(), fpfh_corr_max_dist);
                     corrs = std::move(filtered_corrs);
                     result.num_correspondences = static_cast<int>(corrs.size());
-                } else {
-                    ALOG_WARN(MOD, "[FPFH_GEO_FILTER] tid={} filtered_corrs={} < 10, keeping original corrs",
-                              tid, filtered_corrs.size());
+                } else if (p90 > 10.0) {
+                    // 兼容：过滤后不足 10 对且 p90 很大时，用中位数+倍数做宽松过滤
+                    const double median_dist = p50;
+                    const double abs_threshold = std::max(median_dist * 3.0, 10.0);
+                    std::vector<std::pair<int, int>> fallback_corrs;
+                    fallback_corrs.reserve(corrs.size());
+                    for (const auto& [si, ti] : corrs) {
+                        const auto& sp = src->points[si];
+                        const auto& tp = tgt->points[ti];
+                        double d = std::sqrt((sp.x - tp.x) * (sp.x - tp.x) +
+                                            (sp.y - tp.y) * (sp.y - tp.y) +
+                                            (sp.z - tp.z) * (sp.z - tp.z));
+                        if (d <= abs_threshold) fallback_corrs.emplace_back(si, ti);
+                    }
+                    if (fallback_corrs.size() >= 10) {
+                        corrs = std::move(fallback_corrs);
+                        result.num_correspondences = static_cast<int>(corrs.size());
+                        ALOG_WARN(MOD, "[FPFH_GEO_FILTER] tid={} fallback filtered_corrs={}/{} threshold={:.2f}m",
+                                  tid, corrs.size(), result.num_correspondences, abs_threshold);
+                    }
                 }
             }
         }
@@ -456,6 +460,11 @@ TeaserMatcher::Result TeaserMatcher::match(
 
         result.inlier_ratio = (float)inliers / (float)corrs.size();
 
+        // 将 TEASER 解写入 result，否则 result.T_tgt_src 仍为 Identity，子图间回环会全部 trans_norm=0 被 trivial 过滤
+        result.T_tgt_src = Pose3d::Identity();
+        result.T_tgt_src.linear() = solution.rotation;
+        result.T_tgt_src.translation() = solution.translation;
+
         if (result.inlier_ratio < min_inlier_ratio_) {
             ALOG_INFO(MOD, "[LOOP_COMPUTE][TEASER] teaser_fail reason=inlier_ratio_low inliers={} ratio={:.3f} min_ratio={}", inliers, result.inlier_ratio, min_inlier_ratio_);
             ALOG_WARN(MOD, "[tid={}] step=teaser_inlier_rejected inlier_ratio={:.2f} < thresh={}", tid, result.inlier_ratio, min_inlier_ratio_);
@@ -588,9 +597,12 @@ TeaserMatcher::Result TeaserMatcher::match(
         ALOG_INFO(MOD, "[TEASER_RESULT] FAIL reason=rmse_or_final_check inlier_ratio={:.4f} corrs={} rmse={:.4f}m max_rmse={:.2f}m",
                   result.inlier_ratio, result.num_correspondences, result.rmse, max_rmse_);
     }
-    ALOG_INFO(MOD, "[TEASER_EXIT] result=%s success=%d inlier_ratio=%.4f rmse=%.4fm corrs=%d (若 FAIL 见上方 [LOOP_COMPUTE][TEASER] reason= 或 [TEASER_RESULT] FAIL)",
+    ALOG_INFO(MOD, "[TEASER_EXIT] result={} success={} inlier_ratio={:.4f} rmse={:.4f}m corrs={} (若 FAIL 见上方 [LOOP_COMPUTE][TEASER] reason= 或 [TEASER_RESULT] FAIL)",
               result.success ? "PASS" : "FAIL", result.success ? 1 : 0,
               result.inlier_ratio, result.rmse, result.num_correspondences);
+    ALOG_INFO(MOD, "[LOOP_STEP][TEASER] match_exit success={} inliers≈{} corrs={} rmse={:.4f}m (几何验证完成，success=1 表示回环候选通过 TEASER)",
+              result.success, static_cast<int>(result.inlier_ratio * std::max(0, result.num_correspondences)),
+              result.num_correspondences, result.rmse);
     ALOG_DEBUG(MOD, "[tid={}] step=match_exit", tid);
     return result;
 } catch (const std::bad_alloc& e) {

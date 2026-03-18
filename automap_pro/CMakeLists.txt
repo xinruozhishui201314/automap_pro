@@ -105,14 +105,80 @@ if(Ceres_FOUND)
   add_definitions(-DUSE_CERES)
 endif()
 
-# LibTorch（OverlapTransformer 推理）
+# ─────────────────────────────────────────────────────────────────────────────
+# LibTorch（OverlapTransformer 推理）：优先本地文件夹，便于从日志看到编译状态
+# 查找顺序：1) LIBTORCH_HOME 环境变量  2) -DTorch_DIR  3) 本地候选路径
+# ─────────────────────────────────────────────────────────────────────────────
+message(STATUS "========== [automap_pro] LibTorch (OverlapTransformer) ==========")
+set(_libtorch_resolved "")
+
+# 1) 环境变量 LIBTORCH_HOME
+if(DEFINED ENV{LIBTORCH_HOME})
+  set(_try "$ENV{LIBTORCH_HOME}")
+  if(EXISTS "${_try}/share/cmake/Torch")
+    set(_libtorch_resolved "${_try}")
+    message(STATUS "[automap_pro] LibTorch source: LIBTORCH_HOME (env) = ${_try}")
+  else()
+    message(STATUS "[automap_pro] LibTorch skip: LIBTORCH_HOME set but no share/cmake/Torch under ${_try}")
+  endif()
+endif()
+
+# 2) CMake 已传入 Torch_DIR（命令行 -DTorch_DIR=...）
+if(NOT _libtorch_resolved AND Torch_DIR AND EXISTS "${Torch_DIR}")
+  set(_libtorch_resolved "from_cmake_arg")
+  message(STATUS "[automap_pro] LibTorch source: Torch_DIR (cmake-arg) = ${Torch_DIR}")
+endif()
+
+# 3) 本地文件夹候选（仓库内、install_deps、或系统路径）
+if(NOT _libtorch_resolved)
+  # install_deps：与 GTSAM 一致，编译一次安装到 install_deps，不随工程重复编译
+  set(_install_deps_libtorch "")
+  if(DEFINED ENV{INSTALL_DEPS})
+    set(_install_deps_libtorch "$ENV{INSTALL_DEPS}/libtorch")
+  endif()
+  if(NOT _install_deps_libtorch AND CMAKE_SOURCE_DIR)
+    # colcon 下 CMAKE_SOURCE_DIR 为包源码目录（如 .../src/automap_pro），install_deps 在 workspace 根下
+    get_filename_component(_ws_root "${CMAKE_SOURCE_DIR}/../.." ABSOLUTE)
+    if(EXISTS "${_ws_root}/install_deps/libtorch/share/cmake/Torch")
+      set(_install_deps_libtorch "${_ws_root}/install_deps/libtorch")
+    endif()
+  endif()
+  set(_libtorch_candidates
+    "${CMAKE_CURRENT_SOURCE_DIR}/../libtorch"           # 仓库根目录 /libtorch
+    "${CMAKE_CURRENT_SOURCE_DIR}/../thrid_party/libtorch"
+    "${_install_deps_libtorch}"                         # install_deps/libtorch（与 GTSAM 一致）
+    "${CMAKE_SOURCE_DIR}/libtorch"
+    "${CMAKE_CURRENT_SOURCE_DIR}/libtorch"
+    "/opt/libtorch"
+    "/usr/local/libtorch"
+  )
+  list(REMOVE_ITEM _libtorch_candidates "")            # 去掉空串
+  foreach(_dir IN LISTS _libtorch_candidates)
+    if(EXISTS "${_dir}/share/cmake/Torch")
+      set(_libtorch_resolved "${_dir}")
+      message(STATUS "[automap_pro] LibTorch source: local path = ${_dir}")
+      break()
+    endif()
+  endforeach()
+  if(NOT _libtorch_resolved)
+    message(STATUS "[automap_pro] LibTorch: no local path had share/cmake/Torch (tried repo root/libtorch, thrid_party/libtorch, etc.)")
+  endif()
+endif()
+
+# 仅当解析到的是本地/环境变量路径时设置 Torch_DIR（Torch_DIR 已由 -D 传入时不再覆盖）
+if(_libtorch_resolved AND _libtorch_resolved MATCHES "/")
+  set(Torch_DIR "${_libtorch_resolved}/share/cmake/Torch" CACHE PATH "LibTorch CMake config")
+endif()
 find_package(Torch QUIET)
 if(Torch_FOUND)
   add_definitions(-DUSE_TORCH)
-  message(STATUS "[automap_pro] LibTorch found: ${TORCH_LIBRARIES}")
+  message(STATUS "[automap_pro] LibTorch BUILD STATUS: FOUND -> USE_TORCH=1 (OverlapTransformer .pt will be loaded at runtime)")
+  message(STATUS "[automap_pro] LibTorch libs: ${TORCH_LIBRARIES}")
 else()
-  message(STATUS "[automap_pro] LibTorch NOT found – OverlapTransformer will use fallback descriptor")
+  message(STATUS "[automap_pro] LibTorch BUILD STATUS: NOT FOUND -> USE_TORCH=0 (OverlapTransformer uses fallback descriptor only)")
+  message(STATUS "[automap_pro] To enable: put libtorch in repo as libtorch/ or set LIBTORCH_HOME or -DTorch_DIR=.../libtorch/share/cmake/Torch")
 endif()
+message(STATUS "========== [automap_pro] LibTorch section end ==========")
 
 # CUDA
 find_package(CUDA QUIET)
@@ -390,7 +456,7 @@ target_include_directories(automap_loop_closure PUBLIC
 )
 message(STATUS "[SC] target_include_directories 已设置（PUBLIC）: ${SCANCONTEXT_INCLUDE_DIR} 和 ${SCANCONTEXT_INCLUDE_DIR}/Scancontext")
 target_link_libraries(automap_loop_closure automap_core automap_submap ${AUTOMAP_LIBS})
-ament_target_dependencies(automap_loop_closure ${AUTOMAP_AMENT_DEPS})
+ament_target_dependencies(automap_loop_closure ${AUTOMAP_AMENT_DEPS} ament_index_cpp)
 # 与 PCL 构建对齐，避免 FPFHEstimation 析构时 Eigen aligned_free 崩溃（PCL #4877）
 if(PCL_DEFINITIONS)
   target_compile_definitions(automap_loop_closure PRIVATE ${PCL_DEFINITIONS})
@@ -451,7 +517,7 @@ target_link_libraries(automap_system_component
   automap_visualization
   ${AUTOMAP_LIBS}
 )
-ament_target_dependencies(automap_system_component ${AUTOMAP_AMENT_DEPS})
+ament_target_dependencies(automap_system_component ${AUTOMAP_AMENT_DEPS} ament_index_cpp)
 rclcpp_components_register_node(automap_system_component
   PLUGIN "automap_pro::AutoMapSystem"
   EXECUTABLE automap_system_node
@@ -473,6 +539,26 @@ ament_target_dependencies(automap_system_node_standalone ${AUTOMAP_AMENT_DEPS})
 set_target_properties(automap_system_node_standalone PROPERTIES OUTPUT_NAME automap_system)
 
 # ──────────────────────────────────────────────────────────
+# VTK 轨迹曲线显示工具（可选；未安装 VTK 时跳过构建）
+# ──────────────────────────────────────────────────────────
+find_package(VTK QUIET)
+if(VTK_FOUND)
+  add_executable(vtk_trajectory_viewer src/tools/vtk_trajectory_viewer_node.cpp)
+  target_include_directories(vtk_trajectory_viewer PRIVATE ${AUTOMAP_INCLUDE_DIRS})
+  if(TARGET VTK::RenderingCore)
+    target_link_libraries(vtk_trajectory_viewer VTK::RenderingCore VTK::RenderingUI VTK::IOImage)
+  else()
+    target_link_libraries(vtk_trajectory_viewer ${VTK_LIBRARIES})
+    target_include_directories(vtk_trajectory_viewer PRIVATE ${VTK_INCLUDE_DIRS})
+  endif()
+  ament_target_dependencies(vtk_trajectory_viewer rclcpp nav_msgs)
+  install(TARGETS vtk_trajectory_viewer DESTINATION lib/${PROJECT_NAME})
+  message(STATUS "[automap_pro] VTK found: building vtk_trajectory_viewer")
+else()
+  message(STATUS "[automap_pro] VTK not found: skip vtk_trajectory_viewer (install libvtk9-dev)")
+endif()
+
+# ──────────────────────────────────────────────────────────
 # 安装规则
 # ──────────────────────────────────────────────────────────
 install(TARGETS
@@ -490,6 +576,11 @@ install(DIRECTORY config/ DESTINATION share/${PROJECT_NAME}/config)
 install(DIRECTORY launch/ DESTINATION share/${PROJECT_NAME}/launch)
 install(PROGRAMS launch/run_under_gdb.sh DESTINATION share/${PROJECT_NAME}/launch)
 install(DIRECTORY rviz/ DESTINATION share/${PROJECT_NAME}/rviz)
+install(PROGRAMS scripts/plot_accuracy_curves.py DESTINATION share/${PROJECT_NAME}/scripts)
+install(PROGRAMS scripts/convert_ot_pth_to_torchscript.py DESTINATION share/${PROJECT_NAME}/scripts)
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/models")
+  install(DIRECTORY models/ DESTINATION share/${PROJECT_NAME} FILES_MATCHING PATTERN "*.pt" PATTERN "*.pth.tar")
+endif()
 
 ament_export_include_directories(include)
 ament_export_libraries(

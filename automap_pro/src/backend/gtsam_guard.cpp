@@ -150,6 +150,11 @@ GtsamCallScope::~GtsamCallScope() {
     RCLCPP_INFO(rclcpp::get_logger("automap_system"),
         "[GTSAM_EXIT] caller=%s op=%s duration_ms=%.2f success=%d",
         gtsamCallerString(caller_), op_.c_str(), elapsed_ms, success_ ? 1 : 0);
+    if (elapsed_ms > 2000.0) {
+        RCLCPP_WARN(rclcpp::get_logger("automap_system"),
+            "[AutoMapSystem][STUCK_DIAG] GTSAM call slow: caller=%s op=%s duration_ms=%.2f (grep STUCK_DIAG 精准分析阻塞)",
+            gtsamCallerString(caller_), op_.c_str(), elapsed_ms);
+    }
     if (use_mutex_) {
         globalGtsamMutex().unlock();
     }

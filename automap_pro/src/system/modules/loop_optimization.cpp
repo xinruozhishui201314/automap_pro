@@ -171,30 +171,30 @@ void AutoMapSystem::onPoseUpdated(const std::unordered_map<int, Pose3d>& poses) 
         } catch (...) {}
     }
 
-    // 发布优化后轨迹
-    opt_path_.header.stamp    = now();
-    opt_path_.header.frame_id = "map";
-    opt_path_.poses.clear();
-    
-    std::vector<std::pair<int, Pose3d>> sorted(poses.begin(), poses.end());
-    std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
-    
-    for (const auto& [sm_id, pose] : sorted) {
-        geometry_msgs::msg::PoseStamped ps;
-        ps.header = opt_path_.header;
-        ps.pose.position.x = pose.translation().x();
-        ps.pose.position.y = pose.translation().y();
-        ps.pose.position.z = pose.translation().z();
-        Eigen::Quaterniond q(pose.rotation());
-        ps.pose.orientation.w = q.w(); ps.pose.orientation.x = q.x();
-        ps.pose.orientation.y = q.y(); ps.pose.orientation.z = q.z();
-        opt_path_.poses.push_back(ps);
-    }
-    if (opt_path_pub_) {
-        try { opt_path_pub_->publish(opt_path_); } catch (const std::exception& e) {
-            RCLCPP_DEBUG(get_logger(), "[AutoMapSystem][POSE] opt_path publish: %s", e.what());
-        } catch (...) {}
-        pub_opt_path_count_++;
+    // 发布优化后轨迹（HBA 后不再发布 iSAM2 的 opt_path_，避免覆盖 HBA 轨迹导致 map(HBA)+path(iSAM2) 重影）
+    if (!odom_path_stopped_after_hba_.load(std::memory_order_acquire)) {
+        opt_path_.header.stamp    = now();
+        opt_path_.header.frame_id = "map";
+        opt_path_.poses.clear();
+        std::vector<std::pair<int, Pose3d>> sorted(poses.begin(), poses.end());
+        std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+        for (const auto& [sm_id, pose] : sorted) {
+            geometry_msgs::msg::PoseStamped ps;
+            ps.header = opt_path_.header;
+            ps.pose.position.x = pose.translation().x();
+            ps.pose.position.y = pose.translation().y();
+            ps.pose.position.z = pose.translation().z();
+            Eigen::Quaterniond q(pose.rotation());
+            ps.pose.orientation.w = q.w(); ps.pose.orientation.x = q.x();
+            ps.pose.orientation.y = q.y(); ps.pose.orientation.z = q.z();
+            opt_path_.poses.push_back(ps);
+        }
+        if (opt_path_pub_) {
+            try { opt_path_pub_->publish(opt_path_); } catch (const std::exception& e) {
+                RCLCPP_DEBUG(get_logger(), "[AutoMapSystem][POSE] opt_path publish: %s", e.what());
+            } catch (...) {}
+            pub_opt_path_count_++;
+        }
     }
 
     try {

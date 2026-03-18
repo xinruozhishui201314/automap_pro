@@ -239,6 +239,86 @@ void AutoMapSystem::writeTrajectoryOdomAfterMapping(const std::string& output_di
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// HBA 完成后写入：HBA 优化关键帧位姿 + GPS（便于建图精度分析）
+// ─────────────────────────────────────────────────────────────────────────────
+void AutoMapSystem::writeHbaPosesAndGpsForAccuracy() {
+    if (!trajectory_log_enabled_) return;
+    std::lock_guard<std::mutex> lk(trajectory_log_mutex_);
+    ensureTrajectoryLogDir();
+    auto all_sm = submap_manager_.getFrozenSubmaps();
+    size_t kf_count = 0;
+    for (const auto& sm : all_sm) {
+        if (!sm) continue;
+        kf_count += sm->keyframes.size();
+    }
+    if (kf_count == 0) {
+        RCLCPP_INFO(get_logger(), "[AutoMapSystem][TRAJ_LOG] writeHbaPosesAndGpsForAccuracy: no keyframes, skip");
+        return;
+    }
+    const std::string filename = "trajectory_hba_poses_" + trajectory_session_id_ + ".csv";
+    const std::string path = trajectory_log_dir_ + "/" + filename;
+    std::ofstream out(path);
+    if (!out.is_open()) {
+        RCLCPP_WARN(get_logger(), "[AutoMapSystem][TRAJ_LOG] failed to open %s for HBA poses", path.c_str());
+        return;
+    }
+    out << "timestamp,kf_id,submap_id,hba_x,hba_y,hba_z,hba_qx,hba_qy,hba_qz,hba_qw,"
+        << "gps_valid,gps_x_map,gps_y_map,gps_z_map,gps_enu_x,gps_enu_y,gps_enu_z,gps_hdop,gps_quality\n";
+    constexpr double kGpsMaxDt = 1.0;
+    for (const auto& sm : all_sm) {
+        if (!sm) continue;
+        for (const auto& kf : sm->keyframes) {
+            if (!kf) continue;
+            const Pose3d& T = kf->T_w_b_optimized;
+            Eigen::Quaterniond q(T.rotation());
+            double gps_x_map = 0.0, gps_y_map = 0.0, gps_z_map = 0.0;
+            double gps_enu_x = 0.0, gps_enu_y = 0.0, gps_enu_z = 0.0;
+            double gps_hdop = 0.0;
+            int gps_quality = 0;
+            bool gps_valid = false;
+            if (kf->has_valid_gps) {
+                gps_enu_x = kf->gps.position_enu.x();
+                gps_enu_y = kf->gps.position_enu.y();
+                gps_enu_z = kf->gps.position_enu.z();
+                gps_hdop = kf->gps.hdop;
+                gps_quality = static_cast<int>(kf->gps.quality);
+                gps_valid = kf->gps.is_valid;
+                auto [pos_map, frame] = gps_manager_.enu_to_map_with_frame(kf->gps.position_enu);
+                gps_x_map = pos_map.x();
+                gps_y_map = pos_map.y();
+                gps_z_map = pos_map.z();
+            } else {
+                auto gps_opt = gps_manager_.queryByTimestampForLog(kf->timestamp, kGpsMaxDt);
+                if (gps_opt) {
+                    gps_enu_x = gps_opt->position_enu.x();
+                    gps_enu_y = gps_opt->position_enu.y();
+                    gps_enu_z = gps_opt->position_enu.z();
+                    gps_hdop = gps_opt->hdop;
+                    gps_quality = static_cast<int>(gps_opt->quality);
+                    gps_valid = gps_opt->is_valid;
+                    auto [pos_map, frame] = gps_manager_.enu_to_map_with_frame(gps_opt->position_enu);
+                    gps_x_map = pos_map.x();
+                    gps_y_map = pos_map.y();
+                    gps_z_map = pos_map.z();
+                }
+            }
+            out << std::fixed << std::setprecision(6)
+                << kf->timestamp << "," << static_cast<uint64_t>(kf->id) << "," << kf->submap_id << ","
+                << T.translation().x() << "," << T.translation().y() << "," << T.translation().z() << ","
+                << q.x() << "," << q.y() << "," << q.z() << "," << q.w() << ","
+                << (gps_valid ? "1" : "0") << ","
+                << gps_x_map << "," << gps_y_map << "," << gps_z_map << ","
+                << gps_enu_x << "," << gps_enu_y << "," << gps_enu_z << ","
+                << gps_hdop << "," << gps_quality << "\n";
+        }
+    }
+    out.close();
+    RCLCPP_INFO(get_logger(),
+        "[AutoMapSystem][TRAJ_LOG] wrote trajectory_hba_poses (HBA keyframe + GPS) to %s (%zu rows). Use for mapping accuracy analysis.",
+        path.c_str(), kf_count);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // 轨迹记录：GPS测量日志
 // ─────────────────────────────────────────────────────────────────────────────
 void AutoMapSystem::onGPSMeasurementForLog(double ts, const Eigen::Vector3d& pos_enu) {

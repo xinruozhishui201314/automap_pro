@@ -238,6 +238,64 @@ grep -E '\[MAP_PUB\]|\[LOOP_OPT\]' automap.log | tail -10
 | 有 runScheduledAlignment enter 无 exit | try_align 内死锁或长时间持锁（已修复：回调在锁外） | `GPS_ALIGN` |
 | 有 callbacks_enter 无 callbacks_done | onGPSAligned/addBatchGPSFactors 内卡住（如 waitForPendingTasks） | `GPS_BATCH`、`ISAM2_QUEUE` |
 
+### 8.4 STUCK_DIAG 与精准定位卡住阶段（增强日志）
+
+当出现**卡住/阻塞**时，下列标签可精准定位到**具体步骤**，便于分析 ISAM2、回环或 feeder 背压。
+
+| 标签 / 关键字 | 含义 | 使用方式 |
+|---------------|------|----------|
+| `[STUCK_DIAG]` | 卡住/慢调用诊断：单帧慢(>2s)、ISAM2 慢、forceUpdate 慢、GTSAM 调用慢、feeder 背压、backend 心跳超时 | **首选**：`grep STUCK_DIAG full.log` 快速看到所有阻塞相关告警 |
+| `[STUCK_DIAG] backend stuck last_backend_step=` | 后端线程心跳超时，最后进入的步骤（idle / tryCreateKeyFrame_enter / addKeyFrame_enter / intra_loop_enter / gps_factor_enter / forceUpdate_commitAndUpdate） | 卡住时看**卡在哪个子阶段** |
+| `[STUCK_DIAG] single frame slow` | 单帧处理耗时 >2s，附带 last_backend_step | 结合上方 `BACKEND STEP` 与 `GTSAM_EXIT` 分析是哪一步拖慢 |
+| `[STUCK_DIAG] ISAM2 slow` | commitAndUpdate 耗时 >2s，含 factor_count/nodes | 后端阻塞主因多为 ISAM2；可调 relinearize_skip/threshold 或启用 async_isam2_update |
+| `[STUCK_DIAG] forceUpdate slow` | forceUpdate（含 commitAndUpdate）总耗时 >2s | 子图内回环或 HBA 前 flush 触发 |
+| `[STUCK_DIAG] GTSAM call slow` | 任意 GTSAM 调用（GtsamCallScope）>2s | 与 `[GTSAM_EXIT]` 同条或紧随，caller/op 定位调用点 |
+| `[STUCK_DIAG] feeder blocked` | feeder 因 frame_queue 满首次进入背压等待 | backend 消费过慢或卡在 commitAndUpdate |
+
+**卡住时推荐 grep 顺序：**
+
+```bash
+# 1）所有卡住/慢诊断（精准分析入口）
+grep STUCK_DIAG full.log
+
+# 2）后端步骤时间线（最后一条 STEP enter 无对应 exit 即卡在该步内）
+grep -E 'BACKEND\]\[STEP\] step=.*_enter|BACKEND\]\[STEP\] step=.*_exit' full.log | tail -30
+
+# 3）ISAM2/GTSAM 耗时（定位是否为 commitAndUpdate 阻塞）
+grep -E 'GTSAM_EXIT|ISAM2_DIAG.*elapsed_ms|SLOW.*iSAM2' full.log | tail -20
+
+# 4）心跳与 last_backend_step（确认是否 backend 卡住及卡在何步）
+grep -E 'HEARTBEAT.*stuck|STUCK_DIAG.*last_backend_step' full.log
+```
+
+### 8.5 回环位姿异常详细诊断（pose_anomaly）
+
+当回环约束的 TEASER 相对位姿与里程计相对位姿差异超过配置阈值时，会拒绝该回环并打印**详细诊断日志**，便于排查计算或逻辑错误（高精建图系统不应出现位姿突变）。
+
+**子图内回环（INTRA_LOOP）** 拒绝时连续多行：
+
+| 关键字 | 内容 |
+|--------|------|
+| `[INTRA_LOOP][REJECT] pose_anomaly:` 第一行 | submap_id, kf_i, kf_j, kf_id_cand, kf_id_query, ts_cand, ts_query |
+| `ODOM_rel:` | 里程计相对位姿：trans_xyz、trans_norm(m)、rot_deg |
+| `TEASER_rel:` | TEASER 相对位姿：trans_xyz、trans_norm(m)、rot_deg、inlier、rmse |
+| `DIFF:` | 差异：trans_diff_xyz、trans_diff_norm(m)、rot_diff_deg，以及阈值 |
+| `WORLD:` | 世界系下两帧位置与 dist_world(m) |
+
+**子图间回环（INTER_KF）** 拒绝时同理：`ODOM_rel` / `TEASER_rel` / `DIFF` / `WORLD`（含 dist_world、pos_tgt、pos_query）。
+
+**推荐 grep：**
+
+```bash
+# 所有位姿异常拒绝及详细诊断（按顺序看 ODOM_rel → TEASER_rel → DIFF → WORLD）
+grep -E 'INTRA_LOOP.*REJECT.*pose_anomaly|INTER_KF.*REJECT.*pose_anomaly' full.log
+
+# 仅摘要行（含 kf_id、trans_diff、rot_diff）
+grep -E '\[INTRA_LOOP\]\[REJECT\] pose_anomaly submap_id|\[INTER_KF\]\[REJECT\] pose_anomaly sm_i' full.log
+```
+
+根据 DIFF 的 trans_diff_xyz 可判断是单轴漂移还是整体偏移；结合 WORLD 的 dist_world 与两帧位置可判断是否为误匹配到远处关键帧或坐标系/时序错误。
+
 ---
 
 ## 9. 修改阈值或日志量

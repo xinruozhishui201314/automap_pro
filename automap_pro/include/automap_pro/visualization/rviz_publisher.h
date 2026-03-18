@@ -91,6 +91,26 @@ public:
         const std::vector<std::pair<double, Pose3d>>& odom_path,
         const std::vector<std::pair<double, Pose3d>>& opt_path);
 
+    /**
+     * 发布关键帧级 GPS 轨迹 Path（与 optimized_path 点一一对应，map 系），便于与 HBA 轨迹对比。
+     * gps_positions_map 与关键帧按时间戳排序后的顺序一致；无 GPS 的帧用 HBA 位置填充（偏差为 0）。
+     */
+    void publishGpsKeyframePath(const std::vector<Eigen::Vector3d>& gps_positions_map);
+
+    /**
+     * 发布 HBA 位姿与 GPS 的偏差线段（LINE_LIST：每段从 hba_positions[i] 到 gps_positions_map[i]）。
+     * 建图完成后在 RViz 中可直接看到每帧的轨迹–GPS 偏差。
+     */
+    void publishHbaGpsDeviationMarkers(const std::vector<Eigen::Vector3d>& hba_positions,
+                                       const std::vector<Eigen::Vector3d>& gps_positions_map);
+
+    /**
+     * 使用 PCL 发布 HBA 轨迹与 GPS 轨迹点云（PointCloud2），便于在 RViz 中按点云显示。
+     * HBA 轨迹：绿色点；GPS 轨迹：蓝色点。Topic: /automap/hba_trajectory_points, /automap/gps_trajectory_points
+     */
+    void publishHbaGpsTrajectoryClouds(const std::vector<Eigen::Vector3d>& hba_positions,
+                                       const std::vector<Eigen::Vector3d>& gps_positions_map);
+
     // ═══════════════════════════════════════════════════════════════════════
     // 3. 回环检测可视化
     // ═══════════════════════════════════════════════════════════════════════
@@ -244,6 +264,13 @@ private:
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr opt_path_pub_;
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr gps_raw_path_pub_;
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr gps_aligned_path_pub_;
+    /** 关键帧级 GPS 轨迹（与 optimized_path 同序），用于建图精度偏差显示 */
+    rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr gps_keyframe_path_pub_;
+    /** HBA 位姿–GPS 偏差线段（建图完成后显示） */
+    rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr hba_gps_deviation_pub_;
+    /** PCL 点云：HBA 轨迹点（绿）、GPS 轨迹点（蓝） */
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr hba_trajectory_cloud_pub_;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr gps_trajectory_cloud_pub_;
 
     // 位姿数组发布者
     rclcpp::Publisher<geometry_msgs::msg::PoseArray>::SharedPtr kf_pose_array_pub_;

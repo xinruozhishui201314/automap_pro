@@ -42,6 +42,15 @@ public:
 
     bool isModelLoaded() const { return model_loaded_; }
 
+    /** 编译时是否启用 LibTorch（便于运行日志中确认编译状态：1=可加载 .pt，0=仅 fallback） */
+    static constexpr bool builtWithTorch() {
+#ifdef USE_TORCH
+        return true;
+#else
+        return false;
+#endif
+    }
+
     /**
      * 计算点云的 256 维全局描述子
      * 自动选择 LibTorch 推理或 fallback
@@ -99,6 +108,7 @@ private:
     // ── 统计 ──────────────────────────────────────────────────────────────
     mutable double last_infer_ms_ = 0.0;
     mutable int    total_inferences_ = 0;
+    mutable bool   first_inference_logged_ = false;  // 仅首次推理时打一次状态日志
     mutable std::mutex mutex_;
 
     // ── 私有方法 ──────────────────────────────────────────────────────────

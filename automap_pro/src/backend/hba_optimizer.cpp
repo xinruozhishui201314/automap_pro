@@ -326,6 +326,18 @@ HBAResult HBAOptimizer::runHBA(const PendingTask& task) {
     ALOG_INFO(MOD, "HBA starting: valid_kf={} time_span={:.1f}s gps={}",
               valid_kf_count, time_span, task.enable_gps ? 1 : 0);
 
+    // [PCD_GHOSTING_VERIFY] HBA 输入顺序：与 updateAllFromHBA 的 WRITEBACK_ORDER 应对齐（同为 collect 的 filter+sort+dedupe 顺序）；若 first/last kf_id+ts 不一致则写回错位→PCD 重影（grep HBA_INPUT_ORDER WRITEBACK_ORDER）
+    {
+        const auto& kfs = task.keyframes;
+        if (!kfs.empty()) {
+            const auto& f = kfs.front();
+            const auto& b = kfs.back();
+            RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                "[HBA_INPUT_ORDER] first kf_id=%lu sm_id=%d ts=%.3f last kf_id=%lu sm_id=%d ts=%.3f count=%zu (与 WRITEBACK_ORDER 应对齐，否则写回错位)",
+                f->id, f->submap_id, f->timestamp, b->id, b->submap_id, b->timestamp, kfs.size());
+        }
+    }
+
 #ifdef USE_HBA_API
     const auto& cfg = ConfigManager::instance();
     hba_api::Config hba_cfg;
@@ -451,6 +463,15 @@ HBAResult HBAOptimizer::runGTSAMFallback(const PendingTask& task) {
               [](const KeyFrame::Ptr& a, const KeyFrame::Ptr& b) {
                   return a->timestamp < b->timestamp;
               });
+
+    // [PCD_GHOSTING_VERIFY] GTSAM 路径下 result.optimized_poses 顺序 = sorted_kfs（时间戳序），与 SubMapManager collectKeyframesInHBAOrder 一致；打条便于与 WRITEBACK_ORDER 对照
+    if (!sorted_kfs.empty()) {
+        const auto& f = sorted_kfs.front();
+        const auto& b = sorted_kfs.back();
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[HBA_INPUT_ORDER] first kf_id=%lu sm_id=%d ts=%.3f last kf_id=%lu sm_id=%d ts=%.3f count=%zu (GTSAM_sorted，与 WRITEBACK_ORDER 应对齐)",
+            f->id, f->submap_id, f->timestamp, b->id, b->submap_id, b->timestamp, sorted_kfs.size());
+    }
 
     // 约束合理性：所有关键帧位姿有限且平移在合理范围内，否则不进入 GTSAM 避免崩溃
     auto poseForInitial = [](const KeyFrame::Ptr& kf) -> Pose3d {

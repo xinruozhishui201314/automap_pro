@@ -182,6 +182,8 @@ private:
     double gps_search_radius_  = 200.0;
     /** 几何距离预筛：候选与 query 子图锚定位置距离 > 此值(米)则过滤。0=关闭 */
     double geo_prefilter_max_distance_m_ = 0.0;
+    /** 高置信度绕过：描述子 score ≥ 此值时跳过几何预筛（参考 OverlapTransformer/SeqOT）。0=关闭 */
+    double geo_prefilter_skip_above_score_ = 0.0;
     double min_inlier_ratio_   = 0.30;
     double max_rmse_           = 0.3;
     bool   use_icp_refine_     = true;

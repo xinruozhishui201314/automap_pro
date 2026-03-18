@@ -212,7 +212,10 @@ private:
         const std::vector<std::pair<CloudXYZIPtr, Pose3d>>& cloud_pose_snapshot,
         float voxel_size,
         uint64_t build_id = 0) const;
-    
+
+    /** 与 HBAOptimizer::collectKeyFramesFromSubmaps 相同顺序：过滤(有效 cloud_body + 有限 T_w_b)、按 timestamp 排序、按 timestamp 去重。用于 updateAllFromHBA 写回时与 result.optimized_poses 一一对应，避免顺序错位导致 PCD 重影。调用方须已持 mutex_。 */
+    std::vector<KeyFrame::Ptr> collectKeyframesInHBAOrder() const;
+
     SubMap::Ptr createNewSubmap(const KeyFrame::Ptr& first_kf);
     /** 无参版本仅用于兼容；实际冻结请用传入 submap 的版本，且须在未持 mutex_ 时调用，避免回调内 getFrozenSubmaps 死锁 */
     void        freezeActiveSubmap();

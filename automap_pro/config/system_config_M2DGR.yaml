@@ -37,6 +37,8 @@ system:
   # 背压：frame_queue 满时等待秒数与最大等待次数，超限后强制丢帧（资源受限可缩短）
   backpressure_wait_sec: 60
   backpressure_max_waits: 3
+  # HBA 完成后是否自动启动 VTK 轨迹查看器（两条曲线+偏差）；launch 可覆盖：vtk_viewer_after_hba:=false
+  vtk_viewer_after_hba: true
 
 # 运行模式与传感器空闲超时（EARLY_SHUTDOWN_QUICK_FIX：离线用 7200s 避免 bag 未播完就结束）
 mode:
@@ -273,31 +275,37 @@ gps:
     pitch_roll_base_var:        0.01
     yaw_var_velocity_scale:     0.1
 
-# ── 3.3 回环检测（已放宽：更多候选 + 更松几何接受，减轻点云结构重影）────────────────
+# ── 3.3 回环检测（子图间回环优化：放宽几何预筛 + 描述子阈值 + TEASER，产生更多回环）────────────────
+# 子图间回环要点：geo_prefilter 用“当前估计”下两子图锚点距离；闭环时估计未校正前距离可能>50m，故需调大或关闭
+# 若主要为结构化建筑，可把 fpfh_corr_max_distance_m 改为 10、min_inlier_ratio 改为 0.08
 loop_closure:
-  overlap_threshold:   0.15      # ⬇️ 再放宽（0.20→0.15），更多描述子候选进入几何验证
-  top_k:               15        # ⬆️ 增加候选数（10→15），给 TEASER 更多机会
-  min_temporal_gap_s: 15.0      # ⬇️ 再放宽（20→15），更早/更多触发回环检测
-  min_submap_gap:      0         # 0=不按子图间隔过滤(允许相邻子图回环)
+  overlap_threshold:   0.15      # 略降以增加子图间候选（原 0.18 易把真实闭环挡在检索外）
+  top_k:               15        # 多保留候选进入 TEASER，利于子图间回环
+  min_temporal_gap_s: 15.0
+  min_submap_gap:      0
 
   # ── 子图内回环检测参数 ─────────────────────────────────────────────────────
   intra_submap_enabled: true
-  intra_submap_min_temporal_gap_s: 2.0    # ⬇️ 再放宽（3.0→2.0）
-  intra_submap_min_keyframe_gap: 8        # ⬇️ 放宽（10→8）
-  intra_submap_min_distance_gap_m: 2.0    # ⬇️ 放宽（3.0→2.0）
-  intra_submap_overlap_threshold: 0.15    # ⬇️ 再放宽（0.20→0.15）
-  # 子图间关键帧级回环
+  intra_submap_min_temporal_gap_s: 2.0
+  intra_submap_min_keyframe_gap: 8
+  intra_submap_min_distance_gap_m: 2.0
+  intra_submap_overlap_threshold: 0.15    # 与 overlap_threshold 一致
   inter_keyframe_level:       true
   inter_keyframe_sample_step: 5
-  inter_keyframe_top_k_per_submap: 5      # ⬆️ 放宽（3→5），每子图更多候选
+  inter_keyframe_top_k_per_submap: 5
 
   gps_search_radius_m: 200.0
+  # 子图间回环关键：0=关闭几何预筛（所有描述子候选都做 TEASER）；50~100=仅锚点距离<该值的候选做 TEASER
+  # 闭环时两子图锚点在未校正位姿下常>50m，设 50 会滤掉真实回环；建议 0 或 100~200
   geo_prefilter_max_distance_m: 0.0
+  # 高置信度绕过几何预筛：描述子相似度≥此值时不做距离过滤（参考 OverlapTransformer/SeqOT）。0=关闭；0.90~0.95 可保留强闭环
+  geo_prefilter_skip_above_score: 0.92
   worker_threads:      2
   max_desc_queue_size:  128
   max_match_queue_size: 128
   overlap_transformer:
-    model_path:     "${CMAKE_CURRENT_SOURCE_DIR}/models/pretrained_overlap_transformer.pth.tar"
+    # LibTorch 需 TorchScript .pt；.pth.tar 需先运行 scripts/convert_ot_pth_to_torchscript.py 转换
+    model_path:     "${CMAKE_CURRENT_SOURCE_DIR}/models/overlapTransformer.pt"
     proj_H:         64
     proj_W:         900
     fov_up:         3.0
@@ -305,21 +313,28 @@ loop_closure:
     max_range:      80.0
     descriptor_dim: 256
   teaser:
-    noise_bound:      0.1
+    noise_bound:      0.15      # 树多场景略放宽，适应点云噪声
     cbar2:            1.0
-    voxel_size:       0.4
+    voxel_size:       0.5       # 树多场景略大，减轻树叶/细枝噪声
     max_points:       8000
-    min_inlier_ratio: 0.08   # ⬇️ 再放宽（0.12→0.08），接受更 noisy 的匹配
-    min_safe_inliers: 3       # ⬇️ 再放宽（4→3），最少内点数要求降低
-    max_rmse_m:       0.55   # ⬆️ 再放宽（0.4→0.55），允许更大几何残差
-    min_relative_translation_m: 0.02  # ⬇️ 再放宽（0.03→0.02），小位移回环也入图
+    min_inlier_ratio: 0.04     # 树多场景放宽（配合 fpfh_corr_max_distance_m 过滤后易达标）
+    min_safe_inliers: 3
+    max_rmse_m:       0.75     # 略放宽以通过更多子图间回环（原 0.60 易拒；误回环仍靠 inlier_ratio 抑制）
+    min_relative_translation_m: 0.02
     icp_refine:       true
-  # ── ScanContext 回环粗匹配 ───────────────────────────────────────────
+    # 关键：只保留距离<5m 的 FPFH 对应点送 TEASER，树多场景过滤大量误匹配；结构化场景可改为 10
+    fpfh_corr_max_distance_m: 5.0
+  # 回环位姿一致性：TEASER 结果与里程计相对位姿差异超过阈值视为异常（理论上回环应是微调），拒绝该回环
+  pose_consistency_max_trans_diff_m: 5.0   # 平移差异(m)，>0 启用检查，0=关闭
+  pose_consistency_max_rot_diff_deg: 25.0 # 旋转差异(度)，>0 启用检查，0=关闭
+  # ── ScanContext / OverlapTransformer 回环粗匹配 ─────────────────────────
+  # enabled=true：使用 ScanContext 做子图/关键帧描述子与候选检索（不调用 OT 模型）
+  # enabled=false：使用 OverlapTransformer 模型（overlapTransformer.pt）做描述子与余弦相似度检索；需 LibTorch 与 .pt 模型
   scancontext:
-    enabled:           true
-    dist_threshold:    0.22   # ⬆️ 再放宽（0.18→0.22），更多 ScanContext 候选
-    num_candidates:   15      # ⬆️ 再放宽（10→15）
-    exclude_recent:   3       # 保持：让 ScanContext 更早开始工作
+    enabled:           false  # false=用 OverlapTransformer 做回环检测；true=用 ScanContext
+    dist_threshold:    0.20   # 树多场景略收紧，提高候选质量（仅 ScanContext 时生效）
+    num_candidates:   10
+    exclude_recent:   3
     tree_making_period: 30
     min_history_for_search: 3
 

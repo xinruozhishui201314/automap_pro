@@ -7,6 +7,11 @@
 ## 0. 快速排查（先跑这几条）
 
 ```bash
+# 位姿跳变：一眼看到跳变与原因（回环/GPS 补偿/GPS 对齐/HBA）
+grep POSE_JUMP full.log          # 检测到的跳变（子图/关键帧）
+grep POSE_JUMP_CAUSE full.log     # 跳变触发源（回环入图、GPS 补偿、GPS 对齐、HBA 写回）
+grep POSE_JUMP_DIAG full.log      # 本次写回位姿数量与跳变说明
+
 # 首次建图时的重影排查入口（文档与主要 grep）
 grep GHOSTING_QUICK_REF full.log
 
@@ -49,6 +54,9 @@ grep REBUILD_MERGE full.log
 | **INTRA_LOOP** | 子图内回环 SUMMARY/DETECTED；FINAL_detected=0 表示无子图内回环 | `grep INTRA_LOOP` | loop_detector |
 | **LOOP_STEP** | 回环流水线：addSubmap、onLoopDetected_enter/enqueue/done、CONSTRAINT 等 | `grep LOOP_STEP` | automap_system, loop_detector |
 | **CONSTRAINT** / **BACKEND.*LOOP** | 约束入图/跳过原因（same_node、node_not_in_graph、validation 等） | `grep CONSTRAINT` / `grep BACKEND LOOP` | incremental_optimizer |
+| **POSE_JUMP** | 位姿跳变检测：子图/关键帧优化前后平移或旋转超过阈值（默认 0.3m 或 3°），RViz 轨迹与 GPS 显示会跳变 | `grep POSE_JUMP` | submap_manager (updateSubmapPose), automap_system (onPoseUpdated KF 写回) |
+| **POSE_JUMP_CAUSE** | 跳变触发源：回环约束入图、GPS 延迟补偿、GPS 对齐变换、HBA 写回；出现在跳变之前 | `grep POSE_JUMP_CAUSE` | incremental_optimizer (addLoopFactor/addLoopFactorDeferred), delayed_gps_compensator, gps_processing (transformAllPosesAfterGPSAlign), automap_system (onHBADone) |
+| **POSE_JUMP_DIAG** | 每次 onPoseUpdated 入口：写回位姿数量，并提示若出现 POSE_JUMP 则原因见上文 | `grep POSE_JUMP_DIAG` | automap_system (onPoseUpdated) |
 
 ---
 
@@ -61,6 +69,7 @@ grep REBUILD_MERGE full.log
 | 写回与建图是否竞态 | `GHOSTING_DIAG`（writeback_enter/done 与 pose_snapshot_taken、build_id 时间线） |
 | map 是否用了 fallback 位姿 | `GHOSTING_SOURCE`（snapshot_fallback_count、fallback_merged_cloud）、`GLOBAL_MAP_DIAG` |
 | HBA 后 odom 与优化系差多少 | `HBA_GHOSTING`（last_kf odom->optimized trans_diff）、`GHOSTING_CHEAT_SHEET` |
+| **RViz 上 GPS/轨迹突然跳变** | `POSE_JUMP_CAUSE`（先看触发源）→ `POSE_JUMP`（再看哪个子图/关键帧跳变）→ `LOOP_ACCEPTED` / `GPS_COMPENSATE` / `GPS_TRANSFORM` 对照时间线 |
 
 ---
 
@@ -68,9 +77,11 @@ grep REBUILD_MERGE full.log
 
 | 文件 | TAG 出现位置 |
 |------|----------------|
-| automap_system.cpp | GHOSTING_SOURCE, GHOSTING_DIAG, GHOSTING_CHEAT_SHEET, GHOSTING_FIX, HBA_GHOSTING, BACKEND_ISAM2_GHOSTING_DIAG |
-| submap_manager.cpp | GHOSTING_DIAG, GHOSTING_SOURCE, HBA_GHOSTING, REBUILD_MERGE, GLOBAL_MAP_DIAG, POSE_DIAG, HBA_DIAG |
-| incremental_optimizer.cpp | ISAM2_GHOSTING_DIAG, CONSTRAINT_LOG/BACKEND LOOP, LOOP_ACCEPTED |
+| automap_system.cpp | GHOSTING_SOURCE, GHOSTING_DIAG, GHOSTING_CHEAT_SHEET, GHOSTING_FIX, HBA_GHOSTING, BACKEND_ISAM2_GHOSTING_DIAG, POSE_JUMP (KF), POSE_JUMP_DIAG, POSE_JUMP_CAUSE (onHBADone) |
+| submap_manager.cpp | GHOSTING_DIAG, GHOSTING_SOURCE, HBA_GHOSTING, REBUILD_MERGE, GLOBAL_MAP_DIAG, POSE_DIAG, HBA_DIAG, POSE_JUMP (SUBMAP) |
+| incremental_optimizer.cpp | ISAM2_GHOSTING_DIAG, CONSTRAINT_LOG/BACKEND LOOP, LOOP_ACCEPTED, POSE_JUMP_CAUSE (回环入图) |
+| delayed_gps_compensator.cpp | POSE_JUMP_CAUSE (GPS 延迟补偿) |
+| gps_processing.cpp (automap_system) | POSE_JUMP_CAUSE (GPS 对齐变换) |
 | loop_detector.cpp | INTRA_LOOP, LOOP_STEP, LOOP_ACCEPTED (publishLoopConstraint + TEASER 通过) |
 | loop_optimization.cpp (或 automap_system 内 onLoopDetected) | LOOP_ACCEPTED (enqueue 入后端队列) |
 | hba_optimizer.cpp | HBA_GHOSTING, GHOSTING_DIAG |
@@ -84,5 +95,6 @@ grep REBUILD_MERGE full.log
 - **点云结构重影**：零回环导致同地多点云未对齐 → 查 `LOOP_ACCEPTED`、`INTRA_LOOP`、`CONSTRAINT`；解决：让回环检测/几何校验/后端入图生效。
 - **写回与 build 竞态**：pose_snapshot 落在 writeback enter~exit 之间 → 查 `GHOSTING_DIAG` 时间线；解决：已通过同锁串行修复，日志用于验证。
 - **map 用了 odom 系**：fallback 或 rebuild 前用 merged_cloud → 查 `GHOSTING_SOURCE`、`GLOBAL_MAP_DIAG`、`REBUILD_MERGE`。
+- **RViz 上 GPS/轨迹突然跳变**：回环或 GPS 导致后端优化写回位姿 → 查 `POSE_JUMP_CAUSE`（触发源）、`POSE_JUMP`（哪个子图/KF 跳变及数值）；阈值为平移 >0.3m 或旋转 >3°。
 
 本文档与代码中 TAG 保持同步；新增可定位重影的日志时请在此索引中补充对应 TAG 与 grep 说明。

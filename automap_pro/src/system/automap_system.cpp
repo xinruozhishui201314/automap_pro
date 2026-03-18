@@ -7,6 +7,7 @@
 #include "automap_pro/core/health_monitor.h"
 #include "automap_pro/core/utils.h"
 #include "automap_pro/backend/pose_graph.h"
+#include <ament_index_cpp/get_package_share_directory.hpp>
 #include <unistd.h>
 #include <sys/syscall.h>
 #ifdef __linux__
@@ -29,8 +30,13 @@ static inline int64_t nowMs() {
 #include <chrono>
 #include <memory>
 #include <algorithm>
+#include <tuple>
+#include <thread>
+#include <cstdlib>
+#include <ctime>
 #include <iomanip>
 #include <sstream>
+#include <fstream>
 
 namespace fs = std::filesystem;
 namespace automap_pro {
@@ -177,6 +183,7 @@ void AutoMapSystem::loadConfigAndInit() {
     declare_parameter("trajectory_log_enable", true);
     declare_parameter("trajectory_log_after_mapping_only", true);
     declare_parameter("trajectory_log_dir", std::string(""));
+    declare_parameter("vtk_viewer_after_hba", true);
     std::string config_path = get_parameter("config_file").as_string();
     output_dir_override_ = get_parameter("output_dir").as_string();
     while (!output_dir_override_.empty() && output_dir_override_.back() == '/') output_dir_override_.pop_back();
@@ -214,8 +221,16 @@ void AutoMapSystem::loadConfigAndInit() {
         const char* env_dir = std::getenv("AUTOMAP_LOG_DIR");
         trajectory_log_dir_ = env_dir ? env_dir : "logs";
     }
-    RCLCPP_INFO(get_logger(), "[AutoMapSystem][CONFIG] trajectory_log_enable=%d trajectory_log_after_mapping_only=%d trajectory_log_dir=%s",
-                trajectory_log_enabled_ ? 1 : 0, trajectory_log_after_mapping_only_ ? 1 : 0, trajectory_log_dir_.c_str());
+    trajectory_log_enabled_ = get_parameter("trajectory_log_enable").as_bool();
+    trajectory_log_after_mapping_only_ = get_parameter("trajectory_log_after_mapping_only").as_bool();
+    trajectory_log_dir_    = get_parameter("trajectory_log_dir").as_string();
+    vtk_viewer_after_hba_ = get_parameter("vtk_viewer_after_hba").as_bool();
+    if (trajectory_log_dir_.empty()) {
+        const char* env_dir = std::getenv("AUTOMAP_LOG_DIR");
+        trajectory_log_dir_ = env_dir ? env_dir : "logs";
+    }
+    RCLCPP_INFO(get_logger(), "[AutoMapSystem][CONFIG] trajectory_log_enable=%d trajectory_log_after_mapping_only=%d trajectory_log_dir=%s vtk_viewer_after_hba=%d",
+                trajectory_log_enabled_ ? 1 : 0, trajectory_log_after_mapping_only_ ? 1 : 0, trajectory_log_dir_.c_str(), vtk_viewer_after_hba_ ? 1 : 0);
     if (trajectory_log_enabled_ && trajectory_log_after_mapping_only_) {
         RCLCPP_INFO(get_logger(),
             "[AutoMapSystem][CONFIG] trajectory_odom will be written only at save (keyframe+GPS, map frame); use the CSV in save output_dir for trajectory-GPS comparison.");
@@ -569,39 +584,42 @@ void AutoMapSystem::onOdometry(double ts, const Pose3d& pose, const Mat66d& cov)
     gps_manager_.addKeyFramePose(ts, pose);
 
     // 里程计路径（仅追加+发布，不做 O(n) 裁剪，避免阻塞回调；裁剪在 data_flow 定时器内做）
-    geometry_msgs::msg::PoseStamped ps;
-    ps.header.stamp    = now();
-    ps.header.frame_id = "map";
-    auto& pp           = ps.pose.position;
-    pp.x = pose.translation().x();
-    pp.y = pose.translation().y();
-    pp.z = pose.translation().z();
-    Eigen::Quaterniond q(pose.rotation());
-    ps.pose.orientation.w = q.w(); ps.pose.orientation.x = q.x();
-    ps.pose.orientation.y = q.y(); ps.pose.orientation.z = q.z();
-    odom_path_.poses.push_back(ps);
-    odom_path_.header = ps.header;
-    // 节流发布，避免高频 publish 占满 executor（每 3 帧发一次，前 20 帧每帧发）
-    if (seq <= 20 || seq % 3 == 0) {
-        odom_path_pub_->publish(odom_path_);
-        pub_odom_path_count_++;
-        // [GHOSTING_SOURCE] 精确定位重影：odom_path 使用里程计 T_w_b，与 global_map(T_w_b_optimized) 不同源，同屏会重影
-        if (odom_path_.poses.size() >= 2) {
-            const auto& fp = odom_path_.poses.front().pose.position;
-            RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
-                "[GHOSTING_SOURCE] odom_path published pose_source=odom(T_w_b) count=%zu first_pos=[%.3f,%.3f,%.3f] last_pos=[%.3f,%.3f,%.3f] (若与 global_map 同屏则重影)",
-                odom_path_.poses.size(), fp.x, fp.y, fp.z, pp.x, pp.y, pp.z);
-        } else {
-            RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
-                "[GHOSTING_SOURCE] odom_path published pose_source=odom(T_w_b) frame_id=map count=%zu last_pos=[%.3f,%.3f,%.3f] (若与 global_map 同屏显示则轨迹与点云错位即重影)",
-                odom_path_.poses.size(), pp.x, pp.y, pp.z);
-        }
-        // 一次性 WARN：优化/地图已发布后，odom_path 与 global_map 不同坐标系，同屏会严重重影（见 docs/HBA_GHOSTING_ANALYSIS_RUN_20260317_173943）
-        if (!odom_path_ghosting_warned_ && odom_path_.poses.size() >= 50 &&
-            (pub_opt_path_count_.load() > 0 || pub_map_count_.load() > 0)) {
-            RCLCPP_WARN(get_logger(),
-                "[HBA_GHOSTING] odom_path 与 global_map 使用不同坐标系，同屏显示将产生严重重影；请仅显示 optimized_path + global_map，或在 RViz 中隐藏 odom_path（grep HBA_GHOSTING）");
-            odom_path_ghosting_warned_ = true;
+    // HBA 完成后不再追加/发布 odom_path，避免与 global_map 同屏重影（onHBADone 会清空并发布空 Path）
+    if (!odom_path_stopped_after_hba_.load()) {
+        geometry_msgs::msg::PoseStamped ps;
+        ps.header.stamp    = now();
+        ps.header.frame_id = "map";
+        auto& pp           = ps.pose.position;
+        pp.x = pose.translation().x();
+        pp.y = pose.translation().y();
+        pp.z = pose.translation().z();
+        Eigen::Quaterniond q(pose.rotation());
+        ps.pose.orientation.w = q.w(); ps.pose.orientation.x = q.x();
+        ps.pose.orientation.y = q.y(); ps.pose.orientation.z = q.z();
+        odom_path_.poses.push_back(ps);
+        odom_path_.header = ps.header;
+        // 节流发布，避免高频 publish 占满 executor（每 3 帧发一次，前 20 帧每帧发）
+        if (seq <= 20 || seq % 3 == 0) {
+            odom_path_pub_->publish(odom_path_);
+            pub_odom_path_count_++;
+            // [GHOSTING_SOURCE] 精确定位重影：odom_path 使用里程计 T_w_b，与 global_map(T_w_b_optimized) 不同源，同屏会重影
+            if (odom_path_.poses.size() >= 2) {
+                const auto& fp = odom_path_.poses.front().pose.position;
+                RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
+                    "[GHOSTING_SOURCE] odom_path published pose_source=odom(T_w_b) count=%zu first_pos=[%.3f,%.3f,%.3f] last_pos=[%.3f,%.3f,%.3f] (若与 global_map 同屏则重影)",
+                    odom_path_.poses.size(), fp.x, fp.y, fp.z, pp.x, pp.y, pp.z);
+            } else {
+                RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
+                    "[GHOSTING_SOURCE] odom_path published pose_source=odom(T_w_b) frame_id=map count=%zu last_pos=[%.3f,%.3f,%.3f] (若与 global_map 同屏显示则轨迹与点云错位即重影)",
+                    odom_path_.poses.size(), pp.x, pp.y, pp.z);
+            }
+            // 一次性 WARN：优化/地图已发布后，odom_path 与 global_map 不同坐标系，同屏会严重重影（见 docs/HBA_GHOSTING_ANALYSIS_RUN_20260317_173943）
+            if (!odom_path_ghosting_warned_ && odom_path_.poses.size() >= 50 &&
+                (pub_opt_path_count_.load() > 0 || pub_map_count_.load() > 0)) {
+                RCLCPP_WARN(get_logger(),
+                    "[HBA_GHOSTING] odom_path 与 global_map 使用不同坐标系，同屏显示将产生严重重影；请仅显示 optimized_path + global_map，或在 RViz 中隐藏 odom_path（grep HBA_GHOSTING）");
+                odom_path_ghosting_warned_ = true;
+            }
         }
     }
 
@@ -772,9 +790,6 @@ void AutoMapSystem::feederLoop() {
     feeder_heartbeat_ts_ms_.store(nowMs(), std::memory_order_release);  // 初始心跳
     
     while (!shutdown_requested_.load(std::memory_order_acquire)) {
-        // [TRACE] 精准追踪：feeder 循环开始
-        ALOG_TRACE_STEP("AutoMapSystem", "feeder_loop_iter");
-
         feeder_heartbeat_ts_ms_.store(nowMs(), std::memory_order_release);  // 更新心跳
         FrameToProcess f;
         {
@@ -788,7 +803,9 @@ void AutoMapSystem::feederLoop() {
             ingress_queue_.pop();
             ingress_not_full_cv_.notify_one();
         }
-        
+        // [TRACE] 仅在有数据时打印，避免空转时每 500ms 刷屏
+        ALOG_TRACE_STEP("AutoMapSystem", "feeder_loop_iter");
+
         const int feeder_seq = feeder_frame_count.fetch_add(1) + 1;
         
         // 可选：预计算体素降采样供 backend worker 使用（V1：带超时保护，避免无限阻塞）
@@ -826,6 +843,9 @@ void AutoMapSystem::feederLoop() {
                 if (wait_count == 0) {
                     RCLCPP_INFO(get_logger(), "[AutoMapSystem][FEEDER] backpressure frame_queue_full queue=%zu max=%zu (feeder 等 backend 消费，grep FEEDER backpressure 可定位)",
                                 frame_queue_.size(), max_frame_queue_size_);
+                    RCLCPP_WARN(get_logger(),
+                        "[AutoMapSystem][STUCK_DIAG] feeder blocked: frame_queue full queue=%zu max=%zu (backend 消费过慢或卡在 commitAndUpdate；grep STUCK_DIAG)",
+                        frame_queue_.size(), max_frame_queue_size_);
                 }
                 if (wait_count >= max_waits) {
                     backpressure_force_drop_count_++;
@@ -998,6 +1018,7 @@ void AutoMapSystem::backendWorkerLoop() {
                     }
                 }
                 // 队列空时也打心跳，便于在合并日志中确认后端在“等数据”而非卡死；带 livo/ingress 诊断便于定位断点
+                last_backend_step_id_.store(BACKEND_STEP_IDLE, std::memory_order_release);
                 {
                     auto now_wall = std::chrono::steady_clock::now();
                     if (std::chrono::duration_cast<std::chrono::seconds>(now_wall - s_last_backend_heartbeat_wall).count() >= BACKEND_HEARTBEAT_INTERVAL_SEC) {
@@ -1119,6 +1140,7 @@ void AutoMapSystem::backendWorkerLoop() {
         }
         using Clock = std::chrono::steady_clock;
         const auto t0 = Clock::now();
+        last_backend_step_id_.store(BACKEND_STEP_TRY_CREATE_KF_ENTER, std::memory_order_release);
         RCLCPP_INFO(get_logger(), "[AutoMapSystem][BACKEND][STEP] step=tryCreateKeyFrame_enter processed_no=%d ts=%.3f (grep BACKEND STEP 精准定位卡住阶段)",
                     processed_no, f.ts);
         try {
@@ -1146,6 +1168,11 @@ void AutoMapSystem::backendWorkerLoop() {
         if (duration_ms > 5000.0 && duration_ms <= 30000.0) {
             RCLCPP_INFO(get_logger(), "[AutoMapSystem][BACKEND][SLOW] processed_no=%d ts=%.3f duration_ms=%.1f (>5s, 可能 ISAM2/回环/GPS 批次；若持续见 STUCK)",
                         processed_no, f.ts, duration_ms);
+        }
+        if (duration_ms > 2000.0) {
+            RCLCPP_WARN(get_logger(),
+                "[AutoMapSystem][STUCK_DIAG] single frame slow: processed_no=%d ts=%.3f duration_ms=%.1f last_backend_step=%s (结合上方 BACKEND STEP 与 GTSAM_EXIT 精准分析)",
+                processed_no, f.ts, duration_ms, backendStepName(last_backend_step_id_.load(std::memory_order_relaxed)));
         }
         // 强化日志：每帧处理时间超过 60 秒时告警，便于检测 commitAndUpdate 卡死
         // 超过 60 秒则强制重置 ISAM2 恢复系统
@@ -1490,6 +1517,7 @@ void AutoMapSystem::tryCreateKeyFrame(double ts, const Pose3d& pose, const Mat66
     double ms_create_kf = 1e-6 * std::chrono::duration_cast<std::chrono::microseconds>(t_after_create_kf - t_after_gps).count();
     RCLCPP_DEBUG(get_logger(), "[AutoMapSystem][BACKEND][KF_STEP] ts=%.3f step=createKeyFrame done kf_id=%lu", ts, kf->id);
 
+    last_backend_step_id_.store(BACKEND_STEP_ADD_KEYFRAME_ENTER, std::memory_order_release);
     RCLCPP_INFO(get_logger(), "[AutoMapSystem][BACKEND][STEP] step=addKeyFrame_enter ts=%.3f kf_id=%lu sm_id=%d (grep BACKEND STEP 定位卡住)",
                 ts, kf->id, kf->submap_id);
     RCLCPP_INFO(get_logger(), "[CONSTRAINT] step=keyframe_node_enter kf_id=%lu ts=%.3f (随后 addKeyFrame+addKeyFrameNode+GPS)", kf->id, ts);
@@ -1501,6 +1529,7 @@ void AutoMapSystem::tryCreateKeyFrame(double ts, const Pose3d& pose, const Mat66
     // ─────────────────────────────────────────────────────────────────────────
     // 子图内回环检测（新增）
     // ─────────────────────────────────────────────────────────────────────────
+    last_backend_step_id_.store(BACKEND_STEP_INTRA_LOOP_ENTER, std::memory_order_release);
     RCLCPP_INFO(get_logger(), "[AutoMapSystem][BACKEND][STEP] step=intra_loop_enter ts=%.3f (grep BACKEND STEP 定位卡住)", ts);
     auto t_before_intra_loop = KfClock::now();
     {
@@ -1536,6 +1565,7 @@ void AutoMapSystem::tryCreateKeyFrame(double ts, const Pose3d& pose, const Mat66
                         }
                     }
                     // 本帧所有子图内回环因子一次提交，避免 N 次 commitAndUpdate
+                    last_backend_step_id_.store(BACKEND_STEP_FORCE_UPDATE, std::memory_order_release);
                     isam2_optimizer_.forceUpdate();
                 }
             }
@@ -1548,6 +1578,7 @@ void AutoMapSystem::tryCreateKeyFrame(double ts, const Pose3d& pose, const Mat66
         RCLCPP_INFO(get_logger(), "[AutoMapSystem][BACKEND][KF_STEP_TIMING] ts=%.3f step=intra_loop_ms=%.1f (grep KF_STEP_TIMING)", ts, ms_intra_loop);
     }
 
+    last_backend_step_id_.store(BACKEND_STEP_GPS_FACTOR_ENTER, std::memory_order_release);
     RCLCPP_INFO(get_logger(), "[AutoMapSystem][BACKEND][STEP] step=gps_factor_enter ts=%.3f (grep BACKEND STEP 定位卡住)", ts);
     RCLCPP_INFO(get_logger(), "[CONSTRAINT] step=gps_enter kf_id=%lu sm_id=%d has_gps=%d gps_aligned=%d", kf->id, kf->submap_id, has_gps ? 1 : 0, gps_aligned_ ? 1 : 0);
     auto t_before_gps_factor = KfClock::now();
@@ -1837,6 +1868,10 @@ void AutoMapSystem::onLoopDetected(const LoopConstraint::Ptr& lc) {
             lc->submap_i, lc->submap_j, trans_norm, min_trans_m);
         RCLCPP_INFO(get_logger(), "[AutoMapSystem][LOOP] skip trivial loop sm_i=%d sm_j=%d trans_norm=%.3fm < %.2fm (quality filter)",
             lc->submap_i, lc->submap_j, trans_norm, min_trans_m);
+        if (lc->submap_i != lc->submap_j) {
+            RCLCPP_INFO(get_logger(), "[LOOP_INTER][SKIP] reason=trivial_trans sm_i=%d sm_j=%d trans_norm=%.3fm (子图间回环未入图；grep LOOP_INTER 统计)",
+                lc->submap_i, lc->submap_j, trans_norm);
+        }
         state_ = SystemState::MAPPING;
         return;
     }
@@ -1962,6 +1997,9 @@ void AutoMapSystem::onPoseUpdated(const std::unordered_map<int, Pose3d>& poses) 
     RCLCPP_INFO(get_logger(),
         "[GHOSTING_DIAG] onPoseUpdated_enter ts=%.3f total=%zu (iSAM2 位姿写回 SubMap/KF；若出现在某次 build 的 enter~exit 之间且该 build 未用快照则可能重影)",
         diag_ts, n);
+    RCLCPP_INFO(get_logger(),
+        "[POSE_JUMP_DIAG] 本次写回 %zu 个位姿；若下方出现 [POSE_JUMP][SUBMAP] 或 [POSE_JUMP][KF] 表示检测到明显跳变，原因见上文 POSE_JUMP_CAUSE/LOOP_ACCEPTED/GPS_COMPENSATE/GPS_TRANSFORM",
+        n);
     
     // P3: 区分子图级节点('s')和关键帧级节点('k')
     // 由于 GTSAM Symbol 使用字符区分，这里通过解析 node_id 的范围来判断
@@ -2026,7 +2064,24 @@ void AutoMapSystem::onPoseUpdated(const std::unordered_map<int, Pose3d>& poses) 
                 if (kf_sm_id == active_sm->id && kf_idx < static_cast<int>(active_sm->keyframes.size())) {
                     auto& kf = active_sm->keyframes[kf_idx];
                     if (kf) {
-                        double trans_diff = (kf_pose.translation() - kf->T_w_b.translation()).norm();
+                        double trans_diff_odom = (kf_pose.translation() - kf->T_w_b.translation()).norm();
+                        // 与上一时刻优化位姿比较，用于检测跳变（RViz 显示的是 T_w_b_optimized）
+                        double trans_diff_opt = (kf_pose.translation() - kf->T_w_b_optimized.translation()).norm();
+                        double rot_diff_rad = Eigen::AngleAxisd(
+                            kf_pose.rotation().inverse() * kf->T_w_b_optimized.rotation()).angle();
+                        double rot_diff_deg = rot_diff_rad * 180.0 / M_PI;
+                        const double kPoseJumpThresholdTransM = 0.3;
+                        const double kPoseJumpThresholdRotDeg = 3.0;
+                        bool kf_jump = (trans_diff_opt > kPoseJumpThresholdTransM || rot_diff_deg > kPoseJumpThresholdRotDeg);
+                        if (kf_jump) {
+                            RCLCPP_INFO(get_logger(),
+                                "[POSE_JUMP][KF] kf_id=%lu sm_id=%d idx=%d 优化位姿明显变化: trans_delta_opt=%.3fm rot_delta=%.2fdeg | old_opt=[%.3f,%.3f,%.3f] new_opt=[%.3f,%.3f,%.3f]",
+                                kf->id, active_sm->id, kf_idx, trans_diff_opt, rot_diff_deg,
+                                kf->T_w_b_optimized.translation().x(), kf->T_w_b_optimized.translation().y(), kf->T_w_b_optimized.translation().z(),
+                                kf_pose.translation().x(), kf_pose.translation().y(), kf_pose.translation().z());
+                            RCLCPP_INFO(get_logger(),
+                                "[POSE_JUMP][KF] 原因: 回环或 GPS 因子导致 iSAM2 重优化；RViz optimized_path/gps_positions_map 会跳变。查触发: grep POSE_JUMP_CAUSE 或 LOOP_ACCEPTED");
+                        }
                         // 直接使用 iSAM2 返回的优化位姿（全局坐标）
                         kf->T_w_b_optimized = kf_pose;
                         updated_kf_count++;
@@ -2034,11 +2089,11 @@ void AutoMapSystem::onPoseUpdated(const std::unordered_map<int, Pose3d>& poses) 
                         bool log_this = (updated_kf_count <= 2) || (i == kf_poses.size() - 1) || (i % kSampleStep == 0);
                         if (log_this) {
                             RCLCPP_INFO(get_logger(),
-                                "[BACKEND_ISAM2_GHOSTING_DIAG] KF_writeback kf_id=%lu sm_id=%d idx=%d: T_w_b(odom)=[%.3f,%.3f,%.3f] -> T_w_b_optimized(isam2)=[%.3f,%.3f,%.3f] trans_diff=%.3fm",
+                                "[BACKEND_ISAM2_GHOSTING_DIAG] KF_writeback kf_id=%lu sm_id=%d idx=%d: T_w_b(odom)=[%.3f,%.3f,%.3f] -> T_w_b_optimized(isam2)=[%.3f,%.3f,%.3f] trans_diff_odom=%.3fm trans_diff_opt=%.3fm",
                                 kf->id, active_sm->id, kf_idx,
                                 kf->T_w_b.translation().x(), kf->T_w_b.translation().y(), kf->T_w_b.translation().z(),
                                 kf_pose.translation().x(), kf_pose.translation().y(), kf_pose.translation().z(),
-                                trans_diff);
+                                trans_diff_odom, trans_diff_opt);
                         }
                     }
                 }
@@ -2098,34 +2153,33 @@ void AutoMapSystem::onPoseUpdated(const std::unordered_map<int, Pose3d>& poses) 
     }
 
     // ✅ P3 修复：发布优化后轨迹（按 submap_id 排序，保证 Path 在 RViz 中按顺序连线）
-    opt_path_.header.stamp    = now();
-    opt_path_.header.frame_id = "map";
-    opt_path_.poses.clear();
-
-    // P3：将 unordered_map 转为 sorted vector，按 submap_id 升序
-    // 确保 RViz 中轨迹按子图顺序连接，不会"乱跳"
-    std::vector<std::pair<int, Pose3d>> sorted(poses.begin(), poses.end());
-    std::sort(sorted.begin(), sorted.end(),
-              [](const auto& a, const auto& b) { return a.first < b.first; });
-
-    for (const auto& [sm_id, pose] : sorted) {
-        geometry_msgs::msg::PoseStamped ps;
-        ps.header = opt_path_.header;
-        ps.pose.position.x = pose.translation().x();
-        ps.pose.position.y = pose.translation().y();
-        ps.pose.position.z = pose.translation().z();
-        Eigen::Quaterniond q(pose.rotation());
-        ps.pose.orientation.w = q.w(); ps.pose.orientation.x = q.x();
-        ps.pose.orientation.y = q.y(); ps.pose.orientation.z = q.z();
-        opt_path_.poses.push_back(ps);
-    }
-    if (opt_path_pub_) {
-        try { opt_path_pub_->publish(opt_path_); } catch (const std::exception& e) {
-            RCLCPP_DEBUG(get_logger(), "[AutoMapSystem][POSE] opt_path publish: %s", e.what());
-        } catch (...) {}
-        pub_opt_path_count_++;
-        RCLCPP_DEBUG(get_logger(), "[GHOSTING_SOURCE] opt_path published pose_source=isam2_submap_anchor count=%zu (随后 publishOptimizedPath 会覆盖为 KF T_w_b_optimized)",
-            opt_path_.poses.size());
+    // [HBA_GHOSTING] HBA 后不再发布 iSAM2 的 opt_path_，避免覆盖 HBA 轨迹导致 map(HBA)+path(iSAM2) 重影（max_drift 可达数米）
+    if (!odom_path_stopped_after_hba_.load(std::memory_order_acquire)) {
+        opt_path_.header.stamp    = now();
+        opt_path_.header.frame_id = "map";
+        opt_path_.poses.clear();
+        std::vector<std::pair<int, Pose3d>> sorted(poses.begin(), poses.end());
+        std::sort(sorted.begin(), sorted.end(),
+                  [](const auto& a, const auto& b) { return a.first < b.first; });
+        for (const auto& [sm_id, pose] : sorted) {
+            geometry_msgs::msg::PoseStamped ps;
+            ps.header = opt_path_.header;
+            ps.pose.position.x = pose.translation().x();
+            ps.pose.position.y = pose.translation().y();
+            ps.pose.position.z = pose.translation().z();
+            Eigen::Quaterniond q(pose.rotation());
+            ps.pose.orientation.w = q.w(); ps.pose.orientation.x = q.x();
+            ps.pose.orientation.y = q.y(); ps.pose.orientation.z = q.z();
+            opt_path_.poses.push_back(ps);
+        }
+        if (opt_path_pub_) {
+            try { opt_path_pub_->publish(opt_path_); } catch (const std::exception& e) {
+                RCLCPP_DEBUG(get_logger(), "[AutoMapSystem][POSE] opt_path publish: %s", e.what());
+            } catch (...) {}
+            pub_opt_path_count_++;
+            RCLCPP_DEBUG(get_logger(), "[GHOSTING_SOURCE] opt_path published pose_source=isam2_submap_anchor count=%zu (随后 publishOptimizedPath 会覆盖为 KF T_w_b_optimized)",
+                opt_path_.poses.size());
+        }
     }
 
     try {
@@ -2150,9 +2204,8 @@ void AutoMapSystem::onPoseUpdated(const std::unordered_map<int, Pose3d>& poses) 
 // ─────────────────────────────────────────────────────────────────────────────
 void AutoMapSystem::onHBADone(const HBAResult& result) {
     if (!result.success) {
-        RCLCPP_ERROR(get_logger(), "[AutoMapSystem][HBA][EXCEPTION] optimization failed");
-        RCLCPP_INFO(get_logger(), "[TRACE] step=hba_done result=fail reason=optimization_failed (精准定位: 见 [HBA][BACKEND] 或 stderr 中 HBA failed 详情)");
-        return;
+        RCLCPP_ERROR(get_logger(), "[AutoMapSystem][HBA][FATAL] HBA 优化失败，建图要求高时不允许继续以免掩盖问题，程序即将退出 (见 [HBA][BACKEND] 或 stderr 详情)");
+        std::abort();
     }
     const size_t pose_count = result.optimized_poses.size();
     RCLCPP_INFO(get_logger(),
@@ -2189,6 +2242,8 @@ void AutoMapSystem::onHBADone(const HBAResult& result) {
 
     // 将 HBA 优化结果写回所有子图的关键帧（用于显示和全局图构建）
     RCLCPP_INFO(get_logger(), "[AutoMapSystem][HBA_GHOSTING] onHBADone: 写回顺序 updateAllFromHBA -> rebuildMergedCloudFromOptimizedPoses -> 显示/发布（仅用 T_w_b_optimized 可避免重影）");
+    RCLCPP_INFO(get_logger(),
+        "[POSE_JUMP_CAUSE] HBA 完成：即将写回全部关键帧/子图锚点位姿 → RViz 轨迹与地图将整体更新（可能明显跳变）；查跳变: grep POSE_JUMP");
     submap_manager_.updateAllFromHBA(result);
 
     // [FIX] HBA 完成后重建 merged_cloud，解决 fallback 使用旧位姿点云导致的重影问题
@@ -2208,6 +2263,11 @@ void AutoMapSystem::onHBADone(const HBAResult& result) {
 
     // [HBA_DIAG] 确认 HBA 结果已写回
     RCLCPP_INFO(get_logger(), "[AutoMapSystem][HBA][DIAG] updateAllFromHBA completed, triggering global map refresh");
+
+    // 记录 HBA 优化后的关键帧位姿与 GPS 到 CSV，便于建图完成后的精度分析
+    if (trajectory_log_enabled_) {
+        writeHbaPosesAndGpsForAccuracy();
+    }
 
     try {
         rviz_publisher_.publishHBAResult(result);
@@ -2274,6 +2334,194 @@ void AutoMapSystem::onHBADone(const HBAResult& result) {
         RCLCPP_WARN(get_logger(), "[AutoMapSystem][EXCEPTION] HBA viz refresh: %s", e.what());
     } catch (...) {
         RCLCPP_WARN(get_logger(), "[AutoMapSystem][EXCEPTION] HBA viz refresh: unknown exception");
+    }
+
+    // 建图完成后直接显示 HBA 轨迹与 GPS 轨迹的偏差：发布关键帧级 GPS 轨迹 + 偏差线段
+    if (gps_aligned_) {
+        try {
+            std::vector<std::tuple<double, Eigen::Vector3d, Eigen::Vector3d>> kf_ts_hba_gps;
+            constexpr double kGpsMaxDt = 1.0;
+            for (const auto& sm : all_sm) {
+                if (!sm) continue;
+                for (const auto& kf : sm->keyframes) {
+                    if (!kf) continue;
+                    Eigen::Vector3d hba_pos = kf->T_w_b_optimized.translation();
+                    Eigen::Vector3d gps_map = hba_pos;
+                    if (kf->has_valid_gps) {
+                        auto [pos_map, frame] = gps_manager_.enu_to_map_with_frame(kf->gps.position_enu);
+                        gps_map = pos_map;
+                    } else {
+                        auto gps_opt = gps_manager_.queryByTimestampForLog(kf->timestamp, kGpsMaxDt);
+                        if (gps_opt) {
+                            auto [pos_map, frame] = gps_manager_.enu_to_map_with_frame(gps_opt->position_enu);
+                            gps_map = pos_map;
+                        }
+                    }
+                    kf_ts_hba_gps.emplace_back(kf->timestamp, hba_pos, gps_map);
+                }
+            }
+            std::sort(kf_ts_hba_gps.begin(), kf_ts_hba_gps.end(),
+                [](const auto& a, const auto& b) { return std::get<0>(a) < std::get<0>(b); });
+            std::vector<Eigen::Vector3d> hba_positions, gps_positions_map;
+            hba_positions.reserve(kf_ts_hba_gps.size());
+            gps_positions_map.reserve(kf_ts_hba_gps.size());
+            double sum_dev = 0.0, max_dev = 0.0;
+            int valid_n = 0;
+            for (const auto& [ts, hba, gps] : kf_ts_hba_gps) {
+                hba_positions.push_back(hba);
+                gps_positions_map.push_back(gps);
+                double d = (hba - gps).norm();
+                if (std::isfinite(d)) { sum_dev += d; valid_n++; if (d > max_dev) max_dev = d; }
+            }
+            rviz_publisher_.publishGpsKeyframePath(gps_positions_map);
+            rviz_publisher_.publishHbaGpsDeviationMarkers(hba_positions, gps_positions_map);
+            rviz_publisher_.publishHbaGpsTrajectoryClouds(hba_positions, gps_positions_map);
+            if (valid_n > 0) {
+                RCLCPP_INFO(get_logger(),
+                    "[AutoMapSystem][HBA][ACCURACY] HBA vs GPS deviation: mean=%.3fm max=%.3fm keyframes=%zu (see /automap/gps_keyframe_path and /automap/hba_gps_deviation in RViz)",
+                    sum_dev / valid_n, max_dev, kf_ts_hba_gps.size());
+            }
+        } catch (const std::exception& e) {
+            RCLCPP_WARN(get_logger(), "[AutoMapSystem][HBA][ACCURACY] publish deviation viz: %s", e.what());
+        } catch (...) {}
+
+        // 建图精度结果归档：创建带时间戳的目录（automap_output/YYYYMMDD_HHMM），保存点云地图与轨迹，并供 VTK 保存精度曲线高清图
+        // [PCD_GHOSTING_FIX] HBA 后仅构建一次全局图并缓存，供本处保存与后续 map_publish 发布共用，避免两路 build 导致 PCD 重影（见 docs/PCD_GHOSTING_VS_RVIZ_ANALYSIS_20260317_2137.md）
+        try {
+            CloudXYZIPtr hba_global = submap_manager_.buildGlobalMap(map_voxel_size_);
+            if (hba_global && !hba_global->empty()) {
+                std::lock_guard<std::mutex> lk(last_hba_global_map_mutex_);
+                last_hba_global_map_ = hba_global;
+                RCLCPP_INFO(get_logger(), "[AutoMapSystem][HBA][PCD_GHOSTING_FIX] built global map once (pts=%zu), cache set for save + RViz", hba_global->size());
+            }
+            std::time_t t = std::time(nullptr);
+            std::tm* lt = std::localtime(&t);
+            char buf[32];
+            std::strftime(buf, sizeof(buf), "%Y%m%d_%H%M", lt);
+            std::string base_dir = getOutputDir();
+            while (!base_dir.empty() && base_dir.back() == '/') base_dir.pop_back();
+            std::string timestamped_dir = base_dir.empty() ? std::string(buf) : (base_dir + "/" + buf);
+            fs::create_directories(timestamped_dir);
+            saveMapToFiles(timestamped_dir);
+            RCLCPP_INFO(get_logger(), "[AutoMapSystem][HBA][SAVE] accuracy+map snapshot saved to %s (VTK will save curve image there if enabled)", timestamped_dir.c_str());
+            setenv("AUTOMAP_ACCURACY_SAVE_DIR", timestamped_dir.c_str(), 1);
+
+            // 主进程直接写入标定精度 CSV/摘要并生成曲线图，避免依赖 VTK 子进程（VTK 可能未安装、无 DISPLAY 或 env 未传递导致无图）
+            if (gps_aligned_) {
+                try {
+                    std::vector<std::tuple<double, Eigen::Vector3d, Eigen::Vector3d>> kf_ts_hba_gps;
+                    constexpr double kGpsMaxDt = 1.0;
+                    for (const auto& sm : all_sm) {
+                        if (!sm) continue;
+                        for (const auto& kf : sm->keyframes) {
+                            if (!kf) continue;
+                            Eigen::Vector3d hba_pos = kf->T_w_b_optimized.translation();
+                            Eigen::Vector3d gps_map = hba_pos;
+                            if (kf->has_valid_gps) {
+                                auto [pos_map, frame] = gps_manager_.enu_to_map_with_frame(kf->gps.position_enu);
+                                gps_map = pos_map;
+                            } else {
+                                auto gps_opt = gps_manager_.queryByTimestampForLog(kf->timestamp, kGpsMaxDt);
+                                if (gps_opt) {
+                                    auto [pos_map, frame] = gps_manager_.enu_to_map_with_frame(gps_opt->position_enu);
+                                    gps_map = pos_map;
+                                }
+                            }
+                            kf_ts_hba_gps.emplace_back(kf->timestamp, hba_pos, gps_map);
+                        }
+                    }
+                    std::sort(kf_ts_hba_gps.begin(), kf_ts_hba_gps.end(),
+                        [](const auto& a, const auto& b) { return std::get<0>(a) < std::get<0>(b); });
+                    if (!kf_ts_hba_gps.empty()) {
+                        std::vector<double> hba_x, hba_y, hba_z, gps_x, gps_y, gps_z, deviation, cum_dist;
+                        double cum = 0.0;
+                        for (size_t i = 0; i < kf_ts_hba_gps.size(); ++i) {
+                            const auto& [ts, hba, gps] = kf_ts_hba_gps[i];
+                            hba_x.push_back(hba.x()); hba_y.push_back(hba.y()); hba_z.push_back(hba.z());
+                            gps_x.push_back(gps.x()); gps_y.push_back(gps.y()); gps_z.push_back(gps.z());
+                            double d = (hba - gps).norm();
+                            deviation.push_back(std::isfinite(d) ? d : 0.0);
+                            if (i > 0) {
+                                double ds = (Eigen::Vector3d(hba_x[i]-hba_x[i-1], hba_y[i]-hba_y[i-1], hba_z[i]-hba_z[i-1])).norm();
+                                cum += ds;
+                            }
+                            cum_dist.push_back(cum);
+                        }
+                        const std::string& d = timestamped_dir;
+                        std::ofstream ot(d + "/accuracy_trajectories.csv");
+                        if (ot.is_open()) {
+                            ot << "index,hba_x_m,hba_y_m,hba_z_m,gps_x_m,gps_y_m,gps_z_m,deviation_m,cum_dist_m\n"
+                               << std::fixed << std::setprecision(6);
+                            for (size_t i = 0; i < hba_x.size(); ++i)
+                                ot << i << "," << hba_x[i] << "," << hba_y[i] << "," << hba_z[i] << ","
+                                   << gps_x[i] << "," << gps_y[i] << "," << gps_z[i] << ","
+                                   << deviation[i] << "," << cum_dist[i] << "\n";
+                            ot.close();
+                        }
+                        std::ofstream od(d + "/deviation_curve.csv");
+                        if (od.is_open()) {
+                            od << "cum_dist_m,deviation_m\n" << std::fixed << std::setprecision(6);
+                            for (size_t i = 0; i < cum_dist.size(); ++i) od << cum_dist[i] << "," << deviation[i] << "\n";
+                            od.close();
+                        }
+                        double mean_dev = 0.0, max_dev = 0.0;
+                        for (double dv : deviation) { mean_dev += dv; if (dv > max_dev) max_dev = dv; }
+                        if (!deviation.empty()) mean_dev /= static_cast<double>(deviation.size());
+                        std::ofstream os(d + "/accuracy_summary.txt");
+                        if (os.is_open()) {
+                            os << std::fixed << std::setprecision(4)
+                               << "# HBA vs GPS accuracy (same data as accuracy_curves.png)\n"
+                               << "keyframe_count=" << deviation.size() << "\n"
+                               << "mean_deviation_m=" << mean_dev << "\n"
+                               << "max_deviation_m=" << max_dev << "\n"
+                               << "cum_dist_total_m=" << (cum_dist.empty() ? 0.0 : cum_dist.back()) << "\n";
+                            os.close();
+                        }
+                        RCLCPP_INFO(get_logger(), "[AutoMapSystem][HBA][SAVE] accuracy CSVs + summary written to %s (mean=%.3fm max=%.3fm)", d.c_str(), mean_dev, max_dev);
+
+                        // 调用 Python 脚本生成 accuracy_curves.png（不依赖 VTK/DISPLAY）
+                        try {
+                            std::string pkg_share = ament_index_cpp::get_package_share_directory("automap_pro");
+                            std::string script = pkg_share + "/scripts/plot_accuracy_curves.py";
+                            if (fs::exists(script)) {
+                                std::string cmd = "python3 \"" + script + "\" --dir \"" + timestamped_dir + "\"";
+                                int ret = std::system(cmd.c_str());
+                                if (ret == 0)
+                                    RCLCPP_INFO(get_logger(), "[AutoMapSystem][HBA][SAVE] accuracy_curves.png generated in %s", timestamped_dir.c_str());
+                                else
+                                    RCLCPP_WARN(get_logger(), "[AutoMapSystem][HBA][SAVE] plot_accuracy_curves.py exited %d (check python3/matplotlib)", ret);
+                            } else {
+                                RCLCPP_WARN(get_logger(), "[AutoMapSystem][HBA][SAVE] script not found: %s (install scripts to share/automap_pro/scripts/)", script.c_str());
+                            }
+                        } catch (const std::exception& e2) {
+                            RCLCPP_WARN(get_logger(), "[AutoMapSystem][HBA][SAVE] plot script: %s", e2.what());
+                        }
+                    }
+                } catch (const std::exception& e) {
+                    RCLCPP_WARN(get_logger(), "[AutoMapSystem][HBA][SAVE] accuracy CSV/plot failed: %s", e.what());
+                } catch (...) {}
+            }
+        } catch (const std::exception& e) {
+            RCLCPP_WARN(get_logger(), "[AutoMapSystem][HBA][SAVE] timestamped save failed: %s", e.what());
+        } catch (...) {}
+
+        // HBA 优化后直接启动 VTK 轨迹查看器显示两条曲线与偏差曲线（Path 已用 TransientLocal 发布；若设置了 AUTOMAP_ACCURACY_SAVE_DIR 则保存高清图到该目录）
+        if (vtk_viewer_after_hba_) {
+            std::thread([]() {
+                int ret = std::system("ros2 run automap_pro vtk_trajectory_viewer");
+                (void)ret;
+            }).detach();
+            RCLCPP_INFO(get_logger(), "[AutoMapSystem][HBA][VTK] launched vtk_trajectory_viewer in background (set vtk_viewer_after_hba:=false to disable)");
+        }
+    }
+
+    // HBA 完成后清除 RViz 中的 odom_path 显示并停止后续发布，避免与 global_map（HBA 系）同屏重影（见 GHOSTING_CHEAT_SHEET / PCD_GHOSTING_VS_RVIZ_ANALYSIS）
+    if (gps_aligned_ && !odom_path_stopped_after_hba_.exchange(true)) {
+        odom_path_.poses.clear();
+        odom_path_.header.stamp = now();
+        odom_path_.header.frame_id = "map";
+        odom_path_pub_->publish(odom_path_);
+        RCLCPP_INFO(get_logger(), "[AutoMapSystem][HBA_GHOSTING] cleared odom_path and published empty path (RViz will show only optimized_path + global_map to avoid ghosting)");
     }
 
     // HBA 完成后强制刷新全局点云：用 T_w_b_optimized 重新 buildGlobalMap 并发布到 RViz，
@@ -2637,16 +2885,49 @@ void AutoMapSystem::publishGlobalMap() {
     RCLCPP_INFO(get_logger(), "[AutoMapSystem][MAP] publishGlobalMap step=using_cached_voxel voxel_size=%.3f", voxel_size);
     size_t pts = 0;
     try {
-        RCLCPP_INFO(get_logger(), "[AutoMapSystem][MAP] publishGlobalMap step=buildGlobalMap_enter");
-        RCLCPP_INFO(get_logger(), "[GHOSTING_DIAG] buildGlobalMap_enter (async=快照路径/sync=现场读；若重影请 grep GHOSTING_DIAG 对照 build_id 与 onPoseUpdated/updateAllFromHBA)");
         CloudXYZIPtr global;
-        const bool used_async = ConfigManager::instance().asyncGlobalMapBuild();
-        if (used_async) {
-            global = submap_manager_.buildGlobalMapAsync(voxel_size).get();
-        } else {
-            global = submap_manager_.buildGlobalMap(voxel_size);
+        bool used_async = false;
+        bool used_cached_hba = false;
+        {
+            std::lock_guard<std::mutex> lk(last_hba_global_map_mutex_);
+            if (last_hba_global_map_ && !last_hba_global_map_->empty()) {
+                global = last_hba_global_map_;
+                last_hba_global_map_.reset();
+                pts = global->size();
+                used_cached_hba = true;
+                RCLCPP_INFO(get_logger(), "[AutoMapSystem][PCD_GHOSTING_FIX] publish using cached HBA global map (pts=%zu), same as saved PCD", pts);
+            }
         }
-        pts = global ? global->size() : 0u;
+        if (!global || global->empty()) {
+            RCLCPP_INFO(get_logger(), "[AutoMapSystem][MAP] publishGlobalMap step=buildGlobalMap_enter");
+            RCLCPP_INFO(get_logger(), "[GHOSTING_DIAG] buildGlobalMap_enter (async=快照路径/sync=现场读；若重影请 grep GHOSTING_DIAG 对照 build_id 与 onPoseUpdated/updateAllFromHBA)");
+            // [PCD_GHOSTING_FIX] HBA 已完成后禁止 async：避免无 cache 时启动 async.get() 阻塞，返回后仍发布 pre-HBA 结果；强制 sync 读现场 T_w_b_optimized 彻底杜绝重影
+            const bool hba_done = odom_path_stopped_after_hba_.load(std::memory_order_acquire);
+            used_async = ConfigManager::instance().asyncGlobalMapBuild() && !hba_done;
+            if (used_async) {
+                global = submap_manager_.buildGlobalMapAsync(voxel_size).get();
+                // [PCD_GHOSTING_FIX] 阻塞期间 HBA 可能已完成并写入 cache，必须再检查一次，避免发布 pre-HBA 的 async 结果
+                {
+                    std::lock_guard<std::mutex> lk(last_hba_global_map_mutex_);
+                    if (last_hba_global_map_ && !last_hba_global_map_->empty()) {
+                        global = last_hba_global_map_;
+                        last_hba_global_map_.reset();
+                        pts = global->size();
+                        used_cached_hba = true;
+                        used_async = false;
+                        RCLCPP_INFO(get_logger(), "[AutoMapSystem][PCD_GHOSTING_FIX] after async.get() re-check: using cached HBA map (pts=%zu), discard async result", pts);
+                    } else {
+                        pts = global ? global->size() : 0u;
+                    }
+                }
+            } else {
+                if (hba_done) {
+                    RCLCPP_INFO(get_logger(), "[AutoMapSystem][PCD_GHOSTING_FIX] HBA done: force sync build (no async), avoid pre-HBA map");
+                }
+                global = submap_manager_.buildGlobalMap(voxel_size);
+                pts = global ? global->size() : 0u;
+            }
+        }
         RCLCPP_INFO(get_logger(), "[AutoMapSystem][MAP] publishGlobalMap step=buildGlobalMap_done pts=%zu", pts);
         RCLCPP_INFO(get_logger(), "[GHOSTING_DIAG] buildGlobalMap_done pts=%zu (同一次 build 的 build_id 见上条 SubMapMgr 日志；若重影请 grep GHOSTING_DIAG 查时间线)", pts);
         if (!global || global->empty()) {
@@ -2657,7 +2938,7 @@ void AutoMapSystem::publishGlobalMap() {
         RCLCPP_INFO(get_logger(), "[GHOSTING_DIAG] map_published pts=%zu (若重影：grep GHOSTING_DIAG 取时间线，用 pts 关联上方 buildGlobalMapInternal_exit 的 build_id)", pts);
         RCLCPP_INFO(get_logger(),
             "[GHOSTING_SOURCE] map_published pts=%zu pose_source=%s (与 optimized_path 同源则无重影；async 下若见 snapshot_kf_fallback 则部分 KF 为 odom 会重影)",
-            pts, used_async ? "async_snapshot(T_w_b_optimized)" : "sync_live(T_w_b_optimized)");
+            pts, used_cached_hba ? "cached_hba(T_w_b_optimized)" : (used_async ? "async_snapshot(T_w_b_optimized)" : "sync_live(T_w_b_optimized)"));
         RCLCPP_INFO(get_logger(), "[AutoMapSystem][PIPELINE] event=map_published points=%zu voxel=%.3f", pts, voxel_size);
         // [GLOBAL_MAP_DIAG] 发布环节：确认 frame_id 与点数，便于与 RViz Fixed Frame 对照
         const std::string map_frame_id = "map";
@@ -2824,8 +3105,8 @@ std::vector<KeyFrame::Ptr> AutoMapSystem::collectKeyframesFromSubmaps(const std:
 }
 
 void AutoMapSystem::publishDataFlowSummary() {
-    // 在定时器内做 path 裁剪，避免在 onOdometry 回调中做 O(n) erase 阻塞
-    if (odom_path_.poses.size() > 10000) {
+    // 在定时器内做 path 裁剪，避免在 onOdometry 回调中做 O(n) erase 阻塞；HBA 后不再追加/裁剪 odom_path
+    if (!odom_path_stopped_after_hba_.load() && odom_path_.poses.size() > 10000) {
         const size_t to_trim = odom_path_.poses.size() - 5000;
         odom_path_.poses.erase(odom_path_.poses.begin(), odom_path_.poses.begin() + static_cast<ptrdiff_t>(to_trim));
         RCLCPP_DEBUG(get_logger(), "[AutoMapSystem][DATA_FLOW] odom_path trimmed to %zu poses", odom_path_.poses.size());
@@ -3061,6 +3342,18 @@ void AutoMapSystem::handleFinishMapping(
             }
             finish_mapping_in_progress_.store(false, std::memory_order_release);
             RCLCPP_INFO(get_logger(), "[AutoMapSystem][GHOSTING_FIX] finish_mapping_in_progress_=false (HBA 已结束或未启用，map_publish 可执行)");
+            // HBA 完成后确保发布一次全局点云到 RViz，否则 map 线程可能因 defer 尚未执行即 shutdown 导致后端 RViz 看不到 HBA 优化后的点云
+            if (ConfigManager::instance().hbaEnabled() && ConfigManager::instance().hbaOnFinish() && submap_manager_.submapCount() > 0) {
+                try {
+                    RCLCPP_INFO(get_logger(), "[AutoMapSystem][PIPELINE] event=finish_mapping_publish_hba_map_enter (确保 RViz 显示 HBA 后点云)");
+                    publishGlobalMap();
+                    RCLCPP_INFO(get_logger(), "[AutoMapSystem][PIPELINE] event=finish_mapping_publish_hba_map_done");
+                } catch (const std::exception& e) {
+                    RCLCPP_WARN(get_logger(), "[AutoMapSystem][finish_mapping] publishGlobalMap: %s", e.what());
+                } catch (...) {
+                    RCLCPP_WARN(get_logger(), "[AutoMapSystem][finish_mapping] publishGlobalMap: unknown exception");
+                }
+            }
             std::string out_dir = getOutputDir();
             RCLCPP_INFO(get_logger(), "[AutoMapSystem][PIPELINE] event=finish_mapping_save_enter output_dir=%s", out_dir.c_str());
             RCLCPP_INFO(get_logger(), "[CRASH_CONTEXT] step=finish_mapping_before_save output_dir=%s", out_dir.c_str());
@@ -3384,6 +3677,84 @@ void AutoMapSystem::writeTrajectoryOdomAfterMapping(const std::string& output_di
     }
 }
 
+// HBA 完成后写入：HBA 优化关键帧位姿 + GPS（便于建图精度分析）
+void AutoMapSystem::writeHbaPosesAndGpsForAccuracy() {
+    if (!trajectory_log_enabled_) return;
+    std::lock_guard<std::mutex> lk(trajectory_log_mutex_);
+    ensureTrajectoryLogDir();
+    auto all_sm = submap_manager_.getFrozenSubmaps();
+    size_t kf_count = 0;
+    for (const auto& sm : all_sm) {
+        if (!sm) continue;
+        kf_count += sm->keyframes.size();
+    }
+    if (kf_count == 0) {
+        RCLCPP_INFO(get_logger(), "[AutoMapSystem][TRAJ_LOG] writeHbaPosesAndGpsForAccuracy: no keyframes, skip");
+        return;
+    }
+    const std::string filename = "trajectory_hba_poses_" + trajectory_session_id_ + ".csv";
+    const std::string path = trajectory_log_dir_ + "/" + filename;
+    std::ofstream out(path);
+    if (!out.is_open()) {
+        RCLCPP_WARN(get_logger(), "[AutoMapSystem][TRAJ_LOG] failed to open %s for HBA poses", path.c_str());
+        return;
+    }
+    out << "timestamp,kf_id,submap_id,hba_x,hba_y,hba_z,hba_qx,hba_qy,hba_qz,hba_qw,"
+        << "gps_valid,gps_x_map,gps_y_map,gps_z_map,gps_enu_x,gps_enu_y,gps_enu_z,gps_hdop,gps_quality\n";
+    constexpr double kGpsMaxDt = 1.0;
+    for (const auto& sm : all_sm) {
+        if (!sm) continue;
+        for (const auto& kf : sm->keyframes) {
+            if (!kf) continue;
+            const Pose3d& T = kf->T_w_b_optimized;
+            Eigen::Quaterniond q(T.rotation());
+            double gps_x_map = 0.0, gps_y_map = 0.0, gps_z_map = 0.0;
+            double gps_enu_x = 0.0, gps_enu_y = 0.0, gps_enu_z = 0.0;
+            double gps_hdop = 0.0;
+            int gps_quality = 0;
+            bool gps_valid = false;
+            if (kf->has_valid_gps) {
+                gps_enu_x = kf->gps.position_enu.x();
+                gps_enu_y = kf->gps.position_enu.y();
+                gps_enu_z = kf->gps.position_enu.z();
+                gps_hdop = kf->gps.hdop;
+                gps_quality = static_cast<int>(kf->gps.quality);
+                gps_valid = kf->gps.is_valid;
+                auto [pos_map, frame] = gps_manager_.enu_to_map_with_frame(kf->gps.position_enu);
+                gps_x_map = pos_map.x();
+                gps_y_map = pos_map.y();
+                gps_z_map = pos_map.z();
+            } else {
+                auto gps_opt = gps_manager_.queryByTimestampForLog(kf->timestamp, kGpsMaxDt);
+                if (gps_opt) {
+                    gps_enu_x = gps_opt->position_enu.x();
+                    gps_enu_y = gps_opt->position_enu.y();
+                    gps_enu_z = gps_opt->position_enu.z();
+                    gps_hdop = gps_opt->hdop;
+                    gps_quality = static_cast<int>(gps_opt->quality);
+                    gps_valid = gps_opt->is_valid;
+                    auto [pos_map, frame] = gps_manager_.enu_to_map_with_frame(gps_opt->position_enu);
+                    gps_x_map = pos_map.x();
+                    gps_y_map = pos_map.y();
+                    gps_z_map = pos_map.z();
+                }
+            }
+            out << std::fixed << std::setprecision(6)
+                << kf->timestamp << "," << static_cast<uint64_t>(kf->id) << "," << kf->submap_id << ","
+                << T.translation().x() << "," << T.translation().y() << "," << T.translation().z() << ","
+                << q.x() << "," << q.y() << "," << q.z() << "," << q.w() << ","
+                << (gps_valid ? "1" : "0") << ","
+                << gps_x_map << "," << gps_y_map << "," << gps_z_map << ","
+                << gps_enu_x << "," << gps_enu_y << "," << gps_enu_z << ","
+                << gps_hdop << "," << gps_quality << "\n";
+        }
+    }
+    out.close();
+    RCLCPP_INFO(get_logger(),
+        "[AutoMapSystem][TRAJ_LOG] wrote trajectory_hba_poses (HBA keyframe + GPS) to %s (%zu rows). Use for mapping accuracy analysis.",
+        path.c_str(), kf_count);
+}
+
 void AutoMapSystem::onGPSMeasurementForLog(double ts, const Eigen::Vector3d& pos_enu) {
     if (!trajectory_log_enabled_) return;
     std::lock_guard<std::mutex> lk(trajectory_log_mutex_);
@@ -3428,10 +3799,21 @@ void AutoMapSystem::saveMapToFiles(const std::string& output_dir) {
         fs::create_directories(output_dir);
         RCLCPP_INFO(get_logger(), "[AutoMapSystem][PIPELINE] event=save_writing output_dir=%s", output_dir.c_str());
 
-        const float voxel_size = map_voxel_size_;
-        CloudXYZIPtr global = ConfigManager::instance().asyncGlobalMapBuild()
-            ? submap_manager_.buildGlobalMapAsync(voxel_size).get()
-            : submap_manager_.buildGlobalMap(voxel_size);
+        CloudXYZIPtr global;
+        {
+            std::lock_guard<std::mutex> lk(last_hba_global_map_mutex_);
+            if (last_hba_global_map_ && !last_hba_global_map_->empty()) {
+                global = last_hba_global_map_;
+                RCLCPP_INFO(get_logger(), "[AutoMapSystem][PCD_GHOSTING_FIX] save using cached HBA global map (pts=%zu), same as RViz", global->size());
+                // 不在此处清空，留给 publishGlobalMap 使用后清空，保证 RViz 与 PCD 同源
+            }
+        }
+        if (!global || global->empty()) {
+            const float voxel_size = map_voxel_size_;
+            global = ConfigManager::instance().asyncGlobalMapBuild()
+                ? submap_manager_.buildGlobalMapAsync(voxel_size).get()
+                : submap_manager_.buildGlobalMap(voxel_size);
+        }
         size_t pcd_points = 0;
         if (global && !global->empty()) {
             std::string pcd_path = output_dir + "/global_map.pcd";
@@ -3476,6 +3858,19 @@ void AutoMapSystem::saveMapToFiles(const std::string& output_dir) {
         // 建图完成后写 trajectory_odom CSV：关键帧位姿 + 最终地图系下 GPS，保证与 plot_trajectory_compare 对比时轨迹与 GPS 重合
         if (trajectory_log_enabled_) {
             writeTrajectoryOdomAfterMapping(output_dir);
+            // 若 HBA 已执行过，将 trajectory_hba_poses_*.csv 复制到 output_dir，便于精度分析
+            std::string hba_csv_name = "trajectory_hba_poses_" + trajectory_session_id_ + ".csv";
+            std::string hba_src = trajectory_log_dir_ + "/" + hba_csv_name;
+            if (fs::exists(hba_src)) {
+                std::string hba_dst = output_dir + "/" + hba_csv_name;
+                try {
+                    fs::copy_file(hba_src, hba_dst, fs::copy_options::overwrite_existing);
+                    RCLCPP_INFO(get_logger(), "[AutoMapSystem][TRAJ_LOG] copied %s to %s for accuracy analysis",
+                                hba_csv_name.c_str(), output_dir.c_str());
+                } catch (const std::exception& e) {
+                    RCLCPP_WARN(get_logger(), "[AutoMapSystem][TRAJ_LOG] copy HBA poses CSV failed: %s", e.what());
+                }
+            }
         }
 
         if (!kf_poses_cloud->empty()) {
@@ -3549,8 +3944,20 @@ std::string AutoMapSystem::stateToString(SystemState s) const {
 }
 
 // ============================================================================
-// V2: 线程心跳监控
+// V2: 线程心跳监控（卡住时 last_backend_step 精准定位阶段）
 // ============================================================================
+
+const char* AutoMapSystem::backendStepName(int id) const {
+    switch (id) {
+        case BACKEND_STEP_IDLE: return "idle";
+        case BACKEND_STEP_TRY_CREATE_KF_ENTER: return "tryCreateKeyFrame_enter";
+        case BACKEND_STEP_ADD_KEYFRAME_ENTER: return "addKeyFrame_enter";
+        case BACKEND_STEP_INTRA_LOOP_ENTER: return "intra_loop_enter";
+        case BACKEND_STEP_GPS_FACTOR_ENTER: return "gps_factor_enter";
+        case BACKEND_STEP_FORCE_UPDATE: return "forceUpdate_commitAndUpdate";
+        default: return "unknown";
+    }
+}
 
 void AutoMapSystem::checkThreadHeartbeats() {
     const auto now = std::chrono::steady_clock::now();
@@ -3594,15 +4001,33 @@ void AutoMapSystem::checkThreadHeartbeats() {
         }
     }
     
-    // 输出心跳状态汇总
+    // 输出心跳状态汇总；若 backend 卡住则附带 last_backend_step 便于精准定位
+    const int backend_step_id = last_backend_step_id_.load(std::memory_order_relaxed);
+    const char* backend_step_str = backendStepName(backend_step_id);
     if (has_error) {
-        RCLCPP_ERROR(get_logger(), 
-            "[AutoMapSystem][HEARTBEAT] CRITICAL: threads stuck: %s", 
+        RCLCPP_ERROR(get_logger(),
+            "[AutoMapSystem][HEARTBEAT] CRITICAL: threads stuck: %s",
             error_ss.str().c_str());
+        for (const auto& h : healths) {
+            if (h.status == "ERROR" && h.name == "backend") {
+                RCLCPP_ERROR(get_logger(),
+                    "[AutoMapSystem][STUCK_DIAG] backend stuck last_backend_step=%s (grep STUCK_DIAG 精准定位卡住阶段)",
+                    backend_step_str);
+                break;
+            }
+        }
     } else if (has_warn) {
-        RCLCPP_WARN(get_logger(), 
-            "[AutoMapSystem][HEARTBEAT] WARNING: slow threads: %s", 
+        RCLCPP_WARN(get_logger(),
+            "[AutoMapSystem][HEARTBEAT] WARNING: slow threads: %s",
             warn_ss.str().c_str());
+        for (const auto& h : healths) {
+            if (h.status == "WARN" && h.name == "backend") {
+                RCLCPP_WARN(get_logger(),
+                    "[AutoMapSystem][STUCK_DIAG] backend slow last_backend_step=%s (grep STUCK_DIAG 精准定位卡住阶段)",
+                    backend_step_str);
+                break;
+            }
+        }
     }
     
     // 周期性输出健康状态（每30秒一次，即使正常）

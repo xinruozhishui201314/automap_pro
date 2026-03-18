@@ -182,10 +182,57 @@ if [ -d src/thrid_party/rpg_vikit_ros2 ]; then
   fi
 fi
 
-# 后续 fast_livo / automap_pro 需要找到 gtsam、teaserpp、vikit
+# LibTorch（OverlapTransformer 推理）：与 GTSAM 一致，安装到 install_deps，仅下载解压一次，不随工程重复编译
+LIBTORCH_INSTALL_DIR="${INSTALL_DEPS}/libtorch"
+NEED_LIBTORCH_DOWNLOAD=false
+if [ ! -f "${LIBTORCH_INSTALL_DIR}/share/cmake/Torch/TorchConfig.cmake" ] && [ ! -f "${LIBTORCH_INSTALL_DIR}/lib/libtorch.so" ]; then
+  NEED_LIBTORCH_DOWNLOAD=true
+fi
+if [ "${LIBTORCH_SKIP_DOWNLOAD:-0}" = "1" ]; then
+  NEED_LIBTORCH_DOWNLOAD=false
+  echo "[INFO] LIBTORCH_SKIP_DOWNLOAD=1，跳过 LibTorch 下载（请确保已手动放置到 ${LIBTORCH_INSTALL_DIR}）"
+fi
+if [ "$NEED_LIBTORCH_DOWNLOAD" = true ]; then
+  echo '========================================'
+  echo '安装 LibTorch 到 install_deps（下载预编译包，仅执行一次）'
+  echo '========================================'
+  LIBTORCH_URL="${LIBTORCH_URL:-https://download.pytorch.org/libtorch/cpu/libtorch-cxx11-abi-shared-with-deps-2.1.2%2Bcpu.zip}"
+  LIBTORCH_ZIP="/tmp/libtorch-cpu.zip"
+  mkdir -p "${INSTALL_DEPS}"
+  if [ -d "${LIBTORCH_INSTALL_DIR}" ]; then
+    rm -rf "${LIBTORCH_INSTALL_DIR}"
+  fi
+  echo "[INFO] 下载 LibTorch: ${LIBTORCH_URL}"
+  if command -v wget >/dev/null 2>&1; then
+    wget -q --show-progress -O "${LIBTORCH_ZIP}" "${LIBTORCH_URL}" || { echo "[ERROR] wget LibTorch 失败"; rm -f "${LIBTORCH_ZIP}"; exit 1; }
+  elif command -v curl >/dev/null 2>&1; then
+    curl -# -L -o "${LIBTORCH_ZIP}" "${LIBTORCH_URL}" || { echo "[ERROR] curl LibTorch 失败"; rm -f "${LIBTORCH_ZIP}"; exit 1; }
+  else
+    echo "[ERROR] 需要 wget 或 curl 下载 LibTorch"; exit 1
+  fi
+  echo "[INFO] 解压到 ${LIBTORCH_INSTALL_DIR}"
+  unzip -q -o "${LIBTORCH_ZIP}" -d "${INSTALL_DEPS}"
+  rm -f "${LIBTORCH_ZIP}"
+  if [ -d "${INSTALL_DEPS}/libtorch" ]; then
+    echo "[INFO] LibTorch 已安装于 install_deps/libtorch"
+  else
+    echo "[ERROR] 解压后未找到 ${INSTALL_DEPS}/libtorch"; exit 1
+  fi
+else
+  if [ -f "${LIBTORCH_INSTALL_DIR}/share/cmake/Torch/TorchConfig.cmake" ] || [ -f "${LIBTORCH_INSTALL_DIR}/lib/libtorch.so" ]; then
+    echo "[INFO] LibTorch 已安装于 install_deps，跳过"
+  fi
+fi
+if [ -d "${LIBTORCH_INSTALL_DIR}/lib" ]; then
+  export LIBTORCH_HOME="${LIBTORCH_INSTALL_DIR}"
+  export CMAKE_PREFIX_PATH="${LIBTORCH_INSTALL_DIR}:${CMAKE_PREFIX_PATH}"
+  export LD_LIBRARY_PATH="${LIBTORCH_INSTALL_DIR}/lib:${LD_LIBRARY_PATH}"
+fi
+
+# 后续 fast_livo / automap_pro 需要找到 gtsam、teaserpp、vikit、libtorch
 [ -f "${INSTALL_DEPS}/setup.bash" ] && source "${INSTALL_DEPS}/setup.bash"
-export CMAKE_PREFIX_PATH="${INSTALL_DEPS}/gtsam:${INSTALL_DEPS}/teaserpp:${INSTALL_DEPS}:${CMAKE_PREFIX_PATH}"
-export LD_LIBRARY_PATH="${INSTALL_DEPS}/gtsam/lib:${INSTALL_DEPS}/teaserpp/lib:${LD_LIBRARY_PATH}"
+export CMAKE_PREFIX_PATH="${INSTALL_DEPS}/gtsam:${INSTALL_DEPS}/teaserpp:${INSTALL_DEPS}/libtorch:${INSTALL_DEPS}:${CMAKE_PREFIX_PATH}"
+export LD_LIBRARY_PATH="${INSTALL_DEPS}/gtsam/lib:${INSTALL_DEPS}/teaserpp/lib:${INSTALL_DEPS}/libtorch/lib:${LD_LIBRARY_PATH}"
 
 # fast_livo：优先用 in-tree 直接路径，避免 colcon 对 src/fast_livo 符号链接解析后当成 automap_pro 子目录而忽略（导致 0 packages finished）
 FAST_LIVO_PATH=""
