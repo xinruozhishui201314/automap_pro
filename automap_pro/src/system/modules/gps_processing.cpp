@@ -148,7 +148,6 @@ void AutoMapSystem::transformAllPosesAfterGPSAlign(const GPSAlignResult& result)
     Eigen::Affine3d T_map_to_enu = Eigen::Affine3d::Identity();
     T_map_to_enu.linear() = R_map_to_enu;
     T_map_to_enu.translation() = t_map_to_enu;
-    Eigen::Affine3f T_map_to_enu_f = T_map_to_enu.cast<float>();
 
     int transformed_kf_count = 0;
     int transformed_cloud_count = 0;

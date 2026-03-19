@@ -476,13 +476,13 @@ HealthMonitor& HealthMonitor::instance() {
 
 void HealthMonitor::init(rclcpp::Node::SharedPtr node, const HealthMonitorConfig& config) {
     std::lock_guard<std::mutex> lk(mutex_);
-    if (node_) return;  // Already initialized
+    if (!node_.expired()) return;  // Already initialized
     
     node_ = node;
     config_ = config;
     
     // Create health status publisher
-    health_pub_ = node_->create_publisher<automap_pro::msg::MappingStatusMsg>(
+    health_pub_ = node->create_publisher<automap_pro::msg::MappingStatusMsg>(
         "/automap/health/status", 10);
     
     ALOG_INFO(MOD, "HealthMonitor initialized (check_interval={:.1f}s, heartbeat_interval={:.1f}s)",
@@ -505,8 +505,12 @@ void HealthMonitor::start() {
 }
 
 void HealthMonitor::stop() {
-    std::lock_guard<std::mutex> lk(mutex_);
-    running_.store(false);
+    {
+        std::lock_guard<std::mutex> lk(mutex_);
+        if (!running_.load()) return;
+        running_.store(false);
+        stop_cv_.notify_all();
+    }
     
     if (check_thread_.joinable()) {
         check_thread_.join();
@@ -673,8 +677,11 @@ HealthReport HealthMonitor::performHealthCheck() {
 void HealthMonitor::publishHealthReport(const HealthReport& report) {
     if (!health_pub_) return;
     
+    auto shared_node = node_.lock();
+    if (!shared_node) return;
+
     auto msg = std::make_shared<automap_pro::msg::MappingStatusMsg>();
-    msg->header.stamp = node_->now();
+    msg->header.stamp = shared_node->now();
     msg->state = healthStateToString(report.overall_state);
     
     // Add summary information
@@ -725,17 +732,20 @@ void HealthMonitor::checkLoop() {
             SLOG_INFO(MOD, "Triggering recovery due to state={}", report.overall_state);
         }
         
-        // Sleep until next check
-        std::this_thread::sleep_for(std::chrono::duration<double>(
-            config_.check_interval_sec * 1000.0));
+        // Sleep until next check (using CV for fast shutdown)
+        std::unique_lock<std::mutex> lock(mutex_);
+        stop_cv_.wait_for(lock, std::chrono::duration<double>(config_.check_interval_sec));
     }
 }
 
 void HealthMonitor::heartbeatLoop() {
     while (running_.load()) {
+        auto shared_node = node_.lock();
+        if (!shared_node) break;
+
         // Publish heartbeat
         auto msg = std::make_shared<automap_pro::msg::MappingStatusMsg>();
-        msg->header.stamp = node_->now();
+        msg->header.stamp = shared_node->now();
         msg->state = "HEALTHY";
         msg->gps_aligned = false;
         
@@ -744,9 +754,9 @@ void HealthMonitor::heartbeatLoop() {
         // Structured logging
         SLOG_DEBUG(MOD, "heartbeat", "System alive");
         
-        // Sleep until next heartbeat
-        std::this_thread::sleep_for(std::chrono::duration<double>(
-            config_.heartbeat_interval_sec * 1000.0));
+        // Sleep until next heartbeat (using CV for fast shutdown)
+        std::unique_lock<std::mutex> lock(mutex_);
+        stop_cv_.wait_for(lock, std::chrono::duration<double>(config_.heartbeat_interval_sec));
     }
 }
 

@@ -3,8 +3,12 @@
 
 #include "automap_pro/system/automap_system.h"
 #include "automap_pro/core/config_manager.h"
+#include "automap_pro/core/health_monitor.h"
 
+#include <chrono>
+#include <cstdlib>
 #include <filesystem>
+#include <thread>
 
 namespace automap_pro {
 
@@ -207,6 +211,8 @@ void AutoMapSystem::handleFinishMapping(
                 hba_optimizer_.triggerAsync(all, true, "finish_mapping");
                 RCLCPP_INFO(get_logger(), "[AutoMapSystem][PIPELINE] event=finish_mapping_final_hba_done");
             }
+            // 确保输出目录已初始化（含时间戳）
+            ensureTrajectoryLogDir();
             std::string out_dir = getOutputDir();
             RCLCPP_INFO(get_logger(), "[AutoMapSystem][PIPELINE] event=finish_mapping_save_enter output_dir=%s", out_dir.c_str());
             saveMapToFiles(out_dir);
@@ -215,8 +221,20 @@ void AutoMapSystem::handleFinishMapping(
         res->success = true;
         res->message = "Map saved, requesting shutdown";
         RCLCPP_INFO(get_logger(), "[AutoMapSystem] finish_mapping: requesting context shutdown (end mapping)");
-        // 让 worker 线程在 spin() 返回前就能退出，避免仅依赖析构导致进程长期不退出（见 ROOT_CAUSE_FINISH_MAPPING_NO_EXIT.md）
+        
+        // 🔧 关键修复：在 shutdown 之前显式停止所有子模块内部线程，打破循环引用并解决挂起问题
         shutdown_requested_.store(true, std::memory_order_release);
+        
+        RCLCPP_INFO(get_logger(), "[AutoMapSystem] stopping LoopDetector...");
+        loop_detector_.stop();
+        RCLCPP_INFO(get_logger(), "[AutoMapSystem] stopping SubMapManager...");
+        submap_manager_.stop();
+        RCLCPP_INFO(get_logger(), "[AutoMapSystem] stopping HBAOptimizer...");
+        hba_optimizer_.stop();
+        RCLCPP_INFO(get_logger(), "[AutoMapSystem] stopping HealthMonitor...");
+        HealthMonitor::instance().stop();
+
+        // 唤醒所有 AutoMapSystem 本地线程
         map_publish_cv_.notify_all();
         gps_queue_cv_.notify_all();
         loop_trigger_cv_.notify_all();
@@ -224,7 +242,16 @@ void AutoMapSystem::handleFinishMapping(
         gps_align_cv_.notify_all();
         opt_task_cv_.notify_all();
         status_pub_cv_.notify_all();
+        
+        RCLCPP_INFO(get_logger(), "[AutoMapSystem] calling rclcpp::shutdown()...");
         rclcpp::shutdown();
+        // MultiThreadedExecutor::spin() 在 shutdown 后仍可能阻塞：某 executor 线程卡在耗时订阅回调中。
+        // 离线 launch 依赖本进程退出触发 OnProcessExit，从而结束 bag / fast_livo / rviz。地图已保存且模块已 stop。
+        // 短延迟后 _Exit：给 DDS 时间发出 finish_mapping 响应；若 spin 已返回则 main 先结束进程，本线程随进程终止。
+        std::thread([]() {
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            std::_Exit(EXIT_SUCCESS);
+        }).detach();
     } catch (const std::exception& e) {
         RCLCPP_ERROR(get_logger(), "[AutoMapSystem] finish_mapping failed: %s", e.what());
         res->success = false;

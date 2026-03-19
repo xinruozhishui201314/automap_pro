@@ -75,6 +75,7 @@ void AutoMapSystem::tryCreateKeyFrame(double ts, const Pose3d& pose, const Mat66
             T.linear() = R_snapshot * kf->T_w_b.linear();
             T.translation() = R_snapshot * kf->T_w_b.translation() + t_snapshot;
             kf->T_w_b = T;
+            kf->T_w_b_optimized = T; // 同步更新优化位姿，确保可视化不跳变
         }
     }
 

@@ -35,6 +35,7 @@ public:
     ~SubMapManager();
 
     void init(rclcpp::Node::SharedPtr node);
+    void stop();
 
     // ── 主要接口 ──────────────────────────────────────────────────────────
 
@@ -183,7 +184,7 @@ private:
     double match_res_    = 0.4;     // 降采样分辨率（用于回环匹配）
     double merge_res_    = 0.2;     // 降采样分辨率（合并地图，至少 0.2 避免 PCL 溢出）
 
-    rclcpp::Node::SharedPtr node_;
+    std::weak_ptr<rclcpp::Node> node_;
     rclcpp::Publisher<automap_pro::msg::SubMapEventMsg>::SharedPtr event_pub_;
 
     std::vector<SubMapFrozenCallback> frozen_cbs_;
@@ -218,6 +219,9 @@ private:
         const std::vector<std::pair<CloudXYZIPtr, Pose3d>>& cloud_pose_snapshot,
         float voxel_size,
         uint64_t build_id = 0) const;
+
+    /** 安全获取节点指针 */
+    rclcpp::Node::SharedPtr node() const { return node_.lock(); }
 
     /** 与 HBAOptimizer::collectKeyFramesFromSubmaps 相同顺序：过滤(有效 cloud_body + 有限 T_w_b)、按 timestamp 排序、按 timestamp 去重。用于 updateAllFromHBA 写回时与 result.optimized_poses 一一对应，避免顺序错位导致 PCD 重影。调用方须已持 mutex_。 */
     std::vector<KeyFrame::Ptr> collectKeyframesInHBAOrder() const;

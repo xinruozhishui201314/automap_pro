@@ -417,6 +417,10 @@ private:
     void writeTrajectoryOdomAfterMapping(const std::string& output_dir);
     /** HBA 完成后写：HBA 优化后的关键帧位姿 + GPS（map/ENU），便于建图精度分析（trajectory_hba_poses_*.csv） */
     void writeHbaPosesAndGpsForAccuracy();
+    /**
+     * 建图保存阶段：在全局地图系下对比 GPS 与 HBA/后端优化后关键帧位姿，写 CSV、统计摘要与偏差曲线 PNG（与 output_dir/run_* 同目录）。
+     */
+    void writeMappingAccuracyGpsVsHba(const std::string& output_dir);
     void onGPSMeasurementForLog(double ts, const Eigen::Vector3d& pos_enu);
 
     // ── 工具 ─────────────────────────────────────────────────────────────

@@ -169,7 +169,7 @@ private:
     int                     sc_tree_making_period_ = 50;
 
     // ── ROS2 资源 ─────────────────────────────────────────────────────────
-    rclcpp::Node::SharedPtr node_;
+    std::weak_ptr<rclcpp::Node> node_;
     rclcpp::Publisher<automap_pro::msg::LoopConstraintMsg>::SharedPtr constraint_pub_;
 
 #ifdef USE_OVERLAP_TRANSFORMER_MSGS
@@ -245,6 +245,9 @@ private:
 
     bool computeDescExternal(const SubMap::Ptr& submap);
     void publishLoopConstraint(const LoopConstraint::Ptr& lc);
+
+    /** 安全获取节点指针 */
+    rclcpp::Node::SharedPtr node() const { return node_.lock(); }
 };
 
 } // namespace automap_pro

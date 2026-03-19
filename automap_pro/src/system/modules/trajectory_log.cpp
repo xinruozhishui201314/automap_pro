@@ -2,6 +2,13 @@
 // 包含: ensureTrajectoryLogDir, writeTrajectoryOdom, writeTrajectoryOdomAfterMapping, onGPSMeasurementForLog
 
 #include "automap_pro/system/automap_system.h"
+#include "automap_pro/core/config_manager.h"
+#include <opencv2/imgproc.hpp>
+#include <opencv2/imgcodecs.hpp>
+
+#include <algorithm>
+#include <cmath>
+#include <fstream>
 #include <iomanip>
 #include <sstream>
 #include <filesystem>
@@ -32,6 +39,14 @@ void AutoMapSystem::ensureTrajectoryLogDir() {
         } else {
             trajectory_session_id_ = std::to_string(current_session_id_);
         }
+
+        // 🔧 自动创建带时间戳的输出子目录，满足用户需求：@automap_output/run_timestamp
+        if (output_dir_override_.empty()) {
+            std::string base_dir = ConfigManager::instance().outputDir();
+            output_dir_override_ = base_dir + "/run_" + trajectory_session_id_;
+            RCLCPP_INFO(get_logger(), "[AutoMapSystem][TRAJ_LOG] initialized timestamped output_dir: %s", output_dir_override_.c_str());
+        }
+
         RCLCPP_INFO(get_logger(), "[AutoMapSystem][TRAJ_LOG] trajectory log dir=%s session_id=%s",
                     trajectory_log_dir_.c_str(), trajectory_session_id_.c_str());
     } catch (const std::exception& e) {
@@ -364,6 +379,299 @@ void AutoMapSystem::onGPSMeasurementForLog(double ts, const Eigen::Vector3d& pos
         << static_cast<int>(att.source) << "," << att.velocity_horizontal << ","
         << (att.is_valid ? "1" : "0") << "\n";
     trajectory_gps_file_.flush();
+}
+
+namespace {
+
+constexpr double kPi = 3.14159265358979323846;
+constexpr double kRadToDeg = 180.0 / kPi;
+
+double wrapToPi(double a) {
+    while (a > kPi) a -= 2.0 * kPi;
+    while (a < -kPi) a += 2.0 * kPi;
+    return a;
+}
+
+/** R = Rz(yaw)*Ry(pitch)*Rx(roll) 与 Eigen::eulerAngles(2,1,0) 一致 → [yaw,pitch,roll] 弧度 */
+Eigen::Vector3d yawPitchRollFromR(const Eigen::Matrix3d& R) {
+    Eigen::Vector3d e = R.eulerAngles(2, 1, 0);
+    return Eigen::Vector3d(e[0], e[1], e[2]);
+}
+
+void drawBand(cv::Mat& img, const cv::Rect& band, const std::vector<double>& xv, const std::vector<double>& yv,
+              const cv::Scalar& color, const std::string& title) {
+    if (xv.size() < 2 || xv.size() != yv.size()) return;
+    double ymin = *std::min_element(yv.begin(), yv.end());
+    double ymax = *std::max_element(yv.begin(), yv.end());
+    if (!std::isfinite(ymin) || !std::isfinite(ymax)) return;
+    if (std::abs(ymax - ymin) < 1e-12) {
+        ymin -= 1.0;
+        ymax += 1.0;
+    }
+    const double margin = (ymax - ymin) * 0.08 + 1e-6;
+    ymin -= margin;
+    ymax += margin;
+    double xmin = xv.front(), xmax = xv.back();
+    if (std::abs(xmax - xmin) < 1e-9) {
+        xmin -= 1.0;
+        xmax += 1.0;
+    }
+    const int x0 = band.x + 50, y0 = band.y + 10;
+    const int bw = band.width - 60, bh = band.height - 30;
+    cv::rectangle(img, band, cv::Scalar(230, 230, 230), 1);
+    cv::putText(img, title, cv::Point(band.x + 5, band.y + 18), cv::FONT_HERSHEY_SIMPLEX, 0.45,
+                cv::Scalar(40, 40, 40), 1, cv::LINE_AA);
+    auto tx = [&](double x) { return x0 + static_cast<int>((x - xmin) / (xmax - xmin) * bw); };
+    auto ty = [&](double y) { return y0 + bh - static_cast<int>((y - ymin) / (ymax - ymin) * bh); };
+    for (size_t i = 1; i < xv.size(); ++i) {
+        cv::line(img, cv::Point(tx(xv[i - 1]), ty(yv[i - 1])), cv::Point(tx(xv[i]), ty(yv[i])), color, 1,
+                 cv::LINE_AA);
+    }
+    cv::line(img, cv::Point(x0, y0 + bh), cv::Point(x0 + bw, y0 + bh), cv::Scalar(80, 80, 80), 1, cv::LINE_AA);
+    cv::line(img, cv::Point(x0, y0), cv::Point(x0, y0 + bh), cv::Scalar(80, 80, 80), 1, cv::LINE_AA);
+
+    // 坐标刻度与数值（横轴为 xv 物理量，纵轴为 yv 物理量）
+    constexpr int kDiv = 5;
+    constexpr double kFont = 0.35;
+    const cv::Scalar tick_color(80, 80, 80);
+    auto fmt_axis = [](double v, int prec) {
+        std::ostringstream o;
+        o << std::fixed << std::setprecision(prec) << v;
+        return o.str();
+    };
+    for (int i = 0; i <= kDiv; ++i) {
+        const double xv_tick = xmin + (xmax - xmin) * static_cast<double>(i) / static_cast<double>(kDiv);
+        const int px = tx(xv_tick);
+        cv::line(img, cv::Point(px, y0 + bh), cv::Point(px, y0 + bh + 6), tick_color, 1, cv::LINE_AA);
+        const std::string xs = fmt_axis(xv_tick, (xmax - xmin) >= 100.0 ? 0 : 1);
+        int bl = 0;
+        const cv::Size xsz = cv::getTextSize(xs, cv::FONT_HERSHEY_SIMPLEX, kFont, 1, &bl);
+        int txp = px - xsz.width / 2;
+        txp = std::max(band.x + 2, std::min(txp, band.x + band.width - xsz.width - 2));
+        int x_baseline = y0 + bh + 12;
+        x_baseline = std::min(x_baseline, band.y + band.height - 2);
+        cv::putText(img, xs, cv::Point(txp, x_baseline), cv::FONT_HERSHEY_SIMPLEX, kFont, tick_color, 1, cv::LINE_AA);
+
+        const double yv_tick = ymin + (ymax - ymin) * static_cast<double>(i) / static_cast<double>(kDiv);
+        const int py = ty(yv_tick);
+        cv::line(img, cv::Point(x0 - 6, py), cv::Point(x0, py), tick_color, 1, cv::LINE_AA);
+        const std::string ys = fmt_axis(yv_tick, 3);
+        cv::putText(img, ys, cv::Point(band.x + 4, std::min(py + 4, y0 + bh)), cv::FONT_HERSHEY_SIMPLEX, kFont,
+                    tick_color, 1, cv::LINE_AA);
+    }
+}
+
+bool saveTriplePlot(const std::string& path, const std::vector<double>& xv,
+                    const std::vector<double>& y1, const std::vector<double>& y2, const std::vector<double>& y3,
+                    const char* l1, const char* l2, const char* l3) {
+    if (xv.size() < 2 || y1.size() != xv.size() || y2.size() != xv.size() || y3.size() != xv.size()) return false;
+    const int W = 1100, H = 720, bandH = H / 3;
+    cv::Mat img(H, W, CV_8UC3, cv::Scalar(255, 255, 255));
+    drawBand(img, cv::Rect(0, 0, W, bandH), xv, y1, cv::Scalar(200, 60, 60), std::string(l1));
+    drawBand(img, cv::Rect(0, bandH, W, bandH), xv, y2, cv::Scalar(60, 140, 60), std::string(l2));
+    drawBand(img, cv::Rect(0, 2 * bandH, W, bandH), xv, y3, cv::Scalar(60, 80, 200), std::string(l3));
+    try {
+        return cv::imwrite(path, img);
+    } catch (...) {
+        return false;
+    }
+}
+
+}  // namespace
+
+void AutoMapSystem::writeMappingAccuracyGpsVsHba(const std::string& output_dir) {
+    if (output_dir.empty()) return;
+    if (!trajectory_log_enabled_) return;
+
+    const std::string sid = trajectory_session_id_.empty() ? "nosession" : trajectory_session_id_;
+    const std::string base = "mapping_accuracy_gps_vs_hba_" + sid;
+    const std::string csv_path = output_dir + "/" + base + ".csv";
+    const std::string sum_path = output_dir + "/" + base + "_summary.txt";
+    const std::string png_xyz = output_dir + "/" + base + "_err_xyz.png";
+    const std::string png_rpy = output_dir + "/" + base + "_err_rpy_deg.png";
+
+    const bool also_log = !trajectory_log_dir_.empty() && trajectory_log_dir_ != output_dir;
+
+    auto all_sm = submap_manager_.getAllSubmaps();
+    std::vector<KeyFrame::Ptr> kfs;
+    for (const auto& sm : all_sm) {
+        if (!sm) continue;
+        for (const auto& kf : sm->keyframes) {
+            if (kf) kfs.push_back(kf);
+        }
+    }
+    std::sort(kfs.begin(), kfs.end(), [](const KeyFrame::Ptr& a, const KeyFrame::Ptr& b) {
+        return a->timestamp < b->timestamp;
+    });
+
+    std::ofstream csv(csv_path);
+    if (!csv.is_open()) {
+        RCLCPP_WARN(get_logger(), "[AutoMapSystem][ACCURACY] failed to open %s", csv_path.c_str());
+        return;
+    }
+
+    csv << "timestamp,kf_id,submap_id,gps_pos_valid,gps_att_valid,pos_frame,"
+        << "hba_x_m,hba_y_m,hba_z_m,hba_roll_deg,hba_pitch_deg,hba_yaw_deg,"
+        << "gps_x_map_m,gps_y_map_m,gps_z_map_m,gps_roll_deg,gps_pitch_deg,gps_yaw_deg,"
+        << "err_x_m,err_y_m,err_z_m,horiz_err_m,err_roll_deg,err_pitch_deg,err_yaw_deg,"
+        << "gps_hdop,gps_quality\n";
+
+    constexpr double kGpsMaxDt = 1.0;
+    std::vector<double> plot_t;
+    std::vector<double> ex, ey, ez;
+    std::vector<double> plot_t_rpy;
+    std::vector<double> er, ep, eya;
+
+    double sum_h2 = 0.0, sum_z2 = 0.0;
+    double sum_x2 = 0.0, sum_y2 = 0.0;
+    int n_pos = 0;
+    double sum_rr2 = 0.0, sum_pp2 = 0.0, sum_yy2 = 0.0;
+    int n_att = 0;
+
+    const double t0 = kfs.empty() ? 0.0 : kfs.front()->timestamp;
+
+    for (const auto& kf : kfs) {
+        const Pose3d& T = kf->T_w_b_optimized;
+        const Eigen::Vector3d t_h = T.translation();
+        Eigen::Vector3d ypr_h = yawPitchRollFromR(T.linear());
+
+        double gps_x = 0.0, gps_y = 0.0, gps_z = 0.0;
+        double gps_hdop = 0.0;
+        int gps_quality = 0;
+        bool gps_pos_valid = false;
+        std::string frame_str = "none";
+
+        AttitudeEstimate gatt;
+        if (kf->has_valid_gps) {
+            gps_hdop = kf->gps.hdop;
+            gps_quality = static_cast<int>(kf->gps.quality);
+            gps_pos_valid = kf->gps.is_valid;
+            auto pr = gps_manager_.enu_to_map_with_frame(kf->gps.position_enu);
+            gps_x = pr.first.x();
+            gps_y = pr.first.y();
+            gps_z = pr.first.z();
+            frame_str = pr.second;
+            gatt = kf->gps.attitude;
+        } else if (auto gps_opt = gps_manager_.queryByTimestampForLog(kf->timestamp, kGpsMaxDt)) {
+            gps_hdop = gps_opt->hdop;
+            gps_quality = static_cast<int>(gps_opt->quality);
+            gps_pos_valid = gps_opt->is_valid;
+            auto pr = gps_manager_.enu_to_map_with_frame(gps_opt->position_enu);
+            gps_x = pr.first.x();
+            gps_y = pr.first.y();
+            gps_z = pr.first.z();
+            frame_str = pr.second;
+            gatt = gps_opt->attitude;
+        }
+        const bool gps_att_valid = gatt.is_valid;
+
+        double gr = 0.0, gp = 0.0, gy = 0.0;
+        if (gps_att_valid) {
+            gr = gatt.roll * kRadToDeg;
+            gp = gatt.pitch * kRadToDeg;
+            gy = gatt.yaw * kRadToDeg;
+        }
+
+        const double hr = ypr_h[2] * kRadToDeg;
+        const double hp = ypr_h[1] * kRadToDeg;
+        const double hy = ypr_h[0] * kRadToDeg;
+
+        double dx = 0.0, dy = 0.0, dz = 0.0, dh = 0.0;
+        double dr = 0.0, dp = 0.0, dya = 0.0;
+        if (gps_pos_valid) {
+            dx = t_h.x() - gps_x;
+            dy = t_h.y() - gps_y;
+            dz = t_h.z() - gps_z;
+            dh = std::sqrt(dx * dx + dy * dy);
+            sum_h2 += dh * dh;
+            sum_z2 += dz * dz;
+            sum_x2 += dx * dx;
+            sum_y2 += dy * dy;
+            ++n_pos;
+        }
+        if (gps_att_valid) {
+            dr = wrapToPi(ypr_h[2] - gatt.roll) * kRadToDeg;
+            dp = wrapToPi(ypr_h[1] - gatt.pitch) * kRadToDeg;
+            dya = wrapToPi(ypr_h[0] - gatt.yaw) * kRadToDeg;
+            sum_rr2 += dr * dr;
+            sum_pp2 += dp * dp;
+            sum_yy2 += dya * dya;
+            ++n_att;
+        }
+        if (gps_pos_valid) {
+            plot_t.push_back(kf->timestamp - t0);
+            ex.push_back(dx);
+            ey.push_back(dy);
+            ez.push_back(dz);
+            if (gps_att_valid) {
+                plot_t_rpy.push_back(kf->timestamp - t0);
+                er.push_back(dr);
+                ep.push_back(dp);
+                eya.push_back(dya);
+            }
+        }
+
+        csv << std::fixed << std::setprecision(6)
+            << kf->timestamp << "," << static_cast<uint64_t>(kf->id) << "," << kf->submap_id << ","
+            << (gps_pos_valid ? "1" : "0") << "," << (gps_att_valid ? "1" : "0") << "," << frame_str << ","
+            << t_h.x() << "," << t_h.y() << "," << t_h.z() << "," << hr << "," << hp << "," << hy << ","
+            << gps_x << "," << gps_y << "," << gps_z << "," << gr << "," << gp << "," << gy << ","
+            << dx << "," << dy << "," << dz << "," << dh << "," << dr << "," << dp << "," << dya << ","
+            << gps_hdop << "," << gps_quality << "\n";
+    }
+    csv.close();
+
+    auto rmse = [](double sumsq, int n) { return n > 0 ? std::sqrt(sumsq / static_cast<double>(n)) : 0.0; };
+    const GPSAlignResult& gar = gps_manager_.alignResult();
+
+    std::ofstream sum(sum_path);
+    if (sum.is_open()) {
+        sum << "mapping_accuracy_gps_vs_hba summary (map frame, HBA/ISAM optimized T_w_b vs GPS)\n";
+        sum << "note: position err is map-frame; RPY compares lidar-body euler(ZYX) vs GPS/IMU attitude (ENU), "
+               "meaningful mainly after gps_aligned.\n";
+        sum << "output_dir=" << output_dir << "\n";
+        sum << "keyframes_total=" << kfs.size() << "\n";
+        sum << "gps_aligned=" << (gps_aligned_.load() ? "true" : "false") << "\n";
+        sum << "gps_align_success=" << (gar.success ? "true" : "false") << " rmse_m=" << gar.rmse_m
+            << " matched_points=" << gar.matched_points << " used_measurements=" << gar.used_measurements << "\n";
+        sum << "position_valid_samples=" << n_pos << "\n";
+        sum << "rmse_horiz_m=" << rmse(sum_h2, n_pos) << " rmse_z_m=" << rmse(sum_z2, n_pos) << "\n";
+        sum << "rmse_x_m=" << rmse(sum_x2, n_pos) << " rmse_y_m=" << rmse(sum_y2, n_pos) << "\n";
+        sum << "attitude_valid_samples=" << n_att << "\n";
+        sum << "rmse_roll_deg=" << rmse(sum_rr2, n_att) << " rmse_pitch_deg=" << rmse(sum_pp2, n_att)
+            << " rmse_yaw_deg=" << rmse(sum_yy2, n_att) << "\n";
+        sum << "loop_constraints_accepted=" << loop_detector_.loopDetectedCount() << "\n";
+        sum.close();
+    }
+
+    bool ok_xyz = false, ok_rpy = false;
+    if (plot_t.size() >= 2 && ex.size() == plot_t.size()) {
+        ok_xyz = saveTriplePlot(png_xyz, plot_t, ex, ey, ez, "err_x (m)", "err_y (m)", "err_z (m)");
+    }
+    if (plot_t_rpy.size() >= 2 && er.size() == plot_t_rpy.size()) {
+        ok_rpy = saveTriplePlot(png_rpy, plot_t_rpy, er, ep, eya, "err_roll (deg)", "err_pitch (deg)", "err_yaw (deg)");
+    }
+
+    RCLCPP_INFO(get_logger(),
+                "[AutoMapSystem][ACCURACY] wrote %s, %s, plots xyz=%d rpy=%d (pos_n=%d att_n=%d)",
+                csv_path.c_str(), sum_path.c_str(), ok_xyz ? 1 : 0, ok_rpy ? 1 : 0, n_pos, n_att);
+
+    if (also_log) {
+        try {
+            fs::create_directories(trajectory_log_dir_);
+            fs::copy_file(csv_path, trajectory_log_dir_ + "/" + base + ".csv", fs::copy_options::overwrite_existing);
+            fs::copy_file(sum_path, trajectory_log_dir_ + "/" + base + "_summary.txt",
+                          fs::copy_options::overwrite_existing);
+            if (ok_xyz)
+                fs::copy_file(png_xyz, trajectory_log_dir_ + "/" + base + "_err_xyz.png",
+                              fs::copy_options::overwrite_existing);
+            if (ok_rpy)
+                fs::copy_file(png_rpy, trajectory_log_dir_ + "/" + base + "_err_rpy_deg.png",
+                              fs::copy_options::overwrite_existing);
+        } catch (const std::exception& e) {
+            RCLCPP_WARN(get_logger(), "[AutoMapSystem][ACCURACY] copy to trajectory_log_dir failed: %s", e.what());
+        }
+    }
 }
 
 }  // namespace automap_pro

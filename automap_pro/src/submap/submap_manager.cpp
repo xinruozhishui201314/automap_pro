@@ -56,10 +56,16 @@ SubMapManager::SubMapManager() {
 }
 
 SubMapManager::~SubMapManager() {
-    freeze_post_running_.store(false);
-    freeze_post_cv_.notify_all();
-    if (freeze_post_thread_.joinable())
-        freeze_post_thread_.join();
+    stop();
+}
+
+void SubMapManager::stop() {
+    if (freeze_post_running_.load()) {
+        freeze_post_running_.store(false);
+        freeze_post_cv_.notify_all();
+        if (freeze_post_thread_.joinable())
+            freeze_post_thread_.join();
+    }
 }
 
 void SubMapManager::init(rclcpp::Node::SharedPtr node) {
@@ -458,7 +464,7 @@ SubMap::Ptr SubMapManager::createNewSubmap(const KeyFrame::Ptr& first_kf) {
     sm->t_end       = first_kf->timestamp;
     sm->merged_cloud = std::make_shared<CloudXYZI>();
     publishEvent(sm, "CREATED");
-    RCLCPP_DEBUG(node_->get_logger(), "[SubMapMgr][DATA] createNewSubmap sm_id=%d session=%lu", sm->id, sm->session_id);
+    RCLCPP_DEBUG(node()->get_logger(), "[SubMapMgr][DATA] createNewSubmap sm_id=%d session=%lu", sm->id, sm->session_id);
     return sm;
 }
 
@@ -822,7 +828,7 @@ void SubMapManager::updateAllFromHBA(const HBAResult& result) {
     }
     std::lock_guard<std::mutex> lk(mutex_);
     const rclcpp::Logger log = rclcpp::get_logger("automap_system");
-    const double diag_ts = (node_ && node_->get_clock()) ? node_->get_clock()->now().seconds() : 0.0;
+    const double diag_ts = (node() && node()->get_clock()) ? node()->get_clock()->now().seconds() : 0.0;
     RCLCPP_INFO(log,
         "[SubMapMgr][GHOSTING_DIAG] updateAllFromHBA enter ts=%.3f optimized_poses=%zu submaps=%zu (HBA 写回全部 KF；若在某次 build 的 enter~exit 之间则可能重影，grep GHOSTING_DIAG 查时间线)",
         diag_ts, result.optimized_poses.size(), submaps_.size());
@@ -883,7 +889,7 @@ void SubMapManager::updateAllFromHBA(const HBAResult& result) {
                 idx, kf->id, kf->submap_id, kf->timestamp, t.x(), t.y(), t.z());
         }
     }
-    const double done_ts = (node_ && node_->get_clock()) ? node_->get_clock()->now().seconds() : 0.0;
+    const double done_ts = (node() && node()->get_clock()) ? node()->get_clock()->now().seconds() : 0.0;
     if (!result.optimized_poses.empty()) {
         const auto& first_t = result.optimized_poses.front().translation();
         const auto& last_t = result.optimized_poses.back().translation();
@@ -979,7 +985,7 @@ void SubMapManager::updateAllFromHBA(const HBAResult& result) {
     RCLCPP_INFO(log, 
         "[SubMapMgr][HBA_DIAG] updateAllFromHBA done: submaps=%zu max_trans_diff=%.3fm max_rot_diff=%.2fdeg",
         submaps_.size(), max_trans_diff, max_rot_diff);
-    const double exit_ts = (node_ && node_->get_clock()) ? node_->get_clock()->now().seconds() : 0.0;
+    const double exit_ts = (node() && node()->get_clock()) ? node()->get_clock()->now().seconds() : 0.0;
     RCLCPP_INFO(log,
         "[SubMapMgr][GHOSTING_DIAG] updateAllFromHBA exit ts=%.3f (写回与锚点同步已完成；pose_snapshot_taken 应不落在此 enter~exit 之间，否则存在竞态)",
         exit_ts);
@@ -1069,7 +1075,7 @@ void SubMapManager::rebuildMergedCloudFromOptimizedPoses() {
     }
     
     RCLCPP_INFO(log, "[SubMapMgr][REBUILD_MERGE] Done rebuilding merged_cloud for all submaps");
-    const double done_ts = (node_ && node_->get_clock()) ? node_->get_clock()->now().seconds() : 0.0;
+    const double done_ts = (node() && node()->get_clock()) ? node()->get_clock()->now().seconds() : 0.0;
     RCLCPP_INFO(log,
         "[SubMapMgr][GHOSTING_DIAG] rebuildMergedCloudFromOptimizedPoses done ts=%.3f (此后 buildGlobalMap 与 merged_cloud 均基于 T_w_b_optimized；grep GHOSTING_DIAG 查时间线)",
         done_ts);
@@ -1618,7 +1624,7 @@ void SubMapManager::publishEvent(const SubMap::Ptr& sm, const std::string& event
     if (!event_pub_ || !sm) return;
 
     auto msg = std::make_shared<automap_pro::msg::SubMapEventMsg>();
-    msg->header.stamp = node_->now();
+    msg->header.stamp = node()->now();
     msg->submap_id = sm->id;
     msg->session_id = sm->session_id;
     msg->event_type = event;
@@ -1643,7 +1649,7 @@ void SubMapManager::publishErrorEvent(int submap_id, const ErrorDetail& error) {
     if (!event_pub_) return;
 
     auto msg = std::make_shared<automap_pro::msg::SubMapEventMsg>();
-    msg->header.stamp = node_->now();
+    msg->header.stamp = node()->now();
     msg->submap_id = submap_id;
     msg->session_id = current_session_id_;
     msg->event_type = fmt::format("error_0x{:08X}", static_cast<uint32_t>(error.code()));
@@ -1690,7 +1696,7 @@ std::future<CloudXYZIPtr> SubMapManager::buildGlobalMapAsync(float voxel_size) c
             }
         }
         const rclcpp::Logger log = rclcpp::get_logger("automap_system");
-        const double snap_ts = (node_ && node_->get_clock()) ? node_->get_clock()->now().seconds() : 0.0;
+        const double snap_ts = (node() && node()->get_clock()) ? node()->get_clock()->now().seconds() : 0.0;
         if (!cloud_pose_snapshot.empty()) {
             const auto& first = cloud_pose_snapshot.front().second.translation();
             const auto& last = cloud_pose_snapshot.back().second.translation();

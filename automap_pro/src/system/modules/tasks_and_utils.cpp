@@ -212,6 +212,34 @@ void AutoMapSystem::saveMapToFiles(const std::string& output_dir) {
     std::string traj_path = output_dir + "/trajectory_odom.csv";
     writeTrajectoryOdomAfterMapping(output_dir);
     RCLCPP_INFO(get_logger(), "[AutoMapSystem] Trajectory saved to %s", traj_path.c_str());
+
+    // GPS vs HBA/优化位姿精度报告（CSV + 摘要 + 偏差曲线图，与 output_dir 同目录，如 run_YYYYMMDD_HHMMSS）
+    writeMappingAccuracyGpsVsHba(output_dir);
+
+    // 保存全局合并点云地图 (PCD)
+    RCLCPP_INFO(get_logger(), "[AutoMapSystem] Building global map for saving...");
+    float voxel_size = map_voxel_size_;
+    CloudXYZIPtr global_map;
+    if (ConfigManager::instance().asyncGlobalMapBuild()) {
+        global_map = submap_manager_.buildGlobalMapAsync(voxel_size).get();
+    } else {
+        global_map = submap_manager_.buildGlobalMap(voxel_size);
+    }
+
+    if (global_map && !global_map->empty()) {
+        std::string map_path = output_dir + "/global_map.pcd";
+        try {
+            if (pcl::io::savePCDFileBinary(map_path, *global_map) == 0) {
+                RCLCPP_INFO(get_logger(), "[AutoMapSystem] Global map saved to %s (points: %zu)", map_path.c_str(), global_map->size());
+            } else {
+                RCLCPP_ERROR(get_logger(), "[AutoMapSystem] Failed to save global map to %s", map_path.c_str());
+            }
+        } catch (const std::exception& e) {
+            RCLCPP_ERROR(get_logger(), "[AutoMapSystem] Exception saving global map: %s", e.what());
+        }
+    } else {
+        RCLCPP_WARN(get_logger(), "[AutoMapSystem] Global map is empty, skip saving.");
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

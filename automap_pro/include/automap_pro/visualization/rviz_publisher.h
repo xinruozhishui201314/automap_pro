@@ -227,7 +227,7 @@ public:
     std::string frameId() const { return frame_id_; }
 
 private:
-    rclcpp::Node::SharedPtr node_;
+    std::weak_ptr<rclcpp::Node> node_;
     std::string frame_id_ = "world";
 
     // ── 发布者 ─────────────────────────────────────────────────────────────
@@ -340,6 +340,9 @@ private:
 
     /** 模块名中文→英文，用于 RViz 状态文本 */
     static std::string moduleDisplayName(const std::string& name);
+
+    /** 安全获取节点指针 */
+    rclcpp::Node::SharedPtr node() const { return node_.lock(); }
 };
 
 }  // namespace automap_pro

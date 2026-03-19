@@ -34,7 +34,7 @@ enum class HealthState : uint8_t {
     CRITICAL   = 3   // 严重故障
 };
 
-std::string healthStateToString(HealthState state) {
+inline std::string healthStateToString(HealthState state) {
     switch (state) {
         case HealthState::HEALTHY:    return "HEALTHY";
         case HealthState::DEGRADED:   return "DEGRADED";
@@ -249,11 +249,12 @@ private:
     void updateOverallState();
 
     // 成员变量
-    rclcpp::Node::SharedPtr node_;
+    std::weak_ptr<rclcpp::Node> node_;
     std::shared_ptr<rclcpp::Publisher<automap_pro::msg::MappingStatusMsg>> health_pub_;
     std::vector<std::shared_ptr<HealthChecker>> checkers_;
 
     mutable std::mutex mutex_;
+    std::condition_variable stop_cv_;  // 用于快速响应停止
     std::atomic<bool> running_{false};
     std::thread check_thread_;
     std::thread heartbeat_thread_;

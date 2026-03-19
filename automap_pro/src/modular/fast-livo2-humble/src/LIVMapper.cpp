@@ -80,7 +80,9 @@ LIVMapper::LIVMapper(rclcpp::Node::SharedPtr &node, std::string node_name, const
   path.header.frame_id = "camera_init";
 }
 
-LIVMapper::~LIVMapper() {}
+LIVMapper::~LIVMapper() {
+  savePCD();
+}
 
 void LIVMapper::readParameters(rclcpp::Node::SharedPtr &node)
 {
@@ -223,6 +225,26 @@ void LIVMapper::readParameters(rclcpp::Node::SharedPtr &node)
   this->node->get_parameter("pcd_save.filter_size_pcd", filter_size_pcd);
   this->node->get_parameter("pcd_save.output_dir", pcd_output_dir_);
   if (!pcd_output_dir_.empty() && pcd_output_dir_.back() == '/') pcd_output_dir_.pop_back();
+
+  // 🔧 自动创建带时间戳的输出子目录，与后端 AutoMapSystem 逻辑一致
+  static std::string s_timestamped_dir = "";
+  if (s_timestamped_dir.empty() && !pcd_output_dir_.empty()) {
+      auto now = std::chrono::system_clock::now();
+      auto t = std::chrono::system_clock::to_time_t(now);
+      std::tm buf;
+      std::tm* ptm = ::localtime_r(&t, &buf);
+      char timestamp[64];
+      if (ptm) {
+          std::strftime(timestamp, sizeof(timestamp), "%Y%m%d_%H%M%S", ptm);
+          s_timestamped_dir = pcd_output_dir_ + "/run_" + std::string(timestamp);
+      } else {
+          s_timestamped_dir = pcd_output_dir_ + "/run_default";
+      }
+  }
+  if (!s_timestamped_dir.empty()) {
+      pcd_output_dir_ = s_timestamped_dir;
+  }
+
   if (pcd_save_en) std::cout << "[ LIO ] PCD save enabled, output_dir=" << pcd_output_dir_ << " (与后端 output_dir 一致)" << std::endl;
   this->node->get_parameter("debug_log.mat_pre_en", mat_pre_en);
   this->node->get_parameter("debug_log.mat_out_en", mat_out_en);

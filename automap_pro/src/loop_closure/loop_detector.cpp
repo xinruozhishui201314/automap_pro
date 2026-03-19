@@ -90,32 +90,32 @@ void LoopDetector::init(rclcpp::Node::SharedPtr node) {
     sc_tree_making_period_ = cfg.scancontextTreeMakingPeriod();
 
     teaser_matcher_.applyConfig();
-    RCLCPP_INFO(node_->get_logger(),
+    RCLCPP_INFO(node->get_logger(),
         "[LoopDetector][CONFIG] TEASER applied from YAML: min_safe_inliers=%d min_inlier_ratio=%.2f max_rmse=%.2f (grep CONFIG 验证)",
         ConfigManager::instance().teaserMinSafeInliers(),
         ConfigManager::instance().teaserMinInlierRatio(),
         ConfigManager::instance().teaserMaxRMSE());
-    RCLCPP_INFO(node_->get_logger(),
+    RCLCPP_INFO(node->get_logger(),
         "[LoopDetector][CONFIG] retrieve params from YAML: overlap_threshold=%.2f top_k=%d sc_dist_threshold=%.3f min_temporal_gap_s=%.1f (grep CONFIG 验证)",
         overlap_threshold_, top_k_, sc_dist_threshold_, min_temporal_gap_);
-    RCLCPP_INFO(node_->get_logger(),
+    RCLCPP_INFO(node->get_logger(),
         "[LoopDetector][CONFIG] 运行验证: grep CONFIG 查 TEASER/retrieve/geo_prefilter 参数; grep INTRA_LOOP 查子图内 SUMMARY/DETECTED; grep LOOP_ACCEPTED 或 addLoopFactor 或 loop_intra 查回环入图");
 
-    RCLCPP_INFO(node_->get_logger(),
+    RCLCPP_INFO(node->get_logger(),
         "[LoopDetector][CONFIG] min_submap_gap=%d (0=allow adjacent submaps; intra-submap candidates not filtered by gap)",
         min_submap_gap_);
-    RCLCPP_INFO(node_->get_logger(),
+    RCLCPP_INFO(node->get_logger(),
         "[LoopDetector][CONFIG] geo_prefilter: max_distance_m=%.1f skip_above_score=%.2f (0=off; grep CONFIG 验证)",
         geo_prefilter_max_distance_m_, geo_prefilter_skip_above_score_);
 
     // 加载 OverlapTransformer 模型（LibTorch Level 1）
     std::string model_path = cfg.overlapModelPath();
-    RCLCPP_INFO(node_->get_logger(),
+    RCLCPP_INFO(node->get_logger(),
         "[OT] overlap_transformer.model_path (resolved)=%s (empty=use ScanContext only; grep [OT] for load/inference state)",
         model_path.empty() ? "(empty)" : model_path.c_str());
     if (!model_path.empty()) {
         bool loaded = overlap_infer_.loadModel(model_path, true);
-        RCLCPP_INFO(node_->get_logger(),
+        RCLCPP_INFO(node->get_logger(),
             "[OT] load result: %s (from %s); loop closure descriptor=%s",
             loaded ? "OK" : "FAIL_or_SKIP",
             model_path.c_str(),
@@ -224,8 +224,8 @@ void LoopDetector::addSubmap(const SubMap::Ptr& submap) {
     ALOG_INFO(MOD, "[LOOP_STEP] stage=addSubmap sm_id={} kf={} desc_pts={} desc_queue={} db_size={} (inter-submap: 1 desc per submap from downsampled_cloud; grep LOOP_STEP)",
               submap->id, submap->keyframes.size(),
               submap->downsampled_cloud ? submap->downsampled_cloud->size() : 0u, qsize, dbsize);
-    if (node_) {
-        RCLCPP_INFO(node_->get_logger(), "[LOOP_STEP] stage=addSubmap sm_id=%d kf=%zu desc_pts=%zu desc_queue=%zu db_size=%zu",
+    if (node()) {
+        RCLCPP_INFO(node()->get_logger(), "[LOOP_STEP] stage=addSubmap sm_id=%d kf=%zu desc_pts=%zu desc_queue=%zu db_size=%zu",
                     submap->id, submap->keyframes.size(),
                     submap->downsampled_cloud ? submap->downsampled_cloud->size() : 0u, qsize, dbsize);
     }
@@ -252,8 +252,8 @@ void LoopDetector::descWorkerLoop() {
     { std::lock_guard<std::mutex> lk(desc_mutex_); queue_remaining = desc_queue_.size(); }
     ALOG_INFO(MOD, "[LOOP_STEP] stage=desc_worker_pop submap_id={} desc_queue_remaining={} use_scancontext={}",
               submap->id, queue_remaining, use_scancontext_);
-    if (node_) {
-        RCLCPP_INFO(node_->get_logger(), "[LOOP_STEP] stage=desc_worker_pop submap_id=%d desc_queue_remaining=%zu use_scancontext=%d",
+    if (node()) {
+        RCLCPP_INFO(node()->get_logger(), "[LOOP_STEP] stage=desc_worker_pop submap_id=%d desc_queue_remaining=%zu use_scancontext=%d",
                     submap->id, queue_remaining, use_scancontext_ ? 1 : 0);
     }
 
@@ -305,7 +305,7 @@ void LoopDetector::computeDescriptorAsync(const SubMap::Ptr& submap) {
     if (use_external_desc_service_ && desc_client_) {
         auto req = std::make_shared<overlap_transformer_msgs::srv::ComputeDescriptor::Request>();
         pcl::toROSMsg(*submap->downsampled_cloud, req->pointcloud);
-        req->pointcloud.header.stamp    = node_->now();
+        req->pointcloud.header.stamp    = node()->now();
         req->pointcloud.header.frame_id = "map";  // 点云为世界系（与 merged_cloud/downsampled_cloud 一致）
 
         // ✅ 正确异步模式：async_send_request + callback，不阻塞 Worker 线程
@@ -324,7 +324,7 @@ void LoopDetector::computeDescriptorAsync(const SubMap::Ptr& submap) {
                     }
                     onDescriptorReady(submap);
                 } catch (const std::exception& e) {
-                    RCLCPP_WARN(node_->get_logger(),
+                    RCLCPP_WARN(node()->get_logger(),
                         "[LoopDetector] Descriptor service error: %s, using fallback", e.what());
                     submap->overlap_descriptor = overlap_infer_.computeDescriptor(
                         submap->downsampled_cloud);
@@ -353,8 +353,8 @@ void LoopDetector::onDescriptorReady(const SubMap::Ptr& submap) {
     // auto t_start = std::chrono::steady_clock::now();
     ALOG_INFO(MOD, "[LOOP_PHASE] stage=descriptor_done submap_id={} query_pts={} (描述子就绪，进入候选检索)",
               submap->id, submap->downsampled_cloud ? submap->downsampled_cloud->size() : 0u);
-    if (node_) {
-        RCLCPP_INFO(node_->get_logger(), "[LOOP_PHASE] stage=descriptor_done submap_id=%d query_pts=%zu",
+    if (node()) {
+        RCLCPP_INFO(node()->get_logger(), "[LOOP_PHASE] stage=descriptor_done submap_id=%d query_pts=%zu",
                     submap->id, submap->downsampled_cloud ? submap->downsampled_cloud->size() : 0u);
     }
 
@@ -366,8 +366,8 @@ void LoopDetector::onDescriptorReady(const SubMap::Ptr& submap) {
     { std::shared_lock<std::shared_mutex> lk(db_mutex_); db_size_after = db_submaps_.size(); }
     ALOG_INFO(MOD, "[LOOP_STEP] stage=addToDatabase submap_id={} db_before={} db_after={}",
               submap->id, db_size_before, db_size_after);
-    if (node_) {
-        RCLCPP_INFO(node_->get_logger(), "[LOOP_STEP] stage=addToDatabase submap_id=%d db_before=%zu db_after=%zu",
+    if (node()) {
+        RCLCPP_INFO(node()->get_logger(), "[LOOP_STEP] stage=addToDatabase submap_id=%d db_before=%zu db_after=%zu",
                     submap->id, db_size_before, db_size_after);
     }
 
@@ -381,16 +381,16 @@ void LoopDetector::onDescriptorReady(const SubMap::Ptr& submap) {
     if (db_copy.size() <= 1u) {
         ALOG_INFO(MOD, "[LOOP_PHASE] stage=inter_submap_opportunity query_id={} db_size={} → 无子图间机会(db_size<=1)，仅子图内/自匹配",
                   submap->id, db_copy.size());
-        if (node_) {
-            RCLCPP_INFO(node_->get_logger(), "[LOOP_PHASE] stage=inter_submap_opportunity query_id=%d db_size=%zu (no inter-submap: db_size<=1)",
+        if (node()) {
+            RCLCPP_INFO(node()->get_logger(), "[LOOP_PHASE] stage=inter_submap_opportunity query_id=%d db_size=%zu (no inter-submap: db_size<=1)",
                         submap->id, db_copy.size());
         }
     }
 
     ALOG_INFO(MOD, "[LOOP_STEP] stage=retrieve_enter submap_id={} db_size={} overlap_threshold={:.3f} top_k={} min_submap_gap={} min_temporal_gap_s={:.1f}",
               submap->id, db_copy.size(), overlap_threshold_, top_k_, min_submap_gap_, min_temporal_gap_);
-    if (node_) {
-        RCLCPP_INFO(node_->get_logger(), "[LOOP_STEP] stage=retrieve_enter submap_id=%d db_size=%zu overlap_threshold=%.3f top_k=%d min_submap_gap=%d",
+    if (node()) {
+        RCLCPP_INFO(node()->get_logger(), "[LOOP_STEP] stage=retrieve_enter submap_id=%d db_size=%zu overlap_threshold=%.3f top_k=%d min_submap_gap=%d",
                     submap->id, db_copy.size(), overlap_threshold_, top_k_, min_submap_gap_);
     }
 
@@ -399,15 +399,15 @@ void LoopDetector::onDescriptorReady(const SubMap::Ptr& submap) {
 
     // 根据配置选择候选检索方法（日志便于确认当前使用的描述子与推理状态）
     if (use_scancontext_) {
-        if (node_) {
-            RCLCPP_INFO(node_->get_logger(), "[OT] retrieve: method=ScanContext submap_id=%d db_size=%zu top_k=%d",
+        if (node()) {
+            RCLCPP_INFO(node()->get_logger(), "[OT] retrieve: method=ScanContext submap_id=%d db_size=%zu top_k=%d",
                         submap->id, db_copy.size(), top_k_);
         }
         std::lock_guard<std::mutex> lk(sc_mutex_);
         candidates = retrieveUsingScanContext(submap, db_copy);
     } else {
-        if (node_) {
-            RCLCPP_INFO(node_->get_logger(), "[OT] retrieve: method=%s submap_id=%d db_size=%zu top_k=%d",
+        if (node()) {
+            RCLCPP_INFO(node()->get_logger(), "[OT] retrieve: method=%s submap_id=%d db_size=%zu top_k=%d",
                         overlap_infer_.isModelLoaded() ? "LibTorch(overlapTransformer.pt)" : "fallback_descriptor",
                         submap->id, db_copy.size(), top_k_);
         }
@@ -431,10 +431,10 @@ void LoopDetector::onDescriptorReady(const SubMap::Ptr& submap) {
                   submap->id, db_copy.size(), overlap_threshold_, top_k_, retrieve_ms);
         ALOG_INFO(MOD, "[LOOP_PHASE] stage=inter_submap_opportunity query_id={} db_size={} → 检索无过阈值候选，子图间=0 (grep LOOP_PHASE 统计)",
                   submap->id, db_copy.size());
-        if (node_) {
-            RCLCPP_INFO(node_->get_logger(), "[LOOP_STEP] stage=retrieve_result NO_CAND query_id=%d db_size=%zu overlap_threshold=%.3f top_k=%d",
+        if (node()) {
+            RCLCPP_INFO(node()->get_logger(), "[LOOP_STEP] stage=retrieve_result NO_CAND query_id=%d db_size=%zu overlap_threshold=%.3f top_k=%d",
                         submap->id, db_copy.size(), overlap_threshold_, top_k_);
-            RCLCPP_INFO(node_->get_logger(), "[LOOP_PHASE] stage=inter_submap_opportunity query_id=%d NO_CAND (inter_submap=0)",
+            RCLCPP_INFO(node()->get_logger(), "[LOOP_PHASE] stage=inter_submap_opportunity query_id=%d NO_CAND (inter_submap=0)",
                         submap->id);
         }
         return;
@@ -448,8 +448,8 @@ void LoopDetector::onDescriptorReady(const SubMap::Ptr& submap) {
     }
     ALOG_INFO(MOD, "[LOOP_STEP] stage=retrieve_detail query_id={} raw_targets_and_scores=[{}]",
               submap->id, cand_detail);
-    if (node_) {
-        RCLCPP_INFO(node_->get_logger(), "[LOOP_STEP] stage=retrieve_result OK query_id=%d raw_candidates=%zu retrieve_ms=%.1f",
+    if (node()) {
+        RCLCPP_INFO(node()->get_logger(), "[LOOP_STEP] stage=retrieve_result OK query_id=%d raw_candidates=%zu retrieve_ms=%.1f",
                     submap->id, candidates.size(), retrieve_ms);
     }
 
@@ -491,16 +491,16 @@ void LoopDetector::onDescriptorReady(const SubMap::Ptr& submap) {
     // 🔧 添加详细诊断日志
     ALOG_INFO(MOD, "[LoopDetector][CAND_STATS] query_id=%d: candidates=%zu same_session=%d same_submap=%d diff_submap=%d filtered_by_gap=%d valid=%zu",
         submap->id, candidates.size(), same_session_count, same_submap_count, different_submap_count, filtered_by_gap, valid_candidates.size());
-    if (node_) {
-        RCLCPP_INFO(node_->get_logger(), "[LoopDetector][CAND_STATS] query_id=%d: candidates=%zu same_session=%d same_submap=%d diff_submap=%d filtered_by_gap=%d valid=%zu",
+    if (node()) {
+        RCLCPP_INFO(node()->get_logger(), "[LoopDetector][CAND_STATS] query_id=%d: candidates=%zu same_session=%d same_submap=%d diff_submap=%d filtered_by_gap=%d valid=%zu",
             submap->id, candidates.size(), same_session_count, same_submap_count, different_submap_count, filtered_by_gap, valid_candidates.size());
     }
 
     if (valid_candidates.empty()) {
         ALOG_WARN(MOD, "[LOOP_STEP] stage=gap_filter ALL_FILTERED query_id={} raw_candidates={} min_submap_gap={} (可尝试将 loop_closure.min_submap_gap 调小)",
                   submap->id, candidates.size(), min_submap_gap_);
-        if (node_) {
-            RCLCPP_WARN(node_->get_logger(), "[LOOP_STEP] stage=gap_filter ALL_FILTERED query_id=%d raw_candidates=%zu min_submap_gap=%d",
+        if (node()) {
+            RCLCPP_WARN(node()->get_logger(), "[LOOP_STEP] stage=gap_filter ALL_FILTERED query_id=%d raw_candidates=%zu min_submap_gap=%d",
                         submap->id, candidates.size(), min_submap_gap_);
         }
         return;
@@ -546,8 +546,8 @@ void LoopDetector::onDescriptorReady(const SubMap::Ptr& submap) {
     if (geo_filtered_candidates.empty()) {
         ALOG_WARN(MOD, "[LOOP_STEP] stage=geo_prefilter ALL_FILTERED query_id={} valid_candidates={} geo_prefilter_max_distance_m={:.1f}",
                   submap->id, valid_candidates.size(), geo_prefilter_max_distance_m_);
-        if (node_) {
-            RCLCPP_WARN(node_->get_logger(), "[LOOP_STEP] stage=geo_prefilter ALL_FILTERED query_id=%d valid_candidates=%zu geo_max_m=%.1f",
+        if (node()) {
+            RCLCPP_WARN(node()->get_logger(), "[LOOP_STEP] stage=geo_prefilter ALL_FILTERED query_id=%d valid_candidates=%zu geo_max_m=%.1f",
                         submap->id, valid_candidates.size(), geo_prefilter_max_distance_m_);
         }
         return;
@@ -574,8 +574,8 @@ void LoopDetector::onDescriptorReady(const SubMap::Ptr& submap) {
               submap->id, db_copy.size(), geo_filtered_candidates.size(), score_str, retrieve_ms);
     ALOG_INFO(MOD, "[LOOP_PHASE] stage=candidates_retrieved query_id={} candidate_count={} inter_submap_candidates={} retrieve_ms={:.1f} (inter_submap=0 表示无子图间候选；grep LOOP_PHASE 统计)",
               submap->id, geo_filtered_candidates.size(), inter_submap_in_geo, retrieve_ms);
-    if (node_) {
-        RCLCPP_INFO(node_->get_logger(), "[LOOP_PHASE] stage=candidates_retrieved query_id=%d candidate_count=%zu inter_submap_candidates=%d retrieve_ms=%.1f",
+    if (node()) {
+        RCLCPP_INFO(node()->get_logger(), "[LOOP_PHASE] stage=candidates_retrieved query_id=%d candidate_count=%zu inter_submap_candidates=%d retrieve_ms=%.1f",
                     submap->id, geo_filtered_candidates.size(), inter_submap_in_geo, retrieve_ms);
     }
     // ── 子图间关键帧级：为每个采样关键帧检索跨子图关键帧候选并入队 ──
@@ -641,8 +641,8 @@ void LoopDetector::onDescriptorReady(const SubMap::Ptr& submap) {
         match_cv_.notify_one();
         ALOG_INFO(MOD, "[LOOP_PHASE] stage=match_enqueue INTER_KEYFRAME query_id={} sampled_kf_tasks={} (关键帧级子图间)",
                   submap->id, tasks_enqueued);
-        if (node_) {
-            RCLCPP_INFO(node_->get_logger(), "[LOOP_PHASE] stage=match_enqueue INTER_KEYFRAME query_id=%d tasks=%d",
+        if (node()) {
+            RCLCPP_INFO(node()->get_logger(), "[LOOP_PHASE] stage=match_enqueue INTER_KEYFRAME query_id=%d tasks=%d",
                         submap->id, tasks_enqueued);
         }
         return;
@@ -727,8 +727,8 @@ void LoopDetector::onDescriptorReady(const SubMap::Ptr& submap) {
             if (tasks_enqueued > 0) {
                 ALOG_INFO(MOD, "[LOOP_PHASE] stage=match_enqueue INTER_KEYFRAME_OT query_id={} tasks={} total_candidates_kf={} (共 {} 次子图间关键帧对待 TEASER；grep LOOP_PHASE 统计)",
                           submap->id, tasks_enqueued, total_candidates_kf, total_candidates_kf);
-                if (node_) {
-                    RCLCPP_INFO(node_->get_logger(), "[LOOP_PHASE] stage=match_enqueue INTER_KEYFRAME_OT query_id=%d tasks=%d total_candidates_kf=%d",
+                if (node()) {
+                    RCLCPP_INFO(node()->get_logger(), "[LOOP_PHASE] stage=match_enqueue INTER_KEYFRAME_OT query_id=%d tasks=%d total_candidates_kf=%d",
                                 submap->id, tasks_enqueued, total_candidates_kf);
                 }
                 return;
@@ -756,8 +756,8 @@ void LoopDetector::onDescriptorReady(const SubMap::Ptr& submap) {
     }
     ALOG_INFO(MOD, "[LOOP_PHASE] stage=match_enqueue query_id={} candidates={} query_pts={} (子图级)",
               submap->id, geo_filtered_candidates.size(), query_cloud_copy ? query_cloud_copy->size() : 0u);
-    if (node_) {
-        RCLCPP_INFO(node_->get_logger(), "[LOOP_PHASE] stage=match_enqueue query_id=%d candidates=%zu query_pts=%zu",
+    if (node()) {
+        RCLCPP_INFO(node()->get_logger(), "[LOOP_PHASE] stage=match_enqueue query_id=%d candidates=%zu query_pts=%zu",
                     submap->id, geo_filtered_candidates.size(), query_cloud_copy ? query_cloud_copy->size() : 0u);
     }
     match_cv_.notify_one();
@@ -787,8 +787,8 @@ void LoopDetector::matchWorkerLoop() {
         { std::lock_guard<std::mutex> lk(match_mutex_); match_queue_remaining = match_queue_.size(); }
         ALOG_INFO(MOD, "[LOOP_STEP] stage=match_worker_pop query_id={} candidates={} candidates_kf={} match_queue_remaining={}",
                   task.query ? task.query->id : -1, task.candidates.size(), task.candidates_kf.size(), match_queue_remaining);
-        if (node_) {
-            RCLCPP_INFO(node_->get_logger(), "[LOOP_STEP] stage=match_worker_pop query_id=%d candidates=%zu candidates_kf=%zu match_queue_remaining=%zu",
+        if (node()) {
+            RCLCPP_INFO(node()->get_logger(), "[LOOP_STEP] stage=match_worker_pop query_id=%d candidates=%zu candidates_kf=%zu match_queue_remaining=%zu",
                         task.query ? task.query->id : -1, task.candidates.size(), task.candidates_kf.size(), match_queue_remaining);
         }
         
@@ -870,8 +870,8 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
                 "[INTER_KF][GEOM_DIAG] sm_j=%d kf_j=%d sm_i=%d kf_i=%d | dist_world_m=%.3f rel_trans_m=%.3f rel_rot_deg=%.2f | query_pts=%zu tgt_pts=%zu (同场景轨迹接得近时 dist_world 应小；过大则 ScanContext 可能匹配到错误关键帧)",
                 task.query->id, task.query_kf_idx, kfc.submap_id, kfc.keyframe_idx,
                 dist_world_m, rel_trans_m, rel_rot_deg, query_cloud->size(), target_cloud->size());
-            if (node_) {
-                RCLCPP_INFO(node_->get_logger(),
+            if (node()) {
+                RCLCPP_INFO(node()->get_logger(),
                     "[INTER_KF][GEOM_DIAG] sm_j=%d kf_j=%d sm_i=%d kf_i=%d dist_world_m=%.3f rel_trans_m=%.3f rel_rot_deg=%.2f query_pts=%zu tgt_pts=%zu",
                     task.query->id, task.query_kf_idx, kfc.submap_id, kfc.keyframe_idx,
                     dist_world_m, rel_trans_m, rel_rot_deg, query_cloud->size(), target_cloud->size());
@@ -893,8 +893,8 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
                 "[INTER_KF][GEOM_DIAG] after TEASER sm_j=%d kf_j=%d sm_i=%d kf_i=%d | odom: rel_trans=%.3fm rel_rot=%.2fdeg | teaser: trans=%.3fm rot=%.2fdeg | trans_diff_odom_teaser_m=%.3f inlier_ratio=%.4f valid=%d",
                 task.query->id, task.query_kf_idx, kfc.submap_id, kfc.keyframe_idx,
                 rel_trans_m, rel_rot_deg, teaser_trans_m, teaser_rot_deg, trans_diff_m, res.inlier_ratio, valid);
-            if (node_) {
-                RCLCPP_INFO(node_->get_logger(),
+            if (node()) {
+                RCLCPP_INFO(node()->get_logger(),
                     "[INTER_KF][GEOM_DIAG] after TEASER sm_j=%d kf_j=%d sm_i=%d kf_i=%d odom_rel_trans=%.3f teaser_trans=%.3f trans_diff_m=%.3f inlier_ratio=%.4f",
                     task.query->id, task.query_kf_idx, kfc.submap_id, kfc.keyframe_idx, rel_trans_m, teaser_trans_m, trans_diff_m, res.inlier_ratio);
             }
@@ -910,8 +910,8 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
                 inter_kf_reject_inconsistent++;
                 ALOG_WARN(MOD, "[INTER_KF][REJECT] odom_teaser_inconsistent sm_i=%d kf_i=%d sm_j=%d kf_j=%d dist_world=%.1fm teaser_trans=%.3fm (false positive, skip publish)",
                           kfc.submap_id, kfc.keyframe_idx, task.query->id, task.query_kf_idx, dist_world_m, teaser_trans_m);
-                if (node_) {
-                    RCLCPP_WARN(node_->get_logger(),
+                if (node()) {
+                    RCLCPP_WARN(node()->get_logger(),
                         "[INTER_KF][REJECT] odom_teaser_inconsistent sm_i=%d sm_j=%d dist_world=%.1fm teaser_trans=%.3fm (skip)",
                         kfc.submap_id, task.query->id, dist_world_m, teaser_trans_m);
                 }
@@ -960,8 +960,8 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
                         dist_world_m,
                         pos_w_target.x(), pos_w_target.y(), pos_w_target.z(),
                         pos_w_query.x(), pos_w_query.y(), pos_w_query.z());
-                    if (node_) {
-                        RCLCPP_WARN(node_->get_logger(),
+                    if (node()) {
+                        RCLCPP_WARN(node()->get_logger(),
                             "[INTER_KF][REJECT] pose_anomaly sm_i=%d kf_i=%d sm_j=%d kf_j=%d kf_id_tgt=%d kf_id_query=%d trans_diff=%.3fm rot_diff=%.2fdeg (详见 ODOM_rel/TEASER_rel/DIFF/WORLD；grep INTER_KF REJECT)",
                             kfc.submap_id, kfc.keyframe_idx, task.query->id, task.query_kf_idx, kf_id_target, kf_id_query, trans_diff_m, rot_diff_deg);
                     }
@@ -997,8 +997,8 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
         ALOG_INFO(MOD, "[INTER_KF][SUMMARY] query_id={} kf_j={} candidates_kf={} tried={} teaser_fail={} reject_inconsistent={} reject_pose_anomaly={} published={} (grep INTER_KF SUMMARY 统计子图间过滤)",
                   task.query->id, task.query_kf_idx, static_cast<int>(task.candidates_kf.size()),
                   inter_kf_tried, inter_kf_teaser_fail, inter_kf_reject_inconsistent, inter_kf_reject_pose_anomaly, inter_kf_published);
-        if (node_) {
-            RCLCPP_INFO(node_->get_logger(), "[INTER_KF][SUMMARY] query_id=%d kf_j=%d candidates_kf=%zu tried=%d teaser_fail=%d reject_inconsistent=%d reject_pose_anomaly=%d published=%d",
+        if (node()) {
+            RCLCPP_INFO(node()->get_logger(), "[INTER_KF][SUMMARY] query_id=%d kf_j=%d candidates_kf=%zu tried=%d teaser_fail=%d reject_inconsistent=%d reject_pose_anomaly=%d published=%d",
                         task.query->id, task.query_kf_idx, task.candidates_kf.size(),
                         inter_kf_tried, inter_kf_teaser_fail, inter_kf_reject_inconsistent, inter_kf_reject_pose_anomaly, inter_kf_published);
         }
@@ -1030,8 +1030,8 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
     ALOG_INFO(MOD, "[LOOP_STEP] stage=geom_verify_enter query_id={} query_pts={} candidates={} thresholds: overlap>={:.3f} min_inlier_ratio>={:.3f} max_rmse<={:.3f}m min_safe_inliers>={} (TEASER 拒绝条件，grep LOOP_STEP 精准分析)",
               query->id, query_cloud->size(), task.candidates.size(),
               overlap_threshold_, min_inlier_ratio_, max_rmse_, min_safe_inliers_cfg);
-    if (node_) {
-        RCLCPP_INFO(node_->get_logger(), "[LOOP_STEP] stage=geom_verify_enter query_id=%d query_pts=%zu candidates=%zu overlap_thresh=%.3f min_inlier_ratio=%.3f max_rmse=%.3f min_safe_inliers=%d",
+    if (node()) {
+        RCLCPP_INFO(node()->get_logger(), "[LOOP_STEP] stage=geom_verify_enter query_id=%d query_pts=%zu candidates=%zu overlap_thresh=%.3f min_inlier_ratio=%.3f max_rmse=%.3f min_safe_inliers=%d",
                     query->id, query_cloud->size(), task.candidates.size(),
                     overlap_threshold_, min_inlier_ratio_, max_rmse_, min_safe_inliers_cfg);
     }
@@ -1053,8 +1053,8 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
     }
     ALOG_INFO(MOD, "[LOOP_STEP] stage=geom_verify_score_filter query_id={} input={} dropped_low_score={} dropped_invalid_id={} valid={} (threshold={:.3f})",
               query->id, task.candidates.size(), dropped_low_score, dropped_invalid_id, valid_candidates.size(), overlap_threshold_);
-    if (node_) {
-        RCLCPP_INFO(node_->get_logger(), "[LOOP_STEP] stage=geom_verify_score_filter query_id=%d input=%zu dropped_low_score=%d dropped_invalid_id=%d valid=%zu",
+    if (node()) {
+        RCLCPP_INFO(node()->get_logger(), "[LOOP_STEP] stage=geom_verify_score_filter query_id=%d input=%zu dropped_low_score=%d dropped_invalid_id=%d valid=%zu",
                     query->id, task.candidates.size(), dropped_low_score, dropped_invalid_id, valid_candidates.size());
     }
     for (size_t i = 0; i < valid_candidates.size(); ++i) {
@@ -1065,8 +1065,8 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
     if (valid_candidates.empty()) {
         ALOG_WARN(MOD, "[LOOP_STEP] stage=geom_verify_score_filter NONE_PASSED query_id={} all {} candidates below overlap_threshold={:.3f}",
                   query->id, task.candidates.size(), overlap_threshold_);
-        if (node_) {
-            RCLCPP_WARN(node_->get_logger(), "[LOOP_STEP] stage=geom_verify_score_filter NONE_PASSED query_id=%d candidates=%zu overlap_threshold=%.3f",
+        if (node()) {
+            RCLCPP_WARN(node()->get_logger(), "[LOOP_STEP] stage=geom_verify_score_filter NONE_PASSED query_id=%d candidates=%zu overlap_threshold=%.3f",
                         query->id, task.candidates.size(), overlap_threshold_);
         }
         return;
@@ -1122,8 +1122,8 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
                     ALOG_INFO(MOD, "[LOOP_COMPUTE] query_id={} target_id={} result=exception reason=teaser_exception what={} (parallel)",
                               query->id, works[i].cand.submap_id, e.what());
                     count_exception++;
-                    if (node_) {
-                        RCLCPP_INFO(node_->get_logger(), "[TEASER_REJECT] query_id=%d target_id=%d primary_reason=exception what=%s",
+                    if (node()) {
+                        RCLCPP_INFO(node()->get_logger(), "[TEASER_REJECT] query_id=%d target_id=%d primary_reason=exception what=%s",
                                     query->id, works[i].cand.submap_id, e.what());
                     }
                     continue;
@@ -1131,8 +1131,8 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
                     ALOG_INFO(MOD, "[LOOP_COMPUTE] query_id={} target_id={} result=exception reason=teaser_unknown (parallel)",
                               query->id, works[i].cand.submap_id);
                     count_exception++;
-                    if (node_) {
-                        RCLCPP_INFO(node_->get_logger(), "[TEASER_REJECT] query_id=%d target_id=%d primary_reason=exception_unknown",
+                    if (node()) {
+                        RCLCPP_INFO(node()->get_logger(), "[TEASER_REJECT] query_id=%d target_id=%d primary_reason=exception_unknown",
                                     query->id, works[i].cand.submap_id);
                     }
                     continue;
@@ -1143,8 +1143,8 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
                 ALOG_INFO(MOD, "[LOOP_COMPUTE] query_id={} target_id={} result=done success={} inliers≈{} corrs={} inlier_ratio={:.3f} rmse={:.4f} reason={} (parallel)",
                           query->id, works[i].cand.submap_id, teaser_res.success, inliers_approx, teaser_res.num_correspondences,
                           teaser_res.inlier_ratio, teaser_res.rmse, reason_str);
-                if (node_) {
-                    RCLCPP_INFO(node_->get_logger(), "[LOOP_COMPUTE] query_id=%d target_id=%d success=%d inliers=%d corrs=%d inlier_ratio=%.3f reason=%s (parallel)",
+                if (node()) {
+                    RCLCPP_INFO(node()->get_logger(), "[LOOP_COMPUTE] query_id=%d target_id=%d success=%d inliers=%d corrs=%d inlier_ratio=%.3f reason=%s (parallel)",
                                 query->id, works[i].cand.submap_id, teaser_res.success ? 1 : 0, inliers_approx, teaser_res.num_correspondences, teaser_res.inlier_ratio, reason_str);
                 }
                 if (!teaser_res.success || teaser_res.inlier_ratio < min_inlier_ratio_) {
@@ -1152,8 +1152,8 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
                     const char* primary_reason = !teaser_res.success ? "success_false" : "inlier_ratio_below_threshold";
                     ALOG_INFO(MOD, "[LOOP_REJECTED] query_id={} target_id={} primary_reason={} success={} inlier_ratio={:.4f} min_ratio={:.3f} rmse={:.4f} max_rmse={:.3f} corrs={} (parallel)",
                               query->id, works[i].cand.submap_id, primary_reason, teaser_res.success, teaser_res.inlier_ratio, min_inlier_ratio_, teaser_res.rmse, max_rmse_, teaser_res.num_correspondences);
-                    if (node_) {
-                        RCLCPP_INFO(node_->get_logger(), "[TEASER_REJECT] query_id=%d target_id=%d primary_reason=%s success=%d inlier_ratio=%.4f min_inlier_ratio=%.3f rmse=%.4f max_rmse=%.3f corrs=%d (分析: TEASER 返回 success=0 多为 insufficient_pts/corrs/solution_invalid；inlier_ratio 低可调 teaser.min_inlier_ratio 或改进重叠)",
+                    if (node()) {
+                        RCLCPP_INFO(node()->get_logger(), "[TEASER_REJECT] query_id=%d target_id=%d primary_reason=%s success=%d inlier_ratio=%.4f min_inlier_ratio=%.3f rmse=%.4f max_rmse=%.3f corrs=%d (分析: TEASER 返回 success=0 多为 insufficient_pts/corrs/solution_invalid；inlier_ratio 低可调 teaser.min_inlier_ratio 或改进重叠)",
                                     query->id, works[i].cand.submap_id, primary_reason, teaser_res.success ? 1 : 0, teaser_res.inlier_ratio, min_inlier_ratio_, teaser_res.rmse, max_rmse_, teaser_res.num_correspondences);
                     }
                     continue;
@@ -1174,8 +1174,8 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
                     count_reject_rmse++;
                     ALOG_INFO(MOD, "[LOOP_REJECTED] query_id={} target_id={} primary_reason=rmse_too_high rmse={:.4f} max_rmse={:.4f} inlier_ratio={:.3f} (parallel)",
                               query->id, target->id, final_rmse, max_rmse_, teaser_res.inlier_ratio);
-                    if (node_) {
-                        RCLCPP_INFO(node_->get_logger(), "[TEASER_REJECT] query_id=%d target_id=%d primary_reason=rmse_too_high rmse=%.4f max_rmse=%.4f (分析: 几何残差过大，可适当放宽 loop_closure.teaser.max_rmse_m 或检查点云重叠)",
+                    if (node()) {
+                        RCLCPP_INFO(node()->get_logger(), "[TEASER_REJECT] query_id=%d target_id=%d primary_reason=rmse_too_high rmse=%.4f max_rmse=%.4f (分析: 几何残差过大，可适当放宽 loop_closure.teaser.max_rmse_m 或检查点云重叠)",
                                     query->id, target->id, final_rmse, max_rmse_);
                     }
                     continue;
@@ -1202,10 +1202,10 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
                 lc->information = information;
                 ALOG_INFO(MOD, "[LoopDetector][LOOP_OK] 回环约束已发布(parallel) query_id={} target_id={} inlier={:.3f} rmse={:.4f}m",
                           query->id, target->id, lc->inlier_ratio, lc->rmse);
-                if (node_) {
-                    RCLCPP_INFO(node_->get_logger(), "[LOOP_ACCEPTED] query_id=%d target_id=%d inlier_ratio=%.3f rmse=%.4fm (grep LOOP_ACCEPTED to verify loop constraints)",
+                if (node()) {
+                    RCLCPP_INFO(node()->get_logger(), "[LOOP_ACCEPTED] query_id=%d target_id=%d inlier_ratio=%.3f rmse=%.4fm (grep LOOP_ACCEPTED to verify loop constraints)",
                                 query->id, target->id, lc->inlier_ratio, lc->rmse);
-                    RCLCPP_INFO(node_->get_logger(), "[LoopDetector] Loop %d↔%d | inlier=%.2f rmse=%.3f", lc->submap_i, lc->submap_j, lc->inlier_ratio, lc->rmse);
+                    RCLCPP_INFO(node()->get_logger(), "[LoopDetector] Loop %d↔%d | inlier=%.2f rmse=%.3f", lc->submap_i, lc->submap_j, lc->inlier_ratio, lc->rmse);
                 }
                 publishLoopConstraint(lc);
                 loop_detected_count_++;
@@ -1213,8 +1213,8 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
             }
             ALOG_INFO(MOD, "[TEASER_SUMMARY] query_id={} total_candidates={} reject_success_or_inlier={} reject_rmse={} reject_exception={} accepted={} (若 accepted=0 则本 query 所有回环被 TEASER 拒绝，见上方 [TEASER_REJECT] primary_reason 或 grep LOOP_COMPUTE][TEASER] reason=)",
                       query->id, static_cast<int>(works.size()), count_reject_success_or_inlier, count_reject_rmse, count_exception, count_accepted);
-            if (node_) {
-                RCLCPP_INFO(node_->get_logger(), "[TEASER_SUMMARY] query_id=%d total=%zu reject_success_or_inlier=%d reject_rmse=%d reject_exception=%d accepted=%d (分析回环全被拒: grep TEASER_REJECT)",
+            if (node()) {
+                RCLCPP_INFO(node()->get_logger(), "[TEASER_SUMMARY] query_id=%d total=%zu reject_success_or_inlier=%d reject_rmse=%d reject_exception=%d accepted=%d (分析回环全被拒: grep TEASER_REJECT)",
                             query->id, works.size(), count_reject_success_or_inlier, count_reject_rmse, count_exception, count_accepted);
             }
         }
@@ -1253,8 +1253,8 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
                    tid, query->id, target->id, target_cloud->size(), cand.score);
         ALOG_INFO(MOD, "[LOOP_COMPUTE] query_id={} target_id={} query_pts={} target_pts={} overlap_score={:.3f} (TEASER 计算开始，详见 LOOP_COMPUTE][TEASER])",
                   query->id, target->id, query_cloud->size(), target_cloud->size(), cand.score);
-        if (node_) {
-            RCLCPP_INFO(node_->get_logger(), "[LOOP_COMPUTE] query_id=%d target_id=%d query_pts=%zu target_pts=%zu overlap_score=%.3f",
+        if (node()) {
+            RCLCPP_INFO(node()->get_logger(), "[LOOP_COMPUTE] query_id=%d target_id=%d query_pts=%zu target_pts=%zu overlap_score=%.3f",
                         query->id, target->id, query_cloud->size(), target_cloud->size(), cand.score);
         }
         // Stage 2: TEASER++ 粗配准
@@ -1274,8 +1274,8 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
                       tid, query->id, target->id, e.what());
             ALOG_INFO(MOD, "[LOOP_REJECTED] query_id={} target_id={} reason=teaser_exception what={} score={:.3f}",
                       query->id, target->id, e.what(), cand.score);
-            if (node_) {
-                RCLCPP_INFO(node_->get_logger(), "[TEASER_REJECT] query_id=%d target_id=%d primary_reason=exception what=%s",
+            if (node()) {
+                RCLCPP_INFO(node()->get_logger(), "[TEASER_REJECT] query_id=%d target_id=%d primary_reason=exception what=%s",
                             query->id, target->id, e.what());
             }
             continue;
@@ -1285,8 +1285,8 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
                       tid, query->id, target->id);
             ALOG_INFO(MOD, "[LOOP_REJECTED] query_id={} target_id={} reason=teaser_unknown_exception score={:.3f}",
                       query->id, target->id, cand.score);
-            if (node_) {
-                RCLCPP_INFO(node_->get_logger(), "[TEASER_REJECT] query_id=%d target_id=%d primary_reason=exception_unknown",
+            if (node()) {
+                RCLCPP_INFO(node()->get_logger(), "[TEASER_REJECT] query_id=%d target_id=%d primary_reason=exception_unknown",
                             query->id, target->id);
             }
             continue;
@@ -1299,8 +1299,8 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
         ALOG_INFO(MOD, "[LOOP_COMPUTE] query_id={} target_id={} result=done success={} inliers≈{} corrs={} inlier_ratio={:.3f} rmse={:.4f} reason={} ms={:.1f} (精准优化: 若 inliers<10 可调 safe_min; 若 ratio 低可调 FPFH/voxel)",
                   query->id, target->id, teaser_res.success, inliers_approx, teaser_res.num_correspondences,
                   teaser_res.inlier_ratio, teaser_res.rmse, reason_str, teaser_ms);
-        if (node_) {
-            RCLCPP_INFO(node_->get_logger(), "[LOOP_COMPUTE] query_id=%d target_id=%d success=%d inliers=%d corrs=%d inlier_ratio=%.3f rmse=%.4f reason=%s",
+        if (node()) {
+            RCLCPP_INFO(node()->get_logger(), "[LOOP_COMPUTE] query_id=%d target_id=%d success=%d inliers=%d corrs=%d inlier_ratio=%.3f rmse=%.4f reason=%s",
                         query->id, target->id, teaser_res.success ? 1 : 0, inliers_approx, teaser_res.num_correspondences,
                         teaser_res.inlier_ratio, teaser_res.rmse, reason_str);
         }
@@ -1312,8 +1312,8 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
             const char* primary_reason = !teaser_res.success ? "success_false" : "inlier_ratio_below_threshold";
             ALOG_INFO(MOD, "[LOOP_REJECTED] query_id={} target_id={} primary_reason={} success={} inlier_ratio={:.4f} min_ratio={:.3f} rmse={:.4f} max_rmse={:.3f} corrs={} score={:.3f}",
                       query->id, target->id, primary_reason, teaser_res.success, teaser_res.inlier_ratio, min_inlier_ratio_, teaser_res.rmse, max_rmse_, teaser_res.num_correspondences, cand.score);
-            if (node_) {
-                RCLCPP_INFO(node_->get_logger(), "[TEASER_REJECT] query_id=%d target_id=%d primary_reason=%s success=%d inlier_ratio=%.4f min_inlier_ratio=%.3f rmse=%.4f max_rmse=%.3f corrs=%d (分析: success=0 见 [LOOP_COMPUTE][TEASER] reason=insufficient_pts/corrs/solution_invalid；inlier 低可调 teaser.min_inlier_ratio)",
+            if (node()) {
+                RCLCPP_INFO(node()->get_logger(), "[TEASER_REJECT] query_id=%d target_id=%d primary_reason=%s success=%d inlier_ratio=%.4f min_inlier_ratio=%.3f rmse=%.4f max_rmse=%.3f corrs=%d (分析: success=0 见 [LOOP_COMPUTE][TEASER] reason=insufficient_pts/corrs/solution_invalid；inlier 低可调 teaser.min_inlier_ratio)",
                             query->id, target->id, primary_reason, teaser_res.success ? 1 : 0, teaser_res.inlier_ratio, min_inlier_ratio_, teaser_res.rmse, max_rmse_, teaser_res.num_correspondences);
             }
             continue;
@@ -1336,8 +1336,8 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
             count_reject_rmse++;
             ALOG_INFO(MOD, "[LOOP_REJECTED] query_id={} target_id={} primary_reason=rmse_too_high rmse={:.4f} max_rmse={:.4f} inlier_ratio={:.3f} score={:.3f}",
                       query->id, target->id, final_rmse, max_rmse_, teaser_res.inlier_ratio, cand.score);
-            if (node_) {
-                RCLCPP_INFO(node_->get_logger(), "[TEASER_REJECT] query_id=%d target_id=%d primary_reason=rmse_too_high rmse=%.4f max_rmse=%.4f (分析: 几何残差过大，可放宽 loop_closure.teaser.max_rmse_m)",
+            if (node()) {
+                RCLCPP_INFO(node()->get_logger(), "[TEASER_REJECT] query_id=%d target_id=%d primary_reason=rmse_too_high rmse=%.4f max_rmse=%.4f (分析: 几何残差过大，可放宽 loop_closure.teaser.max_rmse_m)",
                             query->id, target->id, final_rmse, max_rmse_);
             }
             continue;
@@ -1369,10 +1369,10 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
 
         ALOG_INFO(MOD, "[LoopDetector][LOOP_OK] 回环约束已发布 query_id={} target_id={} inlier={:.3f} rmse={:.4f}m score={:.3f}",
                   query->id, target->id, lc->inlier_ratio, lc->rmse, lc->overlap_score);
-        if (node_) {
-            RCLCPP_INFO(node_->get_logger(), "[LOOP_ACCEPTED] query_id=%d target_id=%d inlier_ratio=%.3f rmse=%.4fm (grep LOOP_ACCEPTED to verify loop constraints)",
+        if (node()) {
+            RCLCPP_INFO(node()->get_logger(), "[LOOP_ACCEPTED] query_id=%d target_id=%d inlier_ratio=%.3f rmse=%.4fm (grep LOOP_ACCEPTED to verify loop constraints)",
                         query->id, target->id, lc->inlier_ratio, lc->rmse);
-            RCLCPP_INFO(node_->get_logger(),
+            RCLCPP_INFO(node()->get_logger(),
                 "[LoopDetector] Loop %d↔%d | inlier=%.2f rmse=%.3f score=%.2f",
                 lc->submap_i, lc->submap_j, lc->inlier_ratio, lc->rmse, lc->overlap_score);
         }
@@ -1387,8 +1387,8 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
 
     ALOG_INFO(MOD, "[TEASER_SUMMARY] query_id={} total_candidates={} reject_success_or_inlier={} reject_rmse={} reject_exception={} accepted={} (若 accepted=0 则本 query 所有回环被 TEASER 拒绝，见 [TEASER_REJECT] primary_reason 或 grep LOOP_COMPUTE][TEASER] reason=)",
               query->id, static_cast<int>(valid_candidates.size()), count_reject_success_or_inlier, count_reject_rmse, count_exception, count_accepted);
-    if (node_) {
-        RCLCPP_INFO(node_->get_logger(), "[TEASER_SUMMARY] query_id=%d total=%zu reject_success_or_inlier=%d reject_rmse=%d reject_exception=%d accepted=%d (分析回环全被拒: grep TEASER_REJECT)",
+    if (node()) {
+        RCLCPP_INFO(node()->get_logger(), "[TEASER_SUMMARY] query_id=%d total=%zu reject_success_or_inlier=%d reject_rmse=%d reject_exception=%d accepted=%d (分析回环全被拒: grep TEASER_REJECT)",
                     query->id, valid_candidates.size(), count_reject_success_or_inlier, count_reject_rmse, count_exception, count_accepted);
     }
 }
@@ -1441,7 +1441,7 @@ std::vector<std::pair<int, Eigen::VectorXf>> LoopDetector::exportDescriptorDB() 
 void LoopDetector::publishLoopConstraint(const LoopConstraint::Ptr& lc) {
     if (!constraint_pub_) return;
     automap_pro::msg::LoopConstraintMsg msg;
-    msg.header.stamp  = node_ ? node_->now() : rclcpp::Clock().now();
+    msg.header.stamp  = node() ? node()->now() : rclcpp::Clock().now();
     msg.submap_i      = lc->submap_i;
     msg.submap_j      = lc->submap_j;
     msg.session_i     = lc->session_i;
@@ -1455,8 +1455,8 @@ void LoopDetector::publishLoopConstraint(const LoopConstraint::Ptr& lc) {
         for (int j = 0; j < 6; ++j)
             msg.information_matrix[i*6+j] = lc->information(i,j);
     constraint_pub_->publish(msg);
-    if (node_) {
-        RCLCPP_INFO(node_->get_logger(),
+    if (node()) {
+        RCLCPP_INFO(node()->get_logger(),
             "[LOOP_ACCEPTED] loop_constraint published sm_i=%d sm_j=%d score=%.3f (回环入图可减轻点云结构重影；grep LOOP_ACCEPTED 统计入图回环数)",
             lc->submap_i, lc->submap_j, lc->overlap_score);
     }
@@ -1697,8 +1697,8 @@ std::vector<LoopConstraint::Ptr> LoopDetector::detectIntraSubmapLoop(
             ALOG_WARN(MOD,
                 "[INTRA_LOOP][WARN] skip intra-loop: ScanContext not ready (sc_size=%zu, expected=%zu)",
                 submap->keyframe_scancontexts_.size(), kf_count);
-            if (node_) {
-                RCLCPP_WARN(node_->get_logger(),
+            if (node()) {
+                RCLCPP_WARN(node()->get_logger(),
                     "[INTRA_LOOP][WARN] skip intra-loop: ScanContext not ready sc_size=%zu expected=%zu (grep INTRA_LOOP)",
                     submap->keyframe_scancontexts_.size(), kf_count);
             }
@@ -1709,8 +1709,8 @@ std::vector<LoopConstraint::Ptr> LoopDetector::detectIntraSubmapLoop(
             ALOG_WARN(MOD,
                 "[INTRA_LOOP][WARN] skip intra-loop: descriptors not ready (size=%zu, expected=%zu)",
                 submap->keyframe_descriptors.size(), kf_count);
-            if (node_) {
-                RCLCPP_WARN(node_->get_logger(),
+            if (node()) {
+                RCLCPP_WARN(node()->get_logger(),
                     "[INTRA_LOOP][WARN] skip intra-loop: descriptors not ready size=%zu expected=%zu (grep INTRA_LOOP)",
                     submap->keyframe_descriptors.size(), kf_count);
             }
@@ -1983,8 +1983,8 @@ std::vector<LoopConstraint::Ptr> LoopDetector::detectIntraSubmapLoop(
                         T_w_cand.translation().x(), T_w_cand.translation().y(), T_w_cand.translation().z(),
                         T_w_query.translation().x(), T_w_query.translation().y(), T_w_query.translation().z(),
                         (T_w_query.translation() - T_w_cand.translation()).norm());
-                    if (node_) {
-                        RCLCPP_WARN(node_->get_logger(),
+                    if (node()) {
+                        RCLCPP_WARN(node()->get_logger(),
                             "[INTRA_LOOP][REJECT] pose_anomaly submap_id=%d kf_i=%d kf_j=%d kf_id_cand=%lu kf_id_query=%lu trans_diff=%.3fm rot_diff=%.2fdeg (详见上方 ODOM_rel/TEASER_rel/DIFF/WORLD；grep INTRA_LOOP REJECT)",
                             submap->id, i, query_keyframe_idx, static_cast<unsigned long>(cand_kf->id), static_cast<unsigned long>(query_kf->id), trans_diff_m, rot_diff_deg);
                     }
@@ -2019,8 +2019,8 @@ std::vector<LoopConstraint::Ptr> LoopDetector::detectIntraSubmapLoop(
             t.x(), t.y(), t.z(),
             rpy.x() * 180.0 / M_PI, rpy.y() * 180.0 / M_PI, rpy.z() * 180.0 / M_PI,
             information.norm());
-        if (node_) {
-            RCLCPP_INFO(node_->get_logger(),
+        if (node()) {
+            RCLCPP_INFO(node()->get_logger(),
                 "[INTRA_LOOP][DETECTED] submap_id=%d kf_i=%d kf_j=%d overlap=%.4f inlier=%.4f rmse=%.4f (grep INTRA_LOOP)",
                 submap->id, i, query_keyframe_idx, similarity, teaser_res.inlier_ratio, teaser_res.rmse);
         }
@@ -2071,8 +2071,8 @@ std::vector<LoopConstraint::Ptr> LoopDetector::detectIntraSubmapLoop(
         null_cand_skipped, temporal_filtered, index_filtered, distance_filtered, desc_filtered, empty_cloud_skipped,
         teaser_invoked, teaser_failed, teaser_rejected_inlier, teaser_rejected_rmse, teaser_rejected_pose_anomaly,
         results.size());
-    if (node_) {
-        RCLCPP_INFO(node_->get_logger(),
+    if (node()) {
+        RCLCPP_INFO(node()->get_logger(),
             "[INTRA_LOOP][SUMMARY] submap_id=%d query_kf_idx=%d history_kf=%zu candidates_found=%d "
             "filtered: temporal=%d index=%d dist=%d desc=%d teaser_invoked=%d failed=%d reject_inlier=%d reject_rmse=%d reject_pose_anomaly=%d FINAL_detected=%zu (grep INTRA_LOOP)",
             submap->id, query_keyframe_idx, submap->keyframes.size(), candidates_found,

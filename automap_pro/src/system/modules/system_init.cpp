@@ -142,6 +142,14 @@ AutoMapSystem::~AutoMapSystem() {
     loop_detector_.stop();
     RCLCPP_INFO(get_logger(), "[AutoMapSystem][SHUTDOWN][step=4] loop_detector_.stop() done");
 
+    RCLCPP_INFO(get_logger(), "[AutoMapSystem][SHUTDOWN][step=4a] calling submap_manager_.stop()");
+    submap_manager_.stop();
+    RCLCPP_INFO(get_logger(), "[AutoMapSystem][SHUTDOWN][step=4b] submap_manager_.stop() done");
+
+    RCLCPP_INFO(get_logger(), "[AutoMapSystem][SHUTDOWN][step=4c] calling HealthMonitor::instance().stop()");
+    HealthMonitor::instance().stop();
+    RCLCPP_INFO(get_logger(), "[AutoMapSystem][SHUTDOWN][step=4d] HealthMonitor stop() done");
+
     if (submap_manager_.submapCount() > 0) {
         try {
             std::string out_dir = getOutputDir();

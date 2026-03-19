@@ -455,13 +455,13 @@ HealthMonitor& HealthMonitor::instance() {
 
 void HealthMonitor::init(rclcpp::Node::SharedPtr node, const HealthMonitorConfig& config) {
     std::lock_guard<std::mutex> lk(mutex_);
-    if (node_) return;  // Already initialized
-    
+    if (!node_.expired()) return;  // Already initialized
+
     node_ = node;
     config_ = config;
-    
-    // Create health status publisher
-    health_pub_ = node_->create_publisher<automap_pro::msg::MappingStatusMsg>(
+
+    // Create health status publisher (use param node; node_ is weak_ptr)
+    health_pub_ = node->create_publisher<automap_pro::msg::MappingStatusMsg>(
         "/automap/health/status", 10);
     
     ALOG_INFO(MOD, "HealthMonitor initialized (check_interval={:.1f}s, heartbeat_interval={:.1f}s)",
@@ -651,9 +651,12 @@ HealthReport HealthMonitor::performHealthCheck() {
 
 void HealthMonitor::publishHealthReport(const HealthReport& report) {
     if (!health_pub_) return;
-    
+
+    auto n = node_.lock();
+    if (!n) return;
+
     auto msg = std::make_shared<automap_pro::msg::MappingStatusMsg>();
-    msg->header.stamp = node_->now();
+    msg->header.stamp = n->now();
     msg->state = healthStateToString(report.overall_state);
     
     // Add summary information
@@ -714,9 +717,11 @@ void HealthMonitor::checkLoop() {
 
 void HealthMonitor::heartbeatLoop() {
     while (running_.load()) {
+        auto n = node_.lock();
+        if (!n) break;
         // Publish heartbeat
         auto msg = std::make_shared<automap_pro::msg::MappingStatusMsg>();
-        msg->header.stamp = node_->now();
+        msg->header.stamp = n->now();
         msg->state = "HEALTHY";
         msg->gps_aligned = false;
         
