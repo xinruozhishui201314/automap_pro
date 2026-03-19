@@ -23,6 +23,10 @@ static std::string matrixToString(const Eigen::Matrix3d& m) {
 // GPS 对齐回调（统一投递到队列，由gps_align_thread处理）
 // ─────────────────────────────────────────────────────────────────────────────
 void AutoMapSystem::onGPSAligned(const GPSAlignResult& result) {
+    if (gps_aligned_.load()) {
+        RCLCPP_INFO(get_logger(), "[AutoMapSystem][GPS_ALIGN] system already aligned, ignoring new result");
+        return;
+    }
     if (!result.success) {
         RCLCPP_WARN(get_logger(), "[AutoMapSystem][GPS_ALIGN] alignment failed: %s", result.message.c_str());
         return;
@@ -61,8 +65,9 @@ void AutoMapSystem::processGPSAlignDirectly(const GPSAlignResult& result) {
     {
         std::lock_guard<std::mutex> lk(gps_transform_mutex_);
         gps_aligned_.store(true);
-        gps_transform_R_ = result.R_enu_to_map;
-        gps_transform_t_ = result.t_enu_to_map;
+        // 保存 Map -> ENU 的变换，用于后续新关键帧的全球化
+        gps_transform_R_ = result.R_enu_to_map.transpose();
+        gps_transform_t_ = -gps_transform_R_ * result.t_enu_to_map;
     }
 
     // 1. 转换所有位姿到MAP坐标系
@@ -75,9 +80,13 @@ void AutoMapSystem::processGPSAlignDirectly(const GPSAlignResult& result) {
     auto submap_data = isam2_optimizer_.getAllSubmapData();
     auto odom_factors = isam2_optimizer_.getOdomFactors();
     auto loop_factors = isam2_optimizer_.getLoopFactors();
+    auto keyframe_data = isam2_optimizer_.getKeyFrameData();
+    auto kf_odom_factors = isam2_optimizer_.getKFOdomFactors();
+    auto kf_loop_factors = isam2_optimizer_.getKFLoopFactors();
 
-    RCLCPP_INFO(get_logger(), "[AutoMapSystem][GPS_ALIGN] rebuild data: submaps=%zu odom=%zu loop=%zu",
-                submap_data.size(), odom_factors.size(), loop_factors.size());
+    RCLCPP_INFO(get_logger(), "[AutoMapSystem][GPS_ALIGN] rebuild data: submaps=%zu odom=%zu loop=%zu kf=%zu kf_odom=%zu kf_loop=%zu",
+                submap_data.size(), odom_factors.size(), loop_factors.size(),
+                keyframe_data.size(), kf_odom_factors.size(), kf_loop_factors.size());
 
     // 4. 投递GPS对齐任务到opt_worker线程（等待队列可用）
     {
@@ -94,6 +103,9 @@ void AutoMapSystem::processGPSAlignDirectly(const GPSAlignResult& result) {
                 task.submap_data = std::move(submap_data);
                 task.odom_factors = std::move(odom_factors);
                 task.loop_factors = std::move(loop_factors);
+                task.keyframe_data = std::move(keyframe_data);
+                task.kf_odom_factors = std::move(kf_odom_factors);
+                task.kf_loop_factors = std::move(kf_loop_factors);
                 opt_task_queue_.push_back(task);
                 opt_task_cv_.notify_one();
                 RCLCPP_INFO(get_logger(), "[AutoMapSystem][GPS_ALIGN_DIRECT] enqueued GPS_ALIGN_COMPLETE task after %d waits", wait_count);
@@ -128,11 +140,15 @@ void AutoMapSystem::transformAllPosesAfterGPSAlign(const GPSAlignResult& result)
     auto all_submaps = submap_manager_.getAllSubmaps();
     RCLCPP_INFO(get_logger(), "[AutoMapSystem][GPS_TRANSFORM] transforming %zu submaps", all_submaps.size());
 
-    // 构建变换矩阵
-    Eigen::Affine3d T_enu_to_map = Eigen::Affine3d::Identity();
-    T_enu_to_map.linear() = result.R_enu_to_map;
-    T_enu_to_map.translation() = result.t_enu_to_map;
-    Eigen::Affine3f T_enu_to_map_f = T_enu_to_map.cast<float>();
+    // 构建变换矩阵：使用 Map -> ENU 的逆变换，将地图整体平移/旋转到 GPS 坐标系
+    // result.R_enu_to_map 是 ENU 到 Map 的旋转，其转置就是 Map 到 ENU
+    Eigen::Matrix3d R_map_to_enu = result.R_enu_to_map.transpose();
+    Eigen::Vector3d t_map_to_enu = -R_map_to_enu * result.t_enu_to_map;
+    
+    Eigen::Affine3d T_map_to_enu = Eigen::Affine3d::Identity();
+    T_map_to_enu.linear() = R_map_to_enu;
+    T_map_to_enu.translation() = t_map_to_enu;
+    Eigen::Affine3f T_map_to_enu_f = T_map_to_enu.cast<float>();
 
     int transformed_kf_count = 0;
     int transformed_cloud_count = 0;
@@ -141,8 +157,8 @@ void AutoMapSystem::transformAllPosesAfterGPSAlign(const GPSAlignResult& result)
         if (!sm) continue;
         {
             Pose3d T = Pose3d::Identity();
-            T.linear() = result.R_enu_to_map * sm->pose_w_anchor.linear();
-            T.translation() = result.R_enu_to_map * sm->pose_w_anchor.translation() + result.t_enu_to_map;
+            T.linear() = R_map_to_enu * sm->pose_w_anchor.linear();
+            T.translation() = R_map_to_enu * sm->pose_w_anchor.translation() + t_map_to_enu;
             sm->pose_w_anchor = T;
         }
         sm->pose_w_anchor_optimized = sm->pose_w_anchor;
@@ -152,32 +168,29 @@ void AutoMapSystem::transformAllPosesAfterGPSAlign(const GPSAlignResult& result)
             // 1. 变换位姿
             {
                 Pose3d T = Pose3d::Identity();
-                T.linear() = result.R_enu_to_map * kf->T_w_b.linear();
-                T.translation() = result.R_enu_to_map * kf->T_w_b.translation() + result.t_enu_to_map;
+                T.linear() = R_map_to_enu * kf->T_w_b.linear();
+                T.translation() = R_map_to_enu * kf->T_w_b.translation() + t_map_to_enu;
                 kf->T_w_b = T;
             }
             kf->T_w_b_optimized = kf->T_w_b;
             transformed_kf_count++;
 
-            // 2. 变换点云坐标系（cloud_body 是 body frame 下的点云，不需要变换）
-            //    但如果 cloud_body 已经被配准到世界坐标系，需要变换
-            //    这里我们变换的是已配准的点云 (world frame)
-            // 注意：cloud_body 实际存储的是配准后的世界坐标点云
+            // 2. 变换点云坐标系 - [修复] cloud_body 始终保持在 body 系，不在此变换
+            //    点云合并到子图或显示时会动态使用 T_w_b 变换到世界系。
+            /*
             if (kf->cloud_body && !kf->cloud_body->empty()) {
-                // 变换点云到新的坐标系
-                // 原始点云在旧的世界坐标系，现在需要变换到新的世界坐标系
-                // new_points = R_enu_to_map * old_points + t_enu_to_map
-                pcl::transformPointCloud(*kf->cloud_body, *kf->cloud_body, T_enu_to_map_f);
+                pcl::transformPointCloud(*kf->cloud_body, *kf->cloud_body, T_map_to_enu_f);
                 transformed_cloud_count++;
             }
+            */
         }
     }
 
     // 更新当前里程计位姿
     {
         Pose3d T = Pose3d::Identity();
-        T.linear() = result.R_enu_to_map * last_odom_pose_.linear();
-        T.translation() = result.R_enu_to_map * last_odom_pose_.translation() + result.t_enu_to_map;
+        T.linear() = R_map_to_enu * last_odom_pose_.linear();
+        T.translation() = R_map_to_enu * last_odom_pose_.translation() + t_map_to_enu;
         last_odom_pose_ = T;
     }
 
@@ -222,7 +235,8 @@ void AutoMapSystem::addBatchGPSFactors() {
         if (!sm || !sm->has_valid_gps) continue;
         if (sm->gps_enu_pose.translation().norm() < 1e-6) continue;
 
-        Eigen::Vector3d pos_map = R * sm->gps_enu_pose.translation() + t;
+        // 由于地图已整体变换到 ENU 坐标系，GPS 因子直接使用原 ENU 坐标即可，无需再次变换
+        Eigen::Vector3d pos_map = sm->gps_enu_pose.translation();
         Eigen::Matrix3d cov = sm->gps_cov;
 
         // 🔧 V2 修复：由于 addBatchGPSFactors 已在 opt_worker 线程中执行，

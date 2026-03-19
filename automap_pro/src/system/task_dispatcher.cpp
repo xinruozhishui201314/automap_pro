@@ -149,12 +149,18 @@ bool TaskDispatcher::submitOdomFactor(int from, int to, const Pose3d& rel,
 
 bool TaskDispatcher::submitRebuild(const std::vector<SubmapData>& submaps,
                                   const std::vector<OdomFactorItem>& odom_factors,
-                                  const std::vector<LoopFactorItem>& loop_factors) {
+                                  const std::vector<LoopFactorItem>& loop_factors,
+                                  const std::vector<KeyFrameData>& keyframes,
+                                  const std::vector<OdomFactorItemKF>& kf_odom_factors,
+                                  const std::vector<LoopFactorItemKF>& kf_loop_factors) {
     OptTaskItem task;
     task.type = OptTaskItem::Type::REBUILD;
     task.submap_data = submaps;
     task.odom_factors = odom_factors;
     task.loop_factors = loop_factors;
+    task.keyframe_data = keyframes;
+    task.kf_odom_factors = kf_odom_factors;
+    task.kf_loop_factors = kf_loop_factors;
     
     if (opt_task_mutex_ && opt_task_queue_) {
         std::lock_guard<std::mutex> lock(*opt_task_mutex_);
@@ -178,6 +184,9 @@ bool TaskDispatcher::submitRebuild(const std::vector<SubmapData>& submaps,
 bool TaskDispatcher::submitGPSAlignComplete(const std::vector<SubmapData>& submaps,
                                           const std::vector<OdomFactorItem>& odom_factors,
                                           const std::vector<LoopFactorItem>& loop_factors,
+                                          const std::vector<KeyFrameData>& keyframes,
+                                          const std::vector<OdomFactorItemKF>& kf_odom_factors,
+                                          const std::vector<LoopFactorItemKF>& kf_loop_factors,
                                           const Eigen::Matrix3d& R_enu_to_map,
                                           const Eigen::Vector3d& t_enu_to_map) {
     OptTaskItem task;
@@ -185,6 +194,9 @@ bool TaskDispatcher::submitGPSAlignComplete(const std::vector<SubmapData>& subma
     task.submap_data = submaps;
     task.odom_factors = odom_factors;
     task.loop_factors = loop_factors;
+    task.keyframe_data = keyframes;
+    task.kf_odom_factors = kf_odom_factors;
+    task.kf_loop_factors = kf_loop_factors;
     task.R_enu_to_map = R_enu_to_map;
     task.t_enu_to_map = t_enu_to_map;
     

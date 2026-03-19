@@ -318,6 +318,39 @@ void IncrementalOptimizer::updateSubMapNodePose(int sm_id, const Pose3d& pose) {
     }
 }
 
+void IncrementalOptimizer::updateSubMapNodePosesBatch(const std::unordered_map<int, Pose3d>& poses) {
+    auto lock_start = std::chrono::steady_clock::now();
+    std::unique_lock<std::shared_mutex> lk(rw_mutex_);
+    auto lock_wait_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - lock_start).count();
+    if (lock_wait_ms > 100.0) {
+        RCLCPP_WARN(rclcpp::get_logger("automap_system"),
+            "[IncrementalOptimizer][LOCK_DIAG] updateSubMapNodePosesBatch: rw_mutex wait %.1fms", lock_wait_ms);
+    }
+
+    int updated_count = 0;
+    for (const auto& kv : poses) {
+        int sm_id = kv.first;
+        const Pose3d& pose = kv.second;
+        gtsam::Key key = SM(sm_id);
+        if (!node_exists_.count(sm_id)) continue;
+
+        if (current_estimate_.exists(key)) {
+            current_estimate_.update(key, toPose3(pose));
+            updated_count++;
+        } else {
+            current_estimate_.insert(key, toPose3(pose));
+            updated_count++;
+        }
+    }
+
+    if (updated_count > 0) {
+        // 强制同步 isam2 内部状态（空 graph 仅为了触发内方位同步）
+        isam2_.update(gtsam::NonlinearFactorGraph(), gtsam::Values());
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[IncrementalOptimizer][HBA_SYNC] Synced %d poses to iSAM2 internal state", updated_count);
+    }
+}
+
 void IncrementalOptimizer::addOdomFactor(
     int from, int to,
     const Pose3d& rel,
@@ -348,7 +381,7 @@ void IncrementalOptimizer::addOdomFactor(
         bool to_in_estimate = current_estimate_.exists(SM(to));
         RCLCPP_WARN(rclcpp::get_logger("automap_system"),
             "[IncrementalOptimizer][BACKEND][ODOM] skip addOdomFactor from=%d to=%d "
-            "(from_exists=%d to_exists=%d node_count=%zu) "
+            "(from_exists=%d to_exists=%d node_count=%d) "
             "from_in_estimate=%d to_in_estimate=%d",
             from, to,
             node_exists_.count(from) ? 1 : 0,
@@ -402,6 +435,15 @@ void IncrementalOptimizer::addOdomFactor(
         from, to, factor_count_, pending_graph_.size());
 
     // 里程计因子不立即 update（累积到回环或 GPS 时再提交，减少计算量）
+    {
+        std::lock_guard<std::mutex> hlk(history_mutex_);
+        OdomFactorItem item;
+        item.from_id = from;
+        item.to_id = to;
+        item.rel_pose = rel;
+        item.info_matrix = info_matrix;
+        history_odom_factors_.push_back(item);
+    }
 }
 
 OptimizationResult IncrementalOptimizer::addLoopFactor(
@@ -417,7 +459,7 @@ OptimizationResult IncrementalOptimizer::addLoopFactor(
         RCLCPP_WARN(rclcpp::get_logger("automap_system"),
             "[IncrementalOptimizer][LOCK_DIAG] addLoopFactor: rw_mutex wait %.1fms from=%d to=%d", lock_wait_ms, from, to);
     }
-    BACKEND_STEP("step=addLoopFactor_enter from=%d to=%d rel_norm=%.4f node_count=%zu",
+    BACKEND_STEP("step=addLoopFactor_enter from=%d to=%d rel_norm=%.4f node_count=%d",
         from, to, rel.translation().norm(), node_count_);
     // ✅ 修复：使用 try-catch 包裹，防止 GTSAM 内部 SIGSEGV 导致进程崩溃（已持 lk）
     try {
@@ -493,6 +535,17 @@ OptimizationResult IncrementalOptimizer::addLoopFactor(
             from, to);
         // 回环因子立即触发 iSAM2 update
         OptimizationResult res = commitAndUpdate();
+
+        {
+            std::lock_guard<std::mutex> hlk(history_mutex_);
+            LoopFactorItem item;
+            item.from_id = from;
+            item.to_id = to;
+            item.rel_pose = rel;
+            item.info_matrix = info_matrix;
+            history_loop_factors_.push_back(item);
+        }
+
         BACKEND_STEP("step=addLoopFactor_done from=%d to=%d commit_success=%d nodes_updated=%d elapsed_ms=%.1f",
             from, to, res.success ? 1 : 0, res.nodes_updated, res.elapsed_ms);
         
@@ -539,6 +592,16 @@ OptimizationResult IncrementalOptimizer::addLoopFactorBetweenKeyframes(int kf_id
     pending_graph_.add(gtsam::BetweenFactor<gtsam::Pose3>(
         KF(kf_id_i), KF(kf_id_j), toPose3(rel), robust_noise));
     factor_count_++;
+
+    {
+        std::lock_guard<std::mutex> hlk(history_mutex_);
+        LoopFactorItemKF item;
+        item.from_id = kf_id_i;
+        item.to_id = kf_id_j;
+        item.rel_pose = rel;
+        item.info_matrix = info_matrix;
+        history_kf_loop_factors_.push_back(item);
+    }
 
     // 立即触发 commitAndUpdate
     OptimizationResult res = commitAndUpdate();
@@ -953,6 +1016,13 @@ void IncrementalOptimizer::addKeyFrameNode(int kf_id, const Pose3d& init_pose, b
         return;
     }
 
+    // 🔧 修复 KEY_CONFLICT: 额外检查 pending_values_，防止多任务并发添加同一节点导致 GTSAM 崩溃
+    if (pending_values_.exists(KF(kf_id))) {
+        RCLCPP_DEBUG(rclcpp::get_logger("automap_system"),
+            "[IncrementalOptimizer][BACKEND] addKeyFrameNode: kf_id=%d already exists in pending_values_, skip", kf_id);
+        return;
+    }
+
     // 验证位姿有效性
     const Eigen::Vector3d& t = init_pose.translation();
     const Eigen::Matrix3d& R = init_pose.rotation();
@@ -968,6 +1038,16 @@ void IncrementalOptimizer::addKeyFrameNode(int kf_id, const Pose3d& init_pose, b
     keyframe_count_++;
     pending_values_.insert(KF(kf_id), toPose3(init_pose));
 
+    {
+        std::lock_guard<std::mutex> hlk(history_mutex_);
+        KeyFrameData d;
+        d.id = kf_id;
+        d.pose = init_pose;
+        d.fixed = fixed;
+        d.is_first_kf_of_submap = is_first_kf_of_submap;
+        history_keyframe_data_.push_back(d);
+    }
+
     RCLCPP_INFO(rclcpp::get_logger("automap_system"),
         "[IncrementalOptimizer][BACKEND] addKeyFrameNode: kf_id=%d fixed=%d keyframe_count=%d "
         "pending_values=%zu pending_factors=%zu",
@@ -980,10 +1060,11 @@ void IncrementalOptimizer::addKeyFrameNode(int kf_id, const Pose3d& init_pose, b
         "fixed=%d keyframe_count=%d has_prior_=%d (Prior added if fixed=true OR keyframe_count==1)",
         kf_id, fixed ? 1 : 0, keyframe_count_, has_prior_ ? 1 : 0);
 
-    // 🔧 修复: 第一个 keyframe 或新子图首帧必须添加 Prior 因子，避免孤立节点引发 IndeterminantLinearSystemException
-    // - keyframe_count_ == 1: 全 session 首帧
-    // - is_first_kf_of_submap: 新子图首帧（上一子图冻结后首帧），否则无 odom 约束
-    bool need_prior = fixed || keyframe_count_ == 1 || is_first_kf_of_submap;
+    // 🔧 修复: 第一个 keyframe 必须添加 Prior 因子，避免孤立节点引发 IndeterminantLinearSystemException
+    // - fixed: 外部显式指定（如回环修正后的重锚定）
+    // - !has_prior_: 整个 session 的第一帧（之后所有帧通过 Between 链连接）
+    // 注意：移除 is_first_kf_of_submap 锚定，避免每个子图开头都发生跳变。
+    bool need_prior = fixed || !has_prior_;
     if (need_prior) {
         if (prior_var6_.size() != 6) {
             CONSTRAINT_LOG("step=prior_kf kf_id=%d result=skip reason=prior_var6_size=%zd", kf_id, prior_var6_.size());
@@ -1011,8 +1092,9 @@ void IncrementalOptimizer::addKeyFrameNode(int kf_id, const Pose3d& init_pose, b
             kf_id, fixed ? 1 : 0, keyframe_count_, has_prior_ ? 1 : 0);
     }
 
-    // 🔧 修复欠定：添加相邻 keyframe 间 Between 因子，使 KF 链满秩
-    if (keyframe_count_ >= 2 && !is_first_kf_of_submap && last_keyframe_id_ >= 0) {
+    // 🔧 修复欠定与跳变：建立连续的关键帧链
+    // 只要有上一帧，就建立 BetweenFactor，无论是否跨子图。这确保了轨迹在几何上的连续性。
+    if (last_keyframe_id_ >= 0) {
         Pose3d rel = last_keyframe_pose_.inverse() * init_pose;
         const Eigen::Vector3d& t = rel.translation();
         const Eigen::Matrix3d& R = rel.rotation();
@@ -1465,27 +1547,16 @@ void IncrementalOptimizer::addOdomFactorBetweenKeyframes(int from, int to, const
     auto noise = infoToNoiseDiagonal(info_matrix);
     pending_graph_.add(gtsam::BetweenFactor<gtsam::Pose3>(KF(from), KF(to), toPose3(rel), noise));
     factor_count_++;
-    
-    // 关键帧间的里程计因子通常不立即触发 commitAndUpdate，由 forceUpdate 批量提交
-    scope.setSuccess(true);
-}
 
-void IncrementalOptimizer::addOdomFactorBetweenKeyframes(int from, int to, const Pose3d& rel, const Mat66d& info_matrix) {
-    GtsamCallScope scope(GtsamCaller::ISAM2, "addOdomFactorBetweenKeyframes",
-                         "from=" + std::to_string(from) + " to=" + std::to_string(to), false);
-    std::unique_lock<std::shared_mutex> lk(rw_mutex_);
-    if (!prior_noise_) return;
-
-    if (keyframe_node_exists_.find(from) == keyframe_node_exists_.end() ||
-        keyframe_node_exists_.find(to) == keyframe_node_exists_.end()) {
-        RCLCPP_DEBUG(rclcpp::get_logger("automap_system"),
-            "[IncrementalOptimizer][BACKEND] addOdomFactorBetweenKeyframes: nodes %d or %d not in graph, skip", from, to);
-        return;
+    {
+        std::lock_guard<std::mutex> hlk(history_mutex_);
+        OdomFactorItemKF item;
+        item.from_id = from;
+        item.to_id = to;
+        item.rel_pose = rel;
+        item.info_matrix = info_matrix;
+        history_kf_odom_factors_.push_back(item);
     }
-
-    auto noise = infoToNoiseDiagonal(info_matrix);
-    pending_graph_.add(gtsam::BetweenFactor<gtsam::Pose3>(KF(from), KF(to), toPose3(rel), noise));
-    factor_count_++;
     
     // 关键帧间的里程计因子通常不立即触发 commitAndUpdate，由 forceUpdate 批量提交
     scope.setSuccess(true);
@@ -1597,8 +1668,8 @@ OptimizationResult IncrementalOptimizer::commitAndUpdate() {
                 int fc = key_factor_count.count(k) ? key_factor_count[k] : 0;
                 gtsam::Symbol sym(k);
                 RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-                    "[ISAM2_DIAG] pre_update node key=%zu (type=%c id=%d) has %d constraint(s) - %s",
-                    static_cast<size_t>(k), static_cast<char>(sym.chr()), sym.index(), fc,
+                    "[ISAM2_DIAG] pre_update node key=%zu (type=%c id=%lu) has %d constraint(s) - %s",
+                    static_cast<size_t>(k), static_cast<char>(sym.chr()), (unsigned long)sym.index(), fc,
                     fc == 0 ? "WARNING: ISOLATED NODE!" : (fc == 1 ? "minimal" : "OK"));
             }
 
@@ -1609,7 +1680,7 @@ OptimizationResult IncrementalOptimizer::commitAndUpdate() {
                     has_isolated_node = true;
                     gtsam::Symbol sym(k);
                     RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
-                        "[IncrementalOptimizer][BACKEND][CONSTRAINT] ISOLATED NODE: key=%zu type=%c id=%d has ZERO constraints! "
+                        "[IncrementalOptimizer][BACKEND][CONSTRAINT] ISOLATED NODE: key=%zu type=%c id=%lu has ZERO constraints! "
                         "- this WILL cause IndeterminantLinearSystemException!",
                         static_cast<size_t>(k), static_cast<char>(sym.chr()), sym.index());
                 }
@@ -2247,6 +2318,159 @@ bool IncrementalOptimizer::hasNodePendingEstimate(int sm_id) const {
     return !current_estimate_.exists(key);
 }
 
+std::vector<SubmapData> IncrementalOptimizer::getAllSubmapData() const {
+    std::shared_lock<std::shared_mutex> lk(rw_mutex_);
+    std::vector<SubmapData> out;
+    int first_id = -1;
+    for (const auto& kv : node_exists_) {
+        if (!kv.second) continue;
+        if (first_id < 0 || kv.first < first_id) first_id = kv.first;
+    }
+    for (const auto& kv : node_exists_) {
+        if (!kv.second) continue;
+        int id = kv.first;
+        gtsam::Key key = SM(id);
+        
+        SubmapData d;
+        d.id = id;
+        d.is_fixed = (id == first_id);
+        
+        if (current_estimate_.exists(key)) {
+            d.pose = fromPose3(current_estimate_.at<gtsam::Pose3>(key));
+        } else if (pending_values_.exists(key)) {
+            d.pose = fromPose3(pending_values_.at<gtsam::Pose3>(key));
+        } else {
+            continue;
+        }
+        
+        d.has_gps = false;
+        d.gps_center = Eigen::Vector3d::Zero();
+        d.gps_cov = Eigen::Matrix3d::Identity() * 1e6;
+        out.push_back(std::move(d));
+    }
+    return out;
+}
+
+std::vector<OdomFactorItem> IncrementalOptimizer::getOdomFactors() const {
+    std::lock_guard<std::mutex> lk(history_mutex_);
+    return history_odom_factors_;
+}
+
+std::vector<LoopFactorItem> IncrementalOptimizer::getLoopFactors() const {
+    std::lock_guard<std::mutex> lk(history_mutex_);
+    return history_loop_factors_;
+}
+
+std::vector<KeyFrameData> IncrementalOptimizer::getKeyFrameData() const {
+    std::lock_guard<std::mutex> lk(history_mutex_);
+    return history_keyframe_data_;
+}
+
+std::vector<OdomFactorItemKF> IncrementalOptimizer::getKFOdomFactors() const {
+    std::lock_guard<std::mutex> lk(history_mutex_);
+    return history_kf_odom_factors_;
+}
+
+std::vector<LoopFactorItemKF> IncrementalOptimizer::getKFLoopFactors() const {
+    std::lock_guard<std::mutex> lk(history_mutex_);
+    return history_kf_loop_factors_;
+}
+
+void IncrementalOptimizer::rebuildAfterGPSAlign(const std::vector<SubmapData>& submap_data,
+                                                const std::vector<OdomFactorItem>& odom_factors,
+                                                const std::vector<LoopFactorItem>& loop_factors,
+                                                const std::vector<KeyFrameData>& keyframe_data,
+                                                const std::vector<OdomFactorItemKF>& kf_odom_factors,
+                                                const std::vector<LoopFactorItemKF>& kf_loop_factors) {
+    std::unique_lock<std::shared_mutex> lk(rw_mutex_);
+    if (!prior_noise_) return;
+    gtsam::ISAM2Params params;
+    params.relinearizeThreshold = ConfigManager::instance().isam2RelinThresh();
+    params.relinearizeSkip = ConfigManager::instance().isam2RelinSkip();
+    params.enableRelinearization = true;
+    params.factorization = gtsam::ISAM2Params::QR;
+    params.cacheLinearizedFactors = true;
+    isam2_ = gtsam::ISAM2(params);
+    pending_graph_.resize(0);
+    pending_values_.clear();
+    current_estimate_.clear();
+    node_exists_.clear();
+    keyframe_node_exists_.clear();
+    keyframe_count_ = 0;
+    last_keyframe_id_ = -1;
+    node_count_ = 0;
+    factor_count_ = 0;
+    has_prior_ = false;
+
+    // 1. 恢复子图节点
+    for (const auto& d : submap_data) {
+        node_exists_[d.id] = true;
+        pending_values_.insert(SM(d.id), toPose3(d.pose));
+        node_count_++;
+        
+        if (d.is_fixed || !has_prior_) {
+            auto noise = gtsam::noiseModel::Diagonal::Variances(prior_var6_);
+            pending_graph_.add(gtsam::PriorFactor<gtsam::Pose3>(SM(d.id), toPose3(d.pose), noise));
+            has_prior_ = true;
+            factor_count_++;
+        }
+    }
+
+    // 2. 恢复关键帧节点
+    for (const auto& d : keyframe_data) {
+        keyframe_node_exists_[d.id] = true;
+        pending_values_.insert(KF(d.id), toPose3(d.pose));
+        keyframe_count_++;
+        
+        if (d.fixed || !has_prior_) {
+            auto noise = gtsam::noiseModel::Diagonal::Variances(prior_var6_);
+            pending_graph_.add(gtsam::PriorFactor<gtsam::Pose3>(KF(d.id), toPose3(d.pose), noise));
+            has_prior_ = true;
+            factor_count_++;
+        }
+    }
+
+    // 3. 恢复因子
+    for (const auto& f : odom_factors) {
+        auto noise = infoToNoiseDiagonal(f.info_matrix);
+        pending_graph_.add(gtsam::BetweenFactor<gtsam::Pose3>(SM(f.from_id), SM(f.to_id), toPose3(f.rel_pose), noise));
+        factor_count_++;
+    }
+    for (const auto& f : loop_factors) {
+        auto noise = infoToNoiseDiagonal(f.info_matrix);
+        pending_graph_.add(gtsam::BetweenFactor<gtsam::Pose3>(SM(f.from_id), SM(f.to_id), toPose3(f.rel_pose), noise));
+        factor_count_++;
+    }
+    for (const auto& f : kf_odom_factors) {
+        auto noise = infoToNoiseDiagonal(f.info_matrix);
+        pending_graph_.add(gtsam::BetweenFactor<gtsam::Pose3>(KF(f.from_id), KF(f.to_id), toPose3(f.rel_pose), noise));
+        factor_count_++;
+    }
+    for (const auto& f : kf_loop_factors) {
+        auto noise = infoToNoiseDiagonal(f.info_matrix);
+        pending_graph_.add(gtsam::BetweenFactor<gtsam::Pose3>(KF(f.from_id), KF(f.to_id), toPose3(f.rel_pose), noise));
+        factor_count_++;
+    }
+
+    {
+        std::lock_guard<std::mutex> h(history_mutex_);
+        history_submap_data_ = submap_data;
+        history_odom_factors_ = odom_factors;
+        history_loop_factors_ = loop_factors;
+        history_keyframe_data_ = keyframe_data;
+        history_kf_odom_factors_ = kf_odom_factors;
+        history_kf_loop_factors_ = kf_loop_factors;
+    }
+    try {
+        isam2_.update(pending_graph_, pending_values_);
+        current_estimate_ = isam2_.calculateEstimate();
+        pending_graph_.resize(0);
+        pending_values_.clear();
+    } catch (const std::exception& e) {
+        ALOG_ERROR(MOD, "rebuildAfterGPSAlign update failed: {}", e.what());
+    }
+}
+
 std::unordered_map<int, Pose3d> IncrementalOptimizer::getAllPoses() const {
     std::shared_lock<std::shared_mutex> lk(rw_mutex_);
     std::unordered_map<int, Pose3d> out;
@@ -2293,17 +2517,10 @@ std::unordered_map<int, Pose3d> IncrementalOptimizer::getAllPoses() const {
 }
 
 void IncrementalOptimizer::reset() {
-    // 先清空优化队列并重置进度标志，避免 opt 线程随后处理旧任务访问已清空状态
-    size_t queue_cleared = 0;
-    {
-        std::lock_guard<std::mutex> qlk(opt_queue_mutex_);
-        queue_cleared = opt_queue_.size();
-        while (!opt_queue_.empty()) opt_queue_.pop();
-    }
+    // V2: 内部 opt 队列已移除，优化由外部 opt_worker 处理；仅重置进度标志
     optimization_in_progress_.store(false, std::memory_order_release);
     RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-        "[IncrementalOptimizer][BACKEND][RESET] queue_cleared=%zu optimization_in_progress=0 (grep BACKEND RESET 定位 reset 调用)",
-        queue_cleared);
+        "[IncrementalOptimizer][BACKEND][RESET] optimization_in_progress=0 (grep BACKEND RESET 定位 reset 调用)");
 
     std::unique_lock<std::shared_mutex> lk(rw_mutex_);
     gtsam::ISAM2Params params;
@@ -2325,16 +2542,7 @@ void IncrementalOptimizer::reset() {
 }
 
 void IncrementalOptimizer::clearForShutdown() {
-    // 严格顺序：先停 opt 线程（notify + join），再持 rw_mutex_ 清空 isam2_/prior_noise_，避免与 optLoop 或 GTSAM 静态析构竞态
-    opt_running_ = false;
-    {
-        std::lock_guard<std::mutex> qlk(opt_queue_mutex_);
-        opt_queue_cv_.notify_all();
-    }
-    if (opt_thread_.joinable()) {
-        opt_thread_.join();
-    }
-
+    // V2: 内部 opt 线程已移除，由外部 opt_worker 独占；仅持 rw_mutex_ 清空 isam2_/prior_noise_
     std::unique_lock<std::shared_mutex> lk(rw_mutex_);
     const int nodes = node_count_;
     const int factors = factor_count_;
@@ -2462,292 +2670,14 @@ void IncrementalOptimizer::notifyPoseUpdate(const std::unordered_map<int, Pose3d
 }
 
 // ── P0 异步优化队列实现 ───────────────────────────────────────────────────
+// V2: optLoop 已移除，优化由外部 opt_worker 线程通过 task_dispatcher 投递并执行
 
-void IncrementalOptimizer::optLoop() {
-    // 条件触发式优化方案：
-    // 1. 批量处理：累积一定数量的任务后再处理
-    // 2. 超时触发：即使任务数量不够，超过一定时间也处理
-    // 3. 避免阻塞：主线程添加任务时不等待结果
-
-    // 🔧 DEBUG: 记录 optLoop 启动时间
-    auto opt_start = std::chrono::steady_clock::now();
-    RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-        "[IncrementalOptimizer][DIAG] optLoop started (tid=0x%zx)",
-        static_cast<size_t>(std::hash<std::thread::id>{}(std::this_thread::get_id())));
-
-    // 批量处理参数
-    static constexpr size_t kBatchSizeThreshold = 5;       // 累积5个任务后处理
-    static constexpr int kBatchTimeoutMs = 2000;           // 或2秒超时
-
-    while (true) {
-        // ===== 条件触发：等待任务或超时 =====
-        std::vector<OptimTask> batch_tasks;
-        auto batch_start = std::chrono::steady_clock::now();
-
-        {
-            std::unique_lock<std::mutex> lk(opt_queue_mutex_);
-
-            // 首先检查是否需要立即退出
-            if (!opt_running_ && opt_queue_.empty()) {
-                break;
-            }
-
-            // 如果队列为空，等待新任务
-            if (opt_queue_.empty()) {
-                RCLCPP_DEBUG(rclcpp::get_logger("automap_system"),
-                    "[IncrementalOptimizer][DIAG] optLoop: waiting for task, queue_size=0");
-                opt_queue_cv_.wait_for(lk, std::chrono::milliseconds(kBatchTimeoutMs), [this] {
-                    return !opt_running_ || !opt_queue_.empty();
-                });
-            }
-
-            // 检查是否需要退出
-            if (!opt_running_ && opt_queue_.empty()) {
-                break;
-            }
-
-            // 收集第一批任务
-            while (!opt_queue_.empty() && batch_tasks.size() < kBatchSizeThreshold) {
-                batch_tasks.push_back(opt_queue_.front());
-                opt_queue_.pop();
-            }
-
-            // 如果只有1个任务且队列还有，尝试等待一小段时间看是否能聚合更多
-            if (batch_tasks.size() == 1 && !opt_queue_.empty()) {
-                auto wait_start = std::chrono::steady_clock::now();
-                opt_queue_cv_.wait_for(lk, std::chrono::milliseconds(100), [this] {
-                    return !opt_running_ || opt_queue_.empty();
-                });
-                auto wait_elapsed = std::chrono::duration<double, std::milli>(
-                    std::chrono::steady_clock::now() - wait_start).count();
-
-                while (!opt_queue_.empty() && batch_tasks.size() < kBatchSizeThreshold) {
-                    batch_tasks.push_back(opt_queue_.front());
-                    opt_queue_.pop();
-                }
-
-                if (batch_tasks.size() > 1) {
-                    RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-                        "[IncrementalOptimizer][DIAG] optLoop: batch coalesced %zu tasks after %.1fms wait",
-                        batch_tasks.size(), wait_elapsed);
-                }
-            }
-
-            MetricsRegistry::instance().setGauge(metrics::ISAM2_QUEUE_DEPTH, static_cast<double>(opt_queue_.size()));
-        }
-
-        if (batch_tasks.empty()) {
-            continue;
-        }
-
-        auto batch_collect_ms = std::chrono::duration<double, std::milli>(
-            std::chrono::steady_clock::now() - batch_start).count();
-
-        // ===== 处理批量任务 =====
-        BACKEND_STEP("step=optLoop_batch_start tasks=%zu collected_ms=%.1f", batch_tasks.size(), batch_collect_ms);
-        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-            "[ISAM2_DIAG] optLoop processing batch of %zu tasks, collected in %.1fms",
-            batch_tasks.size(), batch_collect_ms);
-
-        // 🔧 增强: 记录批量任务类型统计和详情
-        int loop_count = 0, gps_count = 0, batch_count = 0;
-        std::string loop_details;
-        std::string gps_details;
-        for (const auto& t : batch_tasks) {
-            if (t.type == OptimTaskType::LOOP_FACTOR) {
-                loop_count++;
-                loop_details += (loop_details.empty() ? "" : ",") + std::to_string(t.from_id) + "->" + std::to_string(t.to_id);
-            }
-            else if (t.type == OptimTaskType::GPS_FACTOR) gps_count++;
-            else if (t.type == OptimTaskType::BATCH_UPDATE) batch_count++;
-        }
-        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-            "[IncrementalOptimizer][DIAG] optLoop batch: LOOP=%d (from->to: [%s]) GPS=%d BATCH=%d total=%zu",
-            loop_count, loop_details.c_str(), gps_count, batch_count, batch_tasks.size());
-
-        auto task_t0 = std::chrono::steady_clock::now();
-        bool batch_ok = false;
-
-        // 🔧 增强: 获取当前优化器状态
-        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-            "[IncrementalOptimizer][DIAG] optLoop batch START: node_count=%d factor_count=%d keyframe_count=%d "
-            "pending_graph=%zu pending_values=%zu current_estimate_=%zu consecutive_failures=%d",
-            node_count_, factor_count_, keyframe_count_,
-            pending_graph_.size(), pending_values_.size(), current_estimate_.size(),
-            consecutive_failures_.load());
-
-        // ✅ 修复：为批量任务添加 try-catch，防止批量任务失败导致整个 optLoop 退出
-        try {
-            // 统一处理批量任务 - 获取一次锁
-            auto lock_start = std::chrono::steady_clock::now();
-            std::unique_lock<std::shared_mutex> lk(rw_mutex_);
-            auto lock_wait_ms = std::chrono::duration<double, std::milli>(
-                std::chrono::steady_clock::now() - lock_start).count();
-
-            if (lock_wait_ms > 100.0) {
-                RCLCPP_WARN(rclcpp::get_logger("automap_system"),
-                    "[IncrementalOptimizer][LOCK_DIAG] optLoop batch: rw_mutex wait %.1fms (WARNING: high contention!)",
-                    lock_wait_ms);
-            }
-
-            if (!prior_noise_) {
-                RCLCPP_WARN(rclcpp::get_logger("automap_system"),
-                    "[IncrementalOptimizer][DIAG] optLoop batch: prior_noise_ is null, optimizer shutting down");
-                continue;
-            }
-
-            // 批量添加因子 - 增强日志
-            int kf_factors_added = 0;
-            int sm_factors_added = 0;
-            for (const auto& task : batch_tasks) {
-                if (task.type == OptimTaskType::LOOP_FACTOR) {
-                    // 🔧 增强: 检查 submap 节点是否存在
-                    auto from_it = node_exists_.find(task.from_id);
-                    auto to_it = node_exists_.find(task.to_id);
-                    bool from_exists = (from_it != node_exists_.end());
-                    bool to_exists = (to_it != node_exists_.end());
-                    bool from_in_estimate = current_estimate_.exists(SM(task.from_id));
-                    bool to_in_estimate = current_estimate_.exists(SM(task.to_id));
-
-                    if (!from_exists || !to_exists) {
-                        RCLCPP_DEBUG(rclcpp::get_logger("automap_system"),
-                            "[IncrementalOptimizer][DIAG] optLoop: SKIP LOOP from=%d to=%d "
-                            "(from_exists=%d to_exists=%d from_in_estimate=%d to_in_estimate=%d)",
-                            task.from_id, task.to_id,
-                            from_exists ? 1 : 0, to_exists ? 1 : 0,
-                            from_in_estimate ? 1 : 0, to_in_estimate ? 1 : 0);
-                        continue;
-                    }
-                    auto base_noise = infoToNoiseDiagonal(task.info_matrix);
-                    auto robust_noise = gtsam::noiseModel::Robust::Create(
-                        gtsam::noiseModel::mEstimator::Huber::Create(1.345), base_noise);
-                    pending_graph_.add(gtsam::BetweenFactor<gtsam::Pose3>(
-                        SM(task.from_id), SM(task.to_id), toPose3(task.rel_pose), robust_noise));
-                    factor_count_++;
-                    sm_factors_added++;
-                } else if (task.type == OptimTaskType::GPS_FACTOR) {
-                    if (!node_exists_.count(task.from_id)) {
-                        RCLCPP_DEBUG(rclcpp::get_logger("automap_system"),
-                            "[IncrementalOptimizer][DIAG] optLoop: SKIP GPS sm_id=%d (node not exists)",
-                            task.from_id);
-                        continue;
-                    }
-                    gtsam::Point3 gps_point(task.gps_pos.x(), task.gps_pos.y(), task.gps_pos.z());
-                    gtsam::Vector3 vars;
-                    vars << std::max(1e-6, task.gps_cov(0, 0)),
-                            std::max(1e-6, task.gps_cov(1, 1)),
-                            std::max(1e-6, task.gps_cov(2, 2));
-                    auto noise = gtsam::noiseModel::Diagonal::Variances(vars);
-                    pending_graph_.add(gtsam::GPSFactor(SM(task.from_id), gps_point, noise));
-                    factor_count_++;
-                    sm_factors_added++;
-                } else if (task.type == OptimTaskType::BATCH_UPDATE && task.action) {
-                    // BATCH_UPDATE 在锁外执行
-                }
-            }
-
-            // 🔧 增强: 记录因子添加结果
-            RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-                "[IncrementalOptimizer][DIAG] optLoop: added %d SM factors, pending_graph now size=%zu",
-                sm_factors_added, pending_graph_.size());
-
-            // 释放锁后再执行 BATCH_UPDATE 和 commit
-            lk.unlock();
-
-            // 执行 BATCH_UPDATE 任务
-            for (const auto& task : batch_tasks) {
-                if (task.type == OptimTaskType::BATCH_UPDATE && task.action) {
-                    RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-                        "[IncrementalOptimizer][DIAG] optLoop: executing BATCH_UPDATE action");
-                    task.action();
-                }
-            }
-
-            // 批量完成后统一 commit 一次
-            if (!pending_graph_.empty() || !pending_values_.empty()) {
-                BACKEND_STEP("step=optLoop_batch_commit pending_factors=%zu pending_values=%zu",
-                    pending_graph_.size(), pending_values_.size());
-                RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-                    "[IncrementalOptimizer][DIAG] optLoop batch: committing %zu factors %zu values",
-                    pending_graph_.size(), pending_values_.size());
-                commitAndUpdate();
-            } else {
-                BACKEND_STEP("step=optLoop_batch_skip reason=no_pending");
-                RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-                    "[IncrementalOptimizer][DIAG] optLoop batch: nothing to commit (pending empty)");
-            }
-            batch_ok = true;
-
-        } catch (const std::exception& e) {
-            double task_elapsed_ms = std::chrono::duration<double, std::milli>(
-                std::chrono::steady_clock::now() - task_t0).count();
-            BACKEND_STEP("step=optLoop_batch_done tasks=%zu elapsed_ms=%.1f result=fail exception=%s",
-                batch_tasks.size(), task_elapsed_ms, e.what());
-            RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
-                "[IncrementalOptimizer][EXCEPTION] optLoop batch failed after %.1fms: %s (grep EXCEPTION)",
-                task_elapsed_ms, e.what());
-            ALOG_ERROR(MOD, "optLoop batch failed: {}", e.what());
-        } catch (...) {
-            double task_elapsed_ms = std::chrono::duration<double, std::milli>(
-                std::chrono::steady_clock::now() - task_t0).count();
-            BACKEND_STEP("step=optLoop_batch_done tasks=%zu elapsed_ms=%.1f result=fail exception=unknown",
-                batch_tasks.size(), task_elapsed_ms);
-            RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
-                "[IncrementalOptimizer][EXCEPTION] optLoop batch unknown exception after %.1fms",
-                task_elapsed_ms);
-            ALOG_ERROR(MOD, "optLoop batch unknown exception");
-        }
-
-        double batch_elapsed_ms = std::chrono::duration<double, std::milli>(
-            std::chrono::steady_clock::now() - task_t0).count();
-        if (batch_ok) {
-            BACKEND_STEP("step=optLoop_batch_done tasks=%zu elapsed_ms=%.1f queue_remaining=%zu result=ok",
-                batch_tasks.size(), batch_elapsed_ms, getQueueDepth());
-        }
-        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-            "[ISAM2_DIAG] optLoop batch done: tasks=%zu elapsed_ms=%.1f queue_remaining=%zu",
-            batch_tasks.size(), batch_elapsed_ms, getQueueDepth());
-    }
-
-    RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-        "[IncrementalOptimizer][DIAG] optLoop exited");
+void IncrementalOptimizer::enqueueOptTask(const OptimTask&) {
+    // V2: 内部队列已移除，优化任务由外部 task_dispatcher/opt_worker 投递，本接口保留为空实现
 }
 
-void IncrementalOptimizer::enqueueOptTask(const OptimTask& task) {
-    const size_t max_sz = static_cast<size_t>(ConfigManager::instance().maxOptimizationQueueSize());
-    std::lock_guard<std::mutex> lk(opt_queue_mutex_);
-    if (opt_queue_.size() >= max_sz) {
-        ALOG_WARN(MOD, "enqueueOptTask: queue full ({}), drop task", max_sz);
-        RCLCPP_WARN(rclcpp::get_logger("automap_system"),
-            "[IncrementalOptimizer][BACKEND][QUEUE] opt queue full (max=%zu), task dropped (grep BACKEND QUEUE)",
-            max_sz);
-        MetricsRegistry::instance().incrementCounter(metrics::ISAM2_TASK_DROPPED, 1.0);
-        return;
-    }
-    opt_queue_.push(task);
-    MetricsRegistry::instance().setGauge(metrics::ISAM2_QUEUE_DEPTH, static_cast<double>(opt_queue_.size()));
-    opt_queue_cv_.notify_one();
-}
-
-void IncrementalOptimizer::enqueueOptTasks(const std::vector<OptimTask>& tasks) {
-    const size_t max_sz = static_cast<size_t>(ConfigManager::instance().maxOptimizationQueueSize());
-    std::lock_guard<std::mutex> lk(opt_queue_mutex_);
-    size_t dropped = 0;
-    for (const auto& t : tasks) {
-        if (opt_queue_.size() >= max_sz) {
-            dropped++;
-            continue;
-        }
-        opt_queue_.push(t);
-    }
-    if (dropped > 0) {
-        RCLCPP_WARN(rclcpp::get_logger("automap_system"),
-            "[IncrementalOptimizer][BACKEND][QUEUE] opt queue full (max=%zu), %zu task(s) dropped (grep BACKEND QUEUE)",
-            max_sz, dropped);
-        MetricsRegistry::instance().incrementCounter(metrics::ISAM2_TASK_DROPPED, static_cast<double>(dropped));
-    }
-    MetricsRegistry::instance().setGauge(metrics::ISAM2_QUEUE_DEPTH, static_cast<double>(opt_queue_.size()));
-    if (!tasks.empty()) opt_queue_cv_.notify_one();
+void IncrementalOptimizer::enqueueOptTasks(const std::vector<OptimTask>&) {
+    // V2: 内部队列已移除，优化任务由外部 task_dispatcher/opt_worker 投递，本接口保留为空实现
 }
 
 void IncrementalOptimizer::waitForPendingTasks() {

@@ -8,7 +8,11 @@
 #include "automap_pro/core/logger.h"
 #include "automap_pro/core/utils.h"
 
+#include <filesystem>
+
 namespace automap_pro {
+
+namespace fs = std::filesystem;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 定时任务：发布状态
@@ -200,7 +204,9 @@ void AutoMapSystem::saveMapToFiles(const std::string& output_dir) {
     RCLCPP_INFO(get_logger(), "[AutoMapSystem] Saving %zu submaps to %s", all_submaps.size(), output_dir.c_str());
 
     fs::create_directories(output_dir);
-    submap_manager_.saveToDirectory(output_dir);
+    for (const auto& sm : submap_manager_.getAllSubmaps()) {
+        if (sm) submap_manager_.archiveSubmap(sm, output_dir);
+    }
 
     // 保存优化后的轨迹到 CSV
     std::string traj_path = output_dir + "/trajectory_odom.csv";
@@ -276,18 +282,8 @@ Mat66d AutoMapSystem::computeOdomInfoMatrix(
     Mat66d info = Mat66d::Identity();
     if (!prev || !curr) return info * 1e-4;
 
-    double trans_norm = rel.translation().norm();
-    double angle_norm = Sophus::SO3d(rel.rotation()).log().norm();
-
     double trans_noise = 0.01;
     double rot_noise = 0.05;
-    if (prev->quality_score > 0.5 && curr->quality_score > 0.5) {
-        trans_noise = 0.005;
-        rot_noise = 0.02;
-    } else if (prev->quality_score < 0.3 || curr->quality_score < 0.3) {
-        trans_noise = 0.05;
-        rot_noise = 0.2;
-    }
 
     for (int i = 0; i < 3; ++i) info(i, i) = 1.0 / (trans_noise * trans_noise);
     for (int i = 3; i < 6; ++i) info(i, i) = 1.0 / (rot_noise * rot_noise);

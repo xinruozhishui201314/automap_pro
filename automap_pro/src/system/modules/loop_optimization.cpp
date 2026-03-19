@@ -233,6 +233,15 @@ void AutoMapSystem::onHBADone(const HBAResult& result) {
     {
         std::lock_guard<std::mutex> lk(submap_update_mutex_);
         submap_manager_.updateAllFromHBA(result);
+        
+        // 🔧 V2 修复：将 HBA 结果同步回 iSAM2 内部状态，解决双轨脱节问题
+        std::unordered_map<int, Pose3d> hba_poses;
+        for (const auto& sm : all_sm) {
+            if (!sm) continue;
+            hba_poses[sm->id] = sm->pose_w_anchor_optimized;
+        }
+        isam2_optimizer_.updateSubMapNodePosesBatch(hba_poses);
+
         // 🔧 V2 修复：HBA 后必须重建 merged_cloud，否则 fallback 路径的点云将出现严重重影
         submap_manager_.rebuildMergedCloudFromOptimizedPoses();
     }

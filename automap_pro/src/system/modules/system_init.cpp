@@ -4,6 +4,7 @@
 
 #include "automap_pro/system/automap_system.h"
 #include "automap_pro/core/config_manager.h"
+#include "automap_pro/config/thread_config.h"
 #include "automap_pro/core/crash_report.h"
 #include "automap_pro/core/logger.h"
 #include "automap_pro/core/metrics.h"
@@ -240,25 +241,25 @@ void AutoMapSystem::loadConfigAndInit() {
             "[AutoMapSystem][CONFIG] trajectory_odom will be written only at save (keyframe+GPS, map frame); use the CSV in save output_dir for trajectory-GPS comparison.");
     }
 
-    max_frame_queue_size_ = ConfigManager::instance().frameQueueMaxSize();
-    max_ingress_queue_size_ = ConfigManager::instance().ingressQueueMaxSize();
+    const size_t max_frame_queue_size = ConfigManager::instance().frameQueueMaxSize();
+    const size_t max_ingress_queue_size = ConfigManager::instance().ingressQueueMaxSize();
 
     // 初始化 ThreadConfig 单例
-    ThreadConfig::mutableInstance().max_frame_queue_size = max_frame_queue_size_;
-    ThreadConfig::mutableInstance().max_ingress_queue_size = max_ingress_queue_size_;
+    ThreadConfig::mutableInstance().max_frame_queue_size = max_frame_queue_size;
+    ThreadConfig::mutableInstance().max_ingress_queue_size = max_ingress_queue_size;
     ThreadConfig::mutableInstance().max_opt_task_queue_size = kMaxOptTaskQueueSize;
     ThreadConfig::mutableInstance().max_loop_trigger_queue_size = kMaxLoopTriggerQueueSize;
     ThreadConfig::mutableInstance().max_gps_queue_size = kMaxGPSQueueSize;
 
     // 初始化 FrameProcessor
-    frame_processor_.init(max_ingress_queue_size_, max_frame_queue_size_);
+    frame_processor_.init(max_ingress_queue_size, max_frame_queue_size);
     frame_processor_.setShutdownFlag(&shutdown_requested_);
 
     // 初始化 TaskDispatcher（使用外部队列）
     task_dispatcher_ = std::make_unique<TaskDispatcher>(&opt_task_queue_, &opt_task_mutex_, &opt_task_cv_, kMaxOptTaskQueueSize);
 
     RCLCPP_INFO(get_logger(), "[AutoMapSystem][CONFIG] frame_queue_max_size=%zu ingress_queue_max_size=%zu sensor_idle_timeout_sec=%.1f (back-pressure in feeder thread, no drop)",
-                max_frame_queue_size_, max_ingress_queue_size_, ConfigManager::instance().sensorIdleTimeoutSec());
+                max_frame_queue_size, max_ingress_queue_size, ConfigManager::instance().sensorIdleTimeoutSec());
 }
 
 void AutoMapSystem::setupModules() {
@@ -386,9 +387,18 @@ void AutoMapSystem::deferredSetupModules() {
                 RCLCPP_DEBUG(get_logger(),
                     "[AutoMapSystem][GPS_BIND] sm_id=%d dt=%.2fs dist=%.2fm (thresh: dt=%.0fs dist=%.0fm)",
                     best_id, best_dt, best_dist, max_bind_dt, max_bind_dist);
+                
+                // 由于系统已全球化，需要将 GPSManager 传出的 local pos 转换到全局 ENU 坐标系
+                // 如果未对齐，R/t 为 Identity，转换后仍为 pos_enu
+                Eigen::Vector3d pos_global;
+                {
+                    std::lock_guard<std::mutex> lk(gps_transform_mutex_);
+                    pos_global = gps_transform_R_ * pos + gps_transform_t_;
+                }
+
                 // 始终通过 TaskDispatcher 投递任务
                 if (task_dispatcher_) {
-                    task_dispatcher_->submitGPSFactor(best_id, pos, cov);
+                    task_dispatcher_->submitGPSFactor(best_id, pos_global, cov);
                 }
             } else {
                 RCLCPP_DEBUG(get_logger(),
@@ -500,3 +510,5 @@ void AutoMapSystem::setupTimers() {
         [this]() { this->checkThreadHeartbeats(); });
     RCLCPP_INFO(get_logger(), "[AutoMapSystem][TIMER] Heartbeat monitor timer started (5s interval)");
 }
+
+}  // namespace automap_pro

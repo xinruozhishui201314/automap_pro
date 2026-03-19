@@ -2,6 +2,7 @@
 // 包含: tryCreateKeyFrame, onSubmapFrozen, transformWorldToBody, processKeyframeTask
 
 #include "automap_pro/system/automap_system.h"
+#include "automap_pro/core/config_manager.h"
 #include <pcl/common/transforms.h>
 
 namespace automap_pro {
@@ -61,18 +62,18 @@ void AutoMapSystem::tryCreateKeyFrame(double ts, const Pose3d& pose, const Mat66
 
     // 4. 如果 GPS 已对齐，对新关键帧应用相同的刚体变换（地图坐标系修正）
     bool aligned = gps_aligned_.load();
+    Eigen::Matrix3d R_snapshot = Eigen::Matrix3d::Identity();
+    Eigen::Vector3d t_snapshot = Eigen::Vector3d::Zero();
     if (aligned) {
-        Eigen::Matrix3d R;
-        Eigen::Vector3d t;
         {
             std::lock_guard<std::mutex> lk(gps_transform_mutex_);
-            R = gps_transform_R_;
-            t = gps_transform_t_;
+            R_snapshot = gps_transform_R_;
+            t_snapshot = gps_transform_t_;
         }
         {
             Pose3d T = Pose3d::Identity();
-            T.linear() = R * kf->T_w_b.linear();
-            T.translation() = R * kf->T_w_b.translation() + t;
+            T.linear() = R_snapshot * kf->T_w_b.linear();
+            T.translation() = R_snapshot * kf->T_w_b.translation() + t_snapshot;
             kf->T_w_b = T;
         }
     }
@@ -84,15 +85,7 @@ void AutoMapSystem::tryCreateKeyFrame(double ts, const Pose3d& pose, const Mat66
 
     // 6. 投递任务到 opt_worker 线程
     if (task_dispatcher_) {
-        Eigen::Matrix3d R_gps = Eigen::Matrix3d::Identity();
-        Eigen::Vector3d t_gps = Eigen::Vector3d::Zero();
-        if (aligned) {
-            std::lock_guard<std::mutex> lk_gps(gps_transform_mutex_);
-            R_gps = gps_transform_R_;
-            t_gps = gps_transform_t_;
-        }
-        
-        if (task_dispatcher_->submitKeyFrameCreate(kf, has_prev_kf, prev_kf_id, prev_kf, aligned, R_gps, t_gps)) {
+        if (task_dispatcher_->submitKeyFrameCreate(kf, has_prev_kf, prev_kf_id, prev_kf, aligned, R_snapshot, t_snapshot)) {
             RCLCPP_INFO(get_logger(), "[AutoMapSystem][KEYFRAME] enqueued KEYFRAME_CREATE task kf_id=%lu prev_kf_id=%d", 
                         kf->id, prev_kf_id);
         } else {
@@ -164,8 +157,8 @@ void AutoMapSystem::onSubmapFrozen(const SubMap::Ptr& submap) {
         }
     }
 
-    // 尝试触发 GPS 对齐
-    if (!gps_aligned_.load() && count >= ConfigManager::instance().gpsAlignMinSubmaps()) {
+    // 尝试触发 GPS 对齐（ConfigManager 无 gpsAlignMinSubmaps，用最少子图数 2）
+    if (!gps_aligned_.load() && count >= 2) {
         RCLCPP_INFO(get_logger(), "[AutoMapSystem] Enough submaps (%d) for GPS alignment attempt", count);
         gps_manager_.requestAlignment();
     }

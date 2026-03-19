@@ -2,8 +2,13 @@
 // 包含: handleSaveMap, handleGetStatus, handleTriggerHBA, handleTriggerOptimize, handleTriggerGpsAlign, handleLoadSession, handleFinishMapping
 
 #include "automap_pro/system/automap_system.h"
+#include "automap_pro/core/config_manager.h"
+
+#include <filesystem>
 
 namespace automap_pro {
+
+namespace fs = std::filesystem;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 服务处理函数
@@ -86,7 +91,6 @@ void AutoMapSystem::handleTriggerOptimize(
             }
             
             res->success = true;
-            res->message = "Optimize completed (async)";
             return;
         }
     }
@@ -95,7 +99,6 @@ void AutoMapSystem::handleTriggerOptimize(
     RCLCPP_WARN(get_logger(), "[AutoMapSystem][OPT_SERVICE] task_dispatcher failed or null, using direct call");
     auto result = isam2_optimizer_.forceUpdate();
     res->success = result.success;
-    res->message = "Optimize called directly (fallback)";
 }
 
 void AutoMapSystem::handleTriggerGpsAlign(
@@ -212,6 +215,15 @@ void AutoMapSystem::handleFinishMapping(
         res->success = true;
         res->message = "Map saved, requesting shutdown";
         RCLCPP_INFO(get_logger(), "[AutoMapSystem] finish_mapping: requesting context shutdown (end mapping)");
+        // 让 worker 线程在 spin() 返回前就能退出，避免仅依赖析构导致进程长期不退出（见 ROOT_CAUSE_FINISH_MAPPING_NO_EXIT.md）
+        shutdown_requested_.store(true, std::memory_order_release);
+        map_publish_cv_.notify_all();
+        gps_queue_cv_.notify_all();
+        loop_trigger_cv_.notify_all();
+        intra_loop_task_cv_.notify_all();
+        gps_align_cv_.notify_all();
+        opt_task_cv_.notify_all();
+        status_pub_cv_.notify_all();
         rclcpp::shutdown();
     } catch (const std::exception& e) {
         RCLCPP_ERROR(get_logger(), "[AutoMapSystem] finish_mapping failed: %s", e.what());

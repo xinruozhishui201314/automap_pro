@@ -14,7 +14,7 @@ void AutoMapSystem::feederLoop() {
 #ifdef __linux__
     pthread_setname_np(pthread_self(), "automap_feeder");
 #endif
-    const int feeder_tid = static_cast<int>(syscall(__NR_gettid));
+    // const int feeder_tid = static_cast<int>(syscall(__NR_gettid));
     RCLCPP_INFO(get_logger(), "[AutoMapSystem][FEEDER] frame_processor_ starting, delegating to FrameProcessor");
     feeder_heartbeat_ts_ms_.store(nowMs(), std::memory_order_release);
 
@@ -65,7 +65,7 @@ void AutoMapSystem::backendWorkerLoop() {
     static std::atomic<int64_t> total_processing_time_ms{0};
     static std::atomic<int> processed_frame_count{0};
 
-    const auto backend_start_time = std::chrono::steady_clock::now();
+    // const auto backend_start_time = std::chrono::steady_clock::now();
     RCLCPP_INFO(get_logger(), "[AutoMapSystem][BACKEND][DIAG] backendWorkerLoop started at t=0, waiting for frames...");
 
     while (!shutdown_requested_.load(std::memory_order_acquire)) {
@@ -269,7 +269,7 @@ void AutoMapSystem::backendWorkerLoop() {
             const auto t0 = Clock::now();
             RCLCPP_INFO(get_logger(), "[AutoMapSystem][BACKEND][STEP] step=tryCreateKeyFrame_enter processed_no=%d ts=%.3f", processed_no, f.ts);
             try {
-                // keyframe_mutex_ 改在 tryCreateKeyFrame 内仅包住 createKeyFrame+addKeyFrame，避免持锁做 intra_loop/ISAM2 导致阻塞（DESIGN_AVOID_BACKEND_BLOCKING.md）
+                // 关键帧创建与入图由 tryCreateKeyFrame 投递 KEYFRAME_CREATE，由 opt_worker 执行 addKeyFrame 与 ISAM2，避免后端持大锁（DESIGN_AVOID_BACKEND_BLOCKING.md）
                 tryCreateKeyFrame(f.ts, pose, cov, cloud_for_kf, &kfinfo_copy,
                     (f.cloud_ds && !f.cloud_ds->empty()) ? &f.cloud_ds : nullptr);
             } catch (const std::exception& e) {
@@ -557,28 +557,69 @@ void AutoMapSystem::gpsAlignWorkerLoop() {
         }
 
         if (has_task) {
-            // 1. 设置 GPS 对齐状态和变换矩阵
+            // 0. 幂等性检查：如果已经对齐，不再重复处理（除非设计支持增量对齐，当前架构不支持）
+            if (gps_aligned_.load()) {
+                RCLCPP_INFO(get_logger(), "[AutoMapSystem][GPS_ALIGN_WORKER] system already aligned, skipping task");
+                continue;
+            }
+
+            // 1. 设置 GPS 对齐状态和变换矩阵 (Map -> ENU 逆变换)
             {
                 std::lock_guard<std::mutex> lk(gps_transform_mutex_);
                 gps_aligned_.store(true);
-                gps_transform_R_ = align_task.R_enu_to_map;
-                gps_transform_t_ = align_task.t_enu_to_map;
+                gps_transform_R_ = align_task.R_enu_to_map.transpose();
+                gps_transform_t_ = -gps_transform_R_ * align_task.t_enu_to_map;
             }
 
-            // 2. 转换所有已有的位姿到 MAP 坐标系
+            // 2. 转换所有已有的位姿到 ENU 坐标系
             GPSAlignResult res_tmp;
             res_tmp.success = true;
             res_tmp.R_enu_to_map = align_task.R_enu_to_map;
             res_tmp.t_enu_to_map = align_task.t_enu_to_map;
             transformAllPosesAfterGPSAlign(res_tmp);
 
-            // 3. 等待后端处理完当前任务，确保重建时拿到一致的图状态
+            // 3. 通知 HBA 对齐状态（使用单位阵，因为子图位姿已转换到 ENU 全球系）
+            GPSAlignResult hba_res = res_tmp;
+            hba_res.R_enu_to_map = Eigen::Matrix3d::Identity();
+            hba_res.t_enu_to_map = Eigen::Vector3d::Zero();
+            // 在 HBA 内部，R_gps_lidar/t_gps_lidar 用于 GPS factor
+            hba_res.R_gps_lidar = Eigen::Matrix3d::Identity();
+            hba_res.t_gps_lidar = Eigen::Vector3d::Zero();
+            hba_optimizer_.setGPSAlignedState(hba_res);
+
+            // 4. 等待后端处理完当前任务，确保重建时拿到一致的图状态
             ensureBackendCompletedAndFlushBeforeHBA();
 
-            // 4. 获取所有约束数据用于重建图
+            // 4. 获取并转换所有子图位姿，用于全球化重建图
             auto submap_data = isam2_optimizer_.getAllSubmapData();
+            {
+                // 将 isam2 拿到的 local 位姿也转换到全球坐标系，保证 rebuild 后的图直接在全球系工作
+                Eigen::Matrix3d R_inv = align_task.R_enu_to_map.transpose();
+                Eigen::Vector3d t_inv = -R_inv * align_task.t_enu_to_map;
+                for (auto& d : submap_data) {
+                    Pose3d T = Pose3d::Identity();
+                    T.linear() = R_inv * d.pose.linear();
+                    T.translation() = R_inv * d.pose.translation() + t_inv;
+                    d.pose = T;
+                }
+            }
             auto odom_factors = isam2_optimizer_.getOdomFactors();
             auto loop_factors = isam2_optimizer_.getLoopFactors();
+            auto keyframe_data = isam2_optimizer_.getKeyFrameData();
+            auto kf_odom_factors = isam2_optimizer_.getKFOdomFactors();
+            auto kf_loop_factors = isam2_optimizer_.getKFLoopFactors();
+
+            {
+                // 将 keyframe 位姿也转换到全球坐标系
+                Eigen::Matrix3d R_inv = align_task.R_enu_to_map.transpose();
+                Eigen::Vector3d t_inv = -R_inv * align_task.t_enu_to_map;
+                for (auto& d : keyframe_data) {
+                    Pose3d T = Pose3d::Identity();
+                    T.linear() = R_inv * d.pose.linear();
+                    T.translation() = R_inv * d.pose.translation() + t_inv;
+                    d.pose = T;
+                }
+            }
 
             // 5. 投递完整GPS对齐任务到opt_worker线程（循环尝试，不持锁等待）
             bool enqueued = false;
@@ -586,8 +627,12 @@ void AutoMapSystem::gpsAlignWorkerLoop() {
             const int wait_ms = 100;
             
             for (int try_count = 0; try_count < max_tries; ++try_count) {
+                // 注意：这里传递的 R, t 实际上没被 rebuild 逻辑直接使用来变换位姿，
+                // 而是由 submitGPSAlignComplete 后的 opt_worker 线程作为上下文。
+                // 真正的变换已在上面的第 4 步完成。
                 if (task_dispatcher_ && task_dispatcher_->submitGPSAlignComplete(
                     submap_data, odom_factors, loop_factors, 
+                    keyframe_data, kf_odom_factors, kf_loop_factors,
                     align_task.R_enu_to_map, align_task.t_enu_to_map)) {
                     enqueued = true;
                     RCLCPP_INFO(get_logger(), "[AutoMapSystem][GPS_ALIGN_WORKER] enqueued GPS_ALIGN_COMPLETE task via TaskDispatcher (try=%d)", try_count);
@@ -668,13 +713,17 @@ void AutoMapSystem::optWorkerLoop() {
                     }
                     case OptTaskItem::Type::REBUILD: {
                         task_type_name = "REBUILD";
-                        isam2_optimizer_.rebuildAfterGPSAlign(task.submap_data, task.odom_factors, task.loop_factors);
+                        isam2_optimizer_.rebuildAfterGPSAlign(
+                            task.submap_data, task.odom_factors, task.loop_factors,
+                            task.keyframe_data, task.kf_odom_factors, task.kf_loop_factors);
                         break;
                     }
                     case OptTaskItem::Type::GPS_ALIGN_COMPLETE: {
                         task_type_name = "GPS_ALIGN_COMPLETE";
                         isam2_optimizer_.waitForPendingTasks();
-                        isam2_optimizer_.rebuildAfterGPSAlign(task.submap_data, task.odom_factors, task.loop_factors);
+                        isam2_optimizer_.rebuildAfterGPSAlign(
+                            task.submap_data, task.odom_factors, task.loop_factors,
+                            task.keyframe_data, task.kf_odom_factors, task.kf_loop_factors);
                         addBatchGPSFactors();
                         RCLCPP_INFO(get_logger(), "[AutoMapSystem][OPT_WORKER] GPS_ALIGN_COMPLETE processed");
                         break;
@@ -799,11 +848,11 @@ void AutoMapSystem::optWorkerLoop() {
                                     loop_trigger_queue_.push_back(kf);
                                     loop_trigger_cv_.notify_one();
                                 } else {
-                                    RCLCPP_WARN(get_logger(), "[AutoMapSystem][OPT_WORKER] loop_trigger_queue full, dropping kf_id=%d", kf->id);
+                                    RCLCPP_WARN(get_logger(), "[AutoMapSystem][OPT_WORKER] loop_trigger_queue full, dropping kf_id=%lu", static_cast<unsigned long>(kf->id));
                                 }
                             }
 
-                            RCLCPP_INFO(get_logger(), "[AutoMapSystem][OPT_WORKER] KEYFRAME_CREATE processed kf_id=%d node_id=%d", kf->id, node_id);
+                            RCLCPP_INFO(get_logger(), "[AutoMapSystem][OPT_WORKER] KEYFRAME_CREATE processed kf_id=%lu node_id=%d", static_cast<unsigned long>(kf->id), node_id);
                         }
                         break;
                     }
@@ -828,8 +877,10 @@ void AutoMapSystem::optWorkerLoop() {
                                 if (!kf) continue;
                                 auto gps_opt = gps_manager_.queryByTimestamp(kf->timestamp);
                                 if (!gps_opt) continue;
-                                
-                                Eigen::Vector3d pos_map = task.R_enu_to_map * gps_opt->position_enu + task.t_enu_to_map;
+                                // 由于整个系统已全球化（Map Frame == ENU Frame），
+                                // 关键帧位姿 T_w_b 已通过 tryCreateKeyFrame 修正到 ENU 坐标系，
+                                // GPS 观测直接使用 gps_opt->position_enu 即可，不应再应用 R, t。
+                                Eigen::Vector3d pos_map = gps_opt->position_enu;
                                 Eigen::Matrix3d cov = Eigen::Matrix3d::Identity();
                                 double hdop_scale = gps_opt->hdop / 10.0;
                                 double sigma_h = 0.5 * hdop_scale;
@@ -888,7 +939,7 @@ void AutoMapSystem::statusPublisherLoop() {
     while (!shutdown_requested_.load(std::memory_order_acquire)) {
         status_pub_heartbeat_ts_ms_.store(nowMs(), std::memory_order_release);
         std::unique_lock<std::mutex> lock(status_pub_mutex_);
-        const bool status_woke = status_pub_cv_.wait_for(lock, std::chrono::seconds(5), [this] {
+        /* const bool status_woke = */ status_pub_cv_.wait_for(lock, std::chrono::seconds(5), [this] {
             return shutdown_requested_.load(std::memory_order_acquire) ||
                    status_publish_pending_.load(std::memory_order_acquire) ||
                    data_flow_publish_pending_.load(std::memory_order_acquire);

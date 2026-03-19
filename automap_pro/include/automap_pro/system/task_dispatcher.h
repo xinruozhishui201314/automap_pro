@@ -95,7 +95,10 @@ public:
      */
     bool submitRebuild(const std::vector<SubmapData>& submaps,
                       const std::vector<OdomFactorItem>& odom_factors,
-                      const std::vector<LoopFactorItem>& loop_factors);
+                      const std::vector<LoopFactorItem>& loop_factors,
+                      const std::vector<KeyFrameData>& keyframes = {},
+                      const std::vector<OdomFactorItemKF>& kf_odom_factors = {},
+                      const std::vector<LoopFactorItemKF>& kf_loop_factors = {});
     
     /**
      * 提交 GPS 对齐完成任务
@@ -103,6 +106,9 @@ public:
     bool submitGPSAlignComplete(const std::vector<SubmapData>& submaps,
                               const std::vector<OdomFactorItem>& odom_factors,
                               const std::vector<LoopFactorItem>& loop_factors,
+                              const std::vector<KeyFrameData>& keyframes,
+                              const std::vector<OdomFactorItemKF>& kf_odom_factors,
+                              const std::vector<LoopFactorItemKF>& kf_loop_factors,
                               const Eigen::Matrix3d& R_enu_to_map,
                               const Eigen::Vector3d& t_enu_to_map);
     

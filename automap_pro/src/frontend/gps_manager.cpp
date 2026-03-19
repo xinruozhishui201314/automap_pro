@@ -574,6 +574,19 @@ GPSAlignResult GPSManager::compute_svd_alignment() {
 
     Eigen::Vector3d t = lio_centroid - R * gps_centroid;
 
+    // 🔧 [修复] 修正 Z 轴平移：2D SVD 只处理了 XY 平面，这里手动计算 Z 轴平均偏差作为平移的一部分
+    double z_sum = 0.0;
+    int z_count = 0;
+    for (const auto& p : pairs) {
+        // LiDAR Z - (R_enu_to_map * GPS_ENU)_z
+        // 注意 R 只是绕 Z 旋转，所以 (R*gps).z == gps.z
+        z_sum += (p.lidar_pos.z() - p.gps_enu.z());
+        z_count++;
+    }
+    if (z_count > 0) {
+        t.z() = z_sum / z_count;
+    }
+
     // 计算 RMSE（仅在XY平面，GPS高度不可靠）
     double rmse = 0.0;
     for (const auto& p : pairs) {

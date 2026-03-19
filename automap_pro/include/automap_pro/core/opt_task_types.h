@@ -38,6 +38,9 @@ struct OptTaskItem {
     std::vector<SubmapData> submap_data;
     std::vector<OdomFactorItem> odom_factors;
     std::vector<LoopFactorItem> loop_factors;
+    std::vector<KeyFrameData> keyframe_data;
+    std::vector<OdomFactorItemKF> kf_odom_factors;
+    std::vector<LoopFactorItemKF> kf_loop_factors;
     
     // KEYFRAME_CREATE 任务专用字段
     KeyFrame::Ptr keyframe;

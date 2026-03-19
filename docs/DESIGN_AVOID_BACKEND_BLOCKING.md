@@ -168,7 +168,7 @@ tryCreateKeyFrame 内部顺序包括：
 
 ## 六、已实现项（当前代码）
 
-- **方案 A**：已实现。`keyframe_mutex_` 仅在 `createKeyFrame` + `addKeyFrame` 段内持有；`detectIntraSubmapLoop`、ISAM2、viz 均在锁外执行（见 `automap_system.cpp` tryCreateKeyFrame 及 `worker_threads.cpp`）。
+- **方案 A**：已实现并演进。当前实现已无 `keyframe_mutex_`：关键帧由 `tryCreateKeyFrame` 创建后投递 `KEYFRAME_CREATE` 到 opt 队列，由 **opt_worker** 执行 `addKeyFrame` 与 ISAM2；`detectIntraSubmapLoop`、ISAM2、viz 均在锁外或异步执行（见 `keyframe_submap.cpp`、`worker_threads.cpp`）。详见 BACKEND_MODULARITY_AND_STABILITY_ANALYSIS.md。
 - **方案 E（部分）**：  
   - **子图内回环超时**：当 `intra_submap_async=false` 时，子图内回环用 `std::async` + `wait_for(max_duration)` 执行，超时则本帧跳过；若上一帧的 async 未完成则本帧跳过检测，避免堆积。  
   - **单帧耗时告警**：配置 `backend.single_frame_warn_duration_sec`（默认 15.0），单帧处理耗时超过该值时打 `[BACKEND][STUCK_DIAG]` WARN，便于定位卡点。

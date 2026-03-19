@@ -56,6 +56,9 @@ public:
     /** 强制更新现有节点的位姿（用于HBA完成后同步） */
     void updateSubMapNodePose(int sm_id, const Pose3d& pose);
 
+    /** 批量更新现有节点的位姿（用于HBA完成后同步，效率更高） */
+    void updateSubMapNodePosesBatch(const std::unordered_map<int, Pose3d>& poses);
+
     /** 添加子图间里程计因子，可能触发 commit */
     void addOdomFactor(int from, int to, const Pose3d& rel, const Mat66d& info_matrix);
 
@@ -164,10 +167,22 @@ public:
     /** 获取所有回环因子（用于 GPS 对齐后重建） */
     std::vector<LoopFactorItem> getLoopFactors() const;
 
+    /** 获取所有关键帧数据（用于 GPS 对齐后重建） */
+    std::vector<KeyFrameData> getKeyFrameData() const;
+
+    /** 获取所有关键帧里程计因子（用于 GPS 对齐后重建） */
+    std::vector<OdomFactorItemKF> getKFOdomFactors() const;
+
+    /** 获取所有关键帧回环因子（用于 GPS 对齐后重建） */
+    std::vector<LoopFactorItemKF> getKFLoopFactors() const;
+
     /** GPS 对齐后重建因子图 */
     void rebuildAfterGPSAlign(const std::vector<SubmapData>& submap_data,
                               const std::vector<OdomFactorItem>& odom_factors,
-                              const std::vector<LoopFactorItem>& loop_factors);
+                              const std::vector<LoopFactorItem>& loop_factors,
+                              const std::vector<KeyFrameData>& keyframe_data = {},
+                              const std::vector<OdomFactorItemKF>& kf_odom_factors = {},
+                              const std::vector<LoopFactorItemKF>& kf_loop_factors = {});
 
     /** 关闭前清空因子图与 iSAM2 状态并释放 prior_noise_，保证可控析构顺序。
      * 不调用 ConfigManager，可重复调用（析构时再次调用安全）；调用后 addSubMapNode 等将不再添加因子。
@@ -286,7 +301,7 @@ private:
     /** 仅用于 shutdown 检查与 has_prior_ 语义；Prior 因子改用 prior_var6_ 新建 noise */
     gtsam::noiseModel::Diagonal::shared_ptr prior_noise_;
 
-    /** 锁顺序约定（防死锁）：automap_system 持 keyframe_mutex_ 后调用本类 add*，本类持 rw_mutex_；optLoop 仅持 opt_queue_mutex_ -> rw_mutex_，不持 keyframe_mutex_。禁止在持 rw_mutex_ 时调用会获取 keyframe_mutex_ 的代码。见 BACKEND_POTENTIAL_ISSUES 1.3.3 */
+    /** 锁顺序约定（防死锁）：由 opt_worker 等调用方在不长时间持 submap_update_mutex_ 的前提下调用本类 add*；本类持 rw_mutex_。禁止在持 rw_mutex_ 时调用会获取 AutoMapSystem::submap_update_mutex_ 或 SubMapManager::mutex_ 的代码。见 BACKEND_POTENTIAL_ISSUES 1.3.3、BACKEND_MODULARITY_AND_STABILITY_ANALYSIS.md */
     mutable std::shared_mutex rw_mutex_;
     std::unordered_map<int, bool> node_exists_;
     // KeyFrame 级别节点跟踪（与 HBA level1 对齐）
@@ -301,6 +316,9 @@ private:
     std::vector<SubmapData> history_submap_data_;
     std::vector<OdomFactorItem> history_odom_factors_;
     std::vector<LoopFactorItem> history_loop_factors_;
+    std::vector<KeyFrameData> history_keyframe_data_;
+    std::vector<OdomFactorItemKF> history_kf_odom_factors_;
+    std::vector<LoopFactorItemKF> history_kf_loop_factors_;
 
     int    node_count_   = 0;
     int    factor_count_ = 0;

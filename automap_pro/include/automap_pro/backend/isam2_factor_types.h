@@ -72,6 +72,36 @@ struct SubmapData {
 };
 
 /**
+ * 关键帧数据结构（用于重建）
+ */
+struct KeyFrameData {
+    int id;
+    Pose3d pose;
+    bool fixed;
+    bool is_first_kf_of_submap;
+};
+
+/**
+ * 关键帧间里程计因子结构体
+ */
+struct OdomFactorItemKF {
+    int from_id;
+    int to_id;
+    Pose3d rel_pose;
+    Mat66d info_matrix;
+};
+
+/**
+ * 关键帧间回环因子结构体
+ */
+struct LoopFactorItemKF {
+    int from_id;
+    int to_id;
+    Pose3d rel_pose;
+    Mat66d info_matrix;
+};
+
+/**
  * 优化任务结构体
  */
 struct OptimTask {
@@ -87,6 +117,9 @@ struct OptimTask {
     std::vector<SubmapData> submap_data;
     std::vector<OdomFactorItem> odom_factors;
     std::vector<LoopFactorItem> loop_factors;
+    std::vector<KeyFrameData> keyframe_data;
+    std::vector<OdomFactorItemKF> kf_odom_factors;
+    std::vector<LoopFactorItemKF> kf_loop_factors;
 };
 
 /**

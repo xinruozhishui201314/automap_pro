@@ -341,7 +341,22 @@ void AutoMapSystem::onGPSMeasurementForLog(double ts, const Eigen::Vector3d& pos
     auto m_opt = gps_manager_.queryByTimestampForLog(ts, 0.1);
     if (!m_opt) return;
     const GPSMeasurement& m = *m_opt;
-    auto [pos, frame_str] = gps_manager_.enu_to_map_with_frame(m.position_enu);
+    
+    // 获取位置和坐标系名称
+    Eigen::Vector3d pos;
+    std::string frame_str;
+    if (gps_aligned_.load()) {
+        // 如果系统已对齐并全球化，则当前 "map" 系就是全球 ENU 系
+        // GPS 的原始 ENU 坐标即为全球系坐标，无需经过 GPSManager 的 enu_to_map 变换
+        pos = m.position_enu;
+        frame_str = "map";
+    } else {
+        // 未对齐时，使用 GPSManager 传出的坐标（此时 enu_to_map 为单位阵，即原始 ENU）
+        auto res = gps_manager_.enu_to_map_with_frame(m.position_enu);
+        pos = res.first;
+        frame_str = res.second;
+    }
+
     const AttitudeEstimate& att = m.attitude;
     trajectory_gps_file_ << std::fixed << std::setprecision(6)
         << m.timestamp << "," << pos.x() << "," << pos.y() << "," << pos.z() << "," << frame_str << ","

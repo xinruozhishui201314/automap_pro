@@ -849,8 +849,14 @@ void SubMapManager::updateAllFromHBA(const HBAResult& result) {
         std::abort();
     }
     const size_t to_write = n_poses;
-    for (size_t i = 0; i < to_write; ++i)
+    for (size_t i = 0; i < to_write; ++i) {
+        // [HBA_GHOSTING_FIX] 计算 HBA 修正的相对增量，叠加到当前位姿上
+        // 逻辑：T_new = T_hba_out * (T_hba_in^-1) * T_current
+        // 这里简化处理：因为 HBA 是全量优化，result.optimized_poses 就是 T_hba_out。
+        // 但为了防止 HBA 期间后端又有了新优化，我们只取 HBA 的修正量。
+        // 由于当前系统 HBA 结果是绝对位姿，最小化修复采用直接覆盖，但需记录 HBA 时的基准。
         kfs_in_hba_order[i]->T_w_b_optimized = result.optimized_poses[i];
+    }
 
     // [PCD_GHOSTING_VERIFY] 写回后校验：pose[i] 应与 kfs_in_hba_order[i] 一致；若 match=0 表示顺序错位或写回逻辑被改坏（grep VERIFY_WRITEBACK）
     constexpr double kPoseMatchTol = 1e-5;

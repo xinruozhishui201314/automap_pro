@@ -323,7 +323,7 @@ Mat66d IcpRefiner::computeCorrespondenceCovariance(
     
     // 计算对应误差的协方差
     for (const auto& [src_idx, tgt_idx] : correspondences) {
-        if (src_idx >= src->size() || tgt_idx >= tgt->size()) continue;
+        if (static_cast<std::size_t>(src_idx) >= src->size() || static_cast<std::size_t>(tgt_idx) >= tgt->size()) continue;
         
         const auto& src_pt = src->points[src_idx];
         const auto& tgt_pt = tgt->points[tgt_idx];
@@ -453,7 +453,7 @@ void IcpRefiner::filterCorrespondences(
     std::vector<std::pair<int, int>> filtered;
     
     for (const auto& [src_idx, tgt_idx] : correspondences) {
-        if (src_idx >= src->size() || tgt_idx >= tgt->size()) continue;
+        if (static_cast<std::size_t>(src_idx) >= src->size() || static_cast<std::size_t>(tgt_idx) >= tgt->size()) continue;
         
         const auto& src_pt = src->points[src_idx];
         const auto& tgt_pt = tgt->points[tgt_idx];

@@ -350,7 +350,7 @@ void LoopDetector::computeDescriptorAsync(const SubMap::Ptr& submap) {
 }
 
 void LoopDetector::onDescriptorReady(const SubMap::Ptr& submap) {
-    auto t_start = std::chrono::steady_clock::now();
+    // auto t_start = std::chrono::steady_clock::now();
     ALOG_INFO(MOD, "[LOOP_PHASE] stage=descriptor_done submap_id={} query_pts={} (描述子就绪，进入候选检索)",
               submap->id, submap->downsampled_cloud ? submap->downsampled_cloud->size() : 0u);
     if (node_) {
@@ -563,8 +563,8 @@ void LoopDetector::onDescriptorReady(const SubMap::Ptr& submap) {
         score_str += fmt::format("{:.3f}", geo_filtered_candidates[i].score);
         if (i < geo_filtered_candidates.size() - 1) score_str += ", ";
     }
-    auto t_end = std::chrono::steady_clock::now();
-    double total_stage1_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+    // auto t_end = std::chrono::steady_clock::now();
+    // double total_stage1_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
     
     // 子图间候选数（用于诊断“为何子图间回环少”：是没候选还是被过滤）
     int inter_submap_in_geo = 0;
@@ -616,7 +616,7 @@ void LoopDetector::onDescriptorReady(const SubMap::Ptr& submap) {
                     if (tsc.size() == 0) continue;
                     auto res = sc_manager_.distanceBtnScanContext(query_sc, tsc);
                     if (res.first >= sc_dist_threshold_) continue;
-                    float score = std::max(0.f, 1.f - static_cast<float>(res.first / sc_dist_threshold_));
+                    // float score = std::max(0.f, 1.f - static_cast<float>(res.first / sc_dist_threshold_));
                     dists.push_back({static_cast<int>(tkf), res.first});
                 }
                 std::sort(dists.begin(), dists.end(), [](const auto& a, const auto& b) { return a.second < b.second; });
@@ -748,7 +748,11 @@ void LoopDetector::onDescriptorReady(const SubMap::Ptr& submap) {
         std::lock_guard<std::mutex> lk(match_mutex_);
         const size_t max_match = ConfigManager::instance().loopMaxMatchQueueSize();
         while (match_queue_.size() >= max_match) match_queue_.pop();
-        match_queue_.push({submap, query_cloud_copy, geo_filtered_candidates});
+        MatchTask task;
+        task.query = submap;
+        task.query_cloud = query_cloud_copy;
+        task.candidates = geo_filtered_candidates;
+        match_queue_.push(std::move(task));
     }
     ALOG_INFO(MOD, "[LOOP_PHASE] stage=match_enqueue query_id={} candidates={} query_pts={} (子图级)",
               submap->id, geo_filtered_candidates.size(), query_cloud_copy ? query_cloud_copy->size() : 0u);
@@ -1981,8 +1985,8 @@ std::vector<LoopConstraint::Ptr> LoopDetector::detectIntraSubmapLoop(
                         (T_w_query.translation() - T_w_cand.translation()).norm());
                     if (node_) {
                         RCLCPP_WARN(node_->get_logger(),
-                            "[INTRA_LOOP][REJECT] pose_anomaly submap_id=%d kf_i=%d kf_j=%d kf_id_cand=%d kf_id_query=%d trans_diff=%.3fm rot_diff=%.2fdeg (详见上方 ODOM_rel/TEASER_rel/DIFF/WORLD；grep INTRA_LOOP REJECT)",
-                            submap->id, i, query_keyframe_idx, cand_kf->id, query_kf->id, trans_diff_m, rot_diff_deg);
+                            "[INTRA_LOOP][REJECT] pose_anomaly submap_id=%d kf_i=%d kf_j=%d kf_id_cand=%lu kf_id_query=%lu trans_diff=%.3fm rot_diff=%.2fdeg (详见上方 ODOM_rel/TEASER_rel/DIFF/WORLD；grep INTRA_LOOP REJECT)",
+                            submap->id, i, query_keyframe_idx, static_cast<unsigned long>(cand_kf->id), static_cast<unsigned long>(query_kf->id), trans_diff_m, rot_diff_deg);
                     }
                     continue;
                 }

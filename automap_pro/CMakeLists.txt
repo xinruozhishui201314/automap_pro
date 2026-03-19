@@ -350,6 +350,7 @@ add_library(automap_core SHARED
   src/core/error_monitor.cpp
   src/core/health_monitor_impl.cpp
   src/core/crash_report.cpp
+  src/config/thread_config.cpp
 )
 target_include_directories(automap_core PUBLIC ${AUTOMAP_INCLUDE_DIRS})
 # 必须与 ament_target_dependencies 一致：全部用普通形式（无 PUBLIC/PRIVATE），否则 CMake 报 keyword/plain 混用
