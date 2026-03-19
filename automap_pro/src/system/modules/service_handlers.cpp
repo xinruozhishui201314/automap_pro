@@ -60,10 +60,15 @@ void AutoMapSystem::handleTriggerHBA(
     std::shared_ptr<automap_pro::srv::TriggerHBA::Response> res)
 {
     auto all = submap_manager_.getAllSubmaps();
-    RCLCPP_INFO(get_logger(), "[AutoMapSystem] Triggered HBA (wait=%d)", req->wait_for_result);
-    RCLCPP_INFO(get_logger(), "[AutoMapSystem][PIPELINE] event=trigger_hba_called wait=%d submaps=%zu", req->wait_for_result ? 1 : 0, all.size());
+    std::vector<LoopConstraint::Ptr> loops;
+    {
+        std::lock_guard<std::mutex> lk(loop_constraints_mutex_);
+        loops = loop_constraints_;
+    }
+    RCLCPP_INFO(get_logger(), "[AutoMapSystem] Triggered HBA (wait=%d) loops=%zu", req->wait_for_result, loops.size());
+    RCLCPP_INFO(get_logger(), "[AutoMapSystem][PIPELINE] event=trigger_hba_called wait=%d submaps=%zu loops=%zu", req->wait_for_result ? 1 : 0, all.size(), loops.size());
     ensureBackendCompletedAndFlushBeforeHBA();
-    hba_optimizer_.triggerAsync(all, req->wait_for_result, "TriggerHBA_srv");
+    hba_optimizer_.triggerAsync(all, loops, req->wait_for_result, "TriggerHBA_srv");
     res->success = true;
     res->message = "HBA triggered";
 }
@@ -207,8 +212,13 @@ void AutoMapSystem::handleFinishMapping(
             ensureBackendCompletedAndFlushBeforeHBA();
             RCLCPP_INFO(get_logger(), "[AutoMapSystem][HBA][TRACE] step=finish_mapping_ensureBackend_done");
             if (ConfigManager::instance().hbaEnabled() && ConfigManager::instance().hbaOnFinish()) {
-                RCLCPP_INFO(get_logger(), "[AutoMapSystem][PIPELINE] event=finish_mapping_final_hba_enter submaps=%zu", all.size());
-                hba_optimizer_.triggerAsync(all, true, "finish_mapping");
+                std::vector<LoopConstraint::Ptr> loops;
+                {
+                    std::lock_guard<std::mutex> lk(loop_constraints_mutex_);
+                    loops = loop_constraints_;
+                }
+                RCLCPP_INFO(get_logger(), "[AutoMapSystem][PIPELINE] event=finish_mapping_final_hba_enter submaps=%zu loops=%zu", all.size(), loops.size());
+                hba_optimizer_.triggerAsync(all, loops, true, "finish_mapping");
                 RCLCPP_INFO(get_logger(), "[AutoMapSystem][PIPELINE] event=finish_mapping_final_hba_done");
             }
             // 确保输出目录已初始化（含时间戳）

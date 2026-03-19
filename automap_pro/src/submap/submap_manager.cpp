@@ -340,8 +340,13 @@ void SubMapManager::freezeActiveSubmap(const SubMap::Ptr& sm) {
         // 队列满或超时：同步执行 voxel + 回调，避免阻塞/死锁
         RCLCPP_WARN(rclcpp::get_logger("automap_system"), "[SubMapMgr][FREEZE_STEP] queue full or timeout, sync fallback sm_id=%d", sm->id);
         if (sm->merged_cloud && !sm->merged_cloud->empty()) {
-            CloudXYZIPtr ds = utils::voxelDownsample(sm->merged_cloud, static_cast<float>(match_res_));
-            if (!ds || ds->empty()) ds = sm->merged_cloud;
+            // [HBA_FIX] 同步路径也应用锚点坐标系变换，防止回环拉花
+            CloudXYZIPtr body_cloud(new CloudXYZI());
+            Eigen::Isometry3d T_anchor_w = sm->pose_w_anchor.inverse();
+            pcl::transformPointCloud(*sm->merged_cloud, *body_cloud, T_anchor_w.matrix().cast<float>());
+            
+            CloudXYZIPtr ds = utils::voxelDownsample(body_cloud, static_cast<float>(match_res_));
+            if (!ds || ds->empty()) ds = body_cloud;
             sm->downsampled_cloud = ds;
             METRICS_HISTOGRAM_OBSERVE(metrics::POINTCLOUD_SIZE, static_cast<double>(sm->merged_cloud->size()));
         }
@@ -387,8 +392,13 @@ void SubMapManager::forceFreezeActiveSubmapForFinish() {
         "[SubMapMgr][FINISH_FREEZE] force-freeze sm_id=%d (sync, so last submap enters factor graph)", sm->id);
     try {
         if (sm->merged_cloud && !sm->merged_cloud->empty()) {
-            CloudXYZIPtr ds = utils::voxelDownsample(sm->merged_cloud, static_cast<float>(match_res_));
-            if (!ds || ds->empty()) ds = sm->merged_cloud;
+            // [HBA_FIX] 结束路径也应用锚点坐标系变换，防止回环拉花
+            CloudXYZIPtr body_cloud(new CloudXYZI());
+            Eigen::Isometry3d T_anchor_w = sm->pose_w_anchor.inverse();
+            pcl::transformPointCloud(*sm->merged_cloud, *body_cloud, T_anchor_w.matrix().cast<float>());
+            
+            CloudXYZIPtr ds = utils::voxelDownsample(body_cloud, static_cast<float>(match_res_));
+            if (!ds || ds->empty()) ds = body_cloud;
             sm->downsampled_cloud = ds;
             METRICS_HISTOGRAM_OBSERVE(metrics::POINTCLOUD_SIZE, static_cast<double>(sm->merged_cloud->size()));
         }
@@ -428,10 +438,24 @@ void SubMapManager::freezePostProcessLoop() {
         if (!sm) continue;
         try {
             if (sm->merged_cloud && !sm->merged_cloud->empty()) {
-                CloudXYZIPtr ds = utils::voxelDownsample(sm->merged_cloud, static_cast<float>(match_res_));
-                if (!ds || ds->empty()) ds = sm->merged_cloud;
+                // [HBA_FIX] 关键修复：将点云变换到子图锚点（Anchor）局部坐标系再进行降采样
+                // 原因：LoopDetector 得到的 res.T_tgt_src 被 HBAOptimizer 直接用作 BetweenFactor。
+                // GTSAM 的 BetweenFactor(X1, X2, T12) 要求 T12 是相对于 X1 的局部变换（body frame）。
+                // 如果 downsampled_cloud 是世界坐标系，TEASER 得到的将是世界系下的变换（通常接近 Identity），
+                // 强制 BetweenFactor 为 Identity 会导致 HBA 将不同位置的子图强行拉到一起，导致点云全花。
+                // 同时也解决了 OverlapTransformer/ScanContext 在世界坐标系（如 ENU 数千米外）下描述子失效的问题。
+                CloudXYZIPtr body_cloud(new CloudXYZI());
+                Eigen::Isometry3d T_anchor_w = sm->pose_w_anchor.inverse();
+                pcl::transformPointCloud(*sm->merged_cloud, *body_cloud, T_anchor_w.matrix().cast<float>());
+                
+                CloudXYZIPtr ds = utils::voxelDownsample(body_cloud, static_cast<float>(match_res_));
+                if (!ds || ds->empty()) ds = body_cloud;
                 sm->downsampled_cloud = ds;
+                
                 METRICS_HISTOGRAM_OBSERVE(metrics::POINTCLOUD_SIZE, static_cast<double>(sm->merged_cloud->size()));
+                RCLCPP_INFO(rclcpp::get_logger("automap_system"), 
+                    "[SubMapMgr][FREEZE_POST] sm_id=%d downsampled_cloud created in ANCHOR frame (pts=%zu)", 
+                    sm->id, ds->size());
             }
             {
                 std::vector<SubMapFrozenCallback> cbs_copy;

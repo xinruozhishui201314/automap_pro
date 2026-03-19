@@ -122,9 +122,14 @@ void AutoMapSystem::backendWorkerLoop() {
                             if (submap_manager_.submapCount() > 0) {
                                 if (ConfigManager::instance().hbaEnabled() && ConfigManager::instance().hbaOnFinish()) {
                                     auto all = submap_manager_.getAllSubmaps();
-                                    RCLCPP_INFO(get_logger(), "[AutoMapSystem][PIPELINE][HBA] event=sensor_idle_final_hba_enter submaps=%zu", all.size());
+                                    std::vector<LoopConstraint::Ptr> loops;
+                                    {
+                                        std::lock_guard<std::mutex> lk(loop_constraints_mutex_);
+                                        loops = loop_constraints_;
+                                    }
+                                    RCLCPP_INFO(get_logger(), "[AutoMapSystem][PIPELINE][HBA] event=sensor_idle_final_hba_enter submaps=%zu loops=%zu", all.size(), loops.size());
                                     ensureBackendCompletedAndFlushBeforeHBA();
-                                    hba_optimizer_.triggerAsync(all, true, "sensor_idle");
+                                    hba_optimizer_.triggerAsync(all, loops, true, "sensor_idle");
                                     RCLCPP_INFO(get_logger(), "[AutoMapSystem][PIPELINE][HBA] event=sensor_idle_final_hba_done");
                                 }
                                 std::string out_dir = getOutputDir();
@@ -162,7 +167,12 @@ void AutoMapSystem::backendWorkerLoop() {
                                         frontend_idle_sec, submap_manager_.submapCount(), idle_min_submaps);
                             ensureBackendCompletedAndFlushBeforeHBA();
                             auto all = submap_manager_.getAllSubmaps();
-                            hba_optimizer_.triggerAsync(all, false, "frontend_idle");
+                            std::vector<LoopConstraint::Ptr> loops;
+                            {
+                                std::lock_guard<std::mutex> lk(loop_constraints_mutex_);
+                                loops = loop_constraints_;
+                            }
+                            hba_optimizer_.triggerAsync(all, loops, false, "frontend_idle");
                             continue;
                         }
                     }

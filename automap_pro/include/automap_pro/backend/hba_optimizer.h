@@ -49,6 +49,7 @@ public:
 
     /** 强制异步触发 HBA（建图结束时调用）。trigger_source 仅用于日志，便于定位重影时是否被多次触发（如 finish_mapping / frontend_idle）。 */
     void triggerAsync(const std::vector<SubMap::Ptr>& all_submaps,
+                      const std::vector<LoopConstraint::Ptr>& loops = {},
                       bool wait = false,
                       const char* trigger_source = nullptr);
 
@@ -57,7 +58,8 @@ public:
 
     /** GPS 对齐完成后，批量为已有关键帧添加 GPS 因子并立即触发 HBA（若仅建图结束时做一次 HBA，则改用 setGPSAlignedState） */
     void onGPSAligned(const GPSAlignResult& align_result,
-                      const std::vector<SubMap::Ptr>& all_submaps);
+                      const std::vector<SubMap::Ptr>& all_submaps,
+                      const std::vector<LoopConstraint::Ptr>& loops = {});
 
     /** 仅设置 GPS 对齐状态，不触发 HBA（建图结束时的那次 HBA 会使用该状态添加 GPS 约束） */
     void setGPSAlignedState(const GPSAlignResult& align_result);
@@ -78,6 +80,7 @@ public:
 private:
     struct PendingTask {
         std::vector<KeyFrame::Ptr> keyframes;
+        std::vector<LoopConstraint::Ptr> loops;
         bool enable_gps = false;
     };
 

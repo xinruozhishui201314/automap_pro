@@ -121,18 +121,82 @@ void HBAOptimizer::onSubmapFrozen(const SubMap::Ptr& submap) {
 
 void HBAOptimizer::triggerAsync(
     const std::vector<SubMap::Ptr>& all_submaps,
+    const std::vector<LoopConstraint::Ptr>& loops,
     bool wait,
     const char* trigger_source)
 {
     auto kfs = collectKeyFramesFromSubmaps(all_submaps);
     if (kfs.empty()) return;
 
+    // 建立 SubMap ID 到其首个有效关键帧全局 ID 的映射，用于解析回环约束
+    std::unordered_map<int, uint64_t> sm_id_to_anchor_kf_id;
+    std::unordered_map<int, SubMap::Ptr> sm_id_to_ptr;
+    for (const auto& sm : all_submaps) {
+        if (!sm) continue;
+        sm_id_to_ptr[sm->id] = sm;
+        for (const auto& kf : sm->keyframes) {
+            if (kf && kf->cloud_body && !kf->cloud_body->empty() && 
+                kf->T_w_b.translation().allFinite() && kf->T_w_b.rotation().matrix().allFinite()) {
+                sm_id_to_anchor_kf_id[sm->id] = kf->id;
+                break; // 找到第一个有效的关键帧作为该子图在 HBA 中的锚点
+            }
+        }
+    }
+
+    // 解析回环约束中的局部索引为全局 ID
+    std::vector<LoopConstraint::Ptr> resolved_loops;
+    for (const auto& lc : loops) {
+        if (!lc) continue;
+        
+        // 创建副本，避免修改原始回环数据（虽然是 shared_ptr，但为了安全建议新建）
+        auto resolved_lc = std::make_shared<LoopConstraint>(*lc);
+        bool resolved = false;
+
+        // 情况1：已经是关键帧级回环（已有全局 ID）
+        if (lc->keyframe_global_id_i >= 0 && lc->keyframe_global_id_j >= 0) {
+            resolved = true;
+        }
+        // 情况2：子图内回环（submap_i == submap_j）
+        else if (lc->submap_i == lc->submap_j) {
+            auto it = sm_id_to_ptr.find(lc->submap_i);
+            if (it != sm_id_to_ptr.end() && !it->second->keyframes.empty()) {
+                const auto& sm_kfs = it->second->keyframes;
+                if (lc->keyframe_i >= 0 && lc->keyframe_i < (int)sm_kfs.size() &&
+                    lc->keyframe_j >= 0 && lc->keyframe_j < (int)sm_kfs.size()) {
+                    resolved_lc->keyframe_global_id_i = sm_kfs[lc->keyframe_i]->id;
+                    resolved_lc->keyframe_global_id_j = sm_kfs[lc->keyframe_j]->id;
+                    resolved = true;
+                }
+            }
+        }
+        // 情况3：子图间回环（submap_i != submap_j）
+        else {
+            auto it_i = sm_id_to_anchor_kf_id.find(lc->submap_i);
+            auto it_j = sm_id_to_anchor_kf_id.find(lc->submap_j);
+            if (it_i != sm_id_to_anchor_kf_id.end() && it_j != sm_id_to_anchor_kf_id.end()) {
+                resolved_lc->keyframe_global_id_i = it_i->second;
+                resolved_lc->keyframe_global_id_j = it_j->second;
+                resolved = true;
+            }
+        }
+
+        if (resolved) {
+            resolved_loops.push_back(resolved_lc);
+        } else {
+            RCLCPP_DEBUG(rclcpp::get_logger("automap_system"),
+                "[HBA][LOOP_RESOLVE] failed to resolve loop sm%d(kf%d) <-> sm%d(kf%d)",
+                lc->submap_i, lc->keyframe_i, lc->submap_j, lc->keyframe_j);
+        }
+    }
+
     size_t kf_count = kfs.size();
     size_t sm_count = all_submaps.size();
+    size_t loop_count = resolved_loops.size();
     {
         std::lock_guard<std::mutex> lk(queue_mutex_);
         PendingTask task;
         task.keyframes  = std::move(kfs);
+        task.loops      = std::move(resolved_loops);
         task.enable_gps = gps_aligned_;
         pending_queue_.push(std::move(task));
         queue_cv_.notify_one();
@@ -142,10 +206,10 @@ void HBAOptimizer::triggerAsync(
     { std::lock_guard<std::mutex> lk(queue_mutex_); queue_depth = pending_queue_.size(); }
     const char* src = trigger_source ? trigger_source : "unknown";
     RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-        "[HBA][STATE] enqueue source=%s submaps=%zu keyframes=%zu gps=%d trigger_count=%d queue_depth=%zu (重影诊断: 同一轮建图内 trigger_count>1 表示被多次触发)",
-        src, sm_count, kf_count, gps_aligned_ ? 1 : 0, trigger_count_, queue_depth);
-    ALOG_INFO(MOD, "HBA triggerAsync: source={} submaps={} keyframes={} gps={} trigger_count={} queue_depth={}",
-              src, sm_count, kf_count, gps_aligned_ ? 1 : 0, trigger_count_, queue_depth);
+        "[HBA][STATE] enqueue source=%s submaps=%zu keyframes=%zu loops=%zu gps=%d trigger_count=%d queue_depth=%zu (重影诊断: 同一轮建图内 trigger_count>1 表示被多次触发)",
+        src, sm_count, kf_count, loop_count, gps_aligned_ ? 1 : 0, trigger_count_, queue_depth);
+    ALOG_INFO(MOD, "HBA triggerAsync: source={} submaps={} keyframes={} loops={} gps={} trigger_count={} queue_depth={}",
+              src, sm_count, kf_count, loop_count, gps_aligned_ ? 1 : 0, trigger_count_, queue_depth);
 
     if (wait) {
         // 设置合理超时：最多等待5分钟，避免永久阻塞导致析构卡死
@@ -186,14 +250,15 @@ void HBAOptimizer::waitUntilIdleFor(std::chrono::milliseconds timeout_ms) {
 
 void HBAOptimizer::onGPSAligned(
     const GPSAlignResult& align_result,
-    const std::vector<SubMap::Ptr>& all_submaps)
+    const std::vector<SubMap::Ptr>& all_submaps,
+    const std::vector<LoopConstraint::Ptr>& loops)
 {
     gps_aligned_     = true;
     gps_align_result_ = align_result;
 
     // GPS 对齐后立即触发一次全局优化（backend.hba.enabled=false 时跳过，仅 ISAM2+GPS）
     if (ConfigManager::instance().hbaEnabled())
-        triggerAsync(all_submaps, false, "onGPSAligned");
+        triggerAsync(all_submaps, loops, false, "onGPSAligned");
 }
 
 void HBAOptimizer::setGPSAlignedState(const GPSAlignResult& align_result) {
@@ -448,7 +513,9 @@ HBAResult HBAOptimizer::runHBA(const PendingTask& task) {
 
 #ifdef USE_GTSAM_FALLBACK
 HBAResult HBAOptimizer::runGTSAMFallback(const PendingTask& task) {
-    BACKEND_STEP("step=HBA_runGTSAMFallback_enter keyframes=%zu gps=%d", task.keyframes.size(), task.enable_gps ? 1 : 0);
+    auto t_start = std::chrono::steady_clock::now();
+    BACKEND_STEP("step=HBA_runGTSAMFallback_enter keyframes=%zu loops=%zu gps=%d", 
+                 task.keyframes.size(), task.loops.size(), task.enable_gps ? 1 : 0);
     HBAResult result;
     result.success = false;
     if (task.keyframes.empty()) {
@@ -463,6 +530,12 @@ HBAResult HBAOptimizer::runGTSAMFallback(const PendingTask& task) {
               [](const KeyFrame::Ptr& a, const KeyFrame::Ptr& b) {
                   return a->timestamp < b->timestamp;
               });
+
+    // 建立 ID 到索引的映射，用于添加回环约束
+    std::unordered_map<uint64_t, size_t> kf_id_to_idx;
+    for (size_t i = 0; i < sorted_kfs.size(); ++i) {
+        kf_id_to_idx[sorted_kfs[i]->id] = i;
+    }
 
     // [PCD_GHOSTING_VERIFY] GTSAM 路径下 result.optimized_poses 顺序 = sorted_kfs（时间戳序），与 SubMapManager collectKeyframesInHBAOrder 一致；打条便于与 WRITEBACK_ORDER 对照
     if (!sorted_kfs.empty()) {
@@ -485,7 +558,7 @@ HBAResult HBAOptimizer::runGTSAMFallback(const PendingTask& task) {
         Pose3d p = poseForInitial(sorted_kfs[i]);
         const auto& t = p.translation();
         const auto& R = p.rotation();
-        if (!t.allFinite() || !R.allFinite()) {
+        if (!t.allFinite() || !R.matrix().allFinite()) {
             RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
                 "[HBA][BACKEND][VALIDATION] GTSAM fallback: keyframe[%zu] pose non-finite, abort (grep HBA VALIDATION)",
                 i);
@@ -502,6 +575,7 @@ HBAResult HBAOptimizer::runGTSAMFallback(const PendingTask& task) {
     ensureGtsamTbbSerialized();
     GtsamCallScope scope(GtsamCaller::HBA, "GTSAM_fallback",
                         "keyframes=" + std::to_string(sorted_kfs.size()) +
+                        " loops=" + std::to_string(task.loops.size()) +
                         " gps=" + (task.enable_gps ? "1" : "0"), true);
 
     try {
@@ -512,39 +586,68 @@ HBAResult HBAOptimizer::runGTSAMFallback(const PendingTask& task) {
 
         // 每个因子使用独立噪声模型，避免多因子共享同一 shared_ptr 在 GTSAM 内触发 double free
         //（与 incremental_optimizer 及 FIX_GPS_BATCH_SIGSEGV 文档中 borglab/gtsam#1189 同类问题一致）
-        const double prior_var = 1e-8;
-        const double between_var = 0.01;
-
-        // 后端优化后再 HBA：优先用 T_w_b_optimized 做初始值（当与 T_w_b 不同时表示已被后端/上一轮 HBA 更新）
-        auto poseForInitial = [](const KeyFrame::Ptr& kf) -> Pose3d {
-            const Pose3d& o = kf->T_w_b_optimized;
-            const Pose3d& t = kf->T_w_b;
-            if ((o.translation() - t.translation()).norm() > 1e-9 || !o.rotation().isApprox(t.rotation()))
-                return o;
-            return t;
-        };
+        const double prior_var = 1e-9;
+        const double between_rotate_var = 1e-6; // 降低旋转方差，增强轨迹刚度
+        const double between_trans_var = 1e-4;  // 降低平移方差
 
         // 使用命名变量作为方差向量，避免将 Eigen 临时量传入 Variances() 导致 GTSAM 内部悬垂引用
-        //（LM 构造时 graph.error(initial) 会触发 NoiseModelFactor::error → double free，见 borglab/gtsam#1189 同类）
         gtsam::Vector6 prior_var6;
         prior_var6 << prior_var, prior_var, prior_var, prior_var, prior_var, prior_var;
+        
         gtsam::Vector6 between_var6;
-        between_var6 << between_var, between_var, between_var, between_var, between_var, between_var;
+        between_var6 << between_rotate_var, between_rotate_var, between_rotate_var, 
+                        between_trans_var, between_trans_var, between_trans_var;
 
         for (size_t i = 0; i < sorted_kfs.size(); ++i) {
             Pose3d pose_i = poseForInitial(sorted_kfs[i]);
             initial.insert(KF(i), toGtsamPose3(pose_i));
             if (i == 0) {
-                auto prior_noise = gtsam::noiseModel::Diagonal::Variances(prior_var6);
-                graph.add(gtsam::PriorFactor<gtsam::Pose3>(KF(0), toGtsamPose3(pose_i), prior_noise));
+                // 🔧 [修复] 为 PriorFactor 引入 Huber 鲁棒核函数
+                // 原因：当 HBA 任务包含 GPS 约束或跨 Session 约束时，第一帧的 Prior 可能会与 GPS 冲突。
+                // 如果 Prior 太死，LM 优化可能会为了满足 Prior 而牺牲 loop/gps 导致轨迹拉花。
+                auto base_noise = gtsam::noiseModel::Diagonal::Variances(prior_var6);
+                auto robust_noise = gtsam::noiseModel::Robust::Create(
+                    gtsam::noiseModel::mEstimator::Huber::Create(1.0), base_noise);
+                
+                graph.add(gtsam::PriorFactor<gtsam::Pose3>(KF(0), toGtsamPose3(pose_i), robust_noise));
                 factor_type_log.push_back("Prior(k0)");
             } else {
-                Pose3d pose_prev = poseForInitial(sorted_kfs[i - 1]);
-                Pose3d rel = pose_prev.inverse() * pose_i;
+                // 🔧 [修复] 关键点：BetweenFactor 的测量值必须始终使用原始里程计 (T_w_b)，
+                // 而非初始值 (poseForInitial 可能返回已优化的位姿)。
+                // 否则会产生“自引用”逻辑错误：将“上次优化的结果”作为“本次优化的真实测量”，
+                // 导致轨迹无法纠偏且误差不断累积（重影根因）。
+                Pose3d rel = sorted_kfs[i - 1]->T_w_b.inverse() * sorted_kfs[i]->T_w_b;
                 auto between_noise = gtsam::noiseModel::Diagonal::Variances(between_var6);
                 graph.add(gtsam::BetweenFactor<gtsam::Pose3>(KF(i - 1), KF(i), toGtsamPose3(rel), between_noise));
                 factor_type_log.push_back("Between(k" + std::to_string(i - 1) + "-k" + std::to_string(i) + ")");
             }
+        }
+
+        // 添加回环约束
+        size_t loop_factors_added = 0;
+        for (const auto& lc : task.loops) {
+            if (!lc || lc->keyframe_global_id_i < 0 || lc->keyframe_global_id_j < 0) continue;
+            
+            // triggerAsync 已解析好全局 ID，此处映射到 task 内的关键帧索引
+            auto it_i = kf_id_to_idx.find((uint64_t)lc->keyframe_global_id_i);
+            auto it_j = kf_id_to_idx.find((uint64_t)lc->keyframe_global_id_j);
+            
+            if (it_i != kf_id_to_idx.end() && it_j != kf_id_to_idx.end()) {
+                gtsam::Pose3 rel = toGtsamPose3(lc->delta_T);
+                
+                // 使用 Huber 鲁棒核函数，防止坏回环拉花地图
+                auto base_noise = gtsam::noiseModel::Gaussian::Information(lc->information);
+                auto robust_noise = gtsam::noiseModel::Robust::Create(
+                    gtsam::noiseModel::mEstimator::Huber::Create(1.345), base_noise);
+
+                graph.add(gtsam::BetweenFactor<gtsam::Pose3>(KF(it_i->second), KF(it_j->second), rel, robust_noise));
+                factor_type_log.push_back("Loop(k" + std::to_string(it_i->second) + "-k" + std::to_string(it_j->second) + ")");
+                loop_factors_added++;
+            }
+        }
+        if (loop_factors_added > 0) {
+            RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                "[HBA][GTSAM][BACKEND] Loop factors added to HBA graph count=%zu", loop_factors_added);
         }
 
         // [POSE_DIAG] HBA 初始值：首/中/尾关键帧记录使用的位姿来源及数值
@@ -575,31 +678,37 @@ HBAResult HBAOptimizer::runGTSAMFallback(const PendingTask& task) {
                 if (!pos_enu.allFinite()) {
                     RCLCPP_WARN(rclcpp::get_logger("automap_system"),
                         "[HBA][GTSAM] skip GPS factor kf=%zu: non-finite position_enu", i);
-                    ALOG_WARN(MOD, "HBA GTSAM: skip GPS kf={} non-finite position_enu", i);
                     continue;
                 }
-                // 与 iSAM2 一致：由于地图已整体变换到 ENU 系，GPS 观测直接使用 ENU 坐标即可，无需再次变换到旧局部系
+                // 与 iSAM2 一致：由于地图已整体变换到 ENU 系，GPS 观测直接使用 ENU 坐标即可
                 Eigen::Vector3d pos_map = pos_enu;
                 gtsam::Point3 pt(pos_map.x(), pos_map.y(), pos_map.z());
                 Eigen::Matrix3d c = kf->gps.covariance;
                 if (!c.allFinite()) {
                     RCLCPP_WARN(rclcpp::get_logger("automap_system"),
                         "[HBA][GTSAM] skip GPS factor kf=%zu: non-finite covariance", i);
-                    ALOG_WARN(MOD, "HBA GTSAM: skip GPS kf={} non-finite covariance", i);
                     continue;
                 }
+                
+                // 🔧 [修复] GPS Z轴降权：高度观测噪声通常远大于水平方向，放大 Z 轴方差
                 double v0 = std::max(1e-6, std::min(1e6, c(0, 0)));
                 double v1 = std::max(1e-6, std::min(1e6, c(1, 1)));
-                double v2 = std::max(1e-6, std::min(1e6, c(2, 2)));
+                double v2 = std::max(1e-6, std::min(1e6, c(2, 2))) * 20.0; // 放大20倍
+                
                 gtsam::Vector3 vars(v0, v1, v2);
                 auto noise = gtsam::noiseModel::Diagonal::Variances(vars);
-                graph.add(gtsam::GPSFactor(KF(i), pt, noise));
+                
+                // 🔧 [修复] 引入 Huber 鲁棒核函数：抑制异常 GPS 点的影响
+                auto robust_noise = gtsam::noiseModel::Robust::Create(
+                    gtsam::noiseModel::mEstimator::Huber::Create(1.0), noise);
+                
+                graph.add(gtsam::GPSFactor(KF(i), pt, robust_noise));
                 factor_type_log.push_back("GPS(k" + std::to_string(i) + ")");
                 gps_factors_added++;
             }
             if (gps_factors_added > 0) {
                 RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-                    "[HBA][GTSAM][BACKEND] GPS positions in map frame (enu_to_map applied) gps_factors=%zu (grep BACKEND 定位坐标系)",
+                    "[HBA][GTSAM][BACKEND] GPS positions in map frame (enu_to_map applied) gps_factors=%zu",
                     gps_factors_added);
             }
         }
@@ -607,9 +716,9 @@ HBAResult HBAOptimizer::runGTSAMFallback(const PendingTask& task) {
         size_t n_factors = graph.size();
         size_t n_values = initial.size();
         RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-            "[HBA][GTSAM] graph built: factors=%zu values=%zu gps_factors=%zu (building LM optimizer...)",
-            n_factors, n_values, gps_factors_added);
-        ALOG_INFO(MOD, "HBA GTSAM: factors={} values={} gps_factors={}", n_factors, n_values, gps_factors_added);
+            "[HBA][GTSAM] graph built: factors=%zu values=%zu loop_factors=%zu gps_factors=%zu (building LM optimizer...)",
+            n_factors, n_values, loop_factors_added, gps_factors_added);
+        ALOG_INFO(MOD, "HBA GTSAM: factors={} values={} loops={} gps={}", n_factors, n_values, loop_factors_added, gps_factors_added);
 
         // 诊断：逐因子打印类型，便于崩溃时定位是哪一个 factor 在 error() 路径触发 double free
         for (size_t idx = 0; idx < graph.size(); ++idx) {
@@ -748,13 +857,15 @@ HBAResult HBAOptimizer::runGTSAMFallback(const PendingTask& task) {
             "[HBA][GHOSTING_DIAG] runHBA no KF write here poses=%zu (writeback in updateAllFromHBA under mutex；若重影请 grep GHOSTING_DIAG 核对 writeback_enter/done 与 pose_snapshot_taken 时间线)",
             result.optimized_poses.size());
         result.success = true;
-        result.elapsed_ms = 0.0;
-        result.final_mme = 0.0;
+        auto t_end = std::chrono::steady_clock::now();
+        result.elapsed_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+        result.final_mme = 0.0; // fallback 路径暂不计算 MME
         scope.setSuccess(true);
-        BACKEND_STEP("step=HBA_runHBA_done backend=GTSAM_fallback success=1 poses=%zu", result.optimized_poses.size());
+        BACKEND_STEP("step=HBA_runHBA_done backend=GTSAM_fallback success=1 MME=%.4f elapsed_ms=%.1f poses=%zu", 
+                     result.final_mme, result.elapsed_ms, result.optimized_poses.size());
         RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-            "[HBA][BACKEND] GTSAM fallback done: poses=%zu", result.optimized_poses.size());
-        ALOG_INFO(MOD, "HBA GTSAM fallback done: optimized_poses={}", result.optimized_poses.size());
+            "[HBA][BACKEND] GTSAM fallback done: poses=%zu elapsed=%.1fms", result.optimized_poses.size(), result.elapsed_ms);
+        ALOG_INFO(MOD, "HBA GTSAM fallback done: optimized_poses={} elapsed={:.1f}ms", result.optimized_poses.size(), result.elapsed_ms);
     } catch (const std::exception& e) {
         BACKEND_STEP("step=HBA_runHBA_done backend=GTSAM_fallback success=0 exception=%s", e.what());
         RCLCPP_ERROR(rclcpp::get_logger("automap_system"),

@@ -154,7 +154,12 @@ void AutoMapSystem::onSubmapFrozen(const SubMap::Ptr& submap) {
         const int trigger_mod = ConfigManager::instance().hbaTriggerSubmaps();
         if (count % trigger_mod == 0) {
             auto all_frozen = submap_manager_.getFrozenSubmaps();
-            hba_optimizer_.triggerAsync(all_frozen, false, "onSubmapFrozen");
+            std::vector<LoopConstraint::Ptr> loops;
+            {
+                std::lock_guard<std::mutex> lk(loop_constraints_mutex_);
+                loops = loop_constraints_;
+            }
+            hba_optimizer_.triggerAsync(all_frozen, loops, false, "onSubmapFrozen");
         }
     }
 
