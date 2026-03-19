@@ -20,8 +20,10 @@ struct OptTaskItem {
         GPS_ALIGN_COMPLETE, RESET,
         KEYFRAME_CREATE,
         FORCE_UPDATE,
-        // 子图内回环批量：由 intra_loop_worker 投递，opt_worker 执行 addSubMapNode + addLoopFactorDeferred + forceUpdate，与主线程完全异步
-        INTRA_LOOP_BATCH
+        // 子图内回环批量
+        INTRA_LOOP_BATCH,
+        // 活跃子图关键帧GPS绑定
+        ACTIVE_SUBMAP_GPS_BIND
     } type;
     int from_id = 0;
     int to_id = 0;
@@ -41,6 +43,7 @@ struct OptTaskItem {
     KeyFrame::Ptr keyframe;
     bool has_prev_kf = false;
     int prev_kf_id = 0;
+    KeyFrame::Ptr prev_keyframe;  // ✅ V2 修复：存储前一关键帧指针，避免异步滞后导致的 ID 匹配失败
     bool gps_aligned = false;
     Eigen::Matrix3d gps_transform_R;
     Eigen::Vector3d gps_transform_t;
@@ -48,6 +51,8 @@ struct OptTaskItem {
     // INTRA_LOOP_BATCH：子图内回环检测结果，由 intra_loop_worker 投递
     SubMap::Ptr intra_loop_submap;
     std::vector<LoopConstraint::Ptr> intra_loop_constraints;
+    /** 子图内回环的 query 关键帧索引（用于节流：成功检测后隔 N 帧再检测） */
+    int intra_loop_query_keyframe_idx = -1;
 };
 
 }  // namespace automap_pro

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "automap_pro/core/frame_types.h"
 #include "automap_pro/core/data_types.h"
 #include "automap_pro/frontend/livo_bridge.h"
 #include "automap_pro/frontend/keyframe_manager.h"
@@ -11,6 +12,9 @@
 #include "automap_pro/backend/delayed_gps_compensator.h"
 #include "automap_pro/backend/hba_optimizer.h"
 #include "automap_pro/visualization/rviz_publisher.h"
+#include "automap_pro/system/task_dispatcher.h"
+#include "automap_pro/system/frame_processor.h"
+#include "automap_pro/core/opt_task_types.h"
 
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_components/register_node_macro.hpp>
@@ -42,13 +46,6 @@
 #include <future>
 
 namespace automap_pro {
-
-/** 按时间戳对齐：帧队列只存 (ts, cloud)，pose/cov/kfinfo 由 worker 从缓存按 ts 查询；可选 cloud_ds 由 feeder 预计算以省去 worker 内体素 */
-struct FrameToProcess {
-    double ts = 0.0;
-    CloudXYZIPtr cloud;
-    CloudXYZIPtr cloud_ds;  // 可选：feeder 预计算体素降采样，worker 有则直接用
-};
 
 /** 里程计按时间戳缓存，worker 用 get(cloud_ts) 对齐 */
 struct OdomCacheEntry {
@@ -116,29 +113,73 @@ private:
     // 异步任务关闭请求标志
     std::atomic<bool> shutdown_requested_{false};
 
-    // 入口缓冲：订阅回调只写入 ingress，快速返回；feeder 线程将 ingress → frame_queue_，背压在 feeder 内，不阻塞 Executor
-    // ingress 保留 mutex 队列：回调在满时需“强制丢帧”即 pop，SPSC 仅允许 consumer(feeder) pop，故不改为无锁
-    size_t max_ingress_queue_size_ = 16;
-    std::queue<FrameToProcess> ingress_queue_;
-    std::mutex                 ingress_mutex_;
-    std::condition_variable    ingress_not_full_cv_;   // feeder 取走一帧时唤醒回调
-    std::condition_variable    ingress_not_empty_cv_;  // 回调放入一帧时唤醒 feeder
     std::thread                feeder_thread_;
     void feederLoop();
 
-    // 后端帧队列：feeder(单生产者)→backend(单消费者)，SPSC 无锁；热路径 push/pop 无锁，仅 wait 时用 mutex+cv（见 BACKEND_FURTHER_OPTIMIZATION_OPPORTUNITIES.md）
-    static constexpr size_t kFrameQueueCapacity = 8192;
-    using FrameQueueSPSC = boost::lockfree::spsc_queue<FrameToProcess, boost::lockfree::capacity<kFrameQueueCapacity>>;
-    size_t max_frame_queue_size_ = 500;
-    FrameQueueSPSC frame_queue_;
-    std::atomic<size_t>        frame_queue_size_{0};     // 供任意线程读的当前长度（feeder push +1, backend pop -1）
-    std::mutex                frame_queue_mutex_;
-    std::condition_variable   frame_queue_cv_;           // 有数据时唤醒 worker
-    std::condition_variable   frame_queue_not_full_cv_; // 有空间时唤醒 feeder（背压）
+    // ── V2: 帧处理器与任务调度器 ────────────────────────────────────────────────
+    FrameProcessor frame_processor_;
+    std::unique_ptr<TaskDispatcher> task_dispatcher_;
+
     std::thread               backend_worker_;
-    std::atomic<int>          frame_queue_dropped_{0};  // 背压模式下恒为 0
-    std::atomic<int>          backpressure_force_drop_count_{0};  // 背压超限强制丢帧次数（可观测）
     void backendWorkerLoop();
+
+    // ── V2: 优化任务队列与线程 ────────────────────────────────────────────────
+    static constexpr size_t kMaxOptTaskQueueSize = 64;
+    std::deque<OptTaskItem> opt_task_queue_;
+    std::mutex              opt_task_mutex_;
+    std::condition_variable opt_task_cv_;
+    std::thread             opt_worker_thread_;
+    std::atomic<bool>       opt_task_in_progress_{false};
+    void optWorkerLoop();
+
+    // ── V2: 其他辅助线程 ────────────────────────────────────────────────────
+    std::thread loop_trigger_thread_;
+    static constexpr size_t kMaxLoopTriggerQueueSize = 100;
+    std::deque<KeyFrame::Ptr> loop_trigger_queue_;
+    std::mutex                loop_trigger_mutex_;
+    std::condition_variable   loop_trigger_cv_;
+    void loopTriggerThreadLoop();
+
+    std::thread intra_loop_worker_thread_;
+
+    // GPS 相关队列与线程
+    static constexpr size_t kMaxGPSQueueSize = 1000;
+    struct GPSQueueItem { double timestamp; double lat, lon, alt, hdop; int sats; };
+    std::deque<GPSQueueItem> gps_queue_;
+    std::mutex               gps_queue_mutex_;
+    std::condition_variable  gps_queue_cv_;
+    std::thread              gps_worker_thread_;
+    void gpsWorkerLoop();
+
+    struct GPSAlignTaskItem { Eigen::Matrix3d R_enu_to_map; Eigen::Vector3d t_enu_to_map; };
+    std::deque<GPSAlignTaskItem> gps_align_queue_;
+    std::mutex                   gps_align_mutex_;
+    std::condition_variable      gps_align_cv_;
+    std::thread                  gps_align_thread_;
+    void gpsAlignWorkerLoop();
+
+    void processGPSAlignDirectly(const GPSAlignResult& result);
+    void transformAllPosesAfterGPSAlign(const GPSAlignResult& result);
+    void addGPSFactorsToActiveSubmapOnAlign(const GPSAlignResult& result);
+
+    // 地图发布与状态发布线程
+    std::thread               map_publish_thread_;
+    std::thread               status_publisher_thread_;
+
+    // GPS 转换状态保护（V2 增强）
+    std::mutex      gps_transform_mutex_;
+    Eigen::Matrix3d gps_transform_R_ = Eigen::Matrix3d::Identity();
+    Eigen::Vector3d gps_transform_t_ = Eigen::Vector3d::Zero();
+    std::mutex      submap_update_mutex_;
+
+    static constexpr size_t kMaxGPSAlignQueueSize = 25;
+
+    // 方案 A：forceUpdate 仅由 backend 线程执行（V1 兼容，V2 主要走 opt_worker）
+    std::atomic<bool>         force_update_requested_{false};
+    std::mutex                force_update_mutex_;
+    std::condition_variable   force_update_done_cv_;
+    /** 由 backend 在每次循环开头检查：若有请求则执行 forceUpdate + flush KF GPS + forceUpdate，然后通知 done_cv_ */
+    void runRequestedForceUpdateIfAny();
 
     // 按时间戳缓存的 odom / kfinfo，有界、非阻塞写，worker 按帧 ts 对齐读取
     static constexpr size_t kMaxOdomCacheSize   = 1000;
@@ -164,54 +205,33 @@ private:
     LivoKeyFrameInfo last_livo_info_;
 
     // GPS 对齐状态
-    bool gps_aligned_        = false;
-    bool gps_batch_added_    = false;  // 对齐后是否已批量添加GPS因子
+    std::atomic<bool> gps_aligned_        {false};
+    std::atomic<bool> gps_batch_added_    {false};  // 对齐后是否已批量添加GPS因子
 
     // 子图计数（用于 HBA 周期触发）
-    int  frozen_submap_count_ = 0;
+    std::atomic<int>  frozen_submap_count_ {0};
 
-    // 地图发布异步化：专用线程执行 buildGlobalMap + publish。拆锁避免背压死锁：关键帧创建与地图发布分离。
-    // keyframe_mutex_：保护 tryCreateKeyFrame 内对 submap_manager_/kf_manager_/isam2 的写操作（backend 持锁）。
-    // map_publish_mutex_：仅保护 map_publish 线程的 cv 等待与 publishGlobalMap 调用（只读 submap 由 SubMapManager 自身锁保护）。
-    std::thread               map_publish_thread_;
-    std::mutex                keyframe_mutex_;
+    // 地图发布异步化
     std::mutex                map_publish_mutex_;
     std::condition_variable   map_publish_cv_;
     std::atomic<bool>         map_publish_pending_{false};
-    /** 从 finish_mapping 进入到 HBA 回调结束期间为 true，避免 map_publish 与 HBA 写回并发导致重影（见 docs/GHOSTING_ROOT_CAUSE_HBA_VS_BACKEND_20260317.md） */
+    /** 从 finish_mapping 进入到 HBA 回调结束期间为 true，避免 map_publish 与 HBA 写回并发导致重影 */
     std::atomic<bool>         finish_mapping_in_progress_{false};
     void mapPublishLoop();
 
-    // 回环 iSAM2 更新异步：match_worker 只入队，本线程取任务执行 addLoopFactor，避免阻塞回环检测（有界队列防堆积/死锁）
-    static constexpr size_t   kMaxLoopFactorQueueSize = 64;
-    std::queue<LoopConstraint::Ptr> loop_factor_queue_;
-    std::mutex                loop_opt_mutex_;
-    std::condition_variable   loop_opt_cv_;
-    std::thread               loop_opt_thread_;
-    void loopOptThreadLoop();
-
-    // 子图内回环与主线程完全异步：后端只投递 (submap, query_idx)，本线程执行 detectIntraSubmapLoop 并投递 INTRA_LOOP_BATCH 到 opt_worker
+    // 回环检测与子图内回环
     struct IntraLoopTask { SubMap::Ptr submap; int query_idx = -1; };
-    static constexpr size_t   kMaxIntraLoopTaskQueueSize = 8;
+    static constexpr size_t   kMaxIntraLoopTaskQueueSize = 512;
     std::deque<IntraLoopTask> intra_loop_task_queue_;
     std::mutex                intra_loop_task_mutex_;
     std::condition_variable   intra_loop_task_cv_;
-    std::thread               intra_loop_worker_thread_;
     void intraLoopWorkerLoop();
 
-    // 可视化与状态发布迁出后端：仅投递不阻塞
-    static constexpr size_t   kVizQueueMaxSize = 2;
-    std::queue<CloudXYZIPtr>  viz_cloud_queue_;
-    std::mutex                viz_mutex_;
-    std::condition_variable   viz_cv_;
-    std::thread               viz_thread_;
-    void vizThreadLoop();
-
+    // 状态发布
     std::atomic<bool>         status_publish_pending_{false};
     std::atomic<bool>         data_flow_publish_pending_{false};
     std::mutex                status_pub_mutex_;
     std::condition_variable   status_pub_cv_;
-    std::thread               status_publisher_thread_;
     void statusPublisherLoop();
 
     // 里程计与优化轨迹保护锁（避免 MultiThreadedExecutor 下 onOdometry 等回调并发修改导致的 vector 损坏与 hang）
@@ -261,9 +281,11 @@ private:
     std::atomic<int64_t> feeder_heartbeat_ts_ms_{0};       // feeder 线程心跳
     std::atomic<int64_t> backend_heartbeat_ts_ms_{0};      // backend worker 线程心跳
     std::atomic<int64_t> map_pub_heartbeat_ts_ms_{0};      // map publish 线程心跳
-    std::atomic<int64_t> loop_opt_heartbeat_ts_ms_{0};     // loop optimization 线程心跳
+    std::atomic<int64_t> opt_worker_heartbeat_ts_ms_{0};   // optimization worker 心跳
+    std::atomic<int64_t> loop_trigger_heartbeat_ts_ms_{0}; // loop trigger 心跳
     std::atomic<int64_t> intra_loop_worker_heartbeat_ts_ms_{0};  // 子图内回环 worker 心跳
-    std::atomic<int64_t> viz_heartbeat_ts_ms_{0};          // visualization 线程心跳
+    std::atomic<int64_t> gps_worker_heartbeat_ts_ms_{0};   // GPS worker 心跳
+    std::atomic<int64_t> gps_align_heartbeat_ts_ms_{0};    // GPS align 心跳
     std::atomic<int64_t> status_pub_heartbeat_ts_ms_{0};   // status publisher 线程心跳
     
     // 心跳阈值（毫秒）：超过此时间未更新视为异常
@@ -286,8 +308,11 @@ private:
     /** 将 BackendStepId 转为可读字符串，供 STUCK_DIAG/心跳日志使用 */
     const char* backendStepName(int id) const;
 
-    /** 子图内回环异步结果（带超时防阻塞）；仅后端线程访问 */
-    std::future<std::vector<LoopConstraint::Ptr>> intra_loop_future_;
+    /** 获取当前墙钟时间戳（毫秒） */
+    int64_t nowMs() const;
+
+    /** 回环检测节流：上次成功检测时的 query 关键帧全局 id，-1 表示未成功过；成功检测后隔 N 帧再检测 */
+    std::atomic<int64_t> last_keyframe_id_after_loop_success_{-1};
 
     // 心跳监控定时器
     rclcpp::TimerBase::SharedPtr heartbeat_monitor_timer_;
@@ -404,6 +429,9 @@ private:
     Mat66d computeOdomInfoMatrix(const SubMap::Ptr& prev,
                                  const SubMap::Ptr& curr,
                                  const Pose3d& rel) const;
+    Mat66d computeOdomInfoMatrixForKeyframes(const KeyFrame::Ptr& prev_kf,
+                                             const KeyFrame::Ptr& curr_kf,
+                                             const Pose3d& rel) const;
 };
 
 } // namespace automap_pro

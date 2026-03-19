@@ -5,8 +5,19 @@
 
 #include <pcl/point_cloud.h>
 #include <pcl/common/transforms.h>
+#include <sstream>
+#include <iomanip>
 
 namespace automap_pro {
+
+static std::string matrixToString(const Eigen::Matrix3d& m) {
+    std::stringstream ss;
+    ss << std::fixed << std::setprecision(3);
+    for (int i = 0; i < 3; ++i) {
+        ss << "[" << m(i, 0) << ", " << m(i, 1) << ", " << m(i, 2) << "]" << (i == 2 ? "" : "\n");
+    }
+    return ss.str();
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GPS 对齐回调（统一投递到队列，由gps_align_thread处理）
@@ -70,7 +81,7 @@ void AutoMapSystem::processGPSAlignDirectly(const GPSAlignResult& result) {
 
     // 4. 投递GPS对齐任务到opt_worker线程（等待队列可用）
     {
-        std::lock_guard<std::mutex> lk(opt_task_mutex_);
+        std::unique_lock<std::mutex> lk(opt_task_mutex_);
         const int max_waits = 50;  // 最多等待50次（总共5秒）
         const int wait_ms = 100;
         bool enqueued = false;
@@ -89,16 +100,16 @@ void AutoMapSystem::processGPSAlignDirectly(const GPSAlignResult& result) {
                 enqueued = true;
                 break;
             }
-            lock.unlock();
+            lk.unlock();
             std::this_thread::sleep_for(std::chrono::milliseconds(wait_ms));
-            lock.lock();
+            lk.lock();
         }
         if (!enqueued) {
             RCLCPP_ERROR(get_logger(), "[AutoMapSystem][GPS_ALIGN_DIRECT] opt_task_queue full after %d waits, GPS align FAILED", max_waits);
         } else {
             RCLCPP_INFO(get_logger(), "[AutoMapSystem][GPS_ALIGN] GPS align task enqueued, waiting for opt_worker to complete...");
-            // 等待opt_worker处理完成
-            isam2_optimizer_.waitForPendingTasks();
+            // 🔧 V2 修复：等待 opt_worker 处理完当前所有任务，确保重建拿到一致的图状态
+            ensureBackendCompletedAndFlushBeforeHBA();
             RCLCPP_INFO(get_logger(), "[AutoMapSystem][GPS_ALIGN] all poses transformed and iSAM2 rebuilt with full constraints");
         }
     }
@@ -128,15 +139,23 @@ void AutoMapSystem::transformAllPosesAfterGPSAlign(const GPSAlignResult& result)
 
     for (const auto& sm : all_submaps) {
         if (!sm) continue;
-        sm->pose_w_anchor = Pose3d(result.R_enu_to_map * sm->pose_w_anchor.linear(),
-                                    result.R_enu_to_map * sm->pose_w_anchor.translation() + result.t_enu_to_map);
+        {
+            Pose3d T = Pose3d::Identity();
+            T.linear() = result.R_enu_to_map * sm->pose_w_anchor.linear();
+            T.translation() = result.R_enu_to_map * sm->pose_w_anchor.translation() + result.t_enu_to_map;
+            sm->pose_w_anchor = T;
+        }
         sm->pose_w_anchor_optimized = sm->pose_w_anchor;
 
         for (const auto& kf : sm->keyframes) {
             if (!kf) continue;
             // 1. 变换位姿
-            kf->T_w_b = Pose3d(result.R_enu_to_map * kf->T_w_b.linear(),
-                                  result.R_enu_to_map * kf->T_w_b.translation() + result.t_enu_to_map);
+            {
+                Pose3d T = Pose3d::Identity();
+                T.linear() = result.R_enu_to_map * kf->T_w_b.linear();
+                T.translation() = result.R_enu_to_map * kf->T_w_b.translation() + result.t_enu_to_map;
+                kf->T_w_b = T;
+            }
             kf->T_w_b_optimized = kf->T_w_b;
             transformed_kf_count++;
 
@@ -155,8 +174,12 @@ void AutoMapSystem::transformAllPosesAfterGPSAlign(const GPSAlignResult& result)
     }
 
     // 更新当前里程计位姿
-    last_odom_pose_ = Pose3d(result.R_enu_to_map * last_odom_pose_.linear(),
-                              result.R_enu_to_map * last_odom_pose_.translation() + result.t_enu_to_map);
+    {
+        Pose3d T = Pose3d::Identity();
+        T.linear() = result.R_enu_to_map * last_odom_pose_.linear();
+        T.translation() = result.R_enu_to_map * last_odom_pose_.translation() + result.t_enu_to_map;
+        last_odom_pose_ = T;
+    }
 
     RCLCPP_INFO(get_logger(), "[AutoMapSystem][GPS_TRANSFORM] done: %d keyframes, %d clouds transformed",
                 transformed_kf_count, transformed_cloud_count);
@@ -192,7 +215,7 @@ void AutoMapSystem::addBatchGPSFactors() {
         t = gps_transform_t_;
     }
 
-    RCLCPP_INFO(get_logger(), "[AutoMapSystem][GPS_BATCH] adding GPS factors to %zu frozen submaps", frozen_submaps.size());
+    RCLCPP_INFO(get_logger(), "[AutoMapSystem][GPS_BATCH] adding GPS factors to %zu frozen submaps (V2 direct)", frozen_submaps.size());
 
     int added_count = 0;
     for (const auto& sm : frozen_submaps) {
@@ -202,25 +225,18 @@ void AutoMapSystem::addBatchGPSFactors() {
         Eigen::Vector3d pos_map = R * sm->gps_enu_pose.translation() + t;
         Eigen::Matrix3d cov = sm->gps_cov;
 
-        // 投队列而不是直接调用，确保GTSAM调用只在opt_worker线程执行
-        OptTaskItem task;
-        task.type = OptTaskItem::Type::GPS_FACTOR;
-        task.to_id = sm->id;
-        task.gps_pos = pos_map;
-        task.gps_cov = cov;
-        {
-            std::lock_guard<std::mutex> lk(opt_task_mutex_);
-            if (opt_task_queue_.size() < kMaxOptTaskQueueSize) {
-                opt_task_queue_.push_back(task);
-                opt_task_cv_.notify_one();
-                added_count++;
-            } else {
-                RCLCPP_WARN(get_logger(), "[AutoMapSystem][GPS_BATCH] opt_task_queue full, dropping GPS factor for sm_id=%d", sm->id);
-            }
-        }
+        // 🔧 V2 修复：由于 addBatchGPSFactors 已在 opt_worker 线程中执行，
+        // 直接操作 isam2_optimizer_ 而非通过 TaskDispatcher 再次投递，避免效率低下和死锁风险。
+        isam2_optimizer_.addGPSFactor(sm->id, pos_map, cov);
+        added_count++;
     }
 
-    RCLCPP_INFO(get_logger(), "[AutoMapSystem][GPS_BATCH] enqueued %d GPS factors", added_count);
+    if (added_count > 0) {
+        // 批量添加后立即触发优化
+        isam2_optimizer_.forceUpdate();
+        RCLCPP_INFO(get_logger(), "[AutoMapSystem][GPS_BATCH] added %d GPS factors and triggered forceUpdate", added_count);
+    }
+    
     gps_batch_added_.store(true);
 }
 
@@ -248,49 +264,13 @@ void AutoMapSystem::addGPSFactorsToActiveSubmapOnAlign(const GPSAlignResult& res
     RCLCPP_INFO(get_logger(), "[AutoMapSystem][GPS_ALIGN_KF] active submap sm_id=%d has %zu keyframes",
                 active_sm->id, active_sm->keyframes.size());
 
-    int added_count = 0;
-    for (const auto& kf : active_sm->keyframes) {
-        if (!kf) continue;
-
-        // 查询该keyframe对应的GPS位置
-        auto gps_opt = gps_manager_.queryByTimestamp(kf->timestamp);
-        if (!gps_opt.has_value()) {
-            continue;
+    // 投递任务到 opt_worker 线程执行，避免直接操作 isam2_optimizer_
+    if (task_dispatcher_) {
+        if (task_dispatcher_->submitActiveSubmapGPSBind(R, t)) {
+            RCLCPP_INFO(get_logger(), "[AutoMapSystem][GPS_ALIGN_KF] enqueued ACTIVE_SUBMAP_GPS_BIND task");
+        } else {
+            RCLCPP_WARN(get_logger(), "[AutoMapSystem][GPS_ALIGN_KF] task_dispatcher failed to submit ACTIVE_SUBMAP_GPS_BIND (queue full?)");
         }
-        const auto& gps = gps_opt.value();
-
-        // 计算在map坐标系下的位置
-        Eigen::Vector3d pos_enu = gps.position_enu;
-        Eigen::Vector3d pos_map = R * pos_enu + t;
-
-        // 计算协方差（基于HDOP）
-        Eigen::Matrix3d cov = Eigen::Matrix3d::Identity();
-        double hdop_scale = gps.hdop / 10.0;  // 归一化HDOP
-        double sigma_h = 0.5 * hdop_scale;    // 水平 sigma
-        double sigma_v = 1.0 * hdop_scale;    // 垂直 sigma
-        cov(0, 0) = sigma_h * sigma_h;
-        cov(1, 1) = sigma_h * sigma_h;
-        cov(2, 2) = sigma_v * sigma_v;
-
-        // 1. 添加keyframe节点到ISAM2
-        bool kf_fixed = (kf->id == 0);  // 第一个keyframe设为fixed
-        isam2_optimizer_.addKeyFrameNode(static_cast<int>(kf->id), kf->T_w_b, kf_fixed);
-
-        // 2. 添加keyframe级别的GPS因子
-        isam2_optimizer_.addGPSFactorForKeyFrame(static_cast<int>(kf->id), pos_map, cov);
-
-        added_count++;
-
-        RCLCPP_DEBUG(get_logger(), "[AutoMapSystem][GPS_ALIGN_KF] added GPS factor for kf_id=%d pos=[%.2f,%.2f,%.2f]",
-                    kf->id, pos_map.x(), pos_map.y(), pos_map.z());
-    }
-
-    // 触发forceUpdate以立即优化
-    if (added_count > 0) {
-        RCLCPP_INFO(get_logger(), "[AutoMapSystem][GPS_ALIGN_KF] added %d GPS factors to active submap, triggering optimization", added_count);
-        isam2_optimizer_.forceUpdate();
-    } else {
-        RCLCPP_INFO(get_logger(), "[AutoMapSystem][GPS_ALIGN_KF] no GPS factors added (no matching GPS data)");
     }
 }
 
@@ -298,14 +278,31 @@ void AutoMapSystem::addGPSFactorsToActiveSubmapOnAlign(const GPSAlignResult& res
 // HBA前确保后端完成
 // ─────────────────────────────────────────────────────────────────────────────
 void AutoMapSystem::ensureBackendCompletedAndFlushBeforeHBA() {
-    RCLCPP_INFO(get_logger(), "[AutoMapSystem][BACKEND] ensuring backend completed before HBA...");
+    RCLCPP_INFO(get_logger(), "[AutoMapSystem][BACKEND] ensuring backend completed before HBA (V2 OptWorker)...");
 
-    // 等待 ISAM2 队列处理完成（最多等待 10 秒）
-    isam2_optimizer_.waitForPendingTasks();
+    // 1. 等待 opt_task_queue_ 清空且当前无任务正在执行
+    auto t0 = std::chrono::steady_clock::now();
+    constexpr int kMaxWaitSec = 10;
+    while (true) {
+        bool empty = false;
+        {
+            std::lock_guard<std::mutex> lk(opt_task_mutex_);
+            empty = opt_task_queue_.empty();
+        }
+        bool in_progress = opt_task_in_progress_.load(std::memory_order_acquire);
+        
+        if (empty && !in_progress) break;
+        
+        if (std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - t0).count() >= kMaxWaitSec) {
+            RCLCPP_WARN(get_logger(), "[AutoMapSystem][BACKEND] ensureBackendCompleted timeout (%ds)! queue_empty=%d in_progress=%d",
+                        kMaxWaitSec, empty ? 1 : 0, in_progress ? 1 : 0);
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
 
-    // 额外等待一段时间确保所有 pending 的更新完成
-    // 增加等待时间以确保 GTSAM 资源完全释放
-    constexpr int kExtraWaitMs = 500;  // 从 100ms 增加到 500ms
+    // 2. 额外等待一段时间确保所有 pending 的更新完成（释放 GTSAM 资源）
+    constexpr int kExtraWaitMs = 500;
     std::this_thread::sleep_for(std::chrono::milliseconds(kExtraWaitMs));
 
     RCLCPP_INFO(get_logger(), "[AutoMapSystem][BACKEND] backend flush done (waited extra %dms), ready for HBA", kExtraWaitMs);

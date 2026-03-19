@@ -99,17 +99,23 @@ void AutoMapSystem::publishGlobalMap() {
         }
         RCLCPP_INFO(get_logger(), "[AutoMapSystem][MAP] publishGlobalMap step=global_map_pub_done");
 
-        // 综合可视化
-        RCLCPP_INFO(get_logger(), "[AutoMapSystem][MAP] publishGlobalMap step=rviz_global_map_enter");
-        rviz_publisher_.publishGlobalMap(global);
-        RCLCPP_INFO(get_logger(), "[AutoMapSystem][MAP] publishGlobalMap step=rviz_global_map_done");
-        auto all_sm = submap_manager_.getAllSubmaps();
-        RCLCPP_INFO(get_logger(), "[AutoMapSystem][MAP] publishGlobalMap step=getAllSubmaps_done sm_count=%zu", all_sm.size());
+    // 综合可视化
+    RCLCPP_INFO(get_logger(), "[AutoMapSystem][MAP] publishGlobalMap step=rviz_global_map_enter");
+    rviz_publisher_.publishGlobalMap(global);
+    RCLCPP_INFO(get_logger(), "[AutoMapSystem][MAP] publishGlobalMap step=rviz_global_map_done");
+
+    auto all_sm = submap_manager_.getAllSubmaps();
+    RCLCPP_INFO(get_logger(), "[AutoMapSystem][MAP] publishGlobalMap step=getAllSubmaps_done sm_count=%zu", all_sm.size());
+
+    // 🔧 V2 修复：在访问子图与关键帧时持有 submap_update_mutex_，避免与 opt_worker 的位姿更新冲突
+    {
+        std::lock_guard<std::mutex> lk(submap_update_mutex_);
         rviz_publisher_.publishSubmapBoundaries(all_sm);
         rviz_publisher_.publishSubmapBoundingBoxes(all_sm);
         rviz_publisher_.publishSubmapGraph(all_sm);
         rviz_publisher_.publishOptimizedPath(all_sm);
         rviz_publisher_.publishKeyframePoses(collectKeyframesFromSubmaps(all_sm));
+    }
 
         // GPS 约束可视化
         if (gps_aligned_.load()) {
@@ -219,6 +225,23 @@ std::string AutoMapSystem::stateToString(SystemState s) const {
 // ─────────────────────────────────────────────────────────────────────────────
 // 线程心跳监控
 // ─────────────────────────────────────────────────────────────────────────────
+int64_t AutoMapSystem::nowMs() const {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+const char* AutoMapSystem::backendStepName(int id) const {
+    switch (id) {
+        case BACKEND_STEP_IDLE: return "idle";
+        case BACKEND_STEP_TRY_CREATE_KF_ENTER: return "tryCreateKeyFrame_enter";
+        case BACKEND_STEP_ADD_KEYFRAME_ENTER: return "submap_manager_addKeyFrame_enter";
+        case BACKEND_STEP_INTRA_LOOP_ENTER: return "detectIntraSubmapLoop_enter";
+        case BACKEND_STEP_GPS_FACTOR_ENTER: return "addGPSFactor_enter";
+        case BACKEND_STEP_FORCE_UPDATE: return "forceUpdate_commitAndUpdate";
+        default: return "unknown";
+    }
+}
+
 void AutoMapSystem::checkThreadHeartbeats() {
     const int64_t now = nowMs();
     const auto check_thread = [&](const char* name, std::atomic<int64_t>& ts_ms, int64_t warn_thresh_ms, int64_t err_thresh_ms) {

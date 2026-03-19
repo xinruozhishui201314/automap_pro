@@ -14,8 +14,8 @@
 #include <condition_variable>
 #include <memory>
 #include <mutex>
-#include <queue>
 #include <thread>
+#include <boost/lockfree/spsc_queue.hpp>
 
 namespace automap_pro {
 
@@ -64,7 +64,7 @@ public:
     void stop();
     
     /**
-     * 推送原始帧到入口队列
+     * 推送原始帧到入口队列 (Wait-Free if queue not full)
      * @return 是否成功入队
      */
     bool pushFrame(double ts, const CloudXYZIPtr& cloud);
@@ -118,17 +118,18 @@ private:
      */
     CloudXYZIPtr downsample(const CloudXYZIPtr& cloud, float resolution);
     
-    // 队列
-    std::queue<FrameToProcess> ingress_queue_;      // 原始帧队列
-    std::queue<FrameToProcess> frame_queue_;         // 处理后帧队列
+    // 队列 (V2 优化: SPSC 无锁队列，容量固定为 8192)
+    // ingress_queue: onCloud -> feederLoop
+    boost::lockfree::spsc_queue<FrameToProcess, boost::lockfree::capacity<8192>> ingress_queue_;
+    // frame_queue: feederLoop -> backendWorkerLoop
+    boost::lockfree::spsc_queue<FrameToProcess, boost::lockfree::capacity<8192>> frame_queue_;
     
-    // 同步原语
-    mutable std::mutex ingress_mutex_;
-    mutable std::mutex frame_queue_mutex_;
+    // 同步原语 (仅用于 wait_for 机制，热路径 push/pop 为无锁)
+    std::mutex ingress_not_empty_mutex_;
     std::condition_variable ingress_not_empty_cv_;
-    std::condition_variable ingress_not_full_cv_;
-    std::condition_variable frame_queue_cv_;
-    std::condition_variable frame_queue_not_full_cv_;
+    
+    std::mutex frame_queue_not_empty_mutex_;
+    std::condition_variable frame_queue_not_empty_cv_;
     
     // 配置
     size_t max_ingress_queue_size_;
@@ -137,7 +138,7 @@ private:
     // 线程
     std::thread feeder_thread_;
     std::atomic<bool> running_{false};
-    const std::atomic<bool>* shutdown_flag_;
+    const std::atomic<bool>* shutdown_flag_ = nullptr;
     
     // 回调
     FrameReadyCallback callback_;
@@ -145,6 +146,8 @@ private:
     // 统计
     std::atomic<int> frame_count_{0};
     std::atomic<int> backpressure_drop_count_{0};
+    std::atomic<size_t> ingress_size_{0};
+    std::atomic<size_t> frame_queue_size_{0};
 };
 
 }  // namespace automap_pro

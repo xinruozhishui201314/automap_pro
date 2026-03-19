@@ -30,13 +30,13 @@ system:
   num_threads: 20             # 高资源可设 16~20；8 核及以下用 8
   log_level: "DEBUG"          # DEBUG | INFO | WARN | ERROR
   # 传感器空闲结束建图与缓冲（计算跟不上时可增大 frame_queue_max_size 与 sensor_idle_timeout_sec）
-  sensor_idle_timeout_sec: 100.0
+  sensor_idle_timeout_sec: 150.0
   auto_finish_on_sensor_idle: true
   # 离线“播完再结束”：true 时仅由 /automap/finish_mapping 在 bag 播完后触发，不因 100s 无点云提前结束
   offline_finish_after_bag: true
   # 计算效率优化：大幅度增加 buff，来一帧修一帧；高资源可 7000/3000（见 docs/PERFORMANCE_HIGH_RESOURCE.md）
-  frame_queue_max_size: 5000
-  ingress_queue_max_size: 2000
+  frame_queue_max_size: 7000
+  ingress_queue_max_size: 4000
   # ROS2 订阅 depth（点云/里程计/KF/GPS），资源受限时可减小以降低内存
   subscription_odom_cloud_depth: 1000
   subscription_gps_depth: 1000
@@ -98,14 +98,14 @@ frontend:
 # ── 2.3 关键帧选取 ───────────────────────────────────────────────────────────
 keyframe:
   # 关键帧选择：与上一关键帧 位置变化≥min_translation 或 角度变化≥min_rotation_deg 即添加
-  min_translation:    0.5    # 米，最小平移触发（满足其一即可）
-  min_rotation_deg:  10.0    # 度，最小旋转触发
+  min_translation:    0.3    # 米，最小平移触发（满足其一即可）
+  min_rotation_deg:  8.0    # 度，最小旋转触发
   max_interval:       2.0    # 秒，最长间隔强制插入
   max_esikf_cov_norm: 1000.0 # ESIKF 协方差范数阈值
   # P1 修复：关键帧点云存储策略
   retain_cloud_body: true
   allow_cloud_archival: false
-  max_memory_mb: 10240            # 64GB 宿主机可 10240~12288；低内存用 4096
+  max_memory_mb: 12288            # 64GB 宿主机可 10240~12288；低内存用 4096
 
 # ── 2.4 前端 Fast-LIVO 详细参数（使能、外参、内参、预处理、VIO/IMU/LIO、发布、保存、调试）──
 # 传感器话题由 sensor 节注入，此处勿重复定义 lid_topic/imu_topic/img_topic
@@ -147,8 +147,8 @@ fast_livo:
   preprocess:                              # LiDAR 预处理（M2DGR Velodyne VLP-32C）
     lidar_type:       2         # 2=Velodyne
     scan_line:        32
-    point_filter_num: 3
-    filter_size_surf: 0.25      # 原 0.25，减小以改善点云密度、减轻模糊
+    point_filter_num: 4
+    filter_size_surf: 0.4      # 原 0.25，减小以改善点云密度、减轻模糊
     blind:            1.0       # 最小量程约 1.0 m
 
   vio:                                     # VIO（仅 img_en=1 生效）
@@ -242,8 +242,8 @@ gps:
   # 接收机是否输出姿态角（双天线/INS）
   has_attitude:            false
   # enu_origin: [31.026058, 121.436795, 26.8]
-  align_min_points:       10
-  align_min_distance_m:   15.0    # 降低阈值（3.0→2.0），更容易触发GPS对齐
+  align_min_points:       15
+  align_min_distance_m:   20.0    # 降低阈值（3.0→2.0），更容易触发GPS对齐
   keyframe_match_window_s: 2.5
   max_interp_gap_s:        3.0
   extrapolation_margin_s: 0.5
@@ -286,14 +286,14 @@ gps:
 # 若主要为结构化建筑，可把 fpfh_corr_max_distance_m 改为 10、min_inlier_ratio 改为 0.08
 loop_closure:
   overlap_threshold:   0.15      # 略降以增加子图间候选（原 0.18 易把真实闭环挡在检索外）
-  top_k:               15        # 多保留候选进入 TEASER，利于子图间回环
+  top_k:               25        # 多保留候选进入 TEASER，利于子图间回环
   min_temporal_gap_s: 15.0
   min_submap_gap:      0
 
   # ── 子图内回环检测参数 ─────────────────────────────────────────────────────
-  intra_submap_enabled: false   # true=开启子图内回环；false=暂时关闭
+  intra_submap_enabled: true   # true=开启子图内回环；false=暂时关闭
   intra_submap_min_temporal_gap_s: 2.0
-  intra_submap_min_keyframe_gap: 8
+  intra_submap_min_keyframe_gap: 20     # 子图内回环关键帧对最小索引间隔（帧数），≥20 避免相邻帧假回环，可配置调整
   intra_submap_min_distance_gap_m: 2.0
   intra_submap_overlap_threshold: 0.15    # 与 overlap_threshold 一致
   intra_submap_max_duration_sec: 8.0     # 单次子图内回环检测最大耗时(秒)，超时则本帧跳过（仅当 intra_submap_async=false 时生效）
@@ -301,6 +301,8 @@ loop_closure:
   inter_keyframe_level:       true
   inter_keyframe_sample_step: 5
   inter_keyframe_top_k_per_submap: 5
+  inter_submap_min_keyframe_gap: 20    # 子图间回环两关键帧对最小全局关键帧间隔（帧数），0=不限制，可配置调整
+  loop_detection_min_keyframe_interval_after_success: 20  # 成功检测回环后隔多少关键帧再检测；0=不节流；未成功则下一帧继续检测
 
   gps_search_radius_m: 200.0
   # 子图间回环关键：0=关闭几何预筛（所有描述子候选都做 TEASER）；50~100=仅锚点距离<该值的候选做 TEASER
@@ -324,7 +326,7 @@ loop_closure:
     noise_bound:      0.15      # 树多场景略放宽，适应点云噪声
     cbar2:            1.0
     voxel_size:       0.5       # 树多场景略大，减轻树叶/细枝噪声
-    max_points:       8000
+    max_points:       15000
     min_inlier_ratio: 0.04     # 树多场景放宽（配合 fpfh_corr_max_distance_m 过滤后易达标）
     min_safe_inliers: 3
     max_rmse_m:       0.75     # 略放宽以通过更多子图间回环（原 0.60 易拒；误回环仍靠 inlier_ratio 抑制）
@@ -332,9 +334,12 @@ loop_closure:
     icp_refine:       true
     # 关键：只保留距离<5m 的 FPFH 对应点送 TEASER，树多场景过滤大量误匹配；结构化场景可改为 10
     fpfh_corr_max_distance_m: 5.0
-  # 回环位姿一致性：TEASER 结果与里程计相对位姿差异超过阈值视为异常（理论上回环应是微调），拒绝该回环
-  pose_consistency_max_trans_diff_m: 5.0   # 平移差异(m)，>0 启用检查，0=关闭
-  pose_consistency_max_rot_diff_deg: 25.0 # 旋转差异(度)，>0 启用检查，0=关闭
+  # 回环位姿一致性：TEASER 相对位姿 与 里程计相对位姿 的差异超过阈值则拒绝（认为异常）。子图内/子图间共用。
+  # 设计前提：回环应是「微调」——即 odom 已较准，TEASER 只做小修正。此时 5m/25° 合理。
+  # 若需「同向+反向+两次位移较大」都能检测回环：反向或大位移时 odom 相对位姿会很大/反向，与 TEASER「同一点」结果差很大，易被拒。
+  # 建议：仅微调场景用 5/25；要兼容反向+大位移则设为 0 关闭检查，或大幅放宽(如 20, 90)，仅靠 TEASER inlier_ratio/rmse 把关。
+  pose_consistency_max_trans_diff_m: 15.0   # 平移差(m)，0=关闭；放宽可试 15~20；关闭用 0
+  pose_consistency_max_rot_diff_deg: 0.0 # 旋转差(度)，0=关闭；反向约 180° 差，要接受反向回环需放宽到 90 或 0
   # ── ScanContext / OverlapTransformer 回环粗匹配 ─────────────────────────
   # enabled=true：使用 ScanContext 做子图/关键帧描述子与候选检索（不调用 OT 模型）
   # enabled=false：使用 OverlapTransformer 模型（overlapTransformer.pt）做描述子与余弦相似度检索；需 LibTorch 与 .pt 模型
@@ -351,7 +356,7 @@ loop_closure:
 backend:
   # 每隔多少帧处理一帧（1=每帧都处理；5=默认跳过4帧处理1帧；10=减少处理频率减轻后端压力）
   # 降低到5以更频繁处理，提高实时性
-  process_every_n_frames: 5
+  process_every_n_frames: 4
   # 每处理多少帧发布一次全局图
   publish_global_map_every_n_processed: 150
   max_pending_gps_keyframe_factors: 1000

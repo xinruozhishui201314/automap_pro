@@ -4,6 +4,9 @@
 #include "automap_pro/system/automap_system.h"
 #include <iomanip>
 #include <sstream>
+#include <filesystem>
+
+namespace fs = std::filesystem;
 
 namespace automap_pro {
 

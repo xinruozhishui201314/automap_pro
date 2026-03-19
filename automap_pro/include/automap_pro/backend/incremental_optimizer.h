@@ -1,6 +1,7 @@
 #pragma once
 
 #include "automap_pro/core/data_types.h"
+#include "automap_pro/backend/isam2_factor_types.h"
 
 #include <gtsam/geometry/Pose3.h>
 #include <gtsam/slam/PriorFactor.h>
@@ -65,6 +66,16 @@ public:
     OptimizationResult addLoopFactor(int from, int to,
                                       const Pose3d& rel, const Mat66d& info_matrix);
 
+    /** Overload for LoopConstraint::Ptr */
+    OptimizationResult addLoopFactor(const LoopConstraint::Ptr& lc);
+
+    /**
+     * 在关键帧图（KF 节点）上添加回环约束，不新建节点，仅 Between(KF(i), KF(j))。
+     * 要求 kf_id_i、kf_id_j 已通过 addKeyFrameNode 加入图中。
+     */
+    OptimizationResult addLoopFactorBetweenKeyframes(int kf_id_i, int kf_id_j,
+                                                      const Pose3d& rel, const Mat66d& info_matrix);
+
     /**
      * 仅将回环约束加入 pending，不触发 commit（用于子图内多条回环时批量提交，避免每条一次 commit）
      * 调用方需在本帧内随后调用 forceUpdate() 一次完成提交
@@ -86,6 +97,9 @@ public:
     /** 添加 keyframe 节点（KF 级别，与 HBA 的 level1 对齐）。
      * @param is_first_kf_of_submap 若为 true 则强制添加 Prior，避免新子图首帧无约束导致 IndeterminantLinearSystemException */
     void addKeyFrameNode(int kf_id, const Pose3d& init_pose, bool fixed = false, bool is_first_kf_of_submap = false);
+
+    /** 添加 keyframe 间的里程计因子 */
+    void addOdomFactorBetweenKeyframes(int from, int to, const Pose3d& rel, const Mat66d& info_matrix);
 
     /** 添加 keyframe 级别的 GPS 因子（KF 级别） */
     void addGPSFactorForKeyFrame(int kf_id, const Eigen::Vector3d& pos_map,
@@ -141,8 +155,21 @@ public:
     /** 重置（新 session 开始） */
     void reset();
 
-    /**
-     * 关闭前清空因子图与 iSAM2 状态并释放 prior_noise_，保证可控析构顺序。
+    /** 获取所有子图数据（用于 GPS 对齐后重建） */
+    std::vector<SubmapData> getAllSubmapData() const;
+
+    /** 获取所有里程计因子（用于 GPS 对齐后重建） */
+    std::vector<OdomFactorItem> getOdomFactors() const;
+
+    /** 获取所有回环因子（用于 GPS 对齐后重建） */
+    std::vector<LoopFactorItem> getLoopFactors() const;
+
+    /** GPS 对齐后重建因子图 */
+    void rebuildAfterGPSAlign(const std::vector<SubmapData>& submap_data,
+                              const std::vector<OdomFactorItem>& odom_factors,
+                              const std::vector<LoopFactorItem>& loop_factors);
+
+    /** 关闭前清空因子图与 iSAM2 状态并释放 prior_noise_，保证可控析构顺序。
      * 不调用 ConfigManager，可重复调用（析构时再次调用安全）；调用后 addSubMapNode 等将不再添加因子。
      */
     void clearForShutdown();
@@ -162,9 +189,10 @@ public:
     enum class OptimTaskType {
         LOOP_FACTOR,    // 回环因子
         GPS_FACTOR,     // GPS 因子
-        BATCH_UPDATE     // 批量更新（强制提交）
+        BATCH_UPDATE,   // 批量更新（强制提交）
+        REBUILD         // 重建任务（GPS对齐后重建）
     };
-    
+
     /** 优化任务数据 */
     struct OptimTask {
         OptimTaskType type;
@@ -174,11 +202,16 @@ public:
         Mat66d info_matrix;
         Eigen::Vector3d gps_pos;
         Eigen::Matrix3d gps_cov;
-        
+        /** 为 true 时表示回环为关键帧级，from_id/to_id 为 KF 节点 id，用 Between(KF(i), KF(j)) */
+        bool loop_is_keyframe_level = false;
         // 用于批量更新
         std::function<void()> action;
+        // REBUILD 任务专用字段
+        std::vector<SubmapData> submap_data;
+        std::vector<OdomFactorItem> odom_factors;
+        std::vector<LoopFactorItem> loop_factors;
     };
-    
+
     /** 提交优化任务到队列（立即返回，异步执行） */
     void enqueueOptTask(const OptimTask& task);
     
@@ -263,6 +296,12 @@ private:
     int last_keyframe_id_ = -1;
     Pose3d last_keyframe_pose_;
 
+    // ── GPS对齐后重建所需历史数据 ──
+    mutable std::mutex history_mutex_;
+    std::vector<SubmapData> history_submap_data_;
+    std::vector<OdomFactorItem> history_odom_factors_;
+    std::vector<LoopFactorItem> history_loop_factors_;
+
     int    node_count_   = 0;
     int    factor_count_ = 0;
     bool   has_prior_    = false;
@@ -270,6 +309,8 @@ private:
     std::vector<PoseUpdateCallback> pose_update_cbs_;
 
     // ── P0 异步优化队列与工作线程 ─────────────────────────────────────────
+    // 🔧 V2 修复：删除内部 opt_thread_，GTSAM 写入由外部 opt_worker_thread_ 独占
+    /*
     static constexpr size_t kMaxQueueSize = 64;
     std::queue<OptimTask>  opt_queue_;
     mutable std::mutex     opt_queue_mutex_;
@@ -277,6 +318,7 @@ private:
     std::atomic<bool>      opt_running_{true};
     std::thread            opt_thread_;
     void optLoop();
+    */
 
     /** 是否有线程正在执行 commitAndUpdate（用于 ensureBackendCompletedAndFlushBeforeHBA 等待「后端真正空闲」再触发 HBA） */
     std::atomic<bool>      optimization_in_progress_{false};

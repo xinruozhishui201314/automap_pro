@@ -269,9 +269,9 @@ public:
     bool intraSubmapLoopEnabled() const {
         return get<bool>("loop_closure.intra_submap_enabled", false);
     }
-    /** 子图内回环检测：关键帧之间最小索引间隔（避免相邻帧假回环） */
+    /** 子图内回环检测：关键帧对之间最小索引间隔（避免相邻帧假回环），可配 20 或更大 */
     int intraSubmapLoopMinKeyframeGap() const {
-        return get<int>("loop_closure.intra_submap_min_keyframe_gap", 10);
+        return get<int>("loop_closure.intra_submap_min_keyframe_gap", 20);
     }
     /** 子图内回环检测：关键帧之间最小距离间隔(米)，避免过密假回环 */
     double intraSubmapLoopMinDistanceGap() const {
@@ -305,6 +305,14 @@ public:
     /** 子图间关键帧级：每个候选子图内取 top-K 个关键帧做 TEASER（控制每 query 关键帧的匹配对数） */
     int interKeyframeTopKPerSubmap() const {
         return std::max(1, std::min(20, get<int>("loop_closure.inter_keyframe_top_k_per_submap", 3)));
+    }
+    /** 子图间回环：两关键帧对之间最小全局关键帧间隔（帧数），0=不限制 */
+    int interSubmapMinKeyframeGap() const {
+        return std::max(0, get<int>("loop_closure.inter_submap_min_keyframe_gap", 20));
+    }
+    /** 回环检测节流：成功检测到回环后，隔多少关键帧再触发下一次检测；0=不节流；仅成功检测后生效，未成功则下一帧继续检测 */
+    int loopDetectionMinKeyframeIntervalAfterSuccess() const {
+        return std::max(0, get<int>("loop_closure.loop_detection_min_keyframe_interval_after_success", 20));
     }
 
     /** 回环描述子队列最大长度，超限丢弃最低优先级，防无界堆积。默认 128 */

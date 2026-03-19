@@ -33,7 +33,7 @@ void FrameProcessor::start() {
     running_.store(true);
     feeder_thread_ = std::thread([this]() {
 #ifdef __linux__
-        pthread_setname_np(pthread_self(), "frame_processor");
+        pthread_setname_np(pthread_self(), "frame_feeder");
 #endif
         feederLoop();
     });
@@ -45,27 +45,36 @@ void FrameProcessor::stop() {
     }
     running_.store(false);
     ingress_not_empty_cv_.notify_all();
-    frame_queue_cv_.notify_all();
+    frame_queue_not_empty_cv_.notify_all();
     if (feeder_thread_.joinable()) {
         feeder_thread_.join();
     }
 }
 
 bool FrameProcessor::pushFrame(double ts, const CloudXYZIPtr& cloud) {
-    std::lock_guard<std::mutex> lock(ingress_mutex_);
-    
-    if (ingress_queue_.size() >= max_ingress_queue_size_) {
-        ALOG_WARN("FrameProcessor", "ingress_queue full, dropping frame ts=%.3f", ts);
+    // 检查硬上限（SPSC 队列物理容量 8192）
+    if (ingress_size_.load(std::memory_order_relaxed) >= 8192) {
+        ALOG_ERROR("FrameProcessor", "SPSC ingress_queue physical limit reached (8192)!");
+        return false;
+    }
+
+    // 检查逻辑上限（从配置读取）
+    if (ingress_size_.load(std::memory_order_relaxed) >= max_ingress_queue_size_) {
+        ALOG_WARN("FrameProcessor", "ingress_queue logical limit reached (%zu), dropping frame ts=%.3f", max_ingress_queue_size_, ts);
         return false;
     }
     
     FrameToProcess f;
     f.ts = ts;
     f.cloud = cloud;
-    ingress_queue_.push(std::move(f));
-    ingress_not_empty_cv_.notify_one();
     
-    return true;
+    if (ingress_queue_.push(f)) {
+        ingress_size_.fetch_add(1, std::memory_order_relaxed);
+        ingress_not_empty_cv_.notify_one();
+        return true;
+    }
+    
+    return false;
 }
 
 void FrameProcessor::registerCallback(FrameReadyCallback cb) {
@@ -73,13 +82,11 @@ void FrameProcessor::registerCallback(FrameReadyCallback cb) {
 }
 
 size_t FrameProcessor::ingressQueueSize() const {
-    std::lock_guard<std::mutex> lock(ingress_mutex_);
-    return ingress_queue_.size();
+    return ingress_size_.load(std::memory_order_relaxed);
 }
 
 size_t FrameProcessor::frameQueueSize() const {
-    std::lock_guard<std::mutex> lock(frame_queue_mutex_);
-    return frame_queue_.size();
+    return frame_queue_size_.load(std::memory_order_relaxed);
 }
 
 void FrameProcessor::setShutdownFlag(const std::atomic<bool>* flag) {
@@ -95,20 +102,28 @@ int FrameProcessor::backpressureDropCount() const {
 }
 
 bool FrameProcessor::tryPopFrame(int timeout_ms, FrameToProcess& out_frame) {
-    std::unique_lock<std::mutex> lock(frame_queue_mutex_);
-    bool has_data = frame_queue_cv_.wait_for(
+    // 快速路径：如果有数据，直接弹出 (Wait-Free)
+    if (frame_queue_.pop(out_frame)) {
+        frame_queue_size_.fetch_sub(1, std::memory_order_relaxed);
+        return true;
+    }
+
+    // 慢速路径：等待条件变量
+    std::unique_lock<std::mutex> lock(frame_queue_not_empty_mutex_);
+    bool has_data = frame_queue_not_empty_cv_.wait_for(
         lock, std::chrono::milliseconds(timeout_ms), [this] {
             return !frame_queue_.empty() || !running_.load();
         });
 
-    if (!has_data || frame_queue_.empty()) {
+    if (!has_data || !running_.load()) {
         return false;
     }
 
-    out_frame = std::move(frame_queue_.front());
-    frame_queue_.pop();
-    frame_queue_not_full_cv_.notify_one();
-    return true;
+    if (frame_queue_.pop(out_frame)) {
+        frame_queue_size_.fetch_sub(1, std::memory_order_relaxed);
+        return true;
+    }
+    return false;
 }
 
 void FrameProcessor::feederLoop() {
@@ -122,20 +137,27 @@ void FrameProcessor::feederLoop() {
 
     while (!shutdown->load(std::memory_order_acquire)) {
         FrameToProcess f;
-        {
-            std::unique_lock<std::mutex> lock(ingress_mutex_);
-            const bool has_data = ingress_not_empty_cv_.wait_for(
+        bool has_data = false;
+
+        // 快速尝试从 ingress_queue 弹出
+        if (ingress_queue_.pop(f)) {
+            ingress_size_.fetch_sub(1, std::memory_order_relaxed);
+            has_data = true;
+        } else {
+            // 没数据，进入等待
+            std::unique_lock<std::mutex> lock(ingress_not_empty_mutex_);
+            bool woke = ingress_not_empty_cv_.wait_for(
                 lock, std::chrono::milliseconds(500), [this, shutdown]() {
                     return shutdown->load(std::memory_order_acquire) || !ingress_queue_.empty();
                 });
 
             if (shutdown->load(std::memory_order_acquire)) break;
-            if (!has_data || ingress_queue_.empty()) continue;
-
-            f = std::move(ingress_queue_.front());
-            ingress_queue_.pop();
-            ingress_not_full_cv_.notify_one();
+            if (!woke || !ingress_queue_.pop(f)) continue;
+            ingress_size_.fetch_sub(1, std::memory_order_relaxed);
+            has_data = true;
         }
+
+        if (!has_data) continue;
 
         const int frame_seq = frame_count_.fetch_add(1) + 1;
 
@@ -159,15 +181,15 @@ void FrameProcessor::feederLoop() {
                 processed_count.fetch_add(1);
 
                 if (timed_out) {
-                    ALOG_ERROR("FrameProcessor", "[COMPUTE_TIMEOUT] voxelDownsampleWithTimeout timed out seq=%d pts=%zu limit_ms=%d (建图时请重点关注)",
+                    ALOG_ERROR("FrameProcessor", "[COMPUTE_TIMEOUT] voxelDownsampleWithTimeout timed out seq=%d pts=%zu limit_ms=%d",
                                frame_seq, f.cloud->size(), voxel_timeout_ms);
                 }
                 if (frame_seq <= 5 || frame_seq % 100 == 0 || voxel_ms > 100.0 || timed_out) {
                     const int64_t avg_voxel = processed_count.load() > 0 ? total_voxel_time_ms.load() / processed_count.load() : 0;
-                    ALOG_INFO("FrameProcessor", "[%d] voxel: pts=%zu->%zu ms=%.1f avg=%ldms timeout=%d queue_i=%zu q=%zu",
+                    ALOG_INFO("FrameProcessor", "[%d] voxel: pts=%zu->%zu ms=%.1f avg=%ldms timeout=%d ingress_q=%zu frame_q=%zu",
                              frame_seq, f.cloud->size(), f.cloud_ds ? f.cloud_ds->size() : 0,
                              voxel_ms, avg_voxel, timed_out ? 1 : 0,
-                             ingress_queue_.size(), frame_queue_.size());
+                             ingress_size_.load(), frame_queue_size_.load());
                 }
             } catch (const std::exception& e) {
                 ALOG_ERROR("FrameProcessor", "voxelDownsample exception: %s", e.what());
@@ -175,37 +197,21 @@ void FrameProcessor::feederLoop() {
             }
         }
 
-        // 推送到处理队列
-        {
-            std::unique_lock<std::mutex> lock(frame_queue_mutex_);
-
-            int max_waits = ConfigManager::instance().backpressureMaxWaits();
-            int wait_sec = ConfigManager::instance().backpressureWaitSec();
-            if (max_waits <= 0) max_waits = 10;
-            if (wait_sec <= 0) wait_sec = 1;
-
-            const size_t queue_before = frame_queue_.size();
-            int wait_count = 0;
-            while (frame_queue_.size() >= max_frame_queue_size_ &&
-                   !shutdown->load(std::memory_order_acquire)) {
-                if (wait_count >= max_waits) {
-                    backpressure_drop_count_.fetch_add(1);
-                    ALOG_ERROR("FrameProcessor", "backpressure force drop, total=%d queue=%zu",
-                              backpressure_drop_count_.load(), frame_queue_.size());
-                    frame_queue_.pop();
-                    break;
+        // 推送到处理队列 (frame_queue)
+        // 注意：SPSC 满时，如果是离线建图，我们希望慢下来；如果是实时建图，且积压严重，则丢弃最老帧
+        if (frame_queue_.push(f)) {
+            frame_queue_size_.fetch_add(1, std::memory_order_relaxed);
+            frame_queue_not_empty_cv_.notify_one();
+        } else {
+            // 队列满：丢弃当前最老的一帧，腾出空间
+            FrameToProcess old_f;
+            if (frame_queue_.pop(old_f)) {
+                frame_queue_size_.fetch_sub(1, std::memory_order_relaxed);
+                backpressure_drop_count_.fetch_add(1);
+                if (frame_queue_.push(f)) {
+                    frame_queue_size_.fetch_add(1, std::memory_order_relaxed);
                 }
-                frame_queue_not_full_cv_.wait_for(lock, std::chrono::seconds(wait_sec));
-                wait_count++;
-            }
-
-            if (!shutdown->load(std::memory_order_acquire)) {
-                frame_queue_.push(std::move(f));
-                frame_queue_cv_.notify_one();
-                const size_t queue_after = frame_queue_.size();
-                if (frame_seq <= 5 || frame_seq % 50 == 0) {
-                    ALOG_INFO("FrameProcessor", "[%d] pushed queue=%zu->%zu", frame_seq, queue_before, queue_after);
-                }
+                ALOG_WARN("FrameProcessor", "frame_queue full, dropped oldest. total_drops=%d", backpressure_drop_count_.load());
             }
         }
     }

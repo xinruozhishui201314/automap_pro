@@ -8,6 +8,7 @@
 // ScanContext
 #include "Scancontext/Scancontext.h"
 
+#include <cstdint>
 #include <queue>
 #include <thread>
 #include <mutex>
@@ -56,11 +57,15 @@ public:
     void init(rclcpp::Node::SharedPtr node);
     void start();  // 启动 Worker 线程
     void stop();   // 优雅关闭
+    bool isRunning() const { return running_.load(); }
 
     // ── 输入接口 ──────────────────────────────────────────────────────────
 
     /** 子图冻结时提交到描述子计算队列 */
     void addSubmap(const SubMap::Ptr& submap);
+
+    /** 为兼容旧 API，V2 中此函数不做任何事（子图间回环改由 addSubmap 触发） */
+    void addKeyFrame(const KeyFrame::Ptr& kf) { (void)kf; }
 
     /** 从历史 session 加载描述子数据库（增量建图） */
     void addToDatabase(const SubMap::Ptr& submap);
@@ -100,6 +105,12 @@ public:
     // ── 回调注册 ──────────────────────────────────────────────────────────
     void registerLoopCallback(LoopConstraintCallback cb) {
         loop_cbs_.push_back(std::move(cb));
+    }
+
+    /** 设置回环检测节流状态：成功检测后 last_success_kf_id 为 query 关键帧 id，interval 为隔多少帧再检测；0=不节流 */
+    void setLoopDetectionThrottleState(int64_t last_success_kf_id, int interval) {
+        last_keyframe_id_after_loop_success_ = last_success_kf_id;
+        min_keyframe_interval_after_success_ = std::max(0, interval);
     }
 
 private:
@@ -211,6 +222,13 @@ private:
     int inter_keyframe_sample_step_ = 5;
     /** 子图间关键帧级：每个候选子图内取 top-K 关键帧 */
     int inter_keyframe_top_k_per_submap_ = 3;
+    /** 子图间回环：两关键帧对之间最小全局关键帧间隔（帧数），0=不限制 */
+    int inter_submap_min_keyframe_gap_ = 20;
+
+    /** 回环检测节流：上次成功检测时的 query 关键帧 id，-1 表示未成功过 */
+    int64_t last_keyframe_id_after_loop_success_ = -1;
+    /** 回环检测节流：成功检测后隔多少关键帧再检测，0=不节流 */
+    int min_keyframe_interval_after_success_ = 0;
 
     // ── 私有方法 ──────────────────────────────────────────────────────────
     void descWorkerLoop();

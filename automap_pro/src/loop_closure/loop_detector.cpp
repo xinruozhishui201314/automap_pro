@@ -46,6 +46,7 @@ LoopDetector::LoopDetector() {
     inter_keyframe_level_enabled_ = cfg.interKeyframeLevelEnabled();
     inter_keyframe_sample_step_ = cfg.interKeyframeSampleStep();
     inter_keyframe_top_k_per_submap_ = cfg.interKeyframeTopKPerSubmap();
+    inter_submap_min_keyframe_gap_ = cfg.interSubmapMinKeyframeGap();
 
     // ScanContext 参数
     use_scancontext_ = cfg.scancontextEnabled();
@@ -81,6 +82,7 @@ void LoopDetector::init(rclcpp::Node::SharedPtr node) {
     inter_keyframe_level_enabled_ = cfg.interKeyframeLevelEnabled();
     inter_keyframe_sample_step_ = cfg.interKeyframeSampleStep();
     inter_keyframe_top_k_per_submap_ = cfg.interKeyframeTopKPerSubmap();
+    inter_submap_min_keyframe_gap_ = cfg.interSubmapMinKeyframeGap();
     use_scancontext_ = cfg.scancontextEnabled();
     sc_dist_threshold_ = cfg.scancontextDistThreshold();
     sc_num_candidates_ = cfg.scancontextNumCandidates();
@@ -587,6 +589,15 @@ void LoopDetector::onDescriptorReady(const SubMap::Ptr& submap) {
         const size_t max_match = ConfigManager::instance().loopMaxMatchQueueSize();
         for (size_t qkf = 0; qkf < submap->keyframes.size(); qkf += step) {
             if (qkf >= submap->keyframe_scancontexts_.size() || qkf >= submap->keyframe_clouds_ds.size()) break;
+            const KeyFrame::Ptr qkf_ptr = (qkf < submap->keyframes.size()) ? submap->keyframes[qkf] : nullptr;
+            if (qkf_ptr && min_keyframe_interval_after_success_ > 0 && last_keyframe_id_after_loop_success_ >= 0) {
+                const int64_t delta = static_cast<int64_t>(qkf_ptr->id) - last_keyframe_id_after_loop_success_;
+                if (delta >= 0 && delta <= static_cast<int64_t>(min_keyframe_interval_after_success_)) {
+                    ALOG_INFO(MOD, "[LOOP_THROTTLE] skip inter query_kf qkf=%zu kf_id=%lu (within %d frames after last success)",
+                        qkf, qkf_ptr->id, min_keyframe_interval_after_success_);
+                    continue;
+                }
+            }
             const auto& query_sc = submap->keyframe_scancontexts_[qkf];
             if (query_sc.size() == 0) continue;
             const auto& query_kf_cloud = submap->keyframe_clouds_ds[qkf];
@@ -663,6 +674,15 @@ void LoopDetector::onDescriptorReady(const SubMap::Ptr& submap) {
             const size_t max_match = ConfigManager::instance().loopMaxMatchQueueSize();
             for (size_t qkf = 0; qkf < submap->keyframes.size(); qkf += step) {
                 if (qkf >= submap->keyframe_descriptors.size() || qkf >= submap->keyframe_clouds_ds.size()) break;
+                const KeyFrame::Ptr qkf_ptr = (qkf < submap->keyframes.size()) ? submap->keyframes[qkf] : nullptr;
+                if (qkf_ptr && min_keyframe_interval_after_success_ > 0 && last_keyframe_id_after_loop_success_ >= 0) {
+                    const int64_t delta = static_cast<int64_t>(qkf_ptr->id) - last_keyframe_id_after_loop_success_;
+                    if (delta >= 0 && delta <= static_cast<int64_t>(min_keyframe_interval_after_success_)) {
+                        ALOG_INFO(MOD, "[LOOP_THROTTLE] skip inter query_kf qkf=%zu kf_id=%lu (within %d frames after last success)",
+                            qkf, qkf_ptr->id, min_keyframe_interval_after_success_);
+                        continue;
+                    }
+                }
                 const auto& query_desc = submap->keyframe_descriptors[qkf];
                 CloudXYZIPtr query_kf_cloud = submap->keyframe_clouds_ds[qkf];
                 if (!query_kf_cloud || query_kf_cloud->empty()) continue;
@@ -827,6 +847,15 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
             // ── 子图间几何诊断：两关键帧在世界系下的距离与相对位姿（精准定位几何一致性差）──
             const KeyFrame::Ptr target_kf = (target && kfc.keyframe_idx >= 0 && kfc.keyframe_idx < static_cast<int>(target->keyframes.size()))
                 ? target->keyframes[kfc.keyframe_idx] : nullptr;
+            // 子图间回环：两关键帧对之间最小全局关键帧间隔（可配置，避免相邻帧假回环）
+            if (inter_submap_min_keyframe_gap_ > 0 && target_kf && query_kf) {
+                const int64_t gap = std::abs(static_cast<int64_t>(target_kf->id) - static_cast<int64_t>(query_kf->id));
+                if (gap < static_cast<int64_t>(inter_submap_min_keyframe_gap_)) {
+                    ALOG_INFO(MOD, "[INTER_KF][FILTER] KEYFRAME_GAP: sm_i=%d kf_i=%lu sm_j=%d kf_j=%lu gap=%ld < %d (SKIP)",
+                        kfc.submap_id, target_kf->id, task.query->id, query_kf->id, static_cast<long>(gap), inter_submap_min_keyframe_gap_);
+                    continue;
+                }
+            }
             const Pose3d T_w_target = target_kf ? target_kf->T_w_b : Pose3d::Identity();
             const Eigen::Vector3d pos_w_target = T_w_target.translation();
             const double dist_world_m = (pos_w_query - pos_w_target).norm();
@@ -941,6 +970,8 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
             lc->submap_j = task.query->id;
             lc->keyframe_i = kfc.keyframe_idx;
             lc->keyframe_j = task.query_kf_idx;
+            lc->keyframe_global_id_i = target_kf ? static_cast<int>(target_kf->id) : -1;
+            lc->keyframe_global_id_j = query_kf ? static_cast<int>(query_kf->id) : -1;
             lc->session_i = target ? target->session_id : 0;
             lc->session_j = task.query->session_id;
             lc->delta_T = res.T_tgt_src;

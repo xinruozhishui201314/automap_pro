@@ -1,6 +1,6 @@
 // 模块1: 构造与初始化
 // 包含: AutoMapSystem 构造函数、析构函数、loadConfigAndInit、setupModules、deferredSetupModules、setupPublishers、setupServices、setupTimers
-// 注意: nowMs() 辅助函数定义在主入口文件 automap_system.cpp 中
+// 注意: nowMs() 辅助函数定义在 tasks_and_utils.cpp 中 (AutoMapSystem 成员函数)
 
 #include "automap_pro/system/automap_system.h"
 #include "automap_pro/core/config_manager.h"
@@ -82,64 +82,61 @@ AutoMapSystem::AutoMapSystem(const rclcpp::NodeOptions& options)
     gps_align_thread_ = std::thread(&AutoMapSystem::gpsAlignWorkerLoop, this);
     // 注意：viz_thread_ 已删除
     status_publisher_thread_ = std::thread(&AutoMapSystem::statusPublisherLoop, this);
-    RCLCPP_INFO(get_logger(), "[AutoMapSystem][INIT] Step 7: feeder + backend + map_publish + gps_worker + opt_worker + loop_trigger + intra_loop_worker + gps_align + status_pub threads started (note: loop_opt and viz threads removed)");
+    RCLCPP_INFO(get_logger(), "[AutoMapSystem][INIT] Step 7: all worker threads started");
 }
 
 AutoMapSystem::~AutoMapSystem() {
     RCLCPP_INFO(get_logger(), "[AutoMapSystem][SHUTDOWN][step=1] destructor entered, requesting backend exit");
     shutdown_requested_.store(true, std::memory_order_release);
 
-    // 通知 FrameProcessor 相关的条件变量
+    // 唤醒所有等待中的条件变量
     frame_processor_.stop();
+    map_publish_cv_.notify_all();
+    gps_queue_cv_.notify_all();
+    loop_trigger_cv_.notify_all();
+    intra_loop_task_cv_.notify_all();
+    gps_align_cv_.notify_all();
+    opt_task_cv_.notify_all();
+    status_pub_cv_.notify_all();
 
+    // 逐个 join 线程
     if (feeder_thread_.joinable()) {
         feeder_thread_.join();
         RCLCPP_INFO(get_logger(), "[AutoMapSystem][SHUTDOWN][step=2a] feeder thread joined");
     }
     if (backend_worker_.joinable()) {
         backend_worker_.join();
-        RCLCPP_INFO(get_logger(), "[AutoMapSystem][SHUTDOWN][step=2] backend worker joined");
+        RCLCPP_INFO(get_logger(), "[AutoMapSystem][SHUTDOWN][step=2b] backend worker joined");
     }
-    map_publish_pending_.store(false);
-    map_publish_cv_.notify_all();
     if (map_publish_thread_.joinable()) {
         map_publish_thread_.join();
-        RCLCPP_INFO(get_logger(), "[AutoMapSystem][SHUTDOWN][step=2b] map_publish thread joined");
+        RCLCPP_INFO(get_logger(), "[AutoMapSystem][SHUTDOWN][step=2c] map_publish thread joined");
     }
-    // 注意：loopOptThreadLoop 已删除，不再需要等待
-
-    gps_queue_cv_.notify_all();
     if (gps_worker_thread_.joinable()) {
         gps_worker_thread_.join();
-        RCLCPP_INFO(get_logger(), "[AutoMapSystem][SHUTDOWN][step=2f] gps_worker thread joined");
+        RCLCPP_INFO(get_logger(), "[AutoMapSystem][SHUTDOWN][step=2d] gps_worker thread joined");
     }
-    loop_trigger_cv_.notify_all();
     if (loop_trigger_thread_.joinable()) {
         loop_trigger_thread_.join();
-        RCLCPP_INFO(get_logger(), "[AutoMapSystem][SHUTDOWN][step=2h] loop_trigger thread joined");
+        RCLCPP_INFO(get_logger(), "[AutoMapSystem][SHUTDOWN][step=2e] loop_trigger thread joined");
     }
-    intra_loop_task_cv_.notify_all();
     if (intra_loop_worker_thread_.joinable()) {
         intra_loop_worker_thread_.join();
-        RCLCPP_INFO(get_logger(), "[AutoMapSystem][SHUTDOWN][step=2h2] intra_loop_worker thread joined");
+        RCLCPP_INFO(get_logger(), "[AutoMapSystem][SHUTDOWN][step=2f] intra_loop_worker thread joined");
     }
-    gps_align_cv_.notify_all();
     if (gps_align_thread_.joinable()) {
         gps_align_thread_.join();
-        RCLCPP_INFO(get_logger(), "[AutoMapSystem][SHUTDOWN][step=2i] gps_align thread joined");
+        RCLCPP_INFO(get_logger(), "[AutoMapSystem][SHUTDOWN][step=2g] gps_align thread joined");
     }
-    opt_task_cv_.notify_all();
     if (opt_worker_thread_.joinable()) {
         opt_worker_thread_.join();
-        RCLCPP_INFO(get_logger(), "[AutoMapSystem][SHUTDOWN][step=2g] opt_worker thread joined");
+        RCLCPP_INFO(get_logger(), "[AutoMapSystem][SHUTDOWN][step=2h] opt_worker thread joined");
     }
-    // 注意：viz_thread_ 已删除
-    
-    status_pub_cv_.notify_all();
     if (status_publisher_thread_.joinable()) {
         status_publisher_thread_.join();
-        RCLCPP_INFO(get_logger(), "[AutoMapSystem][SHUTDOWN][step=2e] status_publisher thread joined");
+        RCLCPP_INFO(get_logger(), "[AutoMapSystem][SHUTDOWN][step=2i] status_publisher thread joined");
     }
+
     RCLCPP_INFO(get_logger(), "[AutoMapSystem][SHUTDOWN][step=3] calling loop_detector_.stop()");
     loop_detector_.stop();
     RCLCPP_INFO(get_logger(), "[AutoMapSystem][SHUTDOWN][step=4] loop_detector_.stop() done");
@@ -389,13 +386,10 @@ void AutoMapSystem::deferredSetupModules() {
                 RCLCPP_DEBUG(get_logger(),
                     "[AutoMapSystem][GPS_BIND] sm_id=%d dt=%.2fs dist=%.2fm (thresh: dt=%.0fs dist=%.0fm)",
                     best_id, best_dt, best_dist, max_bind_dt, max_bind_dist);
-                // 始终投队列，确保GTSAM调用只在opt_worker线程执行
-                IncrementalOptimizer::OptimTask t;
-                t.type = IncrementalOptimizer::OptimTaskType::GPS_FACTOR;
-                t.from_id = best_id;
-                t.gps_pos = pos;
-                t.gps_cov = cov;
-                isam2_optimizer_.enqueueOptTask(t);
+                // 始终通过 TaskDispatcher 投递任务
+                if (task_dispatcher_) {
+                    task_dispatcher_->submitGPSFactor(best_id, pos, cov);
+                }
             } else {
                 RCLCPP_DEBUG(get_logger(),
                     "[AutoMapSystem][GPS_BIND] No suitable submap: best_dt=%.2fs best_dist=%.2fm (thresh: dt=%.0fs dist=%.0fm)",
@@ -452,26 +446,17 @@ void AutoMapSystem::deferredSetupModules() {
 
     state_ = SystemState::MAPPING;
     RCLCPP_INFO(get_logger(), "[AutoMapSystem][DEFERRED] Step 9: state=MAPPING, all modules ready");
-    if (!backend_worker_.joinable()) {
-        backend_worker_ = std::thread(&AutoMapSystem::backendWorkerLoop, this);
-        RCLCPP_INFO(get_logger(), "[AutoMapSystem][DEFERRED] Step 10: backend worker thread started here (queue_max=%zu)", max_frame_queue_size_);
-    } else {
-        RCLCPP_INFO(get_logger(), "[AutoMapSystem][DEFERRED] Step 10: backend worker already running (started in ctor), LivoBridge will feed queue");
-    }
     RCLCPP_INFO(get_logger(), "=== AutoMapSystem READY (session_id=%lu) ===", current_session_id_);
     RCLCPP_INFO(get_logger(), "[AutoMapSystem][PIPELINE] state=READY session_id=%lu (grep PIPELINE 可实时查看建图各环节)", current_session_id_);
 }
 
 void AutoMapSystem::setupPublishers() {
     RCLCPP_DEBUG(get_logger(), "[AutoMapSystem][PUB] Creating publishers");
-    auto path_qos = rclcpp::QoS(rclcpp::KeepLast(100)).reliable();
-    auto map_qos = rclcpp::QoS(rclcpp::KeepLast(5)).reliable();
-    odom_path_pub_  = create_publisher<nav_msgs::msg::Path>("/automap/odom_path", path_qos);
-    opt_path_pub_   = create_publisher<nav_msgs::msg::Path>("/automap/optimized_path", path_qos);
-    global_map_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>("/automap/global_map", map_qos);
-    status_pub_     = create_publisher<automap_pro::msg::MappingStatusMsg>("/automap/status", rclcpp::QoS(rclcpp::KeepLast(10)).reliable());
+    // 🔧 V2 修复：删除冗余发布者，统一使用 rviz_publisher_ 管理可视化 topic
+    // odom_path_pub_, opt_path_pub_, global_map_pub_ 已移至 rviz_publisher_
+    status_pub_ = create_publisher<automap_pro::msg::MappingStatusMsg>("/automap/status", rclcpp::QoS(rclcpp::KeepLast(10)).reliable());
     RCLCPP_INFO(get_logger(),
-        "[AutoMapSystem][TOPIC] publish: /automap/odom_path, /automap/optimized_path, /automap/global_map, /automap/status");
+        "[AutoMapSystem][TOPIC] publish: /automap/status (others via rviz_publisher_)");
 }
 
 void AutoMapSystem::setupServices() {

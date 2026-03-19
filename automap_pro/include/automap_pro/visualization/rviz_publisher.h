@@ -67,6 +67,7 @@ public:
 
     /** 发布里程计轨迹 */
     void publishOdometryPath(const std::vector<std::pair<double, Pose3d>>& path);
+    void publishOdometryPath(const nav_msgs::msg::Path& path);
 
     /** 发布优化后轨迹 */
     void publishOptimizedPath(const std::vector<SubMap::Ptr>& submaps);

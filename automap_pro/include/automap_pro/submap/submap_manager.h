@@ -106,6 +106,12 @@ public:
      */
     void forceFreezeActiveSubmapForFinish();
 
+    /** 检查当前活跃子图是否满足冻结条件 */
+    bool needFreezeSubmap() const;
+
+    /** 冻结当前活跃子图并返回它（用于异步处理） */
+    SubMap::Ptr freezeCurrentSubmap();
+
     /**
      * 冻结指定的活跃子图（必须是 ACTIVE 状态）
      * @param sm 要冻结的子图指针

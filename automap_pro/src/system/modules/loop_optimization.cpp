@@ -50,20 +50,16 @@ void AutoMapSystem::onLoopDetected(const LoopConstraint::Ptr& lc) {
         lc->submap_i, lc->submap_j, lc->overlap_score, lc->inlier_ratio, lc->rmse, tx, ty, tz, info_norm);
     RCLCPP_INFO(get_logger(), "[AutoMapSystem][PIPELINE] event=loop_detected sm_i=%d sm_j=%d score=%.3f rmse=%.3f", lc->submap_i, lc->submap_j, lc->overlap_score, lc->rmse);
 
-    // 始终投队列到 opt_task_queue_，确保GTSAM调用只在opt_worker线程执行
-    {
-        std::lock_guard<std::mutex> lk(opt_task_mutex_);
-        if (opt_task_queue_.size() < kMaxOptTaskQueueSize) {
-            OptTaskItem task;
-            task.type = OptTaskItem::Type::LOOP_FACTOR;
-            task.loop_constraint = lc;
-            opt_task_queue_.push_back(task);
-            opt_task_cv_.notify_one();
+    // 始终通过 TaskDispatcher 投递任务
+    if (task_dispatcher_) {
+        if (task_dispatcher_->submitLoopFactor(lc)) {
+            // 🔧 V2 修复：提交回环后立即触发强制优化，确保及时反映回环修正
+            task_dispatcher_->submitForceUpdate();
             RCLCPP_INFO(get_logger(),
-                "[LOOP_ACCEPTED] onLoopDetected enqueue sm_i=%d sm_j=%d (将入因子图，减轻结构重影；grep LOOP_ACCEPTED)",
+                "[LOOP_ACCEPTED] onLoopDetected enqueue sm_i=%d sm_j=%d (将入因子图并触发优化，减轻结构重影；grep LOOP_ACCEPTED)",
                 lc->submap_i, lc->submap_j);
         } else {
-            RCLCPP_WARN(get_logger(), "[AutoMapSystem][LOOP] opt_task_queue full, dropping loop sm_i=%d sm_j=%d", lc->submap_i, lc->submap_j);
+            RCLCPP_WARN(get_logger(), "[AutoMapSystem][LOOP] task_dispatcher failed to submit loop sm_i=%d sm_j=%d (queue full?)", lc->submap_i, lc->submap_j);
         }
     }
     state_ = SystemState::MAPPING;
@@ -171,7 +167,9 @@ void AutoMapSystem::onPoseUpdated(const std::unordered_map<int, Pose3d>& poses) 
         } catch (...) {}
     }
 
-    // 发布优化后轨迹（HBA 后不再发布 iSAM2 的 opt_path_，避免覆盖 HBA 轨迹导致 map(HBA)+path(iSAM2) 重影）
+    // 🔧 V2 修复：删除冗余的 opt_path_ 直接发布，统一通过 rviz_publisher_ 处理。
+    // HBA 后不再发布 iSAM2 的轨迹，避免覆盖 HBA 轨迹导致 map(HBA)+path(iSAM2) 重影。
+    /*
     if (!odom_path_stopped_after_hba_.load(std::memory_order_acquire)) {
         opt_path_.header.stamp    = now();
         opt_path_.header.frame_id = "map";
@@ -196,10 +194,14 @@ void AutoMapSystem::onPoseUpdated(const std::unordered_map<int, Pose3d>& poses) 
             pub_opt_path_count_++;
         }
     }
+    */
 
     try {
         auto all_sm = submap_manager_.getAllSubmaps();
-        rviz_publisher_.publishOptimizedPath(all_sm);
+        // 🔧 V2 修复：在 HBA 完成后不再发布 iSAM2 轨迹
+        if (!odom_path_stopped_after_hba_.load(std::memory_order_acquire)) {
+            rviz_publisher_.publishOptimizedPath(all_sm);
+        }
         rviz_publisher_.publishKeyframePoses(collectKeyframesFromSubmaps(all_sm));
     } catch (const std::exception& e) {
         RCLCPP_WARN(get_logger(), "[AutoMapSystem][EXCEPTION] publishOptimizedPath: %s", e.what());
@@ -227,12 +229,18 @@ void AutoMapSystem::onHBADone(const HBAResult& result) {
         isam2_poses_before_hba[sm->id] = isam2_optimizer_.getPose(sm->id);
     }
 
-    // 使用锁保护 HBA 结果更新
+    // 使用锁保护 HBA 结果更新与点云重建
     {
         std::lock_guard<std::mutex> lk(submap_update_mutex_);
         submap_manager_.updateAllFromHBA(result);
+        // 🔧 V2 修复：HBA 后必须重建 merged_cloud，否则 fallback 路径的点云将出现严重重影
+        submap_manager_.rebuildMergedCloudFromOptimizedPoses();
     }
 
+    // 🔧 V2 修复：HBA 后强制触发一次地图发布，反映优化后的结果
+    map_publish_pending_.store(true, std::memory_order_release);
+    map_publish_cv_.notify_one();
+    
     try {
         rviz_publisher_.publishHBAResult(result);
     } catch (const std::exception& e) {

@@ -256,6 +256,7 @@ bool TaskDispatcher::submitForceUpdate() {
 bool TaskDispatcher::submitKeyFrameCreate(const KeyFrame::Ptr& kf,
                                          bool has_prev_kf,
                                          int prev_kf_id,
+                                         const KeyFrame::Ptr& prev_kf,
                                          bool gps_aligned,
                                          const Eigen::Matrix3d& gps_transform_R,
                                          const Eigen::Vector3d& gps_transform_t) {
@@ -266,9 +267,35 @@ bool TaskDispatcher::submitKeyFrameCreate(const KeyFrame::Ptr& kf,
     task.keyframe = kf;
     task.has_prev_kf = has_prev_kf;
     task.prev_kf_id = prev_kf_id;
+    task.prev_keyframe = prev_kf;
     task.gps_aligned = gps_aligned;
     task.gps_transform_R = gps_transform_R;
     task.gps_transform_t = gps_transform_t;
+    
+    if (opt_task_mutex_ && opt_task_queue_) {
+        std::lock_guard<std::mutex> lock(*opt_task_mutex_);
+        if (opt_task_queue_->size() < max_queue_size_) {
+            opt_task_queue_->push_back(task);
+            if (opt_task_cv_) {
+                opt_task_cv_->notify_one();
+            }
+            return true;
+        }
+    }
+    
+    if (external_handler_) {
+        external_handler_(task);
+        return true;
+    }
+    
+    return false;
+}
+
+bool TaskDispatcher::submitActiveSubmapGPSBind(const Eigen::Matrix3d& R, const Eigen::Vector3d& t) {
+    OptTaskItem task;
+    task.type = OptTaskItem::Type::ACTIVE_SUBMAP_GPS_BIND;
+    task.R_enu_to_map = R;
+    task.t_enu_to_map = t;
     
     if (opt_task_mutex_ && opt_task_queue_) {
         std::lock_guard<std::mutex> lock(*opt_task_mutex_);

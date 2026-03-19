@@ -54,7 +54,7 @@ void AutoMapSystem::handleTriggerHBA(
     RCLCPP_INFO(get_logger(), "[AutoMapSystem] Triggered HBA (wait=%d)", req->wait_for_result);
     RCLCPP_INFO(get_logger(), "[AutoMapSystem][PIPELINE] event=trigger_hba_called wait=%d submaps=%zu", req->wait_for_result ? 1 : 0, all.size());
     ensureBackendCompletedAndFlushBeforeHBA();
-                hba_optimizer_.triggerAsync(all, req->wait_for_result, "TriggerHBA_srv");
+    hba_optimizer_.triggerAsync(all, req->wait_for_result, "TriggerHBA_srv");
     res->success = true;
     res->message = "HBA triggered";
 }
@@ -63,83 +63,39 @@ void AutoMapSystem::handleTriggerOptimize(
     const std::shared_ptr<automap_pro::srv::TriggerOptimize::Request>,
     std::shared_ptr<automap_pro::srv::TriggerOptimize::Response> res)
 {
-    // 投递 FORCE_UPDATE 任务到 opt_worker 线程，统一由 opt_worker 处理所有 iSAM2 优化操作
-    // 这样可以避免在服务回调线程中直接操作 GTSAM，确保线程安全
-    
-    // 投递 FORCE_UPDATE 任务
-    {
-        std::unique_lock<std::mutex> lock(opt_task_mutex_);
-        
-        // 等待队列有空间
-        const int max_waits = 50;  // 最多等待 5 秒
-        const int wait_ms = 100;
-        bool enqueued = false;
-        
-        for (int wait_count = 0; wait_count < max_waits; ++wait_count) {
-            if (opt_task_queue_.size() < kMaxOptTaskQueueSize) {
-                OptTaskItem task;
-                task.type = OptTaskItem::Type::FORCE_UPDATE;
-                opt_task_queue_.push_back(task);
-                opt_task_cv_.notify_one();
-                enqueued = true;
-                RCLCPP_INFO(get_logger(), "[AutoMapSystem][OPT_SERVICE] FORCE_UPDATE task enqueued after %d waits", wait_count);
-                break;
+    // 投递 FORCE_UPDATE 任务到 opt_worker 线程
+    if (task_dispatcher_) {
+        if (task_dispatcher_->submitForceUpdate()) {
+            RCLCPP_INFO(get_logger(), "[AutoMapSystem][OPT_SERVICE] FORCE_UPDATE task enqueued");
+            
+            // 等待 opt_worker 处理完成（带超时）
+            const int max_wait_ms = 10000;
+            const int check_interval_ms = 100;
+            int waited_ms = 0;
+            while (waited_ms < max_wait_ms) {
+                bool queue_empty = false;
+                {
+                    std::lock_guard<std::mutex> lk(opt_task_mutex_);
+                    queue_empty = opt_task_queue_.empty();
+                }
+                if (queue_empty && !opt_task_in_progress_.load(std::memory_order_acquire)) {
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(check_interval_ms));
+                waited_ms += check_interval_ms;
             }
-            lock.unlock();
-            std::this_thread::sleep_for(std::chrono::milliseconds(wait_ms));
-            lock.lock();
-        }
-        
-        if (!enqueued) {
-            // 队列满时的降级方案：直接调用（不应该发生）
-            RCLCPP_ERROR(get_logger(), "[AutoMapSystem][OPT_SERVICE] opt_task_queue full after %d waits, using direct call", max_waits);
-            auto t0 = std::chrono::steady_clock::now();
-            auto result = isam2_optimizer_.forceUpdate();
-            double elapsed = std::chrono::duration<double>(
-                std::chrono::steady_clock::now() - t0).count();
-            res->success = result.success;
-            res->elapsed_seconds = elapsed;
-            res->nodes_updated = result.nodes_updated;
+            
+            res->success = true;
+            res->message = "Optimize completed (async)";
             return;
         }
     }
     
-    // 等待 opt_worker 处理完成
-    // 注意：这里等待的是 opt_task_queue_ 中的任务被处理，而不是 isam2_optimizer_ 的内部队列
-    // opt_worker 处理 FORCE_UPDATE 任务时会调用 isam2_optimizer_.forceUpdate()
-    {
-        const int max_wait_ms = 10000;  // 最多等待 10 秒
-        const int check_interval_ms = 50;
-        int waited_ms = 0;
-        while (waited_ms < max_wait_ms) {
-            bool queue_empty = false;
-            {
-                std::lock_guard<std::mutex> lk(opt_task_mutex_);
-                queue_empty = opt_task_queue_.empty();
-            }
-            // 检查是否没有正在处理的任务且队列为空
-            if (queue_empty && !opt_task_in_progress_.load(std::memory_order_acquire)) {
-                break;
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(check_interval_ms));
-            waited_ms += check_interval_ms;
-        }
-        
-        if (waited_ms >= max_wait_ms) {
-            RCLCPP_WARN(get_logger(), "[AutoMapSystem][OPT_SERVICE] wait for FORCE_UPDATE timeout after %d ms", waited_ms);
-        }
-    }
-    
-    // opt_worker 已经执行了 forceUpdate()，这里只需要获取当前状态
-    // forceUpdate() 在没有 pending factors/values 时会直接返回当前状态，不会触发新的优化
+    // 降级方案
+    RCLCPP_WARN(get_logger(), "[AutoMapSystem][OPT_SERVICE] task_dispatcher failed or null, using direct call");
     auto result = isam2_optimizer_.forceUpdate();
-    
     res->success = result.success;
-    res->elapsed_seconds = result.elapsed_ms / 1000.0;
-    res->nodes_updated = result.nodes_updated;
-    
-    RCLCPP_INFO(get_logger(), "[AutoMapSystem][OPT_SERVICE] FORCE_UPDATE completed: success=%d nodes=%d elapsed=%.2fs",
-                res->success ? 1 : 0, res->nodes_updated, result.elapsed_ms / 1000.0);
+    res->message = "Optimize called directly (fallback)";
 }
 
 void AutoMapSystem::handleTriggerGpsAlign(

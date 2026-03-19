@@ -178,6 +178,9 @@ public:
     using MeasurementLogCallback = std::function<void(double ts, const Eigen::Vector3d& pos_enu)>;
     void registerMeasurementLogCallback(MeasurementLogCallback cb) { measurement_log_cbs_.push_back(std::move(cb)); }
 
+    /** 手动请求执行一次 GPS 对齐（通常在满足最小子图数后调用） */
+    void requestAlignment() { try_align(); }
+
     // ── 强制重新对齐（用于 GPS 信号恢复后） ──────────────────────────────
     void triggerRealign();
 

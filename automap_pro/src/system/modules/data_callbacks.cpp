@@ -41,6 +41,14 @@ void AutoMapSystem::onOdometry(double ts, const Pose3d& pose, const Mat66d& cov)
 
     gps_manager_.addKeyFramePose(ts, pose);
 
+    // 🔧 V2 修复：如果 HBA 已完成，停止发布里程计轨迹，避免与优化后的地图/轨迹冲突导致重影
+    if (odom_path_stopped_after_hba_.load(std::memory_order_acquire)) {
+        return;
+    }
+
+    // 🔧 V2 修复：使用 odom_path_mutex_ 保护轨迹追加与裁剪，防止 MultiThreadedExecutor 下的竞态
+    std::lock_guard<std::mutex> lk(odom_path_mutex_);
+    
     geometry_msgs::msg::PoseStamped ps;
     ps.header.stamp    = now();
     ps.header.frame_id = "map";
@@ -51,10 +59,17 @@ void AutoMapSystem::onOdometry(double ts, const Pose3d& pose, const Mat66d& cov)
     Eigen::Quaterniond q(pose.rotation());
     ps.pose.orientation.w = q.w(); ps.pose.orientation.x = q.x();
     ps.pose.orientation.y = q.y(); ps.pose.orientation.z = q.z();
+    
     odom_path_.poses.push_back(ps);
     odom_path_.header = ps.header;
+
+    // 🔧 V2 修复：限制轨迹长度，避免长期运行内存爆炸
+    if (odom_path_.poses.size() > 10000) {
+        odom_path_.poses.erase(odom_path_.poses.begin(), odom_path_.poses.begin() + 1000);
+    }
+
     if (seq <= 20 || seq % 100 == 0) {
-        odom_path_pub_->publish(odom_path_);
+        rviz_publisher_.publishOdometryPath(odom_path_);
         pub_odom_path_count_++;
     }
 

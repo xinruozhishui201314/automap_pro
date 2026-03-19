@@ -19,6 +19,9 @@
 
 #include <opencv2/opencv.hpp>
 
+constexpr double kMaxReasonableTranslationNorm = 1e6;
+constexpr int MAX_KF_PER_SUBMAP = 100000;
+
 namespace automap_pro {
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -136,6 +139,7 @@ struct KeyFrame {
     uint64_t id         = 0;
     uint64_t session_id = 0;
     int      submap_id  = -1;
+    int      index_in_submap = -1; // ✅ V2 修复：存储在子图中的索引，用于 iSAM2 节点编码
     double   timestamp  = 0.0;
 
     // 位姿（世界系下 body 位姿）
@@ -171,6 +175,8 @@ enum class LoopStatus { PENDING, ACCEPTED, REJECTED };
 struct LoopConstraint {
     int      submap_i = -1, submap_j = -1;   // i:较旧(目标), j:较新(查询)
     int      keyframe_i = -1, keyframe_j = -1;
+    /** 关键帧全局 id（图中 KF 节点 id），用于子图间 keyframe 级回环入图；-1 表示未设置 */
+    int      keyframe_global_id_i = -1, keyframe_global_id_j = -1;
     uint64_t session_i = 0,  session_j = 0;
 
     /** T_i_j：子图 j 在子图 i 系下的位姿（target=i, source=j），用于 BetweenFactor(i, j, delta_T) */
@@ -229,6 +235,8 @@ struct SubMap {
 
     // GPS 中心（ENU，用于GPS范围过滤）
     Eigen::Vector3d gps_center = Eigen::Vector3d::Zero();
+    Pose3d gps_enu_pose = Pose3d::Identity();
+    Eigen::Matrix3d gps_cov = Eigen::Matrix3d::Identity() * 1e6;
     bool has_valid_gps = false;
 
     // 时间范围

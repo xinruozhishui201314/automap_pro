@@ -216,6 +216,11 @@ void RvizPublisher::publishOdometryPath(const std::vector<std::pair<double, Pose
     odom_path_pub_->publish(msg);
 }
 
+void RvizPublisher::publishOdometryPath(const nav_msgs::msg::Path& path) {
+    if (!node_ || !odom_path_pub_) return;
+    odom_path_pub_->publish(path);
+}
+
 void RvizPublisher::publishOptimizedPath(const std::vector<SubMap::Ptr>& submaps) {
     if (!node_ || !opt_path_pub_) return;
     nav_msgs::msg::Path path;

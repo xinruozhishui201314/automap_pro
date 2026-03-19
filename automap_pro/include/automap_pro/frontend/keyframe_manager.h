@@ -29,10 +29,10 @@ public:
     /** 更新 ESIKF 质量信息，影响 KF 触发策略 */
     void updateLivoInfo(const LivoKeyFrameInfo& info);
 
-    /** 判断是否应创建关键帧 */
+    /** 判断是否应创建关键帧，不执行创建动作 */
     bool shouldCreateKeyFrame(const Pose3d& cur_pose, double timestamp);
 
-    /** 创建关键帧（不会检查条件，直接创建） */
+    /** 创建关键帧（并更新最后位姿） */
     KeyFrame::Ptr createKeyFrame(
         const Pose3d& T_w_b,
         const Mat66d& covariance,
@@ -46,14 +46,11 @@ public:
     void registerCallback(KeyFrameCallback cb) { cbs_.push_back(std::move(cb)); }
     void resetLastPose(const Pose3d& pose, double ts);
     int  keyframeCount() const { return kf_count_; }
-
-    /** 判断是否应创建关键帧，如需要则同时创建（组合操作） */
-    bool needNewKeyFrame(double timestamp, const Pose3d& pose, const Mat66d& cov, const CloudXYZIPtr& cloud);
     
     /** 获取最后一个关键帧 */
     KeyFrame::Ptr getLastKeyFrame() const { return last_keyframe_; }
     
-    /** 添加关键帧到管理器 */
+    /** 添加关键帧到管理器（并更新最后位姿） */
     void addKeyFrame(KeyFrame::Ptr kf);
     
     /** 根据ID获取关键帧 */

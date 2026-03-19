@@ -119,8 +119,9 @@ void SubMapManager::addKeyFrame(const KeyFrame::Ptr& kf) {
         kf->id, __FILE__, __LINE__);
 
     try {
-        kf->id         = kf_id_counter_++;
-        kf->session_id = current_session_id_;
+        // ✅ V2 修复：不再覆盖 kf->id 和 kf->session_id，尊重 Frontend (KeyFrameManager) 分配的原始 ID
+        // kf->id         = kf_id_counter_++; 
+        // kf->session_id = current_session_id_;
 
         // 如果没有活跃子图，创建一个
         if (!active_submap_) {
@@ -150,6 +151,7 @@ void SubMapManager::addKeyFrame(const KeyFrame::Ptr& kf) {
 
         // 添加关键帧到子图
         kf->submap_id = active_submap_->id;
+        kf->index_in_submap = static_cast<int>(active_submap_->keyframes.size()); // ✅ V2 修复：设置子图内索引
         active_submap_->keyframes.push_back(kf);
         active_submap_->t_end = kf->timestamp;
 
@@ -1584,6 +1586,18 @@ void SubMapManager::updateGPSGravityCenter(const KeyFrame::Ptr& kf) {
 
     if (gps_count > 0) {
         active_submap_->gps_center = gps_sum / gps_count;
+        active_submap_->gps_enu_pose = Pose3d::Identity();
+        active_submap_->gps_enu_pose.translation() = active_submap_->gps_center;
+        
+        // 简单起见，使用最后一帧的 GPS 协方差作为子图的 GPS 协方差
+        // 或者计算所有有效帧的平均协方差
+        Eigen::Matrix3d cov_sum = Eigen::Matrix3d::Zero();
+        for (const auto& f : active_submap_->keyframes) {
+            if (f->has_valid_gps) {
+                cov_sum += f->gps.covariance;
+            }
+        }
+        active_submap_->gps_cov = cov_sum / static_cast<double>(gps_count);
         active_submap_->has_valid_gps = true;
         
         SLOG_DEBUG(MOD, "Updated GPS center for SM#{} ({} GPS fixes): ({:.3f}, {:.3f}, {:.3f})",
@@ -1812,6 +1826,27 @@ CloudXYZIPtr SubMapManager::buildGlobalMapInternalFromSnapshot(
         }
     }
     return out ? out : combined;
+}
+
+bool SubMapManager::needFreezeSubmap() const {
+    std::lock_guard<std::mutex> lk(mutex_);
+    if (!active_submap_) return false;
+    return isFull(active_submap_);
+}
+
+SubMap::Ptr SubMapManager::freezeCurrentSubmap() {
+    SubMap::Ptr sm = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(mutex_);
+        if (!active_submap_) return nullptr;
+        sm = active_submap_;
+        active_submap_ = nullptr;
+    }
+    
+    if (sm) {
+        freezeActiveSubmap(sm);
+    }
+    return sm;
 }
 
 }  // namespace automap_pro

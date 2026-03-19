@@ -122,9 +122,15 @@ public:
     bool submitKeyFrameCreate(const KeyFrame::Ptr& kf,
                              bool has_prev_kf,
                              int prev_kf_id,
+                             const KeyFrame::Ptr& prev_kf,
                              bool gps_aligned,
                              const Eigen::Matrix3d& gps_transform_R,
                              const Eigen::Vector3d& gps_transform_t);
+
+    /**
+     * 提交活跃子图关键帧GPS绑定任务
+     */
+    bool submitActiveSubmapGPSBind(const Eigen::Matrix3d& R, const Eigen::Vector3d& t);
     
     /**
      * 等待所有任务完成
