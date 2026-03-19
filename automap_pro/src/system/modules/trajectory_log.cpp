@@ -301,10 +301,16 @@ void AutoMapSystem::writeHbaPosesAndGpsForAccuracy() {
                 gps_hdop = kf->gps.hdop;
                 gps_quality = static_cast<int>(kf->gps.quality);
                 gps_valid = kf->gps.is_valid;
-                auto [pos_map, frame] = gps_manager_.enu_to_map_with_frame(kf->gps.position_enu);
-                gps_x_map = pos_map.x();
-                gps_y_map = pos_map.y();
-                gps_z_map = pos_map.z();
+                if (gps_aligned_.load()) {
+                    gps_x_map = kf->gps.position_enu.x();
+                    gps_y_map = kf->gps.position_enu.y();
+                    gps_z_map = kf->gps.position_enu.z();
+                } else {
+                    auto [pos_map, frame] = gps_manager_.enu_to_map_with_frame(kf->gps.position_enu);
+                    gps_x_map = pos_map.x();
+                    gps_y_map = pos_map.y();
+                    gps_z_map = pos_map.z();
+                }
             } else {
                 auto gps_opt = gps_manager_.queryByTimestampForLog(kf->timestamp, kGpsMaxDt);
                 if (gps_opt) {
@@ -314,10 +320,16 @@ void AutoMapSystem::writeHbaPosesAndGpsForAccuracy() {
                     gps_hdop = gps_opt->hdop;
                     gps_quality = static_cast<int>(gps_opt->quality);
                     gps_valid = gps_opt->is_valid;
-                    auto [pos_map, frame] = gps_manager_.enu_to_map_with_frame(gps_opt->position_enu);
-                    gps_x_map = pos_map.x();
-                    gps_y_map = pos_map.y();
-                    gps_z_map = pos_map.z();
+                    if (gps_aligned_.load()) {
+                        gps_x_map = gps_opt->position_enu.x();
+                        gps_y_map = gps_opt->position_enu.y();
+                        gps_z_map = gps_opt->position_enu.z();
+                    } else {
+                        auto [pos_map, frame] = gps_manager_.enu_to_map_with_frame(gps_opt->position_enu);
+                        gps_x_map = pos_map.x();
+                        gps_y_map = pos_map.y();
+                        gps_z_map = pos_map.z();
+                    }
                 }
             }
             out << std::fixed << std::setprecision(6)
@@ -546,21 +558,38 @@ void AutoMapSystem::writeMappingAccuracyGpsVsHba(const std::string& output_dir) 
             gps_hdop = kf->gps.hdop;
             gps_quality = static_cast<int>(kf->gps.quality);
             gps_pos_valid = kf->gps.is_valid;
-            auto pr = gps_manager_.enu_to_map_with_frame(kf->gps.position_enu);
-            gps_x = pr.first.x();
-            gps_y = pr.first.y();
-            gps_z = pr.first.z();
-            frame_str = pr.second;
+            
+            // 🔧 修复：若系统已全球化（gps_aligned_=true），则 "map" 系就是 "enu" 系，无需再次变换
+            if (gps_aligned_.load()) {
+                gps_x = kf->gps.position_enu.x();
+                gps_y = kf->gps.position_enu.y();
+                gps_z = kf->gps.position_enu.z();
+                frame_str = "map";
+            } else {
+                auto pr = gps_manager_.enu_to_map_with_frame(kf->gps.position_enu);
+                gps_x = pr.first.x();
+                gps_y = pr.first.y();
+                gps_z = pr.first.z();
+                frame_str = pr.second;
+            }
             gatt = kf->gps.attitude;
         } else if (auto gps_opt = gps_manager_.queryByTimestampForLog(kf->timestamp, kGpsMaxDt)) {
             gps_hdop = gps_opt->hdop;
             gps_quality = static_cast<int>(gps_opt->quality);
             gps_pos_valid = gps_opt->is_valid;
-            auto pr = gps_manager_.enu_to_map_with_frame(gps_opt->position_enu);
-            gps_x = pr.first.x();
-            gps_y = pr.first.y();
-            gps_z = pr.first.z();
-            frame_str = pr.second;
+            
+            if (gps_aligned_.load()) {
+                gps_x = gps_opt->position_enu.x();
+                gps_y = gps_opt->position_enu.y();
+                gps_z = gps_opt->position_enu.z();
+                frame_str = "map";
+            } else {
+                auto pr = gps_manager_.enu_to_map_with_frame(gps_opt->position_enu);
+                gps_x = pr.first.x();
+                gps_y = pr.first.y();
+                gps_z = pr.first.z();
+                frame_str = pr.second;
+            }
             gatt = gps_opt->attitude;
         }
         const bool gps_att_valid = gatt.is_valid;

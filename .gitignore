@@ -88,6 +88,7 @@ automap_ws/install_deps/
 automap_ws/build/
 automap_ws/build_*/
 automap_ws/log/
+automap_ws/logs/
 
 # ========== 大模型和第三方库（不提交）==========
 automap_pro/thrid_party/libtorch/

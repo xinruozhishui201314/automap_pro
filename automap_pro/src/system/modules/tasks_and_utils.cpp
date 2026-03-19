@@ -9,6 +9,7 @@
 #include "automap_pro/core/utils.h"
 
 #include <filesystem>
+#include <utility>
 
 namespace automap_pro {
 
@@ -129,11 +130,20 @@ void AutoMapSystem::publishGlobalMap() {
                     if (!sm) continue;
                     for (const auto& kf : sm->keyframes) {
                         if (!kf || !kf->has_valid_gps) continue;
-                        gps_positions_map.push_back(kf->T_w_b_optimized.translation());
+                        // 🔧 修复：若系统已全球化，GPS 坐标本身就在 "map" 系，无需再次变换
+                        if (gps_aligned_.load()) {
+                            gps_positions_map.push_back(kf->gps.position_enu);
+                        } else {
+                            gps_positions_map.push_back(gps_manager_.enu_to_map(kf->gps.position_enu));
+                        }
                     }
                 }
                 if (!gps_positions_map.empty()) {
                     rviz_publisher_.publishGPSPositionsInMap(gps_positions_map);
+                }
+                std::vector<Eigen::Vector3d> kf_gps_path = buildKeyframeGpsPathPointsForRviz(all_sm);
+                if (!kf_gps_path.empty()) {
+                    rviz_publisher_.publishGpsKeyframePath(kf_gps_path);
                 }
             } catch (const std::exception& e) {
                 RCLCPP_DEBUG(get_logger(), "[AutoMapSystem][MAP][GPS] exception: %s", e.what());
@@ -184,6 +194,35 @@ std::vector<KeyFrame::Ptr> AutoMapSystem::collectKeyframesFromSubmaps(const std:
             return a->timestamp < b->timestamp;
         });
     return all_kfs;
+}
+
+std::vector<Eigen::Vector3d> AutoMapSystem::buildKeyframeGpsPathPointsForRviz(
+    const std::vector<SubMap::Ptr>& submaps) const {
+    std::vector<std::pair<double, KeyFrame::Ptr>> sorted;
+    for (const auto& sm : submaps) {
+        if (!sm) continue;
+        for (const auto& kf : sm->keyframes) {
+            if (kf) sorted.push_back({kf->timestamp, kf});
+        }
+    }
+    std::sort(sorted.begin(), sorted.end(),
+        [](const auto& a, const auto& b) { return a.first < b.first; });
+    std::vector<Eigen::Vector3d> out;
+    out.reserve(sorted.size());
+    for (const auto& pr : sorted) {
+        const KeyFrame::Ptr& kf = pr.second;
+        if (kf->has_valid_gps) {
+            // 🔧 修复：若系统已全球化，GPS 坐标本身就在 "map" 系，无需再次变换
+            if (gps_aligned_.load()) {
+                out.push_back(kf->gps.position_enu);
+            } else {
+                out.push_back(gps_manager_.enu_to_map(kf->gps.position_enu));
+            }
+        } else {
+            out.push_back(kf->T_w_b_optimized.translation());
+        }
+    }
+    return out;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

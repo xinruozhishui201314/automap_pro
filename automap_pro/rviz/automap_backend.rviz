@@ -91,11 +91,25 @@ Visualization Manager:
       Class: rviz_default_plugins/Path
       Color: 0; 255; 100
       Enabled: true
+      Line Width: 0.07999999821186066
       Name: optimized odom path
       Topic:
         Depth: 10
         Reliability Policy: Reliable
         Value: /automap/optimized_path
+      Use Fixed Frame: true
+    # 关键帧序 GPS 轨迹（map 系）：有 GPS 点为观测经 enu_to_map；无 GPS 点与 optimized_path 重合，便于对比
+    - Alpha: 0.92
+      Class: rviz_default_plugins/Path
+      Color: 255; 165; 0
+      Enabled: true
+      Line Width: 0.05999999865889549
+      Name: GPS keyframe path
+      Topic:
+        Depth: 10
+        Reliability Policy: Reliable
+        Durability Policy: Transient Local
+        Value: /automap/gps_keyframe_path
       Use Fixed Frame: true
     # 关键帧位姿（iSAM2/HBA/GPS 对齐后后端会刷新，RViz 显示最新一次发布的全部位姿）
     - Class: rviz_default_plugins/PoseArray

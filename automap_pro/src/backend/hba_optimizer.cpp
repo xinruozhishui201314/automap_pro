@@ -578,8 +578,8 @@ HBAResult HBAOptimizer::runGTSAMFallback(const PendingTask& task) {
                     ALOG_WARN(MOD, "HBA GTSAM: skip GPS kf={} non-finite position_enu", i);
                     continue;
                 }
-                // 与 iSAM2 一致：位姿在 map 系，GPS 观测也转换到 map 系（enu_to_map）
-                Eigen::Vector3d pos_map = gps_align_result_.R_gps_lidar * pos_enu + gps_align_result_.t_gps_lidar;
+                // 与 iSAM2 一致：由于地图已整体变换到 ENU 系，GPS 观测直接使用 ENU 坐标即可，无需再次变换到旧局部系
+                Eigen::Vector3d pos_map = pos_enu;
                 gtsam::Point3 pt(pos_map.x(), pos_map.y(), pos_map.z());
                 Eigen::Matrix3d c = kf->gps.covariance;
                 if (!c.allFinite()) {

@@ -426,6 +426,11 @@ private:
     // ── 工具 ─────────────────────────────────────────────────────────────
     /** 从子图列表收集所有关键帧（按时间戳排序），用于 RViz 关键帧位姿实时刷新 */
     static std::vector<KeyFrame::Ptr> collectKeyframesFromSubmaps(const std::vector<SubMap::Ptr>& submaps);
+    /**
+     * 与 RvizPublisher::publishOptimizedPath 同一时间序：有 GPS 且已对齐时用 enu_to_map(观测)；
+     * 无 GPS 时用 T_w_b_optimized 平移。供 /automap/gps_keyframe_path 与 GPS 散点一致。
+     */
+    std::vector<Eigen::Vector3d> buildKeyframeGpsPathPointsForRviz(const std::vector<SubMap::Ptr>& submaps) const;
     /** 返回实际输出目录：launch 传入的 output_dir 优先，否则用 system.output_dir */
     std::string getOutputDir() const;
     void saveMapToFiles(const std::string& output_dir);

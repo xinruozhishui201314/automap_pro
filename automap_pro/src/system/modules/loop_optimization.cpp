@@ -146,7 +146,14 @@ void AutoMapSystem::onPoseUpdated(const std::unordered_map<int, Pose3d>& poses) 
             std::vector<Eigen::Vector3d> gps_positions_map_for_submaps;
             for (const auto& sm : all_sm) {
                 if (!sm || !sm->has_valid_gps) continue;
-                gps_positions_map_for_submaps.push_back(sm->pose_w_anchor_optimized.translation());
+                // 🔧 修复：若系统已对齐且全球化，GPS 坐标本身就在全局 "map" 系，无需再次变换
+                Eigen::Vector3d pos_map;
+                if (gps_aligned_.load()) {
+                    pos_map = sm->gps_center;
+                } else {
+                    pos_map = gps_manager_.enu_to_map(sm->gps_center);
+                }
+                gps_positions_map_for_submaps.push_back(pos_map);
             }
             if (!gps_positions_map_for_submaps.empty()) {
                 rviz_publisher_.publishGPSMarkersWithConstraintLines(all_sm, gps_positions_map_for_submaps);
@@ -155,12 +162,23 @@ void AutoMapSystem::onPoseUpdated(const std::unordered_map<int, Pose3d>& poses) 
             for (const auto& sm : all_sm) {
                 if (!sm) continue;
                 for (const auto& kf : sm->keyframes) {
-                    if (!kf || !kf->has_valid_gps) continue;
-                    gps_positions_map.push_back(kf->T_w_b_optimized.translation());
+            if (!kf->has_valid_gps) continue;
+            // 🔧 修复：若系统已对齐且全球化，GPS 坐标本身就在全局 "map" 系，无需再次变换
+            Eigen::Vector3d pos_map;
+            if (gps_aligned_.load()) {
+                pos_map = kf->gps.position_enu;
+            } else {
+                pos_map = gps_manager_.enu_to_map(kf->gps.position_enu);
+            }
+            gps_positions_map.push_back(pos_map);
                 }
             }
             if (!gps_positions_map.empty()) {
                 rviz_publisher_.publishGPSPositionsInMap(gps_positions_map);
+            }
+            std::vector<Eigen::Vector3d> kf_gps_path = buildKeyframeGpsPathPointsForRviz(all_sm);
+            if (!kf_gps_path.empty()) {
+                rviz_publisher_.publishGpsKeyframePath(kf_gps_path);
             }
         } catch (const std::exception& e) {
             RCLCPP_DEBUG(get_logger(), "[AutoMapSystem][POSE][GPS] update exception: %s", e.what());
@@ -261,10 +279,21 @@ void AutoMapSystem::onHBADone(const HBAResult& result) {
             std::vector<Eigen::Vector3d> gps_positions_map_for_submaps;
             for (const auto& sm : all_sm) {
                 if (!sm || !sm->has_valid_gps) continue;
-                gps_positions_map_for_submaps.push_back(sm->pose_w_anchor_optimized.translation());
+                // 🔧 修复：若系统已对齐且全球化，GPS 坐标本身就在全局 "map" 系，无需再次变换
+                Eigen::Vector3d pos_map;
+                if (gps_aligned_.load()) {
+                    pos_map = sm->gps_center;
+                } else {
+                    pos_map = gps_manager_.enu_to_map(sm->gps_center);
+                }
+                gps_positions_map_for_submaps.push_back(pos_map);
             }
             if (!gps_positions_map_for_submaps.empty()) {
                 rviz_publisher_.publishGPSMarkersWithConstraintLines(all_sm, gps_positions_map_for_submaps);
+            }
+            std::vector<Eigen::Vector3d> kf_gps_path = buildKeyframeGpsPathPointsForRviz(all_sm);
+            if (!kf_gps_path.empty()) {
+                rviz_publisher_.publishGpsKeyframePath(kf_gps_path);
             }
         } catch (const std::exception& e) {
             RCLCPP_DEBUG(get_logger(), "[AutoMapSystem][HBA][GPS] update exception: %s", e.what());

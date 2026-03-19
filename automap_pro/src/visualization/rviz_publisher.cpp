@@ -12,6 +12,15 @@
 
 namespace automap_pro {
 
+namespace {
+// RViz 球体为直径 scale=2*radius；GPS 约束用小球，回环连线略加粗便于辨认
+constexpr float kGpsMarkerSphereRadius   = 0.06f;   // ~12cm 直径
+constexpr float kGpsAlignedSphereRadius   = 0.08f;
+constexpr float kLoopConstraintLineWidth  = 0.12f;
+constexpr float kLoopEdgeLineWidthM       = 0.28f;
+constexpr float kLoopEndpointSphereRadius = 0.10f;
+}  // namespace
+
 // ─────────────────────────────────────────────────────────────────────────────
 // init
 // ─────────────────────────────────────────────────────────────────────────────
@@ -450,8 +459,10 @@ void RvizPublisher::publishLoopMarkers(
     // 先清除该命名空间下旧的回环线，避免数量减少时残留
     auto delete_all = makeDeleteAllMarkers("loops");
     markers.markers.push_back(delete_all.markers.front());
+    markers.markers.push_back(makeDeleteAllMarkers("loop_ends").markers.front());
 
     int id = 0;
+    int end_id = 0;
     for (const auto& lc : loops) {
         auto it_i = sm_pos.find(lc->submap_i);
         auto it_j = sm_pos.find(lc->submap_j);
@@ -464,11 +475,11 @@ void RvizPublisher::publishLoopMarkers(
         line.id    = id++;
         line.type  = visualization_msgs::msg::Marker::LINE_STRIP;
         line.action= visualization_msgs::msg::Marker::ADD;
-        line.scale.x = 0.1;
+        line.scale.x = kLoopEdgeLineWidthM;
         line.color.r = lc->is_inter_session ? 1.0f : 0.0f;
         line.color.g = lc->is_inter_session ? 0.5f : 1.0f;
         line.color.b = 0.0f;
-        line.color.a = 0.9f;
+        line.color.a = 1.0f;
 
         geometry_msgs::msg::Point p1, p2;
         p1.x = it_i->second.x(); p1.y = it_i->second.y(); p1.z = it_i->second.z();
@@ -476,6 +487,13 @@ void RvizPublisher::publishLoopMarkers(
         line.points.push_back(p1);
         line.points.push_back(p2);
         markers.markers.push_back(line);
+
+        std_msgs::msg::ColorRGBA end_c = line.color;
+        end_c.a = 1.0f;
+        markers.markers.push_back(
+            makeSphereMarker("loop_ends", end_id++, it_i->second, kLoopEndpointSphereRadius, end_c));
+        markers.markers.push_back(
+            makeSphereMarker("loop_ends", end_id++, it_j->second, kLoopEndpointSphereRadius, end_c));
     }
     loop_marker_pub_->publish(markers);
 }
@@ -622,7 +640,7 @@ void RvizPublisher::publishGPSMarkers(const std::vector<SubMap::Ptr>& submaps) {
         if (!sm || !sm->has_valid_gps) continue;
         // 使用优化后位姿，与轨迹一致（子图中心即 GPS 约束节点）
         Eigen::Vector3d pos = sm->pose_w_anchor_optimized.translation();
-        auto sphere = makeSphereMarker("gps", id++, pos, 0.8, makeColor(0.0f, 0.6f, 1.0f, 0.85f));
+        auto sphere = makeSphereMarker("gps", id++, pos, kGpsMarkerSphereRadius, makeColor(0.0f, 0.6f, 1.0f, 0.9f));
         markers.markers.push_back(sphere);
     }
     gps_marker_pub_->publish(markers);
@@ -644,10 +662,10 @@ void RvizPublisher::publishGPSMarkersWithConstraintLines(
         if (gps_idx >= gps_positions_map.size()) break;
         Eigen::Vector3d pos = sm->pose_w_anchor_optimized.translation();
         markers.markers.push_back(
-            makeSphereMarker("gps", sphere_id++, pos, 0.8, makeColor(0.0f, 0.6f, 1.0f, 0.85f)));
+            makeSphereMarker("gps", sphere_id++, pos, kGpsMarkerSphereRadius, makeColor(0.0f, 0.6f, 1.0f, 0.9f)));
         markers.markers.push_back(
             makeLineMarker("gps_constraint_lines", static_cast<int>(gps_idx),
-                           pos, gps_positions_map[gps_idx], line_c, 0.15));
+                           pos, gps_positions_map[gps_idx], line_c, kLoopConstraintLineWidth));
         gps_idx++;
     }
     gps_marker_pub_->publish(markers);
@@ -667,7 +685,7 @@ void RvizPublisher::publishGPSAlignment(const GPSAlignResult& result,
     for (const auto& sm : submaps) {
         if (!sm || !sm->has_valid_gps) continue;
         markers.markers.push_back(makeSphereMarker("gps_aligned", static_cast<int>(markers.markers.size()),
-            sm->pose_w_anchor_optimized.translation(), 0.6, c));
+            sm->pose_w_anchor_optimized.translation(), kGpsAlignedSphereRadius, c));
     }
     gps_marker_pub_->publish(markers);
 }
@@ -703,7 +721,7 @@ void RvizPublisher::publishGPSPositionsInMap(const std::vector<Eigen::Vector3d>&
     std_msgs::msg::ColorRGBA c = makeColor(0.0f, 0.8f, 0.4f, 0.85f);  // 青绿色，表示真实 GPS 位置（地图系）
     for (size_t i = 0; i < positions_map.size(); ++i) {
         markers.markers.push_back(
-            makeSphereMarker("gps_positions_map", static_cast<int>(i), positions_map[i], 0.5, c));
+            makeSphereMarker("gps_positions_map", static_cast<int>(i), positions_map[i], kGpsMarkerSphereRadius, c));
     }
     gps_positions_map_pub_->publish(markers);
 }
