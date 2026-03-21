@@ -14,6 +14,10 @@
 // 约束汇总：grep [CONSTRAINT] 可快速定位 先验/里程计/回环/GPS 的添加结果（ok/skip/defer）
 #define CONSTRAINT_LOG(fmt, ...) \
     RCLCPP_INFO(rclcpp::get_logger("automap_system"), "[CONSTRAINT] " fmt, ##__VA_ARGS__)
+// 后端详细追踪：仅当 backend.verbose_trace=true 时输出，grep BACKEND_TRACE 构成证据链闭环
+#define BACKEND_TRACE(fmt, ...) \
+    do { if (ConfigManager::instance().backendVerboseTrace()) \
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"), "[BACKEND_TRACE] " fmt, ##__VA_ARGS__); } while(0)
 
 #include <rclcpp/rclcpp.hpp>
 #include <gtsam/base/Matrix.h>
@@ -281,6 +285,32 @@ void IncrementalOptimizer::addSubMapNode(int sm_id, const Pose3d& init_pose, boo
         factor_count_++;
     }
 
+    // 子图节点加入后尝试刷入此前因缺节点被 defer 的子图里程计因子，避免孤立 s 节点
+    if (!pending_odom_factors_submap_.empty()) {
+        std::vector<OdomFactorItem> still_pending;
+        int flushed = 0;
+        for (const auto& f : pending_odom_factors_submap_) {
+            if (!node_exists_.count(f.from_id) || !node_exists_.count(f.to_id)) {
+                still_pending.push_back(f);
+                continue;
+            }
+            auto noise = infoToNoiseDiagonal(f.info_matrix);
+            pending_graph_.add(gtsam::BetweenFactor<gtsam::Pose3>(
+                SM(f.from_id), SM(f.to_id), toPose3(f.rel_pose), noise));
+            factor_count_++;
+            flushed++;
+            BACKEND_STEP("step=addSubMapNode_flush_deferred_odom_added from=%d to=%d pending_factors=%zu",
+                f.from_id, f.to_id, pending_graph_.size());
+            CONSTRAINT_LOG("step=odom_submap_deferred from=%d to=%d result=ok factor_count=%d", f.from_id, f.to_id, factor_count_);
+        }
+        pending_odom_factors_submap_ = std::move(still_pending);
+        if (flushed > 0) {
+            RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                "[IncrementalOptimizer][BACKEND][ODOM] addSubMapNode: flushed %d deferred submap odom factors (remain=%zu)",
+                flushed, pending_odom_factors_submap_.size());
+        }
+    }
+
     // 🔧 V2 修复：addSubMapNode 不再直接调用 commitAndUpdate，由调用方在适当时候触发 forceUpdate
     // 这是为了避免在持有 rw_mutex_ 时触发 notifyPoseUpdate 回调导致的死锁
 }
@@ -374,13 +404,13 @@ void IncrementalOptimizer::addOdomFactor(
         from, to, node_exists_.size(), current_estimate_.size(), consecutive_failures_.load());
 
     if (!node_exists_.count(from) || !node_exists_.count(to)) {
-        BACKEND_STEP("step=addOdomFactor_skip from=%d to=%d reason=node_not_exists", from, to);
-        CONSTRAINT_LOG("step=odom from=%d to=%d result=skip reason=node_not_exists (grep CONSTRAINT 定位)", from, to);
+        BACKEND_STEP("step=addOdomFactor_defer from=%d to=%d reason=node_not_exists", from, to);
+        CONSTRAINT_LOG("step=odom from=%d to=%d result=defer reason=node_not_exists (grep CONSTRAINT 定位)", from, to);
         // 🔧 诊断: 详细记录节点不存在的情况
         bool from_in_estimate = current_estimate_.exists(SM(from));
         bool to_in_estimate = current_estimate_.exists(SM(to));
         RCLCPP_WARN(rclcpp::get_logger("automap_system"),
-            "[IncrementalOptimizer][BACKEND][ODOM] skip addOdomFactor from=%d to=%d "
+            "[IncrementalOptimizer][BACKEND][ODOM] defer addOdomFactor from=%d to=%d "
             "(from_exists=%d to_exists=%d node_count=%d) "
             "from_in_estimate=%d to_in_estimate=%d",
             from, to,
@@ -389,6 +419,7 @@ void IncrementalOptimizer::addOdomFactor(
             node_count_,
             from_in_estimate ? 1 : 0,
             to_in_estimate ? 1 : 0);
+        pending_odom_factors_submap_.push_back({from, to, rel, info_matrix});
         return;
     }
 
@@ -461,6 +492,9 @@ OptimizationResult IncrementalOptimizer::addLoopFactor(
     }
     BACKEND_STEP("step=addLoopFactor_enter from=%d to=%d rel_norm=%.4f node_count=%d",
         from, to, rel.translation().norm(), node_count_);
+    BACKEND_TRACE("addLoopFactor ENTER from=%d to=%d rel_t=[%.3f,%.3f,%.3f] node_exists_from=%d node_exists_to=%d",
+        from, to, rel.translation().x(), rel.translation().y(), rel.translation().z(),
+        node_exists_.count(from), node_exists_.count(to));
     // ✅ 修复：使用 try-catch 包裹，防止 GTSAM 内部 SIGSEGV 导致进程崩溃（已持 lk）
     try {
         if (!prior_noise_) return OptimizationResult{};
@@ -550,11 +584,10 @@ OptimizationResult IncrementalOptimizer::addLoopFactor(
             from, to, res.success ? 1 : 0, res.nodes_updated, res.elapsed_ms);
         
         // ✅ V2 修复：在释放锁后通知位姿更新，避免死锁
-        std::unordered_map<int, Pose3d> poses_to_notify = res.submap_poses;
         lk.unlock();
         
-        if (!poses_to_notify.empty()) {
-            notifyPoseUpdate(poses_to_notify);
+        if (!res.submap_poses.empty()) {
+            notifyPoseUpdate(res);
         }
         return res;
     } catch (const std::exception& e) {
@@ -571,15 +604,30 @@ OptimizationResult IncrementalOptimizer::addLoopFactor(
     }
 }
 
+OptimizationResult IncrementalOptimizer::addLoopFactor(const LoopConstraint::Ptr& lc) {
+    if (!lc) return OptimizationResult{};
+    if (lc->keyframe_i >= 0 && lc->keyframe_j >= 0) {
+        const int node_i = lc->submap_i * MAX_KF_PER_SUBMAP + lc->keyframe_i;
+        const int node_j = lc->submap_j * MAX_KF_PER_SUBMAP + lc->keyframe_j;
+        return addLoopFactorBetweenKeyframes(node_i, node_j, lc->delta_T, lc->information);
+    }
+    return addLoopFactor(lc->submap_i, lc->submap_j, lc->delta_T, lc->information);
+}
+
 OptimizationResult IncrementalOptimizer::addLoopFactorBetweenKeyframes(int kf_id_i, int kf_id_j,
                                                                         const Pose3d& rel, const Mat66d& info_matrix) {
     GtsamCallScope scope(GtsamCaller::ISAM2, "addLoopFactorBetweenKeyframes",
-                         "kf_i=" + std::to_string(kf_id_i) + " kf_j=" + std::to_string(kf_id_j), true);
+                         // commitAndUpdate() below already enters a serialized GTSAM scope.
+                         // Keep outer scope unlocked to avoid nested lock self-deadlock.
+                         "kf_i=" + std::to_string(kf_id_i) + " kf_j=" + std::to_string(kf_id_j), false);
     std::unique_lock<std::shared_mutex> lk(rw_mutex_);
     if (!prior_noise_) return OptimizationResult{};
 
+    BACKEND_TRACE("addLoopFactorBetweenKeyframes ENTER kf_i=%d kf_j=%d rel_norm=%.3f",
+        kf_id_i, kf_id_j, rel.translation().norm());
     if (keyframe_node_exists_.find(kf_id_i) == keyframe_node_exists_.end() ||
         keyframe_node_exists_.find(kf_id_j) == keyframe_node_exists_.end()) {
+        BACKEND_TRACE("addLoopFactorBetweenKeyframes SKIP kf_i=%d kf_j=%d reason=node_not_in_graph", kf_id_i, kf_id_j);
         RCLCPP_DEBUG(rclcpp::get_logger("automap_system"),
             "[IncrementalOptimizer][BACKEND] addLoopFactorBetweenKeyframes: nodes %d or %d not in graph, skip", kf_id_i, kf_id_j);
         return OptimizationResult{};
@@ -607,11 +655,10 @@ OptimizationResult IncrementalOptimizer::addLoopFactorBetweenKeyframes(int kf_id
     OptimizationResult res = commitAndUpdate();
     
     // ✅ V2 修复：在释放锁后通知位姿更新，避免死锁
-    std::unordered_map<int, Pose3d> poses_to_notify = res.submap_poses;
     lk.unlock();
     
-    if (!poses_to_notify.empty()) {
-        notifyPoseUpdate(poses_to_notify);
+    if (!res.submap_poses.empty()) {
+        notifyPoseUpdate(res);
     }
     
     scope.setSuccess(res.success);
@@ -637,8 +684,18 @@ void IncrementalOptimizer::addLoopFactorDeferred(int from, int to,
             CONSTRAINT_LOG("step=loop_intra from=%d to=%d result=skip reason=same_node", from, to);
             return;
         }
-        if (node_exists_.find(from) == node_exists_.end() || node_exists_.find(to) == node_exists_.end()) {
+        const bool from_is_kf = (keyframe_node_exists_.find(from) != keyframe_node_exists_.end());
+        const bool to_is_kf = (keyframe_node_exists_.find(to) != keyframe_node_exists_.end());
+        const bool from_is_sm = (node_exists_.find(from) != node_exists_.end());
+        const bool to_is_sm = (node_exists_.find(to) != node_exists_.end());
+        const bool use_kf_path = from_is_kf && to_is_kf;
+        const bool use_sm_path = (!use_kf_path) && from_is_sm && to_is_sm;
+        if (!use_kf_path && !use_sm_path) {
             CONSTRAINT_LOG("step=loop_intra from=%d to=%d result=skip reason=node_not_in_graph", from, to);
+            RCLCPP_WARN(rclcpp::get_logger("automap_system"),
+                "[IncrementalOptimizer][BACKEND][LOOP] addLoopFactorDeferred skip: from=%d(from_is_kf=%d from_is_sm=%d) to=%d(to_is_kf=%d to_is_sm=%d)",
+                from, from_is_kf ? 1 : 0, from_is_sm ? 1 : 0,
+                to, to_is_kf ? 1 : 0, to_is_sm ? 1 : 0);
             return;
         }
         const Eigen::Vector3d& rel_t = rel.translation();
@@ -658,7 +715,11 @@ void IncrementalOptimizer::addLoopFactorDeferred(int from, int to,
         auto base_noise = infoToNoiseDiagonal(info_matrix);
         gtsam::noiseModel::Base::shared_ptr robust_noise = gtsam::noiseModel::Robust::Create(
             gtsam::noiseModel::mEstimator::Huber::Create(1.345), base_noise);
-        pending_graph_.add(gtsam::BetweenFactor<gtsam::Pose3>(SM(from), SM(to), toPose3(rel), robust_noise));
+        if (use_kf_path) {
+            pending_graph_.add(gtsam::BetweenFactor<gtsam::Pose3>(KF(from), KF(to), toPose3(rel), robust_noise));
+        } else {
+            pending_graph_.add(gtsam::BetweenFactor<gtsam::Pose3>(SM(from), SM(to), toPose3(rel), robust_noise));
+        }
         factor_count_++;
         BACKEND_STEP("step=addLoopFactorDeferred_added from=%d to=%d pending_factors=%zu result=ok", from, to, pending_graph_.size());
         CONSTRAINT_LOG("step=loop_intra from=%d to=%d result=ok factor_count=%d (子图内回环 deferred)", from, to, factor_count_);
@@ -893,11 +954,10 @@ void IncrementalOptimizer::addGPSFactorsBatch(const std::vector<GPSFactorItem>& 
                 scope.setSuccess(res.success);
                 
                 // ✅ V2 修复：在释放锁后通知位姿更新，避免死锁
-                std::unordered_map<int, Pose3d> poses_to_notify = res.submap_poses;
                 lk.unlock();
                 
-                if (!poses_to_notify.empty()) {
-                    notifyPoseUpdate(poses_to_notify);
+                if (!res.submap_poses.empty()) {
+                    notifyPoseUpdate(res);
                 }
 
                 RCLCPP_INFO(rclcpp::get_logger("automap_system"),
@@ -996,6 +1056,9 @@ void IncrementalOptimizer::addKeyFrameNode(int kf_id, const Pose3d& init_pose, b
         keyframe_count_,
         has_prior_ ? 1 : 0,
         consecutive_failures_.load());
+    BACKEND_TRACE("addKeyFrameNode ENTER kf_id=%d fixed=%d first_of_sm=%d last_kf=%d pos=[%.2f,%.2f,%.2f]",
+        kf_id, fixed ? 1 : 0, is_first_kf_of_submap ? 1 : 0, last_keyframe_id_,
+        init_pose.translation().x(), init_pose.translation().y(), init_pose.translation().z());
 
     if (!prior_noise_) {
         RCLCPP_WARN(rclcpp::get_logger("automap_system"),
@@ -1023,6 +1086,17 @@ void IncrementalOptimizer::addKeyFrameNode(int kf_id, const Pose3d& init_pose, b
         return;
     }
 
+    // 最小化修复：若 key 已在当前估计中但 map 标记缺失，只恢复存在标记，不再重复入图。
+    // 避免“旧帧补录”被再次串到 last_keyframe_id_ 上，形成错误的反序 Between 约束。
+    if (current_estimate_.exists(KF(kf_id))) {
+        keyframe_node_exists_[kf_id] = true;
+        keyframe_count_ = static_cast<int>(keyframe_node_exists_.size());
+        RCLCPP_WARN(rclcpp::get_logger("automap_system"),
+            "[IncrementalOptimizer][BACKEND][KF_RECOVER] addKeyFrameNode recover-only: kf_id=%d already in current_estimate, skip reinsert/relink",
+            kf_id);
+        return;
+    }
+
     // 验证位姿有效性
     const Eigen::Vector3d& t = init_pose.translation();
     const Eigen::Matrix3d& R = init_pose.rotation();
@@ -1037,6 +1111,8 @@ void IncrementalOptimizer::addKeyFrameNode(int kf_id, const Pose3d& init_pose, b
     keyframe_node_exists_[kf_id] = true;
     keyframe_count_++;
     pending_values_.insert(KF(kf_id), toPose3(init_pose));
+    BACKEND_TRACE("addKeyFrameNode VALUE_INSERT kf_id=%d keyframe_count=%d pending_values=%zu",
+        kf_id, keyframe_count_, pending_values_.size());
 
     {
         std::lock_guard<std::mutex> hlk(history_mutex_);
@@ -1047,6 +1123,10 @@ void IncrementalOptimizer::addKeyFrameNode(int kf_id, const Pose3d& init_pose, b
         d.is_first_kf_of_submap = is_first_kf_of_submap;
         history_keyframe_data_.push_back(d);
     }
+
+    const int prev_last_kf_id = last_keyframe_id_;
+    bool added_prior_factor = false;
+    bool added_between_factor = false;
 
     RCLCPP_INFO(rclcpp::get_logger("automap_system"),
         "[IncrementalOptimizer][BACKEND] addKeyFrameNode: kf_id=%d fixed=%d keyframe_count=%d "
@@ -1079,6 +1159,7 @@ void IncrementalOptimizer::addKeyFrameNode(int kf_id, const Pose3d& init_pose, b
             has_prior_ = true;
             factor_count_++;
             CONSTRAINT_LOG("step=prior_kf kf_id=%d result=ok factor_count=%d (首帧/新子图首帧先验)", kf_id, factor_count_);
+            added_prior_factor = true;
             RCLCPP_INFO(rclcpp::get_logger("automap_system"),
                 "[IncrementalOptimizer][BACKEND] addKeyFrameNode: kf_id=%d ADDED PriorFactor "
                 "(fixed=%d first_of_submap=%d keyframe_count=%d) factor_count=%d pending_graph_size=%zu",
@@ -1094,7 +1175,7 @@ void IncrementalOptimizer::addKeyFrameNode(int kf_id, const Pose3d& init_pose, b
 
     // 🔧 修复欠定与跳变：建立连续的关键帧链
     // 只要有上一帧，就建立 BetweenFactor，无论是否跨子图。这确保了轨迹在几何上的连续性。
-    if (last_keyframe_id_ >= 0) {
+    if (last_keyframe_id_ >= 0 && kf_id > last_keyframe_id_) {
         Pose3d rel = last_keyframe_pose_.inverse() * init_pose;
         const Eigen::Vector3d& t = rel.translation();
         const Eigen::Matrix3d& R = rel.rotation();
@@ -1105,6 +1186,7 @@ void IncrementalOptimizer::addKeyFrameNode(int kf_id, const Pose3d& init_pose, b
             pending_graph_.add(gtsam::BetweenFactor<gtsam::Pose3>(
                 KF(last_keyframe_id_), KF(kf_id), toPose3(rel), noise));
             factor_count_++;
+            added_between_factor = true;
             CONSTRAINT_LOG("step=between_kf from=%d to=%d result=ok factor_count=%d (关键帧间里程计)", last_keyframe_id_, kf_id, factor_count_);
             RCLCPP_INFO(rclcpp::get_logger("automap_system"),
                 "[IncrementalOptimizer][BACKEND][KF_ODOM] addKeyFrameNode: added Between(KF%d, KF%d) factor_count=%d",
@@ -1115,9 +1197,23 @@ void IncrementalOptimizer::addKeyFrameNode(int kf_id, const Pose3d& init_pose, b
                 "[IncrementalOptimizer][BACKEND][KF_ODOM] addKeyFrameNode: skip Between(KF%d, KF%d) rel invalid or too large",
                 last_keyframe_id_, kf_id);
         }
+    } else if (last_keyframe_id_ >= 0) {
+        RCLCPP_WARN(rclcpp::get_logger("automap_system"),
+            "[IncrementalOptimizer][BACKEND][KF_ODOM] addKeyFrameNode: skip non-monotonic relink last_kf=%d new_kf=%d (likely rollback/recovery path)",
+            last_keyframe_id_, kf_id);
     }
     last_keyframe_id_ = kf_id;
     last_keyframe_pose_ = init_pose;
+
+    RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+        "[ISAM2_PRE] addKeyFrameNode kf_id=%d added_prior=%d added_between=%d prev_last_kf=%d has_prior_=%d "
+        "(odom 应在 GPS 批量入图前连接节点，grep ISAM2_DIAG ISOLATED)",
+        kf_id, added_prior_factor ? 1 : 0, added_between_factor ? 1 : 0, prev_last_kf_id, has_prior_ ? 1 : 0);
+    if (!added_prior_factor && !added_between_factor) {
+        RCLCPP_WARN(rclcpp::get_logger("automap_system"),
+            "[ISAM2_PRE][ISOLATED_RISK] kf_id=%d: no Prior/Between added this call — pending batch may leave node underconstrained until next commit (grep ISAM2_DIAG ISOLATED)",
+            kf_id);
+    }
 
     // 🔧 修复2: 添加keyframe节点后，立即刷新pending的GPS因子
     // 这样GPS约束可以在keyframe级别生效，而不是等到submap冻结
@@ -1175,6 +1271,7 @@ void IncrementalOptimizer::addGPSFactorForKeyFrame(int kf_id, const Eigen::Vecto
     // 检查节点是否存在
     auto it = keyframe_node_exists_.find(kf_id);
     if (it == keyframe_node_exists_.end()) {
+        BACKEND_TRACE("addGPSFactorForKeyFrame DEFER kf_id=%d reason=kf_not_in_graph pending=%zu", kf_id, pending_gps_factors_kf_.size() + 1);
         BACKEND_STEP("step=addGPSFactorForKeyFrame_defer kf_id=%d reason=kf_not_in_graph pending_kf=%zu", kf_id, pending_gps_factors_kf_.size() + 1);
         CONSTRAINT_LOG("step=gps_kf kf_id=%d result=defer reason=kf_not_in_graph pending=%zu", kf_id, pending_gps_factors_kf_.size() + 1);
         RCLCPP_DEBUG(rclcpp::get_logger("automap_system"),
@@ -1237,6 +1334,7 @@ void IncrementalOptimizer::addGPSFactorForKeyFrame(int kf_id, const Eigen::Vecto
     auto noise = gtsam::noiseModel::Diagonal::Variances(vars);
     pending_graph_.add(gtsam::GPSFactor(KF(kf_id), gps_point, noise));
     factor_count_++;
+    BACKEND_TRACE("addGPSFactorForKeyFrame ADD kf_id=%d factor_count=%d", kf_id, factor_count_);
     BACKEND_STEP("step=addGPSFactorForKeyFrame_added kf_id=%d pending_factors=%zu result=ok", kf_id, pending_graph_.size());
     CONSTRAINT_LOG("step=gps_kf kf_id=%d result=ok factor_count=%d (关键帧级 GPS 约束)", kf_id, factor_count_);
 
@@ -1316,11 +1414,10 @@ void IncrementalOptimizer::addGPSFactorsForKeyFramesBatch(const std::vector<GPSF
             scope.setSuccess(res.success);
             
             // ✅ V2 修复：在释放锁后通知位姿更新，避免死锁
-            std::unordered_map<int, Pose3d> poses_to_notify = res.submap_poses;
             lk.unlock();
             
-            if (!poses_to_notify.empty()) {
-                notifyPoseUpdate(poses_to_notify);
+            if (!res.submap_poses.empty()) {
+                notifyPoseUpdate(res);
             }
 
             RCLCPP_INFO(rclcpp::get_logger("automap_system"),
@@ -1380,12 +1477,36 @@ int IncrementalOptimizer::flushPendingGPSFactorsForKeyFramesInternal() {
 
 void IncrementalOptimizer::rollbackKeyframeStateForPendingKeys(const std::vector<int>& kf_ids_in_pending) {
     if (kf_ids_in_pending.empty()) return;
+    int first_id = kf_ids_in_pending.front();
+    int last_id = kf_ids_in_pending.back();
+    BACKEND_TRACE("rollbackKeyframeStateForPendingKeys ENTER count=%zu first=%d last=%d",
+        kf_ids_in_pending.size(), first_id, last_id);
     for (int id : kf_ids_in_pending) {
         keyframe_node_exists_.erase(id);
     }
     keyframe_count_ = static_cast<int>(keyframe_node_exists_.size());
     bool removed_last = (std::find(kf_ids_in_pending.begin(), kf_ids_in_pending.end(), last_keyframe_id_) != kf_ids_in_pending.end());
-    if (removed_last) last_keyframe_id_ = -1;
+    if (removed_last) {
+        if (keyframe_node_exists_.empty()) {
+            last_keyframe_id_ = -1;
+            last_keyframe_pose_ = Pose3d::Identity();
+        } else {
+            int max_kf_id = -1;
+            for (const auto& kv : keyframe_node_exists_) {
+                if (kv.first > max_kf_id) max_kf_id = kv.first;
+            }
+            last_keyframe_id_ = max_kf_id;
+            if (max_kf_id >= 0 && current_estimate_.exists(KF(max_kf_id))) {
+                try {
+                    last_keyframe_pose_ = fromPose3(current_estimate_.at<gtsam::Pose3>(KF(max_kf_id)));
+                } catch (...) {
+                    last_keyframe_pose_ = Pose3d::Identity();
+                }
+            } else {
+                last_keyframe_pose_ = Pose3d::Identity();
+            }
+        }
+    }
     RCLCPP_WARN(rclcpp::get_logger("automap_system"),
         "[IncrementalOptimizer][BACKEND][VALIDATION] rollbackKeyframeStateForPendingKeys: removed %zu KF ids, keyframe_count_=%d last_keyframe_id_=%d (grep BACKEND VALIDATION)",
         kf_ids_in_pending.size(), keyframe_count_, last_keyframe_id_);
@@ -1456,8 +1577,8 @@ OptimizationResult IncrementalOptimizer::forceUpdate() {
         lk.unlock();
 
         // ✅ V2 修复：在锁外触发位姿更新回调，避免死锁
-        if (!res.submap_poses.empty()) {
-            notifyPoseUpdate(res.submap_poses);
+        if (!res.submap_poses.empty() || !res.keyframe_poses.empty()) {
+            notifyPoseUpdate(res);
         }
 
         double force_elapsed_ms = std::chrono::duration<double, std::milli>(
@@ -1537,16 +1658,30 @@ void IncrementalOptimizer::addOdomFactorBetweenKeyframes(int from, int to, const
     std::unique_lock<std::shared_mutex> lk(rw_mutex_);
     if (!prior_noise_) return;
 
+    BACKEND_TRACE("addOdomFactorBetweenKeyframes ENTER from=%d to=%d rel_norm=%.3f kf_exists_sz=%zu",
+        from, to, rel.translation().norm(), keyframe_node_exists_.size());
     if (keyframe_node_exists_.find(from) == keyframe_node_exists_.end() ||
         keyframe_node_exists_.find(to) == keyframe_node_exists_.end()) {
-        RCLCPP_DEBUG(rclcpp::get_logger("automap_system"),
-            "[IncrementalOptimizer][BACKEND] addOdomFactorBetweenKeyframes: nodes %d or %d not in graph, skip", from, to);
+        const bool from_exists = (keyframe_node_exists_.find(from) != keyframe_node_exists_.end());
+        const bool to_exists = (keyframe_node_exists_.find(to) != keyframe_node_exists_.end());
+        RCLCPP_WARN(rclcpp::get_logger("automap_system"),
+            "[IncrementalOptimizer][BACKEND][KF_ODOM] addOdomFactorBetweenKeyframes skip: from=%d exists=%d to=%d exists=%d "
+            "keyframe_node_exists_size=%zu keyframe_count_=%d last_keyframe_id_=%d "
+            "hint=%s (grep KF_ODOM)",
+            from, from_exists ? 1 : 0, to, to_exists ? 1 : 0, keyframe_node_exists_.size(),
+            keyframe_count_, last_keyframe_id_,
+            (!from_exists || !to_exists)
+                ? "graph_rollback_or_pending_clear_desync_retry_next_kf"
+                : "unexpected");
+        BACKEND_TRACE("addOdomFactorBetweenKeyframes SKIP from=%d to=%d reason=node_not_in_graph", from, to);
+        scope.setSuccess(true);
         return;
     }
 
     auto noise = infoToNoiseDiagonal(info_matrix);
     pending_graph_.add(gtsam::BetweenFactor<gtsam::Pose3>(KF(from), KF(to), toPose3(rel), noise));
     factor_count_++;
+    BACKEND_TRACE("addOdomFactorBetweenKeyframes ADD from=%d to=%d factor_count=%d", from, to, factor_count_);
 
     {
         std::lock_guard<std::mutex> hlk(history_mutex_);
@@ -1742,6 +1877,8 @@ OptimizationResult IncrementalOptimizer::commitAndUpdate() {
                 "[ISAM2_DIAG][CRITICAL] DEFER single-node update (factors=%zu values=%zu types=[%s]) "
                 "- avoid GTSAM first-update double free (borglab/gtsam#1189), pending until 2+ nodes or timeout (%.1fms/%.0fms)",
                 pf, pv, factor_types_str.c_str(), pending_duration_ms, (double)kSingleNodePendingTimeoutMs);
+            BACKEND_TRACE("commitAndUpdate DEFER reason=%s factors=%zu values=%zu",
+                single_prior_only ? "single_prior" : "all_factors_same_key", pf, pv);
             BACKEND_STEP("step=commitAndUpdate_defer reason=%s factors=%zu values=%zu result=deferred",
                 single_prior_only ? "single_prior" : "all_factors_same_key", pf, pv);
             RCLCPP_INFO(rclcpp::get_logger("automap_system"),
@@ -1757,6 +1894,8 @@ OptimizationResult IncrementalOptimizer::commitAndUpdate() {
 
     // ✅ 孤立节点提前中止：避免进入 isam2_.update 后 GTSAM 抛出 IndeterminantLinearSystemException
     if (has_isolated_node) {
+        BACKEND_TRACE("commitAndUpdate ABORT reason=has_isolated_node pending_factors=%zu pending_values=%zu",
+            pf, pv);
         RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
             "[IncrementalOptimizer][BACKEND][CONSTRAINT] ABORT commitAndUpdate: isolated node(s) detected - clearing pending to avoid IndeterminantLinearSystemException (grep BACKEND CONSTRAINT)");
         std::vector<int> kf_ids_in_pending;
@@ -2128,7 +2267,8 @@ OptimizationResult IncrementalOptimizer::commitAndUpdate() {
     double elapsed = std::chrono::duration<double, std::milli>(t1 - t0).count();
 
     // 提取所有位姿（先 exists 再 at，避免异常控制流，符合 GTSAM 推荐用法）
-    std::unordered_map<int, Pose3d> poses;
+    std::unordered_map<int, Pose3d> sm_poses;
+    std::unordered_map<uint64_t, Pose3d> kf_poses;
     try {
         // 1. 提取子图级节点 (Symbol 's')
         for (const auto& kv : node_exists_) {
@@ -2136,17 +2276,17 @@ OptimizationResult IncrementalOptimizer::commitAndUpdate() {
             gtsam::Key key = SM(id);
             if (current_estimate_.exists(key)) {
                 auto p = current_estimate_.at<gtsam::Pose3>(key);
-                poses[id] = fromPose3(p);
+                sm_poses[id] = fromPose3(p);
             }
         }
         
         // 2. 提取关键帧级节点 (Symbol 'x')
         for (const auto& kv : keyframe_node_exists_) {
-            int id = kv.first;
+            uint64_t id = kv.first;
             gtsam::Key key = KF(id);
             if (current_estimate_.exists(key)) {
                 auto p = current_estimate_.at<gtsam::Pose3>(key);
-                poses[id] = fromPose3(p);
+                kf_poses[id] = fromPose3(p);
             }
         }
     } catch (const std::exception& e) {
@@ -2154,50 +2294,45 @@ OptimizationResult IncrementalOptimizer::commitAndUpdate() {
             "[IncrementalOptimizer][EXCEPTION] commitAndUpdate extraction failed: %s", e.what());
     }
 
-    BACKEND_STEP("step=commitAndUpdate_extract_poses node_exists=%zu keyframe_node_exists=%zu estimate_size=%zu poses_extracted=%zu elapsed_ms=%.1f",
-        node_exists_.size(), keyframe_node_exists_.size(), current_estimate_.size(), poses.size(), elapsed);
+    BACKEND_STEP("step=commitAndUpdate_extract_poses node_exists=%zu keyframe_node_exists=%zu estimate_size=%zu sm_extracted=%zu kf_extracted=%zu elapsed_ms=%.1f",
+        node_exists_.size(), keyframe_node_exists_.size(), current_estimate_.size(), sm_poses.size(), kf_poses.size(), elapsed);
 
     // [ISAM2_GHOSTING_DIAG] 重影排查：本次 iSAM2 即将通知的位姿摘要（与 onPoseUpdated / map_publish 时序对照）
-    {
-        int sm_count = 0;
-        int kf_count = 0;
-        for (const auto& [id, pose] : poses) {
-            if (id < 100000) sm_count++;
-            else kf_count++;
-        }
-        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-            "[ISAM2_GHOSTING_DIAG] commitAndUpdate_extract: total_poses=%zu (sm=%d kf=%d) elapsed_ms=%.1f (即将返回，由调用方在锁外 notifyPoseUpdate)",
-            poses.size(), sm_count, kf_count, elapsed);
-    }
-    // 后端图优化后：记录本次提取的所有子图位姿（便于与 backend_before / hba_before / hba_after 对比）
+    RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+        "[ISAM2_GHOSTING_DIAG] commitAndUpdate_extract: total_poses=%zu (sm=%zu kf=%zu) elapsed_ms=%.1f (即将返回，由调用方在锁外 notifyPoseUpdate)",
+        sm_poses.size() + kf_poses.size(), sm_poses.size(), kf_poses.size(), elapsed);
+
+    // 后端图优化后：记录所有提取的位姿（用于追踪）
     {
         auto log = rclcpp::get_logger("automap_system");
-        for (const auto& [id, pose] : poses) {
-            logSubmapPoseTrace(log, "backend_after", id, pose);
+        for (const auto& [id, pose] : sm_poses) {
+            logSubmapPoseTrace(log, "backend_after_sm", id, pose);
+        }
+        for (const auto& [id, pose] : kf_poses) {
+            logSubmapPoseTrace(log, "backend_after_kf", id, pose);
         }
     }
 
     OptimizationResult res;
-    res.nodes_updated = (int)poses.size();
+    res.success = true;
+    res.nodes_updated = (int)(sm_poses.size() + kf_poses.size());
     res.elapsed_ms    = elapsed;
-    res.submap_poses  = poses;
-    // 若未提取到任何位姿（estimate 与 node_exists_ 不一致），视为失败并打清原因，便于 addLoopFactor 等调用方排查
-    if (poses.size() == 0 && node_exists_.size() > 0) {
+    res.submap_poses  = sm_poses;
+    res.keyframe_poses = kf_poses;
+    
+    // 若未提取到任何位姿（estimate 与 node_exists_ 不一致），视为失败并打清原因
+    if (res.nodes_updated == 0 && (node_exists_.size() > 0 || keyframe_node_exists_.size() > 0)) {
         res.success = false;
         BACKEND_STEP("step=commitAndUpdate_done result=fail reason=no_poses_extracted");
-        RCLCPP_WARN(rclcpp::get_logger("automap_system"),
-            "[IncrementalOptimizer][BACKEND] commitAndUpdate success=false reason=no_poses_extracted node_exists_=%zu current_estimate_.size=%zu (grep BACKEND)",
-            node_exists_.size(), current_estimate_.size());
     } else {
-        res.success = true;
         BACKEND_STEP("step=commitAndUpdate_done result=ok nodes_updated=%d elapsed_ms=%.1f", res.nodes_updated, elapsed);
     }
 
     // 健康检查：node_exists_ 与 current_estimate_ 一致性（V5 首次路径或异常后可能不一致）
-    if (poses.size() != node_exists_.size()) {
+    if (sm_poses.size() != node_exists_.size()) {
         RCLCPP_WARN(rclcpp::get_logger("automap_system"),
             "[IncrementalOptimizer][BACKEND][HEALTH] pose count mismatch: poses=%zu node_exists_=%zu path=%s (grep BACKEND HEALTH)",
-            poses.size(), node_exists_.size(), used_first_update_three_phase ? "first_V5" : "incremental");
+            sm_poses.size(), node_exists_.size(), used_first_update_three_phase ? "first_V5" : "incremental");
     }
 
     // V1: 单次 update 耗时分布与队列深度；V2: 可观测性 last success
@@ -2252,7 +2387,7 @@ OptimizationResult IncrementalOptimizer::commitAndUpdate() {
         scope.setSuccess(false);
         RCLCPP_WARN(rclcpp::get_logger("automap_system"),
             "[IncrementalOptimizer][BACKEND] commitAndUpdate FAILED: path=%s elapsed_ms=%.1f nodes=%zu (trying extract anyway)",
-            path_str, res.elapsed_ms, poses.size());
+            path_str, res.elapsed_ms, static_cast<size_t>(res.nodes_updated));
 
         // ✅ V2 修复：不再在 commitAndUpdate 内触发 notifyPoseUpdate，避免持锁回调死锁
     }
@@ -2396,6 +2531,7 @@ void IncrementalOptimizer::rebuildAfterGPSAlign(const std::vector<SubmapData>& s
     current_estimate_.clear();
     node_exists_.clear();
     keyframe_node_exists_.clear();
+    pending_odom_factors_submap_.clear();
     keyframe_count_ = 0;
     last_keyframe_id_ = -1;
     node_count_ = 0;
@@ -2475,44 +2611,27 @@ std::unordered_map<int, Pose3d> IncrementalOptimizer::getAllPoses() const {
     std::shared_lock<std::shared_mutex> lk(rw_mutex_);
     std::unordered_map<int, Pose3d> out;
 
-    // 🔧 增强: 记录当前状态
-    RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-        "[IncrementalOptimizer][DIAG] getAllPoses: node_exists_ size=%zu current_estimate_ size=%zu",
-        node_exists_.size(), current_estimate_.size());
-
-    int found_count = 0;
-    int not_in_estimate_count = 0;
     for (const auto& kv : node_exists_) {
         int id = kv.first;
         gtsam::Key key = SM(id);
-        if (!current_estimate_.exists(key)) {
-            not_in_estimate_count++;
-            ALOG_ERROR(MOD, "getAllPoses sm_id={} not in current_estimate, skip", id);
-            RCLCPP_DEBUG(rclcpp::get_logger("automap_system"),
-                "[IncrementalOptimizer][DIAG] getAllPoses: sm_id=%d not in current_estimate_ (node exists but estimate missing)",
-                id);
-            continue;
-        }
-        try {
-            auto p = current_estimate_.at<gtsam::Pose3>(key);
-            out[id] = fromPose3(p);
-            found_count++;
-        } catch (const std::exception& e) {
-            ALOG_ERROR(MOD, "getAllPoses sm_id={} exception: {}", id, e.what());
-            RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
-                "[IncrementalOptimizer][EXCEPTION] getAllPoses sm_id=%d: %s", id, e.what());
-        } catch (...) {
-            ALOG_ERROR(MOD, "getAllPoses sm_id={} unknown exception", id);
-            RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
-                "[IncrementalOptimizer][EXCEPTION] getAllPoses sm_id=%d: unknown exception", id);
+        if (current_estimate_.exists(key)) {
+            out[id] = fromPose3(current_estimate_.at<gtsam::Pose3>(key));
         }
     }
+    return out;
+}
 
-    // 🔧 增强: 记录查询结果
-    RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-        "[IncrementalOptimizer][DIAG] getAllPoses: found=%d not_in_estimate=%d total_requested=%zu",
-        found_count, not_in_estimate_count, node_exists_.size());
+std::unordered_map<uint64_t, Pose3d> IncrementalOptimizer::getAllKeyFramePoses() const {
+    std::shared_lock<std::shared_mutex> lk(rw_mutex_);
+    std::unordered_map<uint64_t, Pose3d> out;
 
+    for (const auto& kv : keyframe_node_exists_) {
+        uint64_t id = kv.first;
+        gtsam::Key key = KF(id);
+        if (current_estimate_.exists(key)) {
+            out[id] = fromPose3(current_estimate_.at<gtsam::Pose3>(key));
+        }
+    }
     return out;
 }
 
@@ -2532,6 +2651,7 @@ void IncrementalOptimizer::reset() {
     current_estimate_.clear();
     node_exists_.clear();
     keyframe_node_exists_.clear();
+    pending_odom_factors_submap_.clear();
     keyframe_count_ = 0;
     last_keyframe_id_ = -1;
     pending_gps_factors_.clear();
@@ -2663,9 +2783,9 @@ IncrementalOptimizer::infoToNoise(const Mat66d& info) const {
     return gtsam::noiseModel::Gaussian::Covariance(cov);
 }
 
-void IncrementalOptimizer::notifyPoseUpdate(const std::unordered_map<int, Pose3d>& poses) {
+void IncrementalOptimizer::notifyPoseUpdate(const OptimizationResult& res) {
     for (auto& cb : pose_update_cbs_) {
-        cb(poses);
+        cb(res);
     }
 }
 
@@ -2803,6 +2923,7 @@ void IncrementalOptimizer::resetForRecovery() {
     pending_graph_.resize(0);
     pending_values_.clear();
     current_estimate_.clear();
+    pending_odom_factors_submap_.clear();
 
     // 重建 ISAM2
     gtsam::ISAM2Params params;

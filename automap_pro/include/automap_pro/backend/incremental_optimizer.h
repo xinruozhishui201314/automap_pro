@@ -140,6 +140,7 @@ public:
     std::optional<Pose3d> getPoseOptional(int sm_id) const;
 
     std::unordered_map<int, Pose3d> getAllPoses() const;
+    std::unordered_map<uint64_t, Pose3d> getAllKeyFramePoses() const;
 
     /**
      * @brief 检查节点是否存在于因子图但不在 current_estimate_ 中
@@ -193,7 +194,8 @@ public:
     int factorCount() const;
 
     // ── 回调 ─────────────────────────────────────────────────────────────
-    using PoseUpdateCallback = std::function<void(const std::unordered_map<int, Pose3d>&)>;
+    /** 位姿更新回调类型：返回优化后的子图与关键帧位姿 */
+    using PoseUpdateCallback = std::function<void(const OptimizationResult&)>;
     void registerPoseUpdateCallback(PoseUpdateCallback cb) {
         pose_update_cbs_.push_back(std::move(cb));
     }
@@ -349,10 +351,12 @@ private:
     /** 从信息矩阵对角线构造 Diagonal 噪声，避免 Gaussian::Covariance 在 linearize 路径 double free */
     gtsam::noiseModel::Diagonal::shared_ptr infoToNoiseDiagonal(const Mat66d& info) const;
     OptimizationResult commitAndUpdate();
-    void notifyPoseUpdate(const std::unordered_map<int, Pose3d>& poses);
+    void notifyPoseUpdate(const OptimizationResult& res);
 
     /** 首节点 defer 时无法加 GPS 因子，缓存待 forceUpdate 成功后补加 */
     std::vector<GPSFactorItem> pending_gps_factors_;
+    /** 子图里程计缺节点时延迟入图，避免新增 submap 节点孤立 */
+    std::vector<OdomFactorItem> pending_odom_factors_submap_;
     /** KeyFrame 级别 pending GPS 因子 */
     std::vector<GPSFactorItemKF> pending_gps_factors_kf_;
     /** 内部版本：假设锁已由调用者持有（由 public flushPendingGPSFactors 调用） */

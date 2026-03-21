@@ -10,6 +10,25 @@
 
 namespace automap_pro {
 
+namespace {
+const char* optTaskTypeName(OptTaskItem::Type t) {
+    switch (t) {
+        case OptTaskItem::Type::LOOP_FACTOR: return "LOOP_FACTOR";
+        case OptTaskItem::Type::GPS_FACTOR: return "GPS_FACTOR";
+        case OptTaskItem::Type::SUBMAP_NODE: return "SUBMAP_NODE";
+        case OptTaskItem::Type::ODOM_FACTOR: return "ODOM_FACTOR";
+        case OptTaskItem::Type::REBUILD: return "REBUILD";
+        case OptTaskItem::Type::GPS_ALIGN_COMPLETE: return "GPS_ALIGN_COMPLETE";
+        case OptTaskItem::Type::RESET: return "RESET";
+        case OptTaskItem::Type::FORCE_UPDATE: return "FORCE_UPDATE";
+        case OptTaskItem::Type::INTRA_LOOP_BATCH: return "INTRA_LOOP_BATCH";
+        case OptTaskItem::Type::KEYFRAME_CREATE: return "KEYFRAME_CREATE";
+        case OptTaskItem::Type::ACTIVE_SUBMAP_GPS_BIND: return "ACTIVE_SUBMAP_GPS_BIND";
+        default: return "UNKNOWN";
+    }
+}
+}  // namespace
+
 void AutoMapSystem::feederLoop() {
 #ifdef __linux__
     pthread_setname_np(pthread_self(), "automap_feeder");
@@ -26,6 +45,8 @@ void AutoMapSystem::feederLoop() {
     {
         std::unique_lock<std::mutex> lock(status_pub_mutex_);
         status_pub_cv_.wait(lock, [this] { return shutdown_requested_.load(std::memory_order_acquire); });
+        // 唤醒即更新心跳，避免 shutdown 前误报 Feeder stale（正常建图期仍依赖 checkThreadHeartbeats 跳过 Feeder）
+        feeder_heartbeat_ts_ms_.store(nowMs(), std::memory_order_release);
     }
 
     RCLCPP_INFO(get_logger(), "[AutoMapSystem][FEEDER] shutdown requested, stopping frame_processor_");
@@ -572,6 +593,9 @@ void AutoMapSystem::gpsAlignWorkerLoop() {
                 RCLCPP_INFO(get_logger(), "[AutoMapSystem][GPS_ALIGN_WORKER] system already aligned, skipping task");
                 continue;
             }
+            pose_update_barrier_active_.store(true, std::memory_order_release);
+            RCLCPP_INFO(get_logger(),
+                        "[AutoMapSystem][POSE_TX][BARRIER] activated reason=GPS_ALIGN begin");
 
             // 1. 设置 GPS 对齐状态和变换矩阵 (Map -> ENU 逆变换)
             {
@@ -606,11 +630,23 @@ void AutoMapSystem::gpsAlignWorkerLoop() {
                 // 将 isam2 拿到的 local 位姿也转换到全球坐标系，保证 rebuild 后的图直接在全球系工作
                 Eigen::Matrix3d R_inv = align_task.R_enu_to_map.transpose();
                 Eigen::Vector3d t_inv = -R_inv * align_task.t_enu_to_map;
+                int sampled_sm_logs = 0;
                 for (auto& d : submap_data) {
+                    const Eigen::Vector3d before_t = d.pose.translation();
                     Pose3d T = Pose3d::Identity();
                     T.linear() = R_inv * d.pose.linear();
                     T.translation() = R_inv * d.pose.translation() + t_inv;
                     d.pose = T;
+                    if (sampled_sm_logs < 5) {
+                        const Eigen::Vector3d after_t = d.pose.translation();
+                        RCLCPP_INFO(get_logger(),
+                            "[AutoMapSystem][GPS_ALIGN_WORKER][REBUILD_SM] sm_id=%d before=[%.3f,%.3f,%.3f] after=[%.3f,%.3f,%.3f] dtrans=%.3fm",
+                            d.id,
+                            before_t.x(), before_t.y(), before_t.z(),
+                            after_t.x(), after_t.y(), after_t.z(),
+                            (after_t - before_t).norm());
+                        sampled_sm_logs++;
+                    }
                 }
             }
             auto odom_factors = isam2_optimizer_.getOdomFactors();
@@ -623,11 +659,23 @@ void AutoMapSystem::gpsAlignWorkerLoop() {
                 // 将 keyframe 位姿也转换到全球坐标系
                 Eigen::Matrix3d R_inv = align_task.R_enu_to_map.transpose();
                 Eigen::Vector3d t_inv = -R_inv * align_task.t_enu_to_map;
+                int sampled_kf_logs = 0;
                 for (auto& d : keyframe_data) {
+                    const Eigen::Vector3d before_t = d.pose.translation();
                     Pose3d T = Pose3d::Identity();
                     T.linear() = R_inv * d.pose.linear();
                     T.translation() = R_inv * d.pose.translation() + t_inv;
                     d.pose = T;
+                    if (sampled_kf_logs < 8) {
+                        const Eigen::Vector3d after_t = d.pose.translation();
+                        RCLCPP_INFO(get_logger(),
+                            "[AutoMapSystem][GPS_ALIGN_WORKER][REBUILD_KF] kf_id=%d before=[%.3f,%.3f,%.3f] after=[%.3f,%.3f,%.3f] dtrans=%.3fm",
+                            d.id,
+                            before_t.x(), before_t.y(), before_t.z(),
+                            after_t.x(), after_t.y(), after_t.z(),
+                            (after_t - before_t).norm());
+                        sampled_kf_logs++;
+                    }
                 }
             }
 
@@ -657,6 +705,10 @@ void AutoMapSystem::gpsAlignWorkerLoop() {
             
             if (!enqueued) {
                 RCLCPP_ERROR(get_logger(), "[AutoMapSystem][GPS_ALIGN_WORKER] Failed to enqueue GPS_ALIGN_COMPLETE task after %d tries, queue full!", max_tries);
+                pose_update_barrier_active_.store(false, std::memory_order_release);
+                RCLCPP_WARN(get_logger(),
+                            "[AutoMapSystem][POSE_TX][BARRIER] deactivated reason=GPS_ALIGN enqueue_failed");
+                flushDeferredPoseUpdates();
             }
 
             RCLCPP_INFO(get_logger(), "[AutoMapSystem][GPS_ALIGN_WORKER] GPS align task processed");
@@ -676,11 +728,16 @@ void AutoMapSystem::optWorkerLoop() {
     // 性能统计
     static std::atomic<int64_t> total_task_time_ms{0};
     static std::atomic<int> task_count{0};
+    auto deferredPoseTxSize = [this]() -> size_t {
+        std::lock_guard<std::mutex> lk(deferred_pose_updates_mutex_);
+        return deferred_pose_updates_.size();
+    };
 
     while (!shutdown_requested_.load(std::memory_order_acquire)) {
         opt_worker_heartbeat_ts_ms_.store(nowMs(), std::memory_order_release);
         OptTaskItem task;
         bool has_task = false;
+        size_t queue_size_after_pop = 0;
         {
             std::unique_lock<std::mutex> lock(opt_task_mutex_);
             const bool task_woke = opt_task_cv_.wait_for(lock, std::chrono::milliseconds(500), [this] {
@@ -690,10 +747,17 @@ void AutoMapSystem::optWorkerLoop() {
             if (!task_woke || opt_task_queue_.empty()) continue;
             task = opt_task_queue_.front();
             opt_task_queue_.pop_front();
+            queue_size_after_pop = opt_task_queue_.size();
             has_task = true;
         }
         if (has_task) {
             opt_task_in_progress_.store(true, std::memory_order_release);
+            RCLCPP_INFO(get_logger(),
+                "[AutoMapSystem][OPT_WORKER][TASK_BEGIN] type=%s queue_after_pop=%zu barrier_active=%d deferred_pose_tx=%zu",
+                optTaskTypeName(task.type),
+                queue_size_after_pop,
+                pose_update_barrier_active_.load(std::memory_order_acquire) ? 1 : 0,
+                deferredPoseTxSize());
 
             const auto t0 = std::chrono::steady_clock::now();
             std::string task_type_name;
@@ -702,12 +766,25 @@ void AutoMapSystem::optWorkerLoop() {
                     case OptTaskItem::Type::LOOP_FACTOR: {
                         task_type_name = "LOOP_FACTOR";
                         if (task.loop_constraint) {
+                            const auto& lc = *task.loop_constraint;
+                            if (ConfigManager::instance().backendVerboseTrace()) {
+                                RCLCPP_INFO(get_logger(),
+                                    "[BACKEND_TRACE] opt_worker LOOP_FACTOR sm_i=%d sm_j=%d kf_idx_i=%d kf_idx_j=%d "
+                                    "kf_global_i=%d kf_global_j=%d score=%.4f rmse=%.4f",
+                                    lc.submap_i, lc.submap_j, lc.keyframe_i, lc.keyframe_j,
+                                    lc.keyframe_global_id_i, lc.keyframe_global_id_j,
+                                    static_cast<double>(lc.overlap_score), static_cast<double>(lc.rmse));
+                            }
                             isam2_optimizer_.addLoopFactor(task.loop_constraint);
                         }
                         break;
                     }
                     case OptTaskItem::Type::GPS_FACTOR: {
                         task_type_name = "GPS_FACTOR";
+                        if (ConfigManager::instance().backendVerboseTrace()) {
+                            RCLCPP_INFO(get_logger(), "[BACKEND_TRACE] opt_worker GPS_FACTOR to_id=%d pos=[%.2f,%.2f,%.2f]",
+                                task.to_id, task.gps_pos.x(), task.gps_pos.y(), task.gps_pos.z());
+                        }
                         isam2_optimizer_.addGPSFactor(task.to_id, task.gps_pos, task.gps_cov);
                         break;
                     }
@@ -718,6 +795,10 @@ void AutoMapSystem::optWorkerLoop() {
                     }
                     case OptTaskItem::Type::ODOM_FACTOR: {
                         task_type_name = "ODOM_FACTOR";
+                        if (ConfigManager::instance().backendVerboseTrace()) {
+                            RCLCPP_INFO(get_logger(), "[BACKEND_TRACE] opt_worker ODOM_FACTOR from=%d to=%d rel_norm=%.3f",
+                                task.from_id, task.to_id, task.rel_pose.translation().norm());
+                        }
                         isam2_optimizer_.addOdomFactor(task.from_id, task.to_id, task.rel_pose, task.info_matrix);
                         break;
                     }
@@ -735,6 +816,10 @@ void AutoMapSystem::optWorkerLoop() {
                             task.submap_data, task.odom_factors, task.loop_factors,
                             task.keyframe_data, task.kf_odom_factors, task.kf_loop_factors);
                         addBatchGPSFactors();
+                        pose_update_barrier_active_.store(false, std::memory_order_release);
+                        RCLCPP_INFO(get_logger(),
+                                    "[AutoMapSystem][POSE_TX][BARRIER] deactivated reason=GPS_ALIGN_COMPLETE");
+                        flushDeferredPoseUpdates();
                         RCLCPP_INFO(get_logger(), "[AutoMapSystem][OPT_WORKER] GPS_ALIGN_COMPLETE processed");
                         break;
                     }
@@ -747,6 +832,9 @@ void AutoMapSystem::optWorkerLoop() {
                     }
                     case OptTaskItem::Type::FORCE_UPDATE: {
                         task_type_name = "FORCE_UPDATE";
+                        if (ConfigManager::instance().backendVerboseTrace()) {
+                            RCLCPP_INFO(get_logger(), "[BACKEND_TRACE] opt_worker FORCE_UPDATE ENTER");
+                        }
                         RCLCPP_INFO(get_logger(), "[AutoMapSystem][OPT_WORKER] processing FORCE_UPDATE task");
                         auto result = isam2_optimizer_.forceUpdate();
                         RCLCPP_INFO(get_logger(), "[AutoMapSystem][OPT_WORKER] FORCE_UPDATE done: success=%d nodes=%d elapsed_ms=%.1f",
@@ -757,21 +845,8 @@ void AutoMapSystem::optWorkerLoop() {
                         task_type_name = "INTRA_LOOP_BATCH";
                         if (!task.intra_loop_submap || task.intra_loop_constraints.empty()) break;
                         const auto& sm = task.intra_loop_submap;
-                        for (const auto& lc : task.intra_loop_constraints) {
-                            if (!lc) continue;
-                            // 🔧 V2 修复：使用一致的 ID 编码方案 (sm_id * 100000 + kf_idx)
-                            int node_i = lc->submap_i * MAX_KF_PER_SUBMAP + lc->keyframe_i;
-                            int node_j = lc->submap_j * MAX_KF_PER_SUBMAP + lc->keyframe_j;
-                            const auto& kf_i = sm->keyframes[lc->keyframe_i];
-                            const auto& kf_j = sm->keyframes[lc->keyframe_j];
-                            if (kf_i && kf_j) {
-                                // 🔧 V2 修复：使用 addKeyFrameNode (Symbol 'x') 而非 addSubMapNode (Symbol 's')
-                                isam2_optimizer_.addKeyFrameNode(node_i, kf_i->T_w_b, false);
-                                isam2_optimizer_.addKeyFrameNode(node_j, kf_j->T_w_b, false);
-                                isam2_optimizer_.addLoopFactorDeferred(node_i, node_j, lc->delta_T, lc->information);
-                            }
-                        }
-                        isam2_optimizer_.forceUpdate();
+                        // 最小化修复：子图内回环在 detectIntraSubmapLoop 中已通过 loop callback -> LOOP_FACTOR 入图。
+                        // 这里不再重复 addLoopFactorDeferred，避免同一回环双路径重复入图导致图被过度拉扯。
                         if (task.intra_loop_query_keyframe_idx >= 0 && task.intra_loop_query_keyframe_idx < static_cast<int>(sm->keyframes.size())) {
                             const auto& qkf = sm->keyframes[task.intra_loop_query_keyframe_idx];
                             if (qkf) {
@@ -790,6 +865,11 @@ void AutoMapSystem::optWorkerLoop() {
                         task_type_name = "KEYFRAME_CREATE";
                         if (task.keyframe) {
                             auto kf = task.keyframe;
+                            if (ConfigManager::instance().backendVerboseTrace()) {
+                                const int node_id = kf->submap_id * MAX_KF_PER_SUBMAP + kf->index_in_submap;
+                                RCLCPP_INFO(get_logger(), "[BACKEND_TRACE] opt_worker KEYFRAME_CREATE ENTER kf_id=%lu node_id=%d has_prev=%d",
+                                    static_cast<unsigned long>(kf->id), node_id, task.has_prev_kf ? 1 : 0);
+                            }
 
                             // 🔧 V2 修复：不再在 optWorkerLoop 中重复应用 GPS 变换，AutoMapSystem::tryCreateKeyFrame 已应用
                             /*
@@ -832,6 +912,16 @@ void AutoMapSystem::optWorkerLoop() {
                                     Pose3d rel = prev_kf->T_w_b.inverse() * kf->T_w_b;
                                     Mat66d info = computeOdomInfoMatrixForKeyframes(prev_kf, kf, rel);
                                     // 🔧 V2 修复：使用 addOdomFactorBetweenKeyframes (Symbol 'x')
+                                    if (ConfigManager::instance().backendVerboseTrace()) {
+                                        const double rel_trans = rel.translation().norm();
+                                        const double rel_rot_deg =
+                                            std::abs(Eigen::AngleAxisd(rel.rotation()).angle()) * 180.0 / M_PI;
+                                        RCLCPP_INFO(get_logger(),
+                                            "[BACKEND_TRACE] opt_worker KF_ODOM prev_kf_id=%lu curr_kf_id=%lu "
+                                            "prev_node=%d curr_node=%d rel_trans_m=%.3f rel_rot_deg=%.2f",
+                                            static_cast<unsigned long>(prev_kf->id), static_cast<unsigned long>(kf->id),
+                                            prev_node_id, node_id, rel_trans, rel_rot_deg);
+                                    }
                                     isam2_optimizer_.addOdomFactorBetweenKeyframes(prev_node_id, node_id, rel, info);
                                     RCLCPP_INFO(get_logger(), "[AutoMapSystem][OPT_WORKER] odom_factor_kf added: %d -> %d",
                                                 prev_node_id, node_id);
@@ -927,9 +1017,19 @@ void AutoMapSystem::optWorkerLoop() {
                 } else {
                     RCLCPP_DEBUG(get_logger(), "[AutoMapSystem][OPT_WORKER] task=%s time=%ldms", task_type_name.c_str(), task_time_ms);
                 }
+                RCLCPP_INFO(get_logger(),
+                    "[AutoMapSystem][OPT_WORKER][TASK_END] type=%s time_ms=%ld queue_after_pop=%zu barrier_active=%d",
+                    task_type_name.c_str(), task_time_ms, queue_size_after_pop,
+                    pose_update_barrier_active_.load(std::memory_order_acquire) ? 1 : 0);
 
             } catch (const std::exception& e) {
-                RCLCPP_ERROR(get_logger(), "[AutoMapSystem][OPT_WORKER][EXCEPTION] task=%s failed: %s", task_type_name.c_str(), e.what());
+                RCLCPP_ERROR(get_logger(),
+                    "[AutoMapSystem][OPT_WORKER][EXCEPTION] task=%s failed: %s | queue_after_pop=%zu barrier_active=%d deferred_pose_tx=%zu gps_aligned=%d",
+                    task_type_name.c_str(), e.what(),
+                    queue_size_after_pop,
+                    pose_update_barrier_active_.load(std::memory_order_acquire) ? 1 : 0,
+                    deferredPoseTxSize(),
+                    gps_aligned_.load(std::memory_order_acquire) ? 1 : 0);
             }
             opt_task_in_progress_.store(false, std::memory_order_release);
         }

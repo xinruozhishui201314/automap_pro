@@ -81,6 +81,9 @@ void AutoMapSystem::publishGlobalMap() {
             global = submap_manager_.buildGlobalMap(voxel_size);
         }
         RCLCPP_INFO(get_logger(), "[AutoMapSystem][MAP] publishGlobalMap step=buildGlobalMap_done pts=%zu", global ? global->size() : 0u);
+        if (ConfigManager::instance().backendVerboseTrace()) {
+            RCLCPP_INFO(get_logger(), "[GHOSTING_TRACE] publishGlobalMap build_done pts=%zu (主路径/fallback 见 buildGlobalMap 的 GHOSTING_TRACE)", global ? global->size() : 0u);
+        }
         if (!global || global->empty()) {
             RCLCPP_DEBUG(get_logger(), "[AutoMapSystem][MAP] global map empty, skip publish");
             RCLCPP_INFO(get_logger(), "[AutoMapSystem][PIPELINE] event=map_publish_skipped reason=empty");
@@ -325,7 +328,8 @@ void AutoMapSystem::checkThreadHeartbeats() {
             RCLCPP_WARN(get_logger(), "[AutoMapSystem][HEARTBEAT] %s heartbeat stale >%lds", name, age / 1000);
         }
     };
-    check_thread("Feeder", feeder_heartbeat_ts_ms_, kHeartbeatWarnThresholdMs, kHeartbeatErrorThresholdMs);
+    // Feeder 在无数据时阻塞在 status_pub_cv_ 上直到 shutdown，不会在循环内更新心跳；若纳入监控会误报 stale（非真死锁）。
+    // 见 worker_threads.cpp feederLoop（wait 唤醒时也会 bump 心跳）。
     check_thread("Backend", backend_heartbeat_ts_ms_, kHeartbeatWarnThresholdMs, kHeartbeatErrorThresholdMs);
     check_thread("MapPublish", map_pub_heartbeat_ts_ms_, kHeartbeatWarnThresholdMs, kHeartbeatErrorThresholdMs);
     // LoopOpt 已删除，回环约束在 onLoopDetected 中直接处理

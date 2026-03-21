@@ -334,8 +334,8 @@ void AutoMapSystem::deferredSetupModules() {
 
     RCLCPP_INFO(get_logger(), "[AutoMapSystem][DEFERRED] Step 5: register iSAM2 pose callback");
     isam2_optimizer_.registerPoseUpdateCallback(
-        [this](const std::unordered_map<int, Pose3d>& poses) {
-            onPoseUpdated(poses);
+        [this](const OptimizationResult& res) {
+            onPoseUpdated(res);
         });
 
     RCLCPP_INFO(get_logger(), "[AutoMapSystem][DEFERRED] Step 6a: init HBAOptimizer");

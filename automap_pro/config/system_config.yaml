@@ -323,6 +323,8 @@ loop_closure:
 # ── 3.4 后端优化（ISAM2、HBA）────────────────────────────────────────────────
 # HBA 键与 params_from_system_config.get_hba_params / get_hba_cal_mme_params / get_hba_visualize_params 一致
 backend:
+  # 调试阶段：true=每计算环节打 BACKEND_TRACE 便于证据链闭环；发布阶段置 false 关闭
+  verbose_trace: false
   # 每隔多少帧处理一帧（1=每帧都处理；5=默认跳过4帧处理1帧，减轻后端负载；前端仍每帧发，队列照常弹出）
   process_every_n_frames: 5
   # 每处理多少帧发布一次全局图（增大可减轻 publishGlobalMap 峰值耗时，见 docs/FULL_LOG_PERFORMANCE_ANALYSIS.md）

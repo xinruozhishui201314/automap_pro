@@ -1,5 +1,7 @@
 #include "automap_pro/system/task_dispatcher.h"
 
+#include "automap_pro/core/config_manager.h"
+#include "automap_pro/core/data_types.h"
 #include "automap_pro/core/logger.h"
 
 #include <rclcpp/rclcpp.hpp>
@@ -46,6 +48,16 @@ bool TaskDispatcher::submitLoopFactor(const LoopConstraint::Ptr& lc) {
     task.type = OptTaskItem::Type::LOOP_FACTOR;
     task.loop_constraint = lc;
     
+    if (ConfigManager::instance().backendVerboseTrace()) {
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[BACKEND_TRACE][enqueue] kind=LOOP_FACTOR sm_i=%d sm_j=%d kf_idx_i=%d kf_idx_j=%d "
+            "kf_global_id_i=%d kf_global_id_j=%d score=%.4f rmse=%.4f inlier=%.4f",
+            lc->submap_i, lc->submap_j, lc->keyframe_i, lc->keyframe_j,
+            lc->keyframe_global_id_i, lc->keyframe_global_id_j,
+            static_cast<double>(lc->overlap_score), static_cast<double>(lc->rmse),
+            static_cast<double>(lc->inlier_ratio));
+    }
+
     // 原有队列逻辑保留（通过外部设置）
     if (opt_task_mutex_ && opt_task_queue_) {
         std::lock_guard<std::mutex> lock(*opt_task_mutex_);
@@ -283,6 +295,21 @@ bool TaskDispatcher::submitKeyFrameCreate(const KeyFrame::Ptr& kf,
     task.gps_aligned = gps_aligned;
     task.gps_transform_R = gps_transform_R;
     task.gps_transform_t = gps_transform_t;
+
+    if (ConfigManager::instance().backendVerboseTrace()) {
+        const int node_id = kf->submap_id * MAX_KF_PER_SUBMAP + kf->index_in_submap;
+        int prev_node_id = -1;
+        if (has_prev_kf && prev_kf && prev_kf->index_in_submap >= 0) {
+            prev_node_id = prev_kf->submap_id * MAX_KF_PER_SUBMAP + prev_kf->index_in_submap;
+        }
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[BACKEND_TRACE][enqueue] kind=KEYFRAME_CREATE kf_global_id=%lu sm_id=%d kf_idx=%d node_id=%d "
+            "ts=%.6f has_prev=%d prev_kf_global_id=%lu prev_node_id=%d gps_aligned=%d has_valid_gps=%d",
+            static_cast<unsigned long>(kf->id), kf->submap_id, kf->index_in_submap, node_id,
+            kf->timestamp, has_prev_kf ? 1 : 0,
+            (prev_kf ? static_cast<unsigned long>(prev_kf->id) : 0ul),
+            prev_node_id, gps_aligned ? 1 : 0, kf->has_valid_gps ? 1 : 0);
+    }
     
     if (opt_task_mutex_ && opt_task_queue_) {
         std::lock_guard<std::mutex> lock(*opt_task_mutex_);

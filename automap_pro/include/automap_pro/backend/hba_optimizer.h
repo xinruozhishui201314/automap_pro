@@ -40,7 +40,13 @@ public:
 
     void init();
     void start();  // 启动优化线程
-    void stop();   // 等待优化完成并停止
+    void stop();   // 等待优化完成并停止（析构/常规关闭：无限期 join）
+
+    /**
+     * 关闭路径专用：与 triggerAsync(..., wait=true) 的 5 分钟等待对齐，避免 runHBA 内部卡住时 stop() 无限 join。
+     * 超时后打 ERROR 并 detach 工作线程（进程即将退出时仍可接受；见 service_handlers finish_mapping）。
+     */
+    void stopJoinWithTimeout(std::chrono::milliseconds max_join);
 
     // ── 数据输入 ──────────────────────────────────────────────────────────
 
@@ -89,6 +95,8 @@ private:
     std::condition_variable     queue_cv_;
     std::thread                 worker_thread_;
     std::atomic<bool>           running_{false};
+    /** workerLoop 返回前设为 true，供 stopJoinWithTimeout 在限时内 join（避免无限阻塞） */
+    std::atomic<bool>           worker_thread_finished_{false};
     std::atomic<bool>           hba_running_{false};
     int                         trigger_count_ = 0;
     int                         frozen_count_  = 0;
@@ -96,6 +104,7 @@ private:
     // GPS 数据（对齐后缓存）
     bool gps_aligned_ = false;
     GPSAlignResult gps_align_result_;
+    Eigen::Vector3d lever_arm_ = Eigen::Vector3d::Zero();
 
     std::vector<HBADoneCallback> done_cbs_;
 

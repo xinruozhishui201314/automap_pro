@@ -234,15 +234,62 @@ void AutoMapSystem::handleFinishMapping(
         
         // 🔧 关键修复：在 shutdown 之前显式停止所有子模块内部线程，打破循环引用并解决挂起问题
         shutdown_requested_.store(true, std::memory_order_release);
-        
-        RCLCPP_INFO(get_logger(), "[AutoMapSystem] stopping LoopDetector...");
-        loop_detector_.stop();
-        RCLCPP_INFO(get_logger(), "[AutoMapSystem] stopping SubMapManager...");
-        submap_manager_.stop();
-        RCLCPP_INFO(get_logger(), "[AutoMapSystem] stopping HBAOptimizer...");
-        hba_optimizer_.stop();
-        RCLCPP_INFO(get_logger(), "[AutoMapSystem] stopping HealthMonitor...");
-        HealthMonitor::instance().stop();
+
+        const auto shutdown_start = std::chrono::steady_clock::now();
+        auto elapsed_since_shutdown_ms = [&]() -> int64_t {
+            return std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - shutdown_start).count();
+        };
+
+        RCLCPP_INFO(get_logger(),
+            "[AutoMapSystem][finish_shutdown] step=before_stop_loop_detector elapsed_since_shutdown_ms=%ld",
+            static_cast<long>(elapsed_since_shutdown_ms()));
+        {
+            const auto t_before = std::chrono::steady_clock::now();
+            loop_detector_.stop();
+            const auto stop_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t_before).count();
+            RCLCPP_INFO(get_logger(),
+                "[AutoMapSystem][finish_shutdown] step=after_stop_loop_detector stop_ms=%ld elapsed_since_shutdown_ms=%ld",
+                static_cast<long>(stop_ms), static_cast<long>(elapsed_since_shutdown_ms()));
+        }
+        RCLCPP_INFO(get_logger(),
+            "[AutoMapSystem][finish_shutdown] step=before_stop_submap_manager elapsed_since_shutdown_ms=%ld",
+            static_cast<long>(elapsed_since_shutdown_ms()));
+        {
+            const auto t_before = std::chrono::steady_clock::now();
+            submap_manager_.stop();
+            const auto stop_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t_before).count();
+            RCLCPP_INFO(get_logger(),
+                "[AutoMapSystem][finish_shutdown] step=after_stop_submap_manager stop_ms=%ld elapsed_since_shutdown_ms=%ld",
+                static_cast<long>(stop_ms), static_cast<long>(elapsed_since_shutdown_ms()));
+        }
+        RCLCPP_INFO(get_logger(),
+            "[AutoMapSystem][finish_shutdown] step=before_stop_hba_optimizer elapsed_since_shutdown_ms=%ld",
+            static_cast<long>(elapsed_since_shutdown_ms()));
+        {
+            const auto t_before = std::chrono::steady_clock::now();
+            // 与 triggerAsync(..., wait=true) 的 5 分钟 idle 等待一致，避免 runHBA 内部卡住时无限 join
+            hba_optimizer_.stopJoinWithTimeout(std::chrono::minutes(5));
+            const auto stop_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t_before).count();
+            RCLCPP_INFO(get_logger(),
+                "[AutoMapSystem][finish_shutdown] step=after_stop_hba_optimizer stop_ms=%ld elapsed_since_shutdown_ms=%ld",
+                static_cast<long>(stop_ms), static_cast<long>(elapsed_since_shutdown_ms()));
+        }
+        RCLCPP_INFO(get_logger(),
+            "[AutoMapSystem][finish_shutdown] step=before_stop_health_monitor elapsed_since_shutdown_ms=%ld",
+            static_cast<long>(elapsed_since_shutdown_ms()));
+        {
+            const auto t_before = std::chrono::steady_clock::now();
+            HealthMonitor::instance().stop();
+            const auto stop_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t_before).count();
+            RCLCPP_INFO(get_logger(),
+                "[AutoMapSystem][finish_shutdown] step=after_stop_health_monitor stop_ms=%ld elapsed_since_shutdown_ms=%ld",
+                static_cast<long>(stop_ms), static_cast<long>(elapsed_since_shutdown_ms()));
+        }
 
         // 唤醒所有 AutoMapSystem 本地线程
         map_publish_cv_.notify_all();

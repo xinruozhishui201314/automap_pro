@@ -229,6 +229,12 @@ public:
     bool gpsEnuOriginConfigured() const;
     /** 若已配置 ENU 原点，返回 [lat, lon, alt]；否则返回 [0,0,0]。调用前可用 gpsEnuOriginConfigured() 判断。 */
     Eigen::Vector3d gpsEnuOrigin() const;
+    /**
+     * GPS 天线相对 IMU 原点的杆臂（米），在 **IMU/body 系** 下表达（与 HBA 中 pos_imu = pos_gps - R*T_w_b * lever_arm 一致）。
+     * 来自标定：t_gnss^L - t_imu^L（两外参均为 [to LIDAR] 且 R=I 时与 body 系轴对齐）。
+     * 未配置或全零时 HBA 可回退 legacy `sensor_config/gps_imu_extrinsic.yaml`。
+     */
+    Eigen::Vector3d gpsLeverArmImu() const;
 
     // ── 【优化】GPS动态协方差和异常值检测参数 ─────────────────────────────
     bool   gpsEnableDynamicCov() const { return get<bool>("gps.enable_dynamic_cov", true); }
@@ -401,6 +407,10 @@ public:
     int backendMaxPendingGpsKeyframeFactors() const {
         int v = get<int>("backend.max_pending_gps_keyframe_factors", 1000);
         return std::max(100, std::min(5000, v));
+    }
+    /** 后端详细追踪日志：true=每个计算环节打 BACKEND_TRACE，便于证据链闭环定位问题；发布阶段置 false 关闭 */
+    bool backendVerboseTrace() const {
+        return get<bool>("backend.verbose_trace", false);
     }
 
     // ── 性能优化（performance.*）────────────────────────────────────────────

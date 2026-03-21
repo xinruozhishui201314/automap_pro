@@ -10,7 +10,7 @@ namespace automap_pro {
 
 // 回环与优化相关函数声明
 void AutoMapSystem::onLoopDetected(const LoopConstraint::Ptr& lc);
-void AutoMapSystem::onPoseUpdated(const std::unordered_map<int, Pose3d>& poses);
+void AutoMapSystem::onPoseUpdated(const OptimizationResult& res);
 void AutoMapSystem::onHBADone(const HBAResult& result);
 
 }  // namespace automap_pro

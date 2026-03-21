@@ -19,6 +19,12 @@ static std::string matrixToString(const Eigen::Matrix3d& m) {
     return ss.str();
 }
 
+static double rotationDeltaDeg(const Eigen::Matrix3d& R_before, const Eigen::Matrix3d& R_after) {
+    Eigen::Matrix3d dR = R_before.transpose() * R_after;
+    Eigen::AngleAxisd aa(dR);
+    return std::abs(aa.angle() * 180.0 / M_PI);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // GPS 对齐回调（统一投递到队列，由gps_align_thread处理）
 // ─────────────────────────────────────────────────────────────────────────────
@@ -138,7 +144,13 @@ void AutoMapSystem::transformAllPosesAfterGPSAlign(const GPSAlignResult& result)
     RCLCPP_INFO(get_logger(),
         "[POSE_JUMP_CAUSE] GPS 对齐：即将对所有子图/关键帧应用 ENU→map 变换 → RViz 轨迹与 GPS 显示将整体跳变（预期行为）；查跳变: grep POSE_JUMP");
     auto all_submaps = submap_manager_.getAllSubmaps();
-    RCLCPP_INFO(get_logger(), "[AutoMapSystem][GPS_TRANSFORM] transforming %zu submaps", all_submaps.size());
+    RCLCPP_INFO(get_logger(),
+        "[AutoMapSystem][GPS_TRANSFORM] transforming %zu submaps | R_map_to_enu=\n%s | t_map_to_enu=[%.3f, %.3f, %.3f]",
+        all_submaps.size(),
+        matrixToString(result.R_enu_to_map.transpose()).c_str(),
+        (-result.R_enu_to_map.transpose() * result.t_enu_to_map).x(),
+        (-result.R_enu_to_map.transpose() * result.t_enu_to_map).y(),
+        (-result.R_enu_to_map.transpose() * result.t_enu_to_map).z());
 
     // 构建变换矩阵：使用 Map -> ENU 的逆变换，将地图整体平移/旋转到 GPS 坐标系
     // result.R_enu_to_map 是 ENU 到 Map 的旋转，其转置就是 Map 到 ENU
@@ -151,14 +163,34 @@ void AutoMapSystem::transformAllPosesAfterGPSAlign(const GPSAlignResult& result)
 
     int transformed_kf_count = 0;
     int transformed_cloud_count = 0;
+    int sampled_kf_logs = 0;
+    int sampled_sm_logs = 0;
+    double max_kf_trans_delta = 0.0;
+    double max_kf_rot_delta_deg = 0.0;
+    int max_kf_id = -1;
+    int max_kf_sm_id = -1;
 
     for (const auto& sm : all_submaps) {
         if (!sm) continue;
         {
+            const Eigen::Vector3d sm_before_t = sm->pose_w_anchor.translation();
+            const Eigen::Matrix3d sm_before_r = sm->pose_w_anchor.linear();
             Pose3d T = Pose3d::Identity();
             T.linear() = R_map_to_enu * sm->pose_w_anchor.linear();
             T.translation() = R_map_to_enu * sm->pose_w_anchor.translation() + t_map_to_enu;
             sm->pose_w_anchor = T;
+            if (sampled_sm_logs < 5) {
+                const Eigen::Vector3d sm_after_t = sm->pose_w_anchor.translation();
+                const double dtrans = (sm_after_t - sm_before_t).norm();
+                const double drot_deg = rotationDeltaDeg(sm_before_r, sm->pose_w_anchor.linear());
+                RCLCPP_INFO(get_logger(),
+                    "[AutoMapSystem][GPS_TRANSFORM][SM] sm_id=%d before=[%.3f,%.3f,%.3f] after=[%.3f,%.3f,%.3f] dtrans=%.3fm drot=%.3fdeg",
+                    sm->id,
+                    sm_before_t.x(), sm_before_t.y(), sm_before_t.z(),
+                    sm_after_t.x(), sm_after_t.y(), sm_after_t.z(),
+                    dtrans, drot_deg);
+                sampled_sm_logs++;
+            }
         }
         sm->pose_w_anchor_optimized = sm->pose_w_anchor;
 
@@ -166,10 +198,30 @@ void AutoMapSystem::transformAllPosesAfterGPSAlign(const GPSAlignResult& result)
             if (!kf) continue;
             // 1. 变换位姿
             {
+                const Eigen::Vector3d kf_before_t = kf->T_w_b.translation();
+                const Eigen::Matrix3d kf_before_r = kf->T_w_b.linear();
                 Pose3d T = Pose3d::Identity();
                 T.linear() = R_map_to_enu * kf->T_w_b.linear();
                 T.translation() = R_map_to_enu * kf->T_w_b.translation() + t_map_to_enu;
                 kf->T_w_b = T;
+                const Eigen::Vector3d kf_after_t = kf->T_w_b.translation();
+                const double dtrans = (kf_after_t - kf_before_t).norm();
+                const double drot_deg = rotationDeltaDeg(kf_before_r, kf->T_w_b.linear());
+                if (dtrans > max_kf_trans_delta) {
+                    max_kf_trans_delta = dtrans;
+                    max_kf_rot_delta_deg = drot_deg;
+                    max_kf_id = static_cast<int>(kf->id);
+                    max_kf_sm_id = sm->id;
+                }
+                if (sampled_kf_logs < 8) {
+                    RCLCPP_INFO(get_logger(),
+                        "[AutoMapSystem][GPS_TRANSFORM][KF] sm_id=%d kf_id=%lu before=[%.3f,%.3f,%.3f] after=[%.3f,%.3f,%.3f] dtrans=%.3fm drot=%.3fdeg",
+                        sm->id, static_cast<unsigned long>(kf->id),
+                        kf_before_t.x(), kf_before_t.y(), kf_before_t.z(),
+                        kf_after_t.x(), kf_after_t.y(), kf_after_t.z(),
+                        dtrans, drot_deg);
+                    sampled_kf_logs++;
+                }
             }
             kf->T_w_b_optimized = kf->T_w_b;
             transformed_kf_count++;
@@ -187,14 +239,23 @@ void AutoMapSystem::transformAllPosesAfterGPSAlign(const GPSAlignResult& result)
 
     // 更新当前里程计位姿
     {
+        const Eigen::Vector3d odom_before = last_odom_pose_.translation();
         Pose3d T = Pose3d::Identity();
         T.linear() = R_map_to_enu * last_odom_pose_.linear();
         T.translation() = R_map_to_enu * last_odom_pose_.translation() + t_map_to_enu;
         last_odom_pose_ = T;
+        const Eigen::Vector3d odom_after = last_odom_pose_.translation();
+        RCLCPP_INFO(get_logger(),
+            "[AutoMapSystem][GPS_TRANSFORM][ODOM] before=[%.3f,%.3f,%.3f] after=[%.3f,%.3f,%.3f] dtrans=%.3fm",
+            odom_before.x(), odom_before.y(), odom_before.z(),
+            odom_after.x(), odom_after.y(), odom_after.z(),
+            (odom_after - odom_before).norm());
     }
 
-    RCLCPP_INFO(get_logger(), "[AutoMapSystem][GPS_TRANSFORM] done: %d keyframes, %d clouds transformed",
-                transformed_kf_count, transformed_cloud_count);
+    RCLCPP_INFO(get_logger(),
+                "[AutoMapSystem][GPS_TRANSFORM] done: %d keyframes, %d clouds transformed | max_kf_delta: sm_id=%d kf_id=%d dtrans=%.3fm drot=%.3fdeg",
+                transformed_kf_count, transformed_cloud_count,
+                max_kf_sm_id, max_kf_id, max_kf_trans_delta, max_kf_rot_delta_deg);
 
     // ═══════════════════════════════════════════════════════════════════════════════
     // 修复: GPS对齐成功后，立即为当前活跃子图的所有keyframes添加GPS因子

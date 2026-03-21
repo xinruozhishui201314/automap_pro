@@ -239,6 +239,13 @@ submap:
 
 # ── 3.2 GPS 延迟对齐（M2DGR 含 /ublox/fix，可做 GPS 约束）────────────────────
 gps:
+  # GPS 天线相对 IMU 的杆臂（米，IMU/body 系），HBA GTSAM 路径用于 pos_imu = pos_gps - R*lever_arm
+  # 来源：M2DGR calibration_results.txt「Extrinsic [to LIDAR]」平移列
+  #   UBLOX GNSS:  [-0.09825,  0.00582,  0.72673]
+  #   Handsfree IMU: [-0.27255, 0.00053, -0.17954]
+  # 两外参 R=I 时：lever_arm = t_gnss - t_imu = [0.1743, 0.00529, 0.90627]
+  lever_arm_imu: [0.1743, 0.00529, 0.90627]
+
   # 接收机是否输出姿态角（双天线/INS）
   has_attitude:            false
   # enu_origin: [31.026058, 121.436795, 26.8]
@@ -338,8 +345,8 @@ loop_closure:
   # 设计前提：回环应是「微调」——即 odom 已较准，TEASER 只做小修正。此时 5m/25° 合理。
   # 若需「同向+反向+两次位移较大」都能检测回环：反向或大位移时 odom 相对位姿会很大/反向，与 TEASER「同一点」结果差很大，易被拒。
   # 建议：仅微调场景用 5/25；要兼容反向+大位移则设为 0 关闭检查，或大幅放宽(如 20, 90)，仅靠 TEASER inlier_ratio/rmse 把关。
-  pose_consistency_max_trans_diff_m: 15.0   # 平移差(m)，0=关闭；放宽可试 15~20；关闭用 0
-  pose_consistency_max_rot_diff_deg: 0.0 # 旋转差(度)，0=关闭；反向约 180° 差，要接受反向回环需放宽到 90 或 0
+  pose_consistency_max_trans_diff_m: 30.0   # 平移差(m)，放宽到 30m 以通过大漂移场景下的真实回环
+  pose_consistency_max_rot_diff_deg: 45.0 # 旋转差(度)，设置为 45 度以拒绝 180 度翻转等错误匹配（重影主因）
   # ── ScanContext / OverlapTransformer 回环粗匹配 ─────────────────────────
   # enabled=true：使用 ScanContext 做子图/关键帧描述子与候选检索（不调用 OT 模型）
   # enabled=false：使用 OverlapTransformer 模型（overlapTransformer.pt）做描述子与余弦相似度检索；需 LibTorch 与 .pt 模型
@@ -354,6 +361,8 @@ loop_closure:
 # ── 3.4 后端优化（ISAM2、HBA）────────────────────────────────────────────────
 # HBA 键与 params_from_system_config.get_hba_params / get_hba_cal_mme_params / get_hba_visualize_params 一致
 backend:
+  # 调试阶段：true=每个计算环节打 BACKEND_TRACE 便于证据链闭环；发布阶段置 false 关闭
+  verbose_trace: true
   # 每隔多少帧处理一帧（1=每帧都处理；5=默认跳过4帧处理1帧；10=减少处理频率减轻后端压力）
   # 降低到5以更频繁处理，提高实时性
   process_every_n_frames: 4

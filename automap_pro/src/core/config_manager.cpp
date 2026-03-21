@@ -442,14 +442,19 @@ void ConfigManager::load(const std::string& yaml_path) {
                 teaserNoiseBound(), teaserVoxelSize(), teaserMaxPoints(), teaserMinInlierRatio(), teaserMinSafeInliers(), teaserMaxRMSE(), teaserICPRefine() ? "true" : "false");
             RCLCPP_INFO(L, "[ConfigManager][CONFIG_READ_BACK] loop_closure.pose_consistency: max_trans_diff_m=%.1f max_rot_diff_deg=%.1f (0=off)",
                 loopPoseConsistencyMaxTransDiffM(), loopPoseConsistencyMaxRotDiffDeg());
-            RCLCPP_INFO(L, "[ConfigManager][CONFIG_READ_BACK] backend.process_every_n=%d backend.publish_global_map_every_n=%d backend.hba.enabled=%s backend.hba.on_finish=%s backend.hba.frontend_idle_trigger_sec=%.1f backend.hba.frontend_idle_min_submaps=%d backend.hba.enable_gtsam_fallback=%s",
-                backendProcessEveryNFrames(), backendPublishGlobalMapEveryNProcessed(), hbaEnabled() ? "true" : "false", hbaOnFinish() ? "true" : "false", hbaFrontendIdleTriggerSec(), hbaFrontendIdleMinSubmaps(), hbaGtsamFallbackEnabled() ? "true" : "false");
+            RCLCPP_INFO(L, "[ConfigManager][CONFIG_READ_BACK] backend.verbose_trace=%s backend.process_every_n=%d backend.publish_global_map_every_n=%d backend.hba.enabled=%s backend.hba.on_finish=%s backend.hba.frontend_idle_trigger_sec=%.1f backend.hba.frontend_idle_min_submaps=%d backend.hba.enable_gtsam_fallback=%s",
+                backendVerboseTrace() ? "true" : "false", backendProcessEveryNFrames(), backendPublishGlobalMapEveryNProcessed(), hbaEnabled() ? "true" : "false", hbaOnFinish() ? "true" : "false", hbaFrontendIdleTriggerSec(), hbaFrontendIdleMinSubmaps(), hbaGtsamFallbackEnabled() ? "true" : "false");
             RCLCPP_INFO(L, "[ConfigManager][CONFIG_READ_BACK] backend.isam2.relin_thresh=%.4f backend.isam2.relinearize_skip=%d backend.isam2.prior_variance=%.0e",
                 isam2RelinThresh(), isam2RelinSkip(), isam2PriorVariance());
             RCLCPP_INFO(L, "[ConfigManager][CONFIG_READ_BACK] map.voxel_size=%.2f map.frame_config_path=%s",
                 mapVoxelSize(), mapFrameConfigPath().c_str());
             RCLCPP_INFO(L, "[ConfigManager][CONFIG_READ_BACK] gps.align_min_points=%d gps.keyframe_match_window_s=%.2f gps.keyframe_max_hdop=%.2f gps_cached=%s",
                 gpsAlignMinPoints(), gpsKeyframeMatchWindowS(), gpsKeyframeMaxHdop(), gps_cached_ ? "true" : "false");
+            {
+                Eigen::Vector3d la = gpsLeverArmImu();
+                RCLCPP_INFO(L, "[ConfigManager][CONFIG_READ_BACK] gps.lever_arm_imu=[%.4f, %.4f, %.4f] (HBA GPS antenna vs IMU, m)",
+                    la.x(), la.y(), la.z());
+            }
             RCLCPP_INFO(L, "[ConfigManager][CONFIG_READ_BACK] performance.async_global_map_build=%s performance.async_isam2_update=%s",
                 get<bool>("performance.async_global_map_build", true) ? "true" : "false", get<bool>("performance.async_isam2_update", false) ? "true" : "false");
             RCLCPP_INFO(L, "[ConfigManager][CONFIG_READ_BACK] =========================================== (file=%s)", yaml_path.c_str());
@@ -644,6 +649,10 @@ Eigen::Vector3d ConfigManager::gpsEnuOrigin() const {
         return Eigen::Vector3d::Zero();
     }
     return readVector3d(cfg_, "gps.enu_origin", 0.0, 0.0, 0.0);
+}
+
+Eigen::Vector3d ConfigManager::gpsLeverArmImu() const {
+    return readVector3d(cfg_, "gps.lever_arm_imu", 0.0, 0.0, 0.0);
 }
 
 std::vector<std::string> ConfigManager::previousSessionDirs() const {

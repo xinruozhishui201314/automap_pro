@@ -300,7 +300,8 @@ CloudXYZIPtr voxelDownsampleChunkedWithTimeout(const CloudXYZIPtr& cloud, float 
 }
 
 // 点云点数低于此值时直接单次体素滤波，不走分块循环，避免 PCL 在部分 chunk 上 SIGSEGV
-static constexpr size_t kVoxelChunkedSizeThreshold = 250000u;
+// 🔧 [修复] 降低分块阈值：250000 -> 100000，更积极地使用分块下采样，避免单次 PCL 网格过大导致精度损失
+static constexpr size_t kVoxelChunkedSizeThreshold = 100000u;
 
 CloudXYZIPtr voxelDownsampleSafe(const CloudXYZIPtr& cloud, float leaf_size, float chunk_size_m) {
     if (!cloud || cloud->empty()) return cloud;

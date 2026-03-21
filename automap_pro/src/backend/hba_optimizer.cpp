@@ -14,6 +14,8 @@
 #include <string>
 #include <cmath>
 #include <cstdint>
+#include <filesystem>
+#include <vector>
 
 #ifdef USE_HBA_API
 #include <hba_api/hba_api.h>
@@ -29,8 +31,54 @@
 #include <gtsam/inference/Symbol.h>
 #include <gtsam/linear/NoiseModel.h>
 #endif
+#include <yaml-cpp/yaml.h>
 
 namespace automap_pro {
+namespace {
+// 与 ConfigManager::gpsLeverArmImu 同源；主配置未给出非零杆臂时，按主 YAML 所在目录回退 sensor_config/gps_imu_extrinsic.yaml（避免依赖进程 CWD）
+void resolveGpsLeverArmForHba(Eigen::Vector3d& lever_arm) {
+    lever_arm = Eigen::Vector3d::Zero();
+    try {
+        const auto& cfg = ConfigManager::instance();
+        if (cfg.isLoaded()) {
+            lever_arm = cfg.gpsLeverArmImu();
+            if (lever_arm.norm() > 1e-12) {
+                return;
+            }
+        }
+    } catch (const std::exception&) {
+        // 回退到外参文件
+    }
+
+    std::vector<std::filesystem::path> candidates;
+    try {
+        const auto& cfg = ConfigManager::instance();
+        if (cfg.isLoaded() && !cfg.configFilePath().empty()) {
+            std::filesystem::path base(cfg.configFilePath());
+            candidates.push_back(base.parent_path() / "sensor_config" / "gps_imu_extrinsic.yaml");
+        }
+    } catch (...) {
+    }
+    candidates.emplace_back("automap_pro/config/sensor_config/gps_imu_extrinsic.yaml");
+
+    for (const auto& extrinsic_path : candidates) {
+        try {
+            if (extrinsic_path.empty() || !std::filesystem::exists(extrinsic_path)) {
+                continue;
+            }
+            YAML::Node config = YAML::LoadFile(extrinsic_path.string());
+            if (config["T_gps_imu"] && config["T_gps_imu"]["translation"]) {
+                auto trans = config["T_gps_imu"]["translation"];
+                lever_arm = Eigen::Vector3d(trans[0].as<double>(), trans[1].as<double>(), trans[2].as<double>());
+                return;
+            }
+        } catch (const std::exception&) {
+            continue;
+        }
+    }
+}
+} // namespace
+
 #ifdef USE_GTSAM_FALLBACK
 namespace {
 constexpr double kMaxReasonableTranslationNorm = 1e6;
@@ -56,9 +104,20 @@ HBAOptimizer::HBAOptimizer() = default;
 
 HBAOptimizer::~HBAOptimizer() { stop(); }
 
-void HBAOptimizer::init() {}
+void HBAOptimizer::init() {
+    resolveGpsLeverArmForHba(lever_arm_);
+    if (lever_arm_.norm() > 1e-12) {
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[HBA] GPS lever arm (gps.lever_arm_imu or sensor_config/gps_imu_extrinsic.yaml next to config): [%.4f, %.4f, %.4f] m",
+            lever_arm_.x(), lever_arm_.y(), lever_arm_.z());
+    } else {
+        RCLCPP_WARN(rclcpp::get_logger("automap_system"),
+            "[HBA] GPS lever arm is zero (set gps.lever_arm_imu in main YAML or T_gps_imu.translation in config_dir/sensor_config/gps_imu_extrinsic.yaml)");
+    }
+}
 
 void HBAOptimizer::start() {
+    worker_thread_finished_.store(false, std::memory_order_release);
     running_ = true;
     worker_thread_ = std::thread(&HBAOptimizer::workerLoop, this);
 }
@@ -67,6 +126,25 @@ void HBAOptimizer::stop() {
     running_ = false;
     queue_cv_.notify_all();
     if (worker_thread_.joinable()) worker_thread_.join();
+}
+
+void HBAOptimizer::stopJoinWithTimeout(std::chrono::milliseconds max_join) {
+    running_ = false;
+    queue_cv_.notify_all();
+    if (!worker_thread_.joinable()) return;
+    const auto deadline = std::chrono::steady_clock::now() + max_join;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (worker_thread_finished_.load(std::memory_order_acquire)) {
+            worker_thread_.join();
+            return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+        "[HBAOptimizer][SHUTDOWN] stopJoinWithTimeout: worker did not finish within %lld ms (likely blocked inside runHBA). "
+        "Detaching HBA worker thread — system state: HBA worker abandoned; process exit should follow immediately.",
+        static_cast<long long>(max_join.count()));
+    worker_thread_.detach();
 }
 
 void HBAOptimizer::onSubmapFrozen(const SubMap::Ptr& submap) {
@@ -216,9 +294,10 @@ void HBAOptimizer::triggerAsync(
         constexpr auto kMaxWaitTime = std::chrono::minutes(5);
         waitUntilIdleFor(kMaxWaitTime);
         if (!isIdle()) {
-            ALOG_WARN(MOD, "HBA wait timeout after 5 minutes, forcing stop to avoid deadlock");
-            RCLCPP_WARN(rclcpp::get_logger("automap_system"),
-                "[HBAOptimizer][TIMEOUT] HBA did not finish after 5 minutes, forcing stop");
+            ALOG_ERROR(MOD, "HBA wait timeout after 5 minutes — save/stop may race with running HBA (use stopJoinWithTimeout on shutdown)");
+            RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+                "[HBAOptimizer][TIMEOUT] HBA did not become idle after 5 minutes (wait=true). "
+                "saveMapToFiles / shutdown will use stopJoinWithTimeout to avoid unbounded join; expect possible abandoned HBA worker if still blocked in runHBA.");
         }
     }
 }
@@ -320,6 +399,7 @@ void HBAOptimizer::workerLoop() {
         for (auto& cb : done_cbs_) cb(result);
         hba_running_ = false;
     }
+    worker_thread_finished_.store(true, std::memory_order_release);
 }
 
 HBAResult HBAOptimizer::runHBA(const PendingTask& task) {
@@ -402,6 +482,9 @@ HBAResult HBAOptimizer::runHBA(const PendingTask& task) {
                 f->id, f->submap_id, f->timestamp, b->id, b->submap_id, b->timestamp, kfs.size());
         }
     }
+
+    // 与 ConfigManager::gpsLeverArmImu 同源刷新，避免 HBA 侧杆臂与主配置脱节
+    resolveGpsLeverArmForHba(lever_arm_);
 
 #ifdef USE_HBA_API
     const auto& cfg = ConfigManager::instance();
@@ -525,6 +608,9 @@ HBAResult HBAOptimizer::runGTSAMFallback(const PendingTask& task) {
         return result;
     }
 
+    // 与主配置 gps.lever_arm_imu / 主 YAML 同目录下 sensor_config 外参一致（init 之后配置或工作目录可能才就绪）
+    resolveGpsLeverArmForHba(lever_arm_);
+
     std::vector<KeyFrame::Ptr> sorted_kfs = task.keyframes;
     std::sort(sorted_kfs.begin(), sorted_kfs.end(),
               [](const KeyFrame::Ptr& a, const KeyFrame::Ptr& b) {
@@ -586,7 +672,9 @@ HBAResult HBAOptimizer::runGTSAMFallback(const PendingTask& task) {
 
         // 每个因子使用独立噪声模型，避免多因子共享同一 shared_ptr 在 GTSAM 内触发 double free
         //（与 incremental_optimizer 及 FIX_GPS_BATCH_SIGSEGV 文档中 borglab/gtsam#1189 同类问题一致）
-        const double prior_var = 1e-9;
+        // 🔧 [修复] 放宽首帧 Prior 约束：1e-9 -> 0.25 (0.5m std dev)
+        // 原因：若初始对齐有微小偏差，过死的 Prior 会阻止轨迹向 GPS 整体偏移，导致拉花。
+        const double prior_var = 0.25;
         const double between_rotate_var = 1e-6; // 降低旋转方差，增强轨迹刚度
         const double between_trans_var = 1e-4;  // 降低平移方差
 
@@ -625,6 +713,7 @@ HBAResult HBAOptimizer::runGTSAMFallback(const PendingTask& task) {
 
         // 添加回环约束
         size_t loop_factors_added = 0;
+        double total_loop_info_norm = 0.0;
         for (const auto& lc : task.loops) {
             if (!lc || lc->keyframe_global_id_i < 0 || lc->keyframe_global_id_j < 0) continue;
             
@@ -633,6 +722,21 @@ HBAResult HBAOptimizer::runGTSAMFallback(const PendingTask& task) {
             auto it_j = kf_id_to_idx.find((uint64_t)lc->keyframe_global_id_j);
             
             if (it_i != kf_id_to_idx.end() && it_j != kf_id_to_idx.end()) {
+                // 详细记录回环因子的测量值 vs 当前位姿，识别潜在重影风险
+                Pose3d pose_i = sorted_kfs[it_i->second]->T_w_b;
+                Pose3d pose_j = sorted_kfs[it_j->second]->T_w_b;
+                Pose3d current_rel = pose_i.inverse() * pose_j;
+                double trans_diff = (current_rel.translation() - lc->delta_T.translation()).norm();
+                double rot_diff = Eigen::AngleAxisd(current_rel.rotation().inverse() * lc->delta_T.rotation()).angle() * 180.0 / M_PI;
+                double info_norm = lc->information.norm();
+                total_loop_info_norm += info_norm;
+
+                if (trans_diff > 5.0 || rot_diff > 20.0) {
+                    RCLCPP_WARN(rclcpp::get_logger("automap_system"),
+                        "[HBA][LOOP_CONFLICT] High conflict loop detected BEFORE OPT: k%zu-k%zu trans_diff=%.3fm rot_diff=%.2fdeg info_norm=%.2e (测量值与里程计差异过大，极可能导致重影)",
+                        it_i->second, it_j->second, trans_diff, rot_diff, info_norm);
+                }
+
                 gtsam::Pose3 rel = toGtsamPose3(lc->delta_T);
                 
                 // 使用 Huber 鲁棒核函数，防止坏回环拉花地图
@@ -647,7 +751,8 @@ HBAResult HBAOptimizer::runGTSAMFallback(const PendingTask& task) {
         }
         if (loop_factors_added > 0) {
             RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-                "[HBA][GTSAM][BACKEND] Loop factors added to HBA graph count=%zu", loop_factors_added);
+                "[HBA][GTSAM][BACKEND] Loop factors added to HBA graph count=%zu avg_info_norm=%.2e", 
+                loop_factors_added, total_loop_info_norm / loop_factors_added);
         }
 
         // [POSE_DIAG] HBA 初始值：首/中/尾关键帧记录使用的位姿来源及数值
@@ -681,7 +786,10 @@ HBAResult HBAOptimizer::runGTSAMFallback(const PendingTask& task) {
                     continue;
                 }
                 // 与 iSAM2 一致：由于地图已整体变换到 ENU 系，GPS 观测直接使用 ENU 坐标即可
-                Eigen::Vector3d pos_map = pos_enu;
+                // 🔧 [修复] GPS 杠臂补偿 (Lever-arm Compensation)
+                // 原理：pos_imu = pos_gps_antenna - R_enu_imu * p_lever_arm
+                Eigen::Vector3d pos_map = pos_enu - kf->T_w_b.rotation() * lever_arm_;
+                
                 gtsam::Point3 pt(pos_map.x(), pos_map.y(), pos_map.z());
                 Eigen::Matrix3d c = kf->gps.covariance;
                 if (!c.allFinite()) {
@@ -813,9 +921,34 @@ HBAResult HBAOptimizer::runGTSAMFallback(const PendingTask& task) {
         RCLCPP_INFO(rclcpp::get_logger("automap_system"),
             "[HBA][GTSAM] LevenbergMarquardtOptimizer constructor exit (LM built ok)");
 
+        // [GHOSTING_DIAG] 记录优化前各类因子的残差
+        auto logFactorErrors = [&](const gtsam::NonlinearFactorGraph& g, const gtsam::Values& v, const std::string& label) {
+            double total_err = 0, prior_err = 0, odom_err = 0, gps_err = 0, loop_err = 0;
+            size_t p_cnt = 0, o_cnt = 0, g_cnt = 0, l_cnt = 0;
+            
+            for (size_t idx = 0; idx < g.size(); ++idx) {
+                if (!g[idx]) continue;
+                double e = g[idx]->error(v);
+                total_err += e;
+                
+                std::string type = (idx < factor_type_log.size()) ? factor_type_log[idx] : "unknown";
+                if (type.find("Prior") != std::string::npos) { prior_err += e; p_cnt++; }
+                else if (type.find("Between") != std::string::npos) { odom_err += e; o_cnt++; }
+                else if (type.find("GPS") != std::string::npos) { gps_err += e; g_cnt++; }
+                else if (type.find("Loop") != std::string::npos) { loop_err += e; l_cnt++; }
+            }
+            RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                "[HBA][ERROR_BREAKDOWN][%s] total=%.2f prior=%.2f(%zu) odom=%.2f(%zu) gps=%.2f(%zu) loop=%.2f(%zu)",
+                label.c_str(), total_err, prior_err, p_cnt, odom_err, o_cnt, gps_err, g_cnt, loop_err, l_cnt);
+        };
+
+        logFactorErrors(graph_copy, initial_copy, "BEFORE");
+
         gtsam::Values optimized = opt.optimize();
         RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-            "[HBA][GTSAM] LM optimize() exit iterations done");
+            "[HBA][GTSAM] LM optimize() exit iterations done. final_error=%.6g", graph_copy.error(optimized));
+
+        logFactorErrors(graph_copy, optimized, "AFTER");
 
         // [GHOSTING_DIAG] 写回前抽样记录 T_w_b vs 即将写回的 T_w_b_optimized，便于定位重影是否来自写回不一致
         const size_t kSampleStep = std::max<size_t>(1, sorted_kfs.size() / 8);
@@ -824,13 +957,59 @@ HBAResult HBAOptimizer::runGTSAMFallback(const PendingTask& task) {
                 const auto& kf = sorted_kfs[i];
                 Pose3d new_pose = fromGtsamPose3(optimized.at<gtsam::Pose3>(KF(i)));
                 double trans_diff = (new_pose.translation() - kf->T_w_b.translation()).norm();
+                double rot_diff = Eigen::AngleAxisd(new_pose.linear() * kf->T_w_b.linear().transpose()).angle() * 180.0 / M_PI;
                 RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-                    "[HBA][GHOSTING_DIAG] pre_writeback kf_id=%lu idx=%zu: T_w_b=[%.2f,%.2f,%.2f] -> T_w_b_optimized=[%.2f,%.2f,%.2f] trans_diff=%.3fm",
+                    "[HBA][GHOSTING_DIAG] pre_writeback kf_id=%lu idx=%zu: T_w_b=[%.2f,%.2f,%.2f] -> T_w_b_optimized=[%.2f,%.2f,%.2f] trans_diff=%.3fm rot_diff=%.2fdeg",
                     kf->id, i,
                     kf->T_w_b.translation().x(), kf->T_w_b.translation().y(), kf->T_w_b.translation().z(),
                     new_pose.translation().x(), new_pose.translation().y(), new_pose.translation().z(),
-                    trans_diff);
+                    trans_diff, rot_diff);
             }
+        }
+
+        // 详细记录回环因子的残差，识别哪些回环被优化器认为“不可信”
+        if (loop_factors_added > 0) {
+            double total_loop_error = 0.0;
+            int high_residual_count = 0;
+            for (size_t idx = 0; idx < graph_copy.size(); ++idx) {
+                if (idx < factor_type_log.size() && factor_type_log[idx].find("Loop") != std::string::npos) {
+                    double err = graph_copy[idx]->error(optimized);
+                    total_loop_error += err;
+                    if (err > 1.0) { // 残差较大
+                        high_residual_count++;
+                        
+                        // [GHOSTING_DIAG] 提取该因子的节点 ID
+                        auto factor = dynamic_cast<const gtsam::BetweenFactor<gtsam::Pose3>*>(graph_copy[idx].get());
+                        std::string nodes_str = "unknown";
+                        if (factor) {
+                            nodes_str = fmt::format("k{}-k{}", factor->key1(), factor->key2());
+                        }
+
+                        RCLCPP_WARN(rclcpp::get_logger("automap_system"),
+                            "[HBA][LOOP_RESIDUAL] factor[%zu] nodes=%s residual=%.4f (High residual indicates conflict with odom/GPS/other loops)", 
+                            idx, nodes_str.c_str(), err);
+                        
+                        // [GHOSTING_DIAG] 记录该坏因子的具体位姿偏移，便于量化对重影的贡献
+                        if (err > 10.0) {
+                            std::string info_str = "N/A";
+                            if (factor) {
+                                auto noise = dynamic_cast<const gtsam::noiseModel::Gaussian*>(factor->noiseModel().get());
+                                if (noise) {
+                                    Eigen::MatrixXd info = noise->information();
+                                    info_str = fmt::format("diag=[{:.1f},{:.1f},{:.1f},{:.1f},{:.1f},{:.1f}]", 
+                                        info(0,0), info(1,1), info(2,2), info(3,3), info(4,4), info(5,5));
+                                }
+                            }
+                            RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+                                "[HBA][CRITICAL_LOOP_ERROR] EXTREME residual=%.2f at %s. Info: %s. This loop is definitely conflicting and likely causing ghosting!",
+                                err, nodes_str.c_str(), info_str.c_str());
+                        }
+                    }
+                }
+            }
+            RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                "[HBA][LOOP_SUMMARY] total_loops=%zu high_residual=%d avg_err=%.4f",
+                loop_factors_added, high_residual_count, total_loop_error / loop_factors_added);
         }
 
         const size_t n_kf = sorted_kfs.size();

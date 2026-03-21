@@ -248,8 +248,11 @@ TeaserMatcher::Result TeaserMatcher::match(
             double p50 = distances[distances.size() / 2];
             double p90 = distances[std::min(size_t(distances.size() * 0.9), distances.size() - 1)];
             ALOG_WARN(MOD, "[FPFH_DIAG] tid={} corrs={} dist_p10={:.2f}m p50={:.2f}m p90={:.2f}m "
-                      "(p90>>5m 表示存在大量误匹配)",
+                      "(p90>>5m 表示存在大量误匹配；若 p10 也很大则 FPFH 特征可能在不同区域发生了严重哈希碰撞)",
                       tid, corrs.size(), p10, p50, p90);
+            if (p90 > 20.0) {
+                ALOG_WARN(MOD, "[FPFH_DIAG][CRITICAL] High p90 distance ({:.2f}m) detected! TEASER input contains mostly garbage correspondences. Ghosting likely.", p90);
+            }
 
             // FPFH 对应点几何过滤：仅保留距离 <= fpfh_corr_max_dist 的对应点再送 TEASER（树木场景建议 3～5m）
             if (fpfh_corr_max_dist > 0 && !corrs.empty()) {
@@ -403,9 +406,20 @@ TeaserMatcher::Result TeaserMatcher::match(
         // 子图间几何诊断：TEASER 估计的 T_tgt_src（target 系下 source 位姿），便于与 odom 相对位姿对比
         {
             const double teaser_trans_m = solution.translation.norm();
-            const double teaser_rot_deg = Eigen::AngleAxisd(solution.rotation).angle() * 180.0 / M_PI;
-            ALOG_INFO(MOD, "[TEASER_DIAG] estimated_pose T_tgt_src: trans_norm_m={:.3f} rot_deg={:.2f} (与 INTER_KF GEOM_DIAG 中 odom rel_trans/rel_rot 对比；差异大则误匹配或 FPFH 对应点差)",
-                      teaser_trans_m, teaser_rot_deg);
+            const Eigen::Matrix3d R = solution.rotation;
+            const double teaser_rot_deg = Eigen::AngleAxisd(R).angle() * 180.0 / M_PI;
+            
+            // 提取 RPY
+            Eigen::Vector3d rpy = R.eulerAngles(2, 1, 0).reverse() * 180.0 / M_PI;
+            
+            ALOG_INFO(MOD, "[TEASER_DIAG] estimated_pose T_tgt_src: trans_norm_m={:.3f} rot_deg={:.2f} rpy=[{:.1f},{:.1f},{:.1f}] (与 INTER_KF GEOM_DIAG 中 odom rel_trans/rel_rot 对比；差异大则误匹配或 FPFH 对应点差)",
+                      teaser_trans_m, teaser_rot_deg, rpy.x(), rpy.y(), rpy.z());
+            
+            // ⚠️ [GHOSTING_DIAG] 特别关注 Pitch 和 Roll
+            // 正常路面建图 Pitch/Roll 不应超过 30 度（除非是无人机或极端坡度）
+            if (std::abs(rpy.x()) > 30.0 || std::abs(rpy.y()) > 30.0) {
+                ALOG_WARN(MOD, "[TEASER_DIAG][UNUSUAL_ORIENTATION] Large Pitch/Roll detected: P={:.1f} R={:.1f}. This is likely a flipped mismatch causing ghosting!", rpy.y(), rpy.x());
+            }
         }
 
         // 【TEASER_DIAG】使用 solution 的位姿计算内点 RMSE 和距离分布（result.T_tgt_src 尚未赋值）

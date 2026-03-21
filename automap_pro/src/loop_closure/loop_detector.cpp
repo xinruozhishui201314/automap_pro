@@ -943,9 +943,27 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
                     const int kf_id_query = query_kf ? query_kf->id : -1;
                     const double ts_target = target_kf_log ? target_kf_log->timestamp : 0.0;
                     const double ts_query = query_kf ? query_kf->timestamp : 0.0;
+                    
+                    // 增加根本原因猜测日志
+                    std::string root_cause = "unknown";
+                    if (rot_diff_deg > 150.0) root_cause = "possibly_matched_backwards (180deg flip)";
+                    else if (trans_diff_m > 30.0) root_cause = "massive_odometry_drift_or_wrong_place";
+                    else if (trans_anomaly && !rot_anomaly) root_cause = "translation_only_mismatch (check voxel/feature)";
+                    else if (!trans_anomaly && rot_anomaly) root_cause = "rotation_only_mismatch (check feature ambiguity)";
+
                     ALOG_WARN(MOD,
-                        "[INTER_KF][REJECT] pose_anomaly: sm_i=%d kf_i=%d sm_j=%d kf_j=%d kf_id_tgt=%d kf_id_query=%d ts_tgt=%.3f ts_query=%.3f",
-                        kfc.submap_id, kfc.keyframe_idx, task.query->id, task.query_kf_idx, kf_id_target, kf_id_query, ts_target, ts_query);
+                        "[INTER_KF][REJECT] pose_anomaly: sm_i=%d kf_i=%d sm_j=%d kf_j=%d kf_id_tgt=%d kf_id_query=%d ts_tgt=%.3f ts_query=%.3f cause=%s",
+                        kfc.submap_id, kfc.keyframe_idx, task.query->id, task.query_kf_idx, kf_id_target, kf_id_query, ts_target, ts_query, root_cause.c_str());
+                    
+                    // [GHOSTING_DIAG] 如果几何匹配很好但被位姿一致性检查拒绝，记录为潜在的“被错杀的真实回环”或“隐蔽的误匹配”
+                    if (res.inlier_ratio > 0.15 && res.rmse < 0.3) {
+                        RCLCPP_ERROR(node()->get_logger(),
+                            "[INTER_KF][POSE_CONFLICT] STRONG geometric match REJECTED by pose consistency: "
+                            "sm_i=%d kf_i=%d sm_j=%d kf_j=%d inlier=%.3f rmse=%.3f trans_diff=%.2fm rot_diff=%.2fdeg. "
+                            "If ghosting persists, consider if this loop was actually correct!",
+                            kfc.submap_id, kfc.keyframe_idx, task.query->id, task.query_kf_idx, res.inlier_ratio, res.rmse, trans_diff_m, rot_diff_deg);
+                    }
+
                     ALOG_WARN(MOD,
                         "[INTER_KF][REJECT] pose_anomaly ODOM_rel:  trans_xyz=[%.4f,%.4f,%.4f] trans_norm=%.4fm rot_deg=%.2f",
                         t_odom.x(), t_odom.y(), t_odom.z(), t_odom.norm(), odom_rot_deg);
@@ -962,8 +980,8 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
                         pos_w_query.x(), pos_w_query.y(), pos_w_query.z());
                     if (node()) {
                         RCLCPP_WARN(node()->get_logger(),
-                            "[INTER_KF][REJECT] pose_anomaly sm_i=%d kf_i=%d sm_j=%d kf_j=%d kf_id_tgt=%d kf_id_query=%d trans_diff=%.3fm rot_diff=%.2fdeg (详见 ODOM_rel/TEASER_rel/DIFF/WORLD；grep INTER_KF REJECT)",
-                            kfc.submap_id, kfc.keyframe_idx, task.query->id, task.query_kf_idx, kf_id_target, kf_id_query, trans_diff_m, rot_diff_deg);
+                            "[INTER_KF][REJECT] pose_anomaly sm_i=%d kf_i=%d sm_j=%d kf_j=%d kf_id_tgt=%d kf_id_query=%d trans_diff=%.3fm rot_diff=%.2fdeg cause=%s (详见 ODOM_rel/TEASER_rel/DIFF/WORLD；grep INTER_KF REJECT)",
+                            kfc.submap_id, kfc.keyframe_idx, task.query->id, task.query_kf_idx, kf_id_target, kf_id_query, trans_diff_m, rot_diff_deg, root_cause.c_str());
                     }
                     continue;
                 }
@@ -986,6 +1004,11 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
             lc->information = Mat66d::Identity();
             lc->information.block<3,3>(0,0) *= info_scale * 0.1;
             lc->information.block<3,3>(3,3) *= info_scale;
+
+            // [GHOSTING_DIAG] 记录子图间回环信息矩阵强度
+            RCLCPP_INFO(node()->get_logger(), 
+                "[INTER_KF][INFO_DIAG] sm_%d->%d kf_%d->%d info_scale=%.2e trans_w=%.2e rot_w=%.2e",
+                lc->submap_i, lc->submap_j, lc->keyframe_i, lc->keyframe_j, info_scale, lc->information(0,0), lc->information(3,3));
             lc->status = LoopStatus::ACCEPTED;
             ALOG_INFO(MOD, "[INTER_KF][LOOP_ACCEPTED] sm_i=%d kf_i=%d sm_j=%d kf_j=%d score=%.3f inlier=%.3f rmse=%.4f",
                       lc->submap_i, lc->keyframe_i, lc->submap_j, lc->keyframe_j, lc->overlap_score, lc->inlier_ratio, lc->rmse);
@@ -1943,19 +1966,21 @@ std::vector<LoopConstraint::Ptr> LoopDetector::detectIntraSubmapLoop(
         // 旋转差 rot_diff_deg = angle(R_teaser * R_odom^T) ∈ [0,180]°：方向差约 180° 时相对旋转角≈180°，会超阈值。故反向运动（含平移偏移）会被正确拒绝。
         const double max_trans_diff = ConfigManager::instance().loopPoseConsistencyMaxTransDiffM();
         const double max_rot_diff_deg = ConfigManager::instance().loopPoseConsistencyMaxRotDiffDeg();
+        double trans_diff_m = 0.0;
+        double rot_diff_deg = 0.0;
         if (max_trans_diff > 0.0 || max_rot_diff_deg > 0.0) {
             const KeyFrame::Ptr& cand_kf = submap->keyframes[i];
             if (cand_kf) {
                 const Pose3d T_w_cand = cand_kf->T_w_b;
                 const Pose3d T_w_query = query_kf->T_w_b;
                 const Pose3d T_tgt_src_odom = T_w_cand.inverse() * T_w_query;
-                const double trans_diff_m = (teaser_res.T_tgt_src.translation() - T_tgt_src_odom.translation()).norm();
+                trans_diff_m = (teaser_res.T_tgt_src.translation() - T_tgt_src_odom.translation()).norm();
                 const Eigen::Matrix3d R_teaser = teaser_res.T_tgt_src.linear();
                 const Eigen::Matrix3d R_odom = T_tgt_src_odom.linear();
                 const Eigen::Matrix3d R_diff = R_teaser * R_odom.transpose();
                 const double trace_r = R_diff.trace();
                 const double angle_rad = std::acos(std::max(-1.0, std::min(1.0, (trace_r - 1.0) * 0.5)));
-                const double rot_diff_deg = angle_rad * 180.0 / M_PI;
+                rot_diff_deg = angle_rad * 180.0 / M_PI;
                 const bool trans_anomaly = (max_trans_diff > 0.0 && trans_diff_m > max_trans_diff);
                 const bool rot_anomaly = (max_rot_diff_deg > 0.0 && rot_diff_deg > max_rot_diff_deg);
                 if (trans_anomaly || rot_anomaly) {
@@ -1965,9 +1990,27 @@ std::vector<LoopConstraint::Ptr> LoopDetector::detectIntraSubmapLoop(
                     const Eigen::Vector3d t_diff = t_teaser - t_odom;
                     const double odom_rot_deg = Eigen::AngleAxisd(R_odom).angle() * 180.0 / M_PI;
                     const double teaser_rot_deg = Eigen::AngleAxisd(R_teaser).angle() * 180.0 / M_PI;
+                    
+                    // 增加根本原因猜测日志
+                    std::string root_cause = "unknown";
+                    if (rot_diff_deg > 150.0) root_cause = "possibly_matched_backwards (180deg flip)";
+                    else if (trans_diff_m > 30.0) root_cause = "massive_odometry_drift_or_wrong_place";
+                    else if (trans_anomaly && !rot_anomaly) root_cause = "translation_only_mismatch (check voxel/feature)";
+                    else if (!trans_anomaly && rot_anomaly) root_cause = "rotation_only_mismatch (check feature ambiguity)";
+
                     ALOG_WARN(MOD,
-                        "[INTRA_LOOP][REJECT] pose_anomaly: submap_id=%d kf_i=%d kf_j=%d kf_id_cand=%d kf_id_query=%d ts_cand=%.3f ts_query=%.3f",
-                        submap->id, i, query_keyframe_idx, cand_kf->id, query_kf->id, cand_kf->timestamp, query_kf->timestamp);
+                        "[INTRA_LOOP][REJECT] pose_anomaly: submap_id=%d kf_i=%d kf_j=%d kf_id_cand=%d kf_id_query=%d ts_cand=%.3f ts_query=%.3f cause=%s",
+                        submap->id, i, query_keyframe_idx, cand_kf->id, query_kf->id, cand_kf->timestamp, query_kf->timestamp, root_cause.c_str());
+                    
+                    // [GHOSTING_DIAG] 如果几何匹配很好但被位姿一致性检查拒绝，记录为潜在的“被错杀的真实回环”或“隐蔽的误匹配”
+                    if (teaser_res.inlier_ratio > 0.15 && teaser_res.rmse < 0.3) {
+                        RCLCPP_ERROR(node()->get_logger(),
+                            "[INTRA_LOOP][POSE_CONFLICT] STRONG geometric match REJECTED by pose consistency: "
+                            "submap_id=%d kf_%d->%d inlier=%.3f rmse=%.3f trans_diff=%.2fm rot_diff=%.2fdeg. "
+                            "If ghosting persists, consider if this loop was actually correct!",
+                            submap->id, i, query_keyframe_idx, teaser_res.inlier_ratio, teaser_res.rmse, trans_diff_m, rot_diff_deg);
+                    }
+
                     ALOG_WARN(MOD,
                         "[INTRA_LOOP][REJECT] pose_anomaly ODOM_rel:  trans_xyz=[%.4f,%.4f,%.4f] trans_norm=%.4fm rot_deg=%.2f",
                         t_odom.x(), t_odom.y(), t_odom.z(), t_odom.norm(), odom_rot_deg);
@@ -1985,8 +2028,8 @@ std::vector<LoopConstraint::Ptr> LoopDetector::detectIntraSubmapLoop(
                         (T_w_query.translation() - T_w_cand.translation()).norm());
                     if (node()) {
                         RCLCPP_WARN(node()->get_logger(),
-                            "[INTRA_LOOP][REJECT] pose_anomaly submap_id=%d kf_i=%d kf_j=%d kf_id_cand=%lu kf_id_query=%lu trans_diff=%.3fm rot_diff=%.2fdeg (详见上方 ODOM_rel/TEASER_rel/DIFF/WORLD；grep INTRA_LOOP REJECT)",
-                            submap->id, i, query_keyframe_idx, static_cast<unsigned long>(cand_kf->id), static_cast<unsigned long>(query_kf->id), trans_diff_m, rot_diff_deg);
+                            "[INTRA_LOOP][REJECT] pose_anomaly submap_id=%d kf_i=%d kf_j=%d kf_id_cand=%lu kf_id_query=%lu trans_diff=%.3fm rot_diff=%.2fdeg cause=%s (详见上方 ODOM_rel/TEASER_rel/DIFF/WORLD；grep INTRA_LOOP REJECT)",
+                            submap->id, i, query_keyframe_idx, static_cast<unsigned long>(cand_kf->id), static_cast<unsigned long>(query_kf->id), trans_diff_m, rot_diff_deg, root_cause.c_str());
                     }
                     continue;
                 }
@@ -2008,6 +2051,11 @@ std::vector<LoopConstraint::Ptr> LoopDetector::detectIntraSubmapLoop(
         information.block<3,3>(0,0) *= info_scale * 0.1;  // 平移自由度权重较小
         information.block<3,3>(3,3) *= info_scale;        // 旋转自由度权重较大
 
+        // [GHOSTING_DIAG] 记录信息矩阵强度，防止过强导致系统“硬扭”
+        RCLCPP_INFO(node()->get_logger(), 
+            "[INTRA_LOOP][INFO_DIAG] sm_id=%d kf_%d->%d info_scale=%.2e trans_w=%.2e rot_w=%.2e",
+            submap->id, i, query_keyframe_idx, info_scale, information(0,0), information(3,3));
+
         ALOG_INFO(MOD,
             "[INTRA_LOOP][DETECTED] ★★★ INTRA_SUBMAP_LOOP ★★★ "
             "submap_id=%d kf_i=%d kf_j=%d "
@@ -2026,6 +2074,13 @@ std::vector<LoopConstraint::Ptr> LoopDetector::detectIntraSubmapLoop(
         }
 
         // 创建回环约束
+        // [GHOSTING_DIAG] 记录接近阈值的“危险”回环，这些往往是重影的源头
+        if (trans_diff_m > max_trans_diff * 0.8 || rot_diff_deg > max_rot_diff_deg * 0.8) {
+            RCLCPP_WARN(node()->get_logger(),
+                "[INTRA_LOOP][RISK] Borderline loop accepted: submap_id=%d kf_i=%d kf_j=%d trans_diff=%.2fm (max=%.1f) rot_diff=%.2fdeg (max=%.1f)",
+                submap->id, i, query_keyframe_idx, trans_diff_m, max_trans_diff, rot_diff_deg, max_rot_diff_deg);
+        }
+
         auto lc = std::make_shared<LoopConstraint>();
         lc->submap_i = submap->id;
         lc->submap_j = submap->id;

@@ -14,6 +14,7 @@
 #include "automap_pro/visualization/rviz_publisher.h"
 #include "automap_pro/system/task_dispatcher.h"
 #include "automap_pro/system/frame_processor.h"
+#include "automap_pro/system/pose_update_transaction.h"
 #include "automap_pro/core/opt_task_types.h"
 
 #include <rclcpp/rclcpp.hpp>
@@ -171,6 +172,12 @@ private:
     Eigen::Matrix3d gps_transform_R_ = Eigen::Matrix3d::Identity();
     Eigen::Vector3d gps_transform_t_ = Eigen::Vector3d::Zero();
     std::mutex      submap_update_mutex_;
+    // Pose 写回事务控制：GPS 对齐重建期间开启 barrier，避免并发写回交叉污染
+    std::atomic<bool> pose_update_barrier_active_{false};
+    std::atomic<uint64_t> pose_tx_version_counter_{0};
+    std::atomic<uint64_t> last_applied_pose_tx_version_{0};
+    std::deque<PoseUpdateTransaction> deferred_pose_updates_;
+    std::mutex                     deferred_pose_updates_mutex_;
 
     static constexpr size_t kMaxGPSAlignQueueSize = 25;
 
@@ -364,7 +371,9 @@ private:
     CloudXYZIPtr transformWorldToBody(const CloudXYZIPtr& world_cloud, const Pose3d& T_w_b) const;
     void onSubmapFrozen(const SubMap::Ptr& submap);
     void onLoopDetected(const LoopConstraint::Ptr& lc);
-    void onPoseUpdated(const std::unordered_map<int, Pose3d>& poses);
+    void onPoseUpdated(const OptimizationResult& res);
+    void applyPoseTransaction(const PoseUpdateTransaction& tx);
+    void flushDeferredPoseUpdates();
     void onHBADone(const HBAResult& result);
     void onGPSAligned(const GPSAlignResult& result);
     void addBatchGPSFactors();
