@@ -28,6 +28,46 @@ inline long getLwpForLog() {
     return -1;
 #endif
 }
+
+/// SVD/Umeyama 配准：无 TEASER PMC 依赖，极少对应点时仍稳定不崩溃
+/// 当 corrs 少时 TEASER 析构会 SIGSEGV，用此替代可从根本上避免
+void runSvdRegistration(const CloudXYZIPtr& src, const CloudXYZIPtr& tgt,
+                        const std::vector<std::pair<int, int>>& corrs,
+                        TeaserMatcher::Result& result, float max_rmse) {
+    Eigen::Matrix3Xd src_pts(3, corrs.size()), tgt_pts(3, corrs.size());
+    for (size_t i = 0; i < corrs.size(); ++i) {
+        const auto& sp = src->points[corrs[i].first];
+        const auto& tp = tgt->points[corrs[i].second];
+        src_pts.col(i) << sp.x, sp.y, sp.z;
+        tgt_pts.col(i) << tp.x, tp.y, tp.z;
+    }
+    Eigen::Vector3d src_centroid = src_pts.rowwise().mean();
+    Eigen::Vector3d tgt_centroid = tgt_pts.rowwise().mean();
+    Eigen::Matrix3Xd src_c = src_pts.colwise() - src_centroid;
+    Eigen::Matrix3Xd tgt_c = tgt_pts.colwise() - tgt_centroid;
+    Eigen::Matrix3d H = src_c * tgt_c.transpose();
+    Eigen::JacobiSVD<Eigen::Matrix3d> svd(H, Eigen::ComputeFullU | Eigen::ComputeFullV);
+    Eigen::Matrix3d R = svd.matrixV() * svd.matrixU().transpose();
+    if (R.determinant() < 0) {
+        Eigen::Matrix3d V = svd.matrixV();
+        V.col(2) *= -1;
+        R = V * svd.matrixU().transpose();
+    }
+    Eigen::Vector3d t = tgt_centroid - R * src_centroid;
+    result.T_tgt_src = Pose3d::Identity();
+    result.T_tgt_src.linear() = R;
+    result.T_tgt_src.translation() = t;
+    double sq_err = 0;
+    int cnt = 0;
+    for (size_t i = 0; i < corrs.size(); ++i) {
+        Eigen::Vector3d pred = R * src_pts.col(i) + t;
+        sq_err += (pred - tgt_pts.col(i)).squaredNorm();
+        cnt++;
+    }
+    result.rmse = cnt > 0 ? static_cast<float>(std::sqrt(sq_err / cnt)) : 1e6f;
+    result.inlier_ratio = 1.0f;  // SVD 无内点筛选
+    result.success = (result.rmse < max_rmse);
+}
 }  // namespace
 
 TeaserMatcher::TeaserMatcher() {
@@ -306,40 +346,24 @@ TeaserMatcher::Result TeaserMatcher::match(
         }
 
 #ifdef USE_TEASER
-    // ===【关键修复】先验检查：对应点数下界，避免极少对应触发 TEASER 析构崩溃===
-    // 根因：TEASER++ PMC 求解器在 inlier < 5 时易在析构时产生堆损坏（多线程或数值退化）
-    // 策略：对应点 < 20 时提前返回，避免进入 TEASER 不稳定路径
     const int corr_count = static_cast<int>(corrs.size());
+    // 【根本修复】corrs < 20 时用 SVD 替代 TEASER：不创建 TEASER 对象，从根源避免 PMC 析构崩溃
+    // 内点可能确实很少，SVD 无 PMC 依赖，鲁棒性略低但绝不崩溃
     if (corr_count < 20) {
-        ALOG_INFO(MOD, "[LOOP_COMPUTE][TEASER] teaser_fail reason=teaser_precheck_insufficient_corrs corrs={} safe_min=20", corr_count);
-        ALOG_WARN(MOD, "[tid={}] step=teaser_precheck_skip corr_count={} < safe_threshold=20, too risky for TEASER PMC",
-                 tid, corr_count);
-        ALOG_INFO(MOD, "[TRACE] step=loop_match result=fail reason=teaser_precheck_insufficient_corrs tid={} corrs={} safe_min=20",
-                 tid, corr_count);
-        return result;
-    }
-
-    // 至少 12 对对应点再跑 TEASER，减少极少 inlier（如 2）导致的退化路径，避免 TEASER 析构时 SIGSEGV
-    if (static_cast<int>(corrs.size()) < 12) {
-        ALOG_WARN(MOD, "[tid={}] step=teaser_skip insufficient_corrs={} (min=12 for TEASER)", tid, corrs.size());
-        ALOG_INFO(MOD, "[TRACE] step=loop_match result=fail reason=insufficient_corrs_for_teaser tid={} corrs={} min=12", tid, corrs.size());
-        return result;
-    }
-
-    // ===【V3 激进修复】完全避免在极少对应点时创建 TEASER solver===
-    // 根因：TEASER++ PMC 求解器在极少 inliers 时内部堆损坏，即使自然析构也崩溃
-    // 解决：在创建 solver 前就检查并提前返回，完全避免 TEASER 对象的创建
-    // 实测：corrs < 20 时 inliers < 10 的概率极高，直接跳过 TEASER
-    const int kCorrsThreshold = 20;
-    if (static_cast<int>(corrs.size()) < kCorrsThreshold) {
-        ALOG_INFO(MOD, "[LOOP_COMPUTE][TEASER] teaser_fail reason=insufficient_corrs_v3 corrs={} safe_min={}", static_cast<int>(corrs.size()), kCorrsThreshold);
-        ALOG_WARN(MOD, "[tid={}] [CRITICAL_V3] step=teaser_skip_before_creation corrs={} < safe_threshold={}, COMPLETELY AVOIDING TEASER CREATION",
-                 tid, static_cast<int>(corrs.size()), kCorrsThreshold);
-        ALOG_INFO(MOD, "[TRACE] step=loop_match result=fail reason=insufficient_corrs_v3 tid={} corrs={} safe_min={} (V3: skip before solver creation)",
-                 tid, static_cast<int>(corrs.size()), kCorrsThreshold);
-        // 关键：完全不创建 solver 对象，从根源避免堆损坏
-        return result;
-    }
+        ALOG_INFO(MOD, "[LOOP_COMPUTE][TEASER] corrs={} < 20, using SVD fallback (avoids TEASER PMC destructor crash)",
+                  corr_count);
+        ALOG_INFO(MOD, "[tid={}] step=svd_fallback_low_corrs corrs={} (fundamental fix: no TEASER, no crash)", tid, corr_count);
+        try {
+            runSvdRegistration(src, tgt, corrs, result, max_rmse_);
+            ALOG_INFO(MOD, "[tid={}] step=svd_fallback_done rmse={:.3f}m success={}", tid, result.rmse, result.success);
+        } catch (const std::exception& e) {
+            ALOG_ERROR(MOD, "[tid={}] step=svd_fallback_exception msg={}", tid, e.what());
+            return result;
+        } catch (...) {
+            ALOG_ERROR(MOD, "[tid={}] step=svd_fallback_unknown_exception", tid);
+            return result;
+        }
+    } else {
 
     teaser::PointCloud src_pts, tgt_pts;
     std::vector<std::pair<int, int>> teaser_corrs;
@@ -384,10 +408,7 @@ TeaserMatcher::Result TeaserMatcher::match(
             ALOG_INFO(MOD, "[LOOP_COMPUTE][TEASER] teaser_fail reason=teaser_solution_invalid corrs={}", static_cast<int>(corrs.size()));
             ALOG_WARN(MOD, "[tid={}] step=teaser_solve_invalid corr={}", tid, corrs.size());
             ALOG_INFO(MOD, "[TRACE] step=loop_match result=fail reason=teaser_solution_invalid tid={} corrs={}", tid, corrs.size());
-            ALOG_INFO(MOD, "[CRASH_TRACE][tid={} lwp={}] step=teaser_invalid_natural_destruct solver_ptr={} (solver will destruct naturally)",
-                      tid, getLwpForLog(), static_cast<const void*>(solver.get()));
-            std::cerr << "[CRASH_TRACE] lwp=" << getLwpForLog() << " step=teaser_invalid_natural_destruct (no explicit reset)" << std::endl;
-            // 注意：不调用 solver.reset()，让 unique_ptr 自然析构
+            solver.release();  // 避免析构崩溃（TEASER 内部状态可能已损坏）
             return result;
         }
         ALOG_DEBUG(MOD, "[tid={}] step=teaser_solution_valid", tid);
@@ -520,6 +541,13 @@ TeaserMatcher::Result TeaserMatcher::match(
             ALOG_INFO(MOD, "[tid={}] step=teaser_rmse_final cnt={} rmse={:.3f}m success={}", 
                      tid, cnt, result.rmse, result.success);
         }
+        // 【SAFEGUARD】极少 inliers 的 success 路径也会触发 TEASER 析构崩溃（见 TEASER_CRASH_ANALYSIS.md）
+        // 当 inliers < 10 时用 release() 避免析构，防止任何配置（含 min_safe_inliers=3）下崩溃
+        if (inliers < 10) {
+            ALOG_WARN(MOD, "[tid={}] [SAFEGUARD] success path inliers={} < 10, release solver to avoid TEASER destructor crash",
+                      tid, inliers);
+            solver.release();
+        }
         ALOG_INFO(MOD, "[CRASH_TRACE][tid={} lwp={}] step=teaser_solver_scope_exit success_path solver_ptr={} (unique_ptr leaving scope, natural destruct)",
                   tid, getLwpForLog(), static_cast<const void*>(solver.get()));
         std::cerr << "[CRASH_TRACE] lwp=" << getLwpForLog() << " step=teaser_success_path_solver_natural_destruct solver_ptr=" 
@@ -545,46 +573,13 @@ TeaserMatcher::Result TeaserMatcher::match(
         std::cerr << "[ROBUST_FIX_L5_CRITICAL] lwp=" << getLwpForLog() << " UNKNOWN EXCEPTION - solver may have crashed" << std::endl;
         return result;
     }
+    }  // else (corrs >= 20, TEASER path)
 #else
-    // 无 TEASER++ 时回退到 Umeyama/SVD 相似变换（鲁棒性低于 TEASER，但可运行）
+    // 无 TEASER++ 时用 SVD
     ALOG_DEBUG(MOD, "[tid={}] step=svd_fallback TEASER disabled, using SVD corrs={}", tid, corrs.size());
     try {
-        Eigen::Matrix3Xd src_pts(3, corrs.size()), tgt_pts(3, corrs.size());
-        for (size_t i = 0; i < corrs.size(); ++i) {
-            const auto& sp = src->points[corrs[i].first];
-            const auto& tp = tgt->points[corrs[i].second];
-            src_pts.col(i) << sp.x, sp.y, sp.z;
-            tgt_pts.col(i) << tp.x, tp.y, tp.z;
-        }
-        Eigen::Vector3d src_centroid = src_pts.rowwise().mean();
-        Eigen::Vector3d tgt_centroid = tgt_pts.rowwise().mean();
-        Eigen::Matrix3Xd src_c = src_pts.colwise() - src_centroid;
-        Eigen::Matrix3Xd tgt_c = tgt_pts.colwise() - tgt_centroid;
-        Eigen::Matrix3d H = src_c * tgt_c.transpose();
-        Eigen::JacobiSVD<Eigen::Matrix3d> svd(H, Eigen::ComputeFullU | Eigen::ComputeFullV);
-        Eigen::Matrix3d R = svd.matrixV() * svd.matrixU().transpose();
-        if (R.determinant() < 0) {
-            Eigen::Matrix3d V = svd.matrixV();
-            V.col(2) *= -1;
-            R = V * svd.matrixU().transpose();
-        }
-        Eigen::Vector3d t = tgt_centroid - R * src_centroid;
-        result.T_tgt_src = Pose3d::Identity();
-        result.T_tgt_src.linear() = R;
-        result.T_tgt_src.translation() = t;
-        
-        double sq_err = 0;
-        int cnt = 0;
-        for (size_t i = 0; i < corrs.size(); ++i) {
-            Eigen::Vector3d pred = R * src_pts.col(i) + t;
-            sq_err += (pred - tgt_pts.col(i)).squaredNorm();
-            cnt++;
-        }
-        result.rmse = cnt > 0 ? static_cast<float>(std::sqrt(sq_err / cnt)) : 1e6f;
-        result.inlier_ratio = 1.0f;  // SVD 无内点筛选，保守视为全部内点
-        result.success = (result.rmse < max_rmse_);
-        ALOG_INFO(MOD, "[tid={}] step=svd_done rmse={:.3f}m success={} inlier_ratio={}", 
-                 tid, result.rmse, result.success, result.inlier_ratio);
+        runSvdRegistration(src, tgt, corrs, result, max_rmse_);
+        ALOG_INFO(MOD, "[tid={}] step=svd_done rmse={:.3f}m success={}", tid, result.rmse, result.success);
     } catch (const std::exception& e) {
         ALOG_ERROR(MOD, "[tid={}] step=svd_exception msg={}", tid, e.what());
         return result;

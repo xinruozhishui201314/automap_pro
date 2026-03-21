@@ -79,6 +79,9 @@ void AutoMapSystem::processGPSAlignDirectly(const GPSAlignResult& result) {
     // 1. 转换所有位姿到MAP坐标系
     transformAllPosesAfterGPSAlign(result);
 
+    // 🔧 V3 修复：同步 GPSManager 对齐矩阵
+    gps_manager_.resetAlignmentToIdentity();
+
     // 2. 等待后端优化完成
     isam2_optimizer_.waitForPendingTasks();
 
@@ -89,6 +92,25 @@ void AutoMapSystem::processGPSAlignDirectly(const GPSAlignResult& result) {
     auto keyframe_data = isam2_optimizer_.getKeyFrameData();
     auto kf_odom_factors = isam2_optimizer_.getKFOdomFactors();
     auto kf_loop_factors = isam2_optimizer_.getKFLoopFactors();
+
+    // 🔧 V3 修复：在 Direct 路径下，也需要将从 iSAM2 拿到的 local 位姿转换到全球系
+    // 否则 rebuild 后的图仍处于旧的 local 系，导致 GPS 因子拉扯
+    {
+        Eigen::Matrix3d R_inv = result.R_enu_to_map.transpose();
+        Eigen::Vector3d t_inv = -R_inv * result.t_enu_to_map;
+        for (auto& d : submap_data) {
+            Pose3d T = Pose3d::Identity();
+            T.linear() = R_inv * d.pose.linear();
+            T.translation() = R_inv * d.pose.translation() + t_inv;
+            d.pose = T;
+        }
+        for (auto& d : keyframe_data) {
+            Pose3d T = Pose3d::Identity();
+            T.linear() = R_inv * d.pose.linear();
+            T.translation() = R_inv * d.pose.translation() + t_inv;
+            d.pose = T;
+        }
+    }
 
     RCLCPP_INFO(get_logger(), "[AutoMapSystem][GPS_ALIGN] rebuild data: submaps=%zu odom=%zu loop=%zu kf=%zu kf_odom=%zu kf_loop=%zu",
                 submap_data.size(), odom_factors.size(), loop_factors.size(),

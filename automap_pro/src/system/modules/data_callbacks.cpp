@@ -49,14 +49,30 @@ void AutoMapSystem::onOdometry(double ts, const Pose3d& pose, const Mat66d& cov)
     // 🔧 V2 修复：使用 odom_path_mutex_ 保护轨迹追加与裁剪，防止 MultiThreadedExecutor 下的竞态
     std::lock_guard<std::mutex> lk(odom_path_mutex_);
     
+    // 🔧 V3 修复：如果系统已全球化，将实时位姿变换到全局 ENU 系，确保 RViz 显示不跳变且角度对齐
+    Pose3d pose_global = pose;
+    if (gps_aligned_.load(std::memory_order_acquire)) {
+        static bool first_global_logged = false;
+        std::lock_guard<std::mutex> lk_tx(gps_transform_mutex_);
+        pose_global.linear() = gps_transform_R_ * pose.linear();
+        pose_global.translation() = gps_transform_R_ * pose.translation() + gps_transform_t_;
+        
+        if (!first_global_logged) {
+            RCLCPP_INFO(get_logger(), "[AutoMapSystem][VIZ_DIAG] First real-time odom globalized: local=[%.2f,%.2f,%.2f] global=[%.2f,%.2f,%.2f]",
+                        pose.translation().x(), pose.translation().y(), pose.translation().z(),
+                        pose_global.translation().x(), pose_global.translation().y(), pose_global.translation().z());
+            first_global_logged = true;
+        }
+    }
+
     geometry_msgs::msg::PoseStamped ps;
     ps.header.stamp    = now();
     ps.header.frame_id = "map";
     auto& pp           = ps.pose.position;
-    pp.x = pose.translation().x();
-    pp.y = pose.translation().y();
-    pp.z = pose.translation().z();
-    Eigen::Quaterniond q(pose.rotation());
+    pp.x = pose_global.translation().x();
+    pp.y = pose_global.translation().y();
+    pp.z = pose_global.translation().z();
+    Eigen::Quaterniond q(pose_global.rotation());
     ps.pose.orientation.w = q.w(); ps.pose.orientation.x = q.x();
     ps.pose.orientation.y = q.y(); ps.pose.orientation.z = q.z();
     

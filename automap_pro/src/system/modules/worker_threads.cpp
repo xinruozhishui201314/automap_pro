@@ -612,7 +612,10 @@ void AutoMapSystem::gpsAlignWorkerLoop() {
             res_tmp.t_enu_to_map = align_task.t_enu_to_map;
             transformAllPosesAfterGPSAlign(res_tmp);
 
-            // 3. 通知 HBA 对齐状态（使用单位阵，因为子图位姿已转换到 ENU 全球系）
+            // 3. 通知 GPSManager 重置对齐矩阵（同步坐标系）
+            gps_manager_.resetAlignmentToIdentity();
+
+            // 4. 通知 HBA 对齐状态（使用单位阵，因为子图位姿已转换到 ENU 全球系）
             GPSAlignResult hba_res = res_tmp;
             hba_res.R_enu_to_map = Eigen::Matrix3d::Identity();
             hba_res.t_enu_to_map = Eigen::Vector3d::Zero();
@@ -905,6 +908,33 @@ void AutoMapSystem::optWorkerLoop() {
                             bool is_first_kf_of_submap = (kf->index_in_submap == 0);
                             isam2_optimizer_.addKeyFrameNode(node_id, kf->T_w_b, kf->id == 0, is_first_kf_of_submap);
 
+                            // 🔧 V3 修复：实时添加 GPS 因子，减少无约束漂移窗口
+                            if (kf->has_valid_gps && gps_aligned_.load(std::memory_order_acquire)) {
+                                Eigen::Vector3d pos_map = kf->gps.position_enu;
+                                // 协方差计算逻辑与 ACTIVE_SUBMAP_GPS_BIND 一致
+                                Eigen::Matrix3d cov = Eigen::Matrix3d::Identity();
+                                double hdop_safe = std::max(kf->gps.hdop, 0.5);
+                                double sigma_h = 0.5 * (hdop_safe / 10.0);
+                                double sigma_v = 1.0 * (hdop_safe / 10.0);
+                                cov(0, 0) = sigma_h * sigma_h;
+                                cov(1, 1) = sigma_h * sigma_h;
+                                cov(2, 2) = sigma_v * sigma_v;
+                                
+                                isam2_optimizer_.addGPSFactorForKeyFrame(node_id, pos_map, cov);
+                                
+                                static std::atomic<int> kf_gps_factor_count{0};
+                                int cur_count = kf_gps_factor_count.fetch_add(1) + 1;
+                                if (cur_count <= 10 || cur_count % 100 == 0) {
+                                    RCLCPP_INFO(get_logger(), "[AutoMapSystem][GPS_KF] GPS factor added to new KF: kf_id=%lu node_id=%d count=%d pos=[%.3f,%.3f,%.3f] hdop=%.2f",
+                                        static_cast<unsigned long>(kf->id), node_id, cur_count, pos_map.x(), pos_map.y(), pos_map.z(), kf->gps.hdop);
+                                }
+                                
+                                if (ConfigManager::instance().backendVerboseTrace()) {
+                                    RCLCPP_INFO(get_logger(), "[BACKEND_TRACE] opt_worker GPS_KF kf_id=%lu node_id=%d pos=[%.3f,%.3f,%.3f]",
+                                        static_cast<unsigned long>(kf->id), node_id, pos_map.x(), pos_map.y(), pos_map.z());
+                                }
+                            }
+
                             if (task.has_prev_kf) {
                                 auto prev_kf = task.prev_keyframe;
                                 if (prev_kf && prev_kf->index_in_submap >= 0) {
@@ -981,10 +1011,11 @@ void AutoMapSystem::optWorkerLoop() {
                                 // 关键帧位姿 T_w_b 已通过 tryCreateKeyFrame 修正到 ENU 坐标系，
                                 // GPS 观测直接使用 gps_opt->position_enu 即可，不应再应用 R, t。
                                 Eigen::Vector3d pos_map = gps_opt->position_enu;
+                                // 🔧 V3 修复：统一协方差计算逻辑
                                 Eigen::Matrix3d cov = Eigen::Matrix3d::Identity();
-                                double hdop_scale = gps_opt->hdop / 10.0;
-                                double sigma_h = 0.5 * hdop_scale;
-                                double sigma_v = 1.0 * hdop_scale;
+                                double hdop_safe = std::max(gps_opt->hdop, 0.5);
+                                double sigma_h = 0.5 * (hdop_safe / 10.0);
+                                double sigma_v = 1.0 * (hdop_safe / 10.0);
                                 cov(0, 0) = sigma_h * sigma_h;
                                 cov(1, 1) = sigma_h * sigma_h;
                                 cov(2, 2) = sigma_v * sigma_v;

@@ -133,6 +133,7 @@ GPSManager::GPSManager() {
     online_calib_min_dist_    = 5.0;   // 最小累积距离触发在线校正（米）
     online_calib_max_rmse_    = 2.0;   // 在线校正RMSE阈值（米）
     online_calib_min_samples_ = 5;     // 在线校正最小样本数
+    lever_arm_imu_            = cfg.gpsLeverArmImu();
 
     // 若配置中显式给出了 ENU 原点，经纬高以配置为准，避免首条 GPS 改写原点
     if (cfg.gpsEnuOriginConfigured()) {
@@ -163,7 +164,8 @@ void GPSManager::applyConfig() {
     quality_hdop_thresh_   = cfg.gpsQualityThreshold();
     rmse_accept_thresh_   = cfg.gpsAlignRmseThresh();
     good_samples_needed_  = cfg.gpsGoodSamplesNeeded();
-    ALOG_INFO(MOD, "[applyConfig] min_align_points={} min_align_dist_m={:.1f} keyframe_match_window_s={:.2f} good_samples_needed={} rmse_thresh={:.2f}m (align triggers when good_sample_count>=good_samples_needed and try_align passes dist/points)",
+    lever_arm_imu_        = cfg.gpsLeverArmImu();
+    ALOG_INFO(MOD, "[applyConfig] min_align_points={} min_align_dist_m={:.1f} keyframe_match_window_s={:.2f} good_samples_needed={} rmse_thresh={:.2f}m",
               min_align_points_, min_align_dist_m_, keyframe_match_window_s_, good_samples_needed_, rmse_accept_thresh_);
 }
 
@@ -202,6 +204,36 @@ void GPSManager::addGPSMeasurement(
 
         pos_enu = wgs84_to_enu(latitude, longitude, altitude);
         quality = hdop_to_quality(hdop);
+
+        // 🔧 V3 修复：GPS 杆臂补偿
+        // 原理：pos_body = pos_antenna - R_body_world * lever_arm
+        // 注意：此处我们需要 body 在 ENU 系下的姿态。
+        // 1. 如果已对齐，使用当前对齐矩阵 R_map_enu * R_body_local
+        // 2. 如果未对齐，暂不补偿或仅补偿 Z（此处选择仅在已对齐后补偿以保证精确，或使用最近邻姿态）
+        if (lever_arm_imu_.norm() > 1e-6) {
+            auto odom_opt = findNearestOdomPose(timestamp);
+            if (odom_opt) {
+                Eigen::Matrix3d R_body_enu;
+                if (state_ == GPSAlignState::ALIGNED || state_ == GPSAlignState::DEGRADED) {
+                    // R_body_enu = R_map_enu * R_body_map
+                    R_body_enu = align_result_.R_gps_lidar.transpose() * odom_opt->second.linear();
+                } else {
+                    // 未对齐时，假设 local 系与 ENU 系水平对齐（仅用于初始对齐前的粗略补偿）
+                    R_body_enu = odom_opt->second.linear();
+                }
+                pos_enu -= R_body_enu * lever_arm_imu_;
+                
+                static std::atomic<uint32_t> lever_arm_log_count{0};
+                if (lever_arm_log_count.fetch_add(1) % 100 == 0) {
+                    Eigen::Vector3d antenna_pos = pos_enu + R_body_enu * lever_arm_imu_;
+                    ALOG_INFO(MOD, "[GPS_LEVER_ARM] Applied compensation: antenna=({:.3f},{:.3f},{:.3f}) -> body=({:.3f},{:.3f},{:.3f}) lever_arm_body=({:.3f},{:.3f},{:.3f}) state={}",
+                              antenna_pos.x(), antenna_pos.y(), antenna_pos.z(),
+                              pos_enu.x(), pos_enu.y(), pos_enu.z(),
+                              lever_arm_imu_.x(), lever_arm_imu_.y(), lever_arm_imu_.z(),
+                              static_cast<int>(state_));
+                }
+            }
+        }
 
         // 填入滑动窗口
         GPSRecord rec;
@@ -618,6 +650,16 @@ void GPSManager::on_aligned(const GPSAlignResult& result) {
     for (auto& cb : align_cbs_) cb(result);
 }
 
+void GPSManager::resetAlignmentToIdentity() {
+    std::lock_guard<std::recursive_mutex> lk(mutex_);
+    align_result_.R_gps_lidar = Eigen::Matrix3d::Identity();
+    align_result_.t_gps_lidar = Eigen::Vector3d::Zero();
+    align_result_.R_enu_to_map = Eigen::Matrix3d::Identity();
+    align_result_.t_enu_to_map = Eigen::Vector3d::Zero();
+    // 保持 state_ 为 ALIGNED，确保后续查询走 enu_to_map 返回 map (即 ENU)
+    ALOG_INFO(MOD, "[GPS_ALIGN] Reset alignment to identity (system is now globalized)");
+}
+
 Eigen::Vector3d GPSManager::wgs84_to_enu(double lat, double lon, double alt) const {
     // ✅ 修复：检查ENU原点是否已设置，避免使用未初始化的原点坐标
     if (!enu_origin_set_.load(std::memory_order_acquire)) {
@@ -654,10 +696,19 @@ Eigen::Vector3d GPSManager::map_to_enu(const Eigen::Vector3d& map_pos) const {
 }
 
 std::pair<Eigen::Vector3d, std::string> GPSManager::enu_to_map_with_frame(const Eigen::Vector3d& enu) const {
-    if (state_ != GPSAlignState::ALIGNED && state_ != GPSAlignState::DEGRADED)
+    if (state_ != GPSAlignState::ALIGNED && state_ != GPSAlignState::DEGRADED) {
         return {enu, "enu"};
+    }
     std::lock_guard<std::recursive_mutex> lk(mutex_);
-    return {align_result_.R_gps_lidar * enu + align_result_.t_gps_lidar, "map"};
+    Eigen::Vector3d pos_map = align_result_.R_gps_lidar * enu + align_result_.t_gps_lidar;
+    
+    static std::atomic<uint32_t> query_log_count{0};
+    if (query_log_count.fetch_add(1) % 500 == 0) {
+        ALOG_INFO(MOD, "[GPS_QUERY_DIAG] Frame query: enu=({:.2f},{:.2f},{:.2f}) -> map=({:.2f},{:.2f},{:.2f}) frame=map",
+                  enu.x(), enu.y(), enu.z(), pos_map.x(), pos_map.y(), pos_map.z());
+    }
+    
+    return {pos_map, "map"};
 }
 
 int GPSManager::getGoodSampleCount() const {
@@ -683,13 +734,13 @@ std::vector<std::pair<double, Eigen::Vector3d>> GPSManager::getGpsPositionsInMap
     ALOG_DEBUG(MOD, "[GPS_QUERY] getGpsPositionsInMapFrame got_snapshot window_size={} is_aligned={}", snap.window.size(), snap.is_aligned ? 1 : 0);
     std::vector<std::pair<double, Eigen::Vector3d>> out;
     if (!snap.is_aligned) {
-        ALOG_DEBUG(MOD, "[GPS_QUERY] getGpsPositionsInMapFrame exit reason=not_aligned out_size=0");
+        ALOG_INFO(MOD, "[GPS_QUERY_DIAG] getGpsPositionsInMapFrame exit reason=not_aligned out_size=0");
         return out;
     }
     out.reserve(snap.window.size());
     for (const auto& r : snap.window)
         out.emplace_back(r.timestamp, enu_to_map_from_snapshot(r.pos_enu, snap));
-    ALOG_DEBUG(MOD, "[GPS_QUERY] getGpsPositionsInMapFrame exit out_size={}", out.size());
+    ALOG_INFO(MOD, "[GPS_QUERY_DIAG] getGpsPositionsInMapFrame exit out_size={} (transformed to map frame)", out.size());
     return out;
 }
 

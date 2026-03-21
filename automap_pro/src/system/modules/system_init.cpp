@@ -227,6 +227,9 @@ void AutoMapSystem::loadConfigAndInit() {
                     gps_enabled_from_config_ ? "true" : "false", gps_topic_from_config_.c_str());
         RCLCPP_INFO(get_logger(), "[AutoMapSystem][GPS_DIAG] config_path=%s gps_topic=%s (M2DGR bag: /ublox/fix; grep LivoBridge[GPS] for first message)",
                     config_path.c_str(), gps_topic_from_config_.c_str());
+        gps_lever_arm_imu_ = ConfigManager::instance().gpsLeverArmImu();
+        RCLCPP_INFO(get_logger(), "[AutoMapSystem][CONFIG] gps.lever_arm_imu=[%.4f, %.4f, %.4f]",
+                    gps_lever_arm_imu_.x(), gps_lever_arm_imu_.y(), gps_lever_arm_imu_.z());
         RCLCPP_INFO(get_logger(), "[AutoMapSystem][CONFIG] backend.hba.enable_gtsam_fallback=%s (HBA GTSAM fallback; false=skip HBA when no hba_api, grep HBA CONFIG to verify)",
                     ConfigManager::instance().hbaGtsamFallbackEnabled() ? "true" : "false");
     } else {

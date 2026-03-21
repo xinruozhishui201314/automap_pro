@@ -247,6 +247,9 @@ private:
 
     // 地图体素大小（init 时从 ConfigManager 缓存，避免 publishGlobalMap 回调中访问单例导致析构顺序 SIGSEGV）
     float map_voxel_size_ = 0.2f;
+
+    // GPS 杆臂补偿（V3 修复）
+    Eigen::Vector3d gps_lever_arm_imu_ = Eigen::Vector3d::Zero();
     /** HBA 完成后构建一次的全局图缓存，供发布与保存共用，避免 save 与 map_publish 两路 build 导致 PCD 重影（见 docs/PCD_GHOSTING_VS_RVIZ_ANALYSIS_20260317_2137.md） */
     CloudXYZIPtr last_hba_global_map_;
     std::mutex    last_hba_global_map_mutex_;

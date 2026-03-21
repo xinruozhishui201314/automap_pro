@@ -181,6 +181,9 @@ public:
     /** 手动请求执行一次 GPS 对齐（通常在满足最小子图数后调用） */
     void requestAlignment() { try_align(); }
 
+    /** 重置对齐矩阵为单位阵（用于 AutoMapSystem 完成全局变换后，同步坐标系） */
+    void resetAlignmentToIdentity();
+
     // ── 强制重新对齐（用于 GPS 信号恢复后） ──────────────────────────────
     void triggerRealign();
 
@@ -301,6 +304,9 @@ private:
     double online_calib_min_dist_    = 5.0;   // 最小累积距离触发在线校正（米）
     double online_calib_max_rmse_    = 2.0;   // 在线校正RMSE阈值（米）
     int    online_calib_min_samples_ = 5;     // 在线校正最小样本数
+
+    // GPS 杆臂补偿（V3 修复）：GPS 天线相对于 IMU 原点的偏移（IMU 系）
+    Eigen::Vector3d lever_arm_imu_ = Eigen::Vector3d::Zero();
 };
 
 } // namespace automap_pro
