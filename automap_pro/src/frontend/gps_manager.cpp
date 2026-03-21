@@ -230,7 +230,7 @@ void GPSManager::addGPSMeasurement(
                               antenna_pos.x(), antenna_pos.y(), antenna_pos.z(),
                               pos_enu.x(), pos_enu.y(), pos_enu.z(),
                               lever_arm_imu_.x(), lever_arm_imu_.y(), lever_arm_imu_.z(),
-                              static_cast<int>(state_));
+                              static_cast<int>(state_.load()));
                 }
             }
         }
