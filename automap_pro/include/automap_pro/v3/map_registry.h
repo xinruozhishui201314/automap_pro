@@ -39,6 +39,8 @@ public:
     
     void addKeyFrame(KeyFrame::Ptr kf);
     KeyFrame::Ptr getKeyFrame(int id) const;
+    /** 时间戳最大的关键帧（用于与当前帧点云对齐到最新优化位姿链）；无时返回 nullptr */
+    KeyFrame::Ptr getLatestKeyFrameByTimestamp() const;
     std::vector<KeyFrame::Ptr> getAllKeyFrames() const;
     size_t keyframeCount() const { return keyframes_count_.load(); }
 

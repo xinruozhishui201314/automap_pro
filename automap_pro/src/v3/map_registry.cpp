@@ -1,6 +1,7 @@
 #include "automap_pro/v3/map_registry.h"
 #include <rclcpp/rclcpp.hpp>
 #include <filesystem>
+#include <limits>
 
 namespace fs = std::filesystem;
 
@@ -26,6 +27,21 @@ KeyFrame::Ptr MapRegistry::getKeyFrame(int id) const {
     std::lock_guard<std::mutex> lock(kf_mutex_);
     auto it = keyframes_.find(id);
     return (it != keyframes_.end()) ? it->second : nullptr;
+}
+
+KeyFrame::Ptr MapRegistry::getLatestKeyFrameByTimestamp() const {
+    std::lock_guard<std::mutex> lock(kf_mutex_);
+    KeyFrame::Ptr best;
+    double best_ts = -std::numeric_limits<double>::infinity();
+    for (const auto& [id, kf] : keyframes_) {
+        (void)id;
+        if (!kf) continue;
+        if (kf->timestamp > best_ts) {
+            best_ts = kf->timestamp;
+            best = kf;
+        }
+    }
+    return best;
 }
 
 std::vector<KeyFrame::Ptr> MapRegistry::getAllKeyFrames() const {

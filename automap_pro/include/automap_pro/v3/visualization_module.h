@@ -30,25 +30,44 @@ public:
 
         // 订阅同步帧（用于显示当前点云）
         onEvent<SyncedFrameEvent>([this](const SyncedFrameEvent& ev) {
-            // 🏛️ [修复] 实时点云重影：根据最新快照中的 GPS 对齐状态发布点云
+            // 与 global_map / optimized_path 一致：回环或 iSAM2 修正后 T_map_b_optimized ≠ T_odom_b，
+            // 当前帧 /cloud_registered 仍在 LIO 世界系，需用「最新关键帧」上的 odom→优化 链式修正到 map。
             try {
                 auto snapshot = map_registry_->getPoseSnapshot();
                 CloudXYZIPtr cloud_map(new CloudXYZI());
-                Eigen::Isometry3d T_map_odom = Eigen::Isometry3d::Identity();
-                
+
+                Pose3d T_map_odom = Pose3d::Identity();
                 if (snapshot->gps_aligned) {
-                    T_map_odom.linear() = snapshot->R_enu_to_map;
+                    T_map_odom.linear()      = snapshot->R_enu_to_map;
                     T_map_odom.translation() = snapshot->t_enu_to_map;
                 }
 
-                const char* cloud_frame = ConfigManager::instance().frontendCloudFrame().c_str();
+                KeyFrame::Ptr anchor_kf = map_registry_->getLatestKeyFrameByTimestamp();
+                Pose3d T_world_to_map = Pose3d::Identity();
+                if (anchor_kf) {
+                    Pose3d T_k_opt = anchor_kf->T_map_b_optimized;
+                    auto it = snapshot->keyframe_poses.find(anchor_kf->id);
+                    if (it != snapshot->keyframe_poses.end()) {
+                        T_k_opt = it->second;
+                    }
+                    // p_map ≈ T_k_opt * inv(T_k_odom) * p_lio_world（帧间相对仍用前端里程计）
+                    T_world_to_map = T_k_opt * anchor_kf->T_odom_b.inverse();
+                }
+
                 if (ConfigManager::instance().frontendCloudFrame() == "world") {
-                    // 云已经在 odom 系 (camera_init)，只需应用 map -> odom 修正
-                    pcl::transformPointCloud(*ev.cloud, *cloud_map, T_map_odom.matrix().cast<float>());
+                    if (anchor_kf) {
+                        pcl::transformPointCloud(*ev.cloud, *cloud_map, T_world_to_map.matrix().cast<float>());
+                    } else {
+                        pcl::transformPointCloud(*ev.cloud, *cloud_map, T_map_odom.matrix().cast<float>());
+                    }
                 } else {
-                    // 云在 body 系，需应用完整的 T_map_body = T_map_odom * T_odom_body
-                    Pose3d T_map_body = T_map_odom * ev.T_odom_b;
-                    pcl::transformPointCloud(*ev.cloud, *cloud_map, T_map_body.matrix().cast<float>());
+                    if (anchor_kf) {
+                        Pose3d T_map_body = T_world_to_map * ev.T_odom_b;
+                        pcl::transformPointCloud(*ev.cloud, *cloud_map, T_map_body.matrix().cast<float>());
+                    } else {
+                        Pose3d T_map_body = T_map_odom * ev.T_odom_b;
+                        pcl::transformPointCloud(*ev.cloud, *cloud_map, T_map_body.matrix().cast<float>());
+                    }
                 }
                 rviz_publisher_.publishCurrentCloud(cloud_map);
             } catch (const std::exception& e) {

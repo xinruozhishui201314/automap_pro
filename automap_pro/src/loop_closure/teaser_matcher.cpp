@@ -291,8 +291,14 @@ TeaserMatcher::Result TeaserMatcher::match(
             ALOG_WARN(MOD, "[FPFH_DIAG] tid={} corrs={} dist_p10={:.2f}m p50={:.2f}m p90={:.2f}m "
                       "(p90>>5m 表示存在大量误匹配；若 p10 也很大则 FPFH 特征可能在不同区域发生了严重哈希碰撞)",
                       tid, corrs.size(), p10, p50, p90);
+            
+            // 【架构防护】拦截极端垃圾数据：若 90% 的对应点距离超过 20m，说明特征完全匹配错误
+            // 此时调用 TEASER++ 会触发内部 PMC 内存损坏风险，必须直接拒绝
             if (p90 > 20.0) {
-                ALOG_WARN(MOD, "[FPFH_DIAG][CRITICAL] High p90 distance ({:.2f}m) detected! TEASER input contains mostly garbage correspondences. Ghosting likely.", p90);
+                ALOG_ERROR(MOD, "[FPFH_DIAG][CRITICAL] High p90 distance ({:.2f}m) detected! REJECTING garbage input to prevent TEASER++ heap corruption.", p90);
+                ALOG_INFO(MOD, "[TRACE] step=loop_match result=fail reason=fpfh_garbage_input tid={} p90={:.2f}", tid, p90);
+                result.success = false;
+                return result;
             }
 
             // FPFH 对应点几何过滤：仅保留距离 <= fpfh_corr_max_dist 的对应点再送 TEASER（树木场景建议 3～5m）
@@ -409,7 +415,8 @@ TeaserMatcher::Result TeaserMatcher::match(
             ALOG_INFO(MOD, "[LOOP_COMPUTE][TEASER] teaser_fail reason=teaser_solution_invalid corrs={}", static_cast<int>(corrs.size()));
             ALOG_WARN(MOD, "[tid={}] step=teaser_solve_invalid corr={}", tid, corrs.size());
             ALOG_INFO(MOD, "[TRACE] step=loop_match result=fail reason=teaser_solution_invalid tid={} corrs={}", tid, corrs.size());
-            solver.release();  // 避免析构崩溃（TEASER 内部状态可能已损坏）
+            // 【V4 修复】不再 release 导致泄漏；已通过 pre-filter 拦截垃圾输入，此处 reset 是安全的
+            solver.reset();
             return result;
         }
         ALOG_DEBUG(MOD, "[tid={}] step=teaser_solution_valid", tid);
@@ -488,11 +495,11 @@ TeaserMatcher::Result TeaserMatcher::match(
             std::cerr << "[CRASH_TRACE_CRITICAL] lwp=" << getLwpForLog()
                       << " step=teaser_extremely_few_inliers inliers=" << inliers
                       << " safe_min=" << min_safe_inliers_ << std::endl;
-            // 【关键修复】使用 release() 让 solver 自然析构，延长生命周期直到函数退出
-            solver.release();
-            ALOG_INFO(MOD, "[CRASH_TRACE][tid={} lwp={}] step=teaser_solver_released solver_ptr_released=true",
+            // 【V4 修复】不再 release 导致泄漏；已通过 pre-filter 拦截垃圾输入，此处 reset 是安全的
+            solver.reset();
+            ALOG_INFO(MOD, "[CRASH_TRACE][tid={} lwp={}] step=teaser_solver_reset_done solver_ptr_reset=true",
                       tid, getLwpForLog());
-            ALOG_INFO(MOD, "[TRACE] step=loop_match result=fail reason=teaser_extremely_few_inliers tid={} inliers={} safe_min={} (V3: released solver)",
+            ALOG_INFO(MOD, "[TRACE] step=loop_match result=fail reason=teaser_extremely_few_inliers tid={} inliers={} safe_min={} (V4: reset solver)",
                      tid, inliers, min_safe_inliers_);
             return result;
         }
@@ -512,9 +519,9 @@ TeaserMatcher::Result TeaserMatcher::match(
                       tid, getLwpForLog(), static_cast<const void*>(solver.get()), inliers);
             std::cerr << "[CRASH_TRACE] lwp=" << getLwpForLog() << " step=teaser_inlier_rejected_natural_destruct inliers=" << inliers 
                       << " (solver will be released and destruct at function exit)" << std::endl;
-            // 【V3 激进修复】使用 release() 延迟析构，避免在异常处理路径中立即析构
-            solver.release();
-            ALOG_INFO(MOD, "[CRASH_TRACE][tid={} lwp={}] step=teaser_solver_released solver_ptr_released=true (delayed destruct)",
+            // 【V4 修复】不再 release 导致泄漏；已通过 pre-filter 拦截垃圾输入，此处 reset 是安全的
+            solver.reset();
+            ALOG_INFO(MOD, "[CRASH_TRACE][tid={} lwp={}] step=teaser_solver_reset_done solver_ptr_reset=true (delayed destruct)",
                       tid, getLwpForLog());
             return result;
         }
@@ -545,12 +552,11 @@ TeaserMatcher::Result TeaserMatcher::match(
             ALOG_INFO(MOD, "[tid={}] step=teaser_rmse_final cnt={} rmse={:.3f}m success={}", 
                      tid, cnt, result.rmse, result.success);
         }
-        // 【SAFEGUARD】极少 inliers 的 success 路径也会触发 TEASER 析构崩溃（见 TEASER_CRASH_ANALYSIS.md）
-        // 当 inliers < 10 时用 release() 避免析构，防止任何配置（含 min_safe_inliers=3）下崩溃
+        // 【V4 优化】不再 release；已通过 pre-filter 拦截垃圾输入
         if (inliers < 10) {
-            ALOG_WARN(MOD, "[tid={}] [SAFEGUARD] success path inliers={} < 10, release solver to avoid TEASER destructor crash",
+            ALOG_WARN(MOD, "[tid={}] [SAFEGUARD] success path inliers={} < 10, resetting solver",
                       tid, inliers);
-            solver.release();
+            solver.reset();
         }
         ALOG_INFO(MOD, "[CRASH_TRACE][tid={} lwp={}] step=teaser_solver_scope_exit success_path solver_ptr={} (unique_ptr leaving scope, natural destruct)",
                   tid, getLwpForLog(), static_cast<const void*>(solver.get()));
