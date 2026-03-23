@@ -1812,6 +1812,8 @@ OptimizationResult IncrementalOptimizer::commitAndUpdate() {
         bool single_prior_only = false;
         bool all_factors_same_key = false;  // 新增：检测所有因子指向同一 key
         bool has_isolated_node = false;     // 存在 0 约束节点时置 true，用于提前中止避免 GTSAM 抛异常
+        int isolated_sm_nodes = 0;
+        int isolated_kf_nodes = 0;
         std::string factor_types_str;       // 用于日志
         // 🔧 增强: 统计 keyframe 节点和因子数量
         int kf_node_count = 0;
@@ -1876,6 +1878,11 @@ OptimizationResult IncrementalOptimizer::commitAndUpdate() {
                 if (fc == 0) {
                     has_isolated_node = true;
                     gtsam::Symbol sym(k);
+                    if (sym.chr() == 's') {
+                        isolated_sm_nodes++;
+                    } else if (sym.chr() == 'x') {
+                        isolated_kf_nodes++;
+                    }
                     RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
                         "[IncrementalOptimizer][BACKEND][CONSTRAINT] ISOLATED NODE: key=%zu type=%c id=%lu has ZERO constraints! "
                         "- this WILL cause IndeterminantLinearSystemException!",
@@ -1955,7 +1962,26 @@ OptimizationResult IncrementalOptimizer::commitAndUpdate() {
     }
 
     // ✅ 孤立节点提前中止：避免进入 isam2_.update 后 GTSAM 抛出 IndeterminantLinearSystemException
+    // 例外：仅子图(s)孤立且当前无待提交因子时，通常是冻结子图任务到达时序窗口；
+    //      先短暂 defer，等待后续 odom 因子补齐，超时后再回退到原有 abort 逻辑。
     if (has_isolated_node) {
+        const bool submap_isolated_only = (isolated_sm_nodes > 0 && isolated_kf_nodes == 0);
+        const bool no_pending_factors = (pf == 0u);
+        if (submap_isolated_only && no_pending_factors) {
+            if (pending_duration_ms <= kSingleNodePendingTimeoutMs) {
+                RCLCPP_WARN(rclcpp::get_logger("automap_system"),
+                    "[IncrementalOptimizer][BACKEND][CONSTRAINT] DEFER isolated submap node(s): sm=%d kf=%d factors=%zu values=%zu "
+                    "(pending %.1fms/%.0fms, waiting odom/link factors)",
+                    isolated_sm_nodes, isolated_kf_nodes, pf, pv,
+                    pending_duration_ms, static_cast<double>(kSingleNodePendingTimeoutMs));
+                BACKEND_STEP("step=commitAndUpdate_defer reason=isolated_submap_wait_link factors=%zu values=%zu result=deferred", pf, pv);
+                scope.setSuccess(true);
+                return OptimizationResult{};
+            }
+            RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+                "[IncrementalOptimizer][BACKEND][CONSTRAINT] isolated submap timeout: pending %.1fms > %.0fms, fallback to abort",
+                pending_duration_ms, static_cast<double>(kSingleNodePendingTimeoutMs));
+        }
         BACKEND_TRACE("commitAndUpdate ABORT reason=has_isolated_node pending_factors=%zu pending_values=%zu",
             pf, pv);
         RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
