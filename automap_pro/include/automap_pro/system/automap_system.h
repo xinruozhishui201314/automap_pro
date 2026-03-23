@@ -9,6 +9,7 @@
 #include "automap_pro/v3/loop_module.h"
 #include "automap_pro/v3/visualization_module.h"
 #include "automap_pro/v3/frontend_module.h"
+#include "automap_pro/v3/dynamic_filter_module.h"
 #include "automap_pro/v3/mapping_module.h"
 
 #include <rclcpp/rclcpp.hpp>
@@ -57,6 +58,7 @@ private:
     std::shared_ptr<v3::LoopModule> loop_module_;
     std::shared_ptr<v3::VisualizationModule> viz_module_;
     std::shared_ptr<v3::FrontEndModule> frontend_module_;
+    std::shared_ptr<v3::DynamicFilterModule> dynamic_filter_module_;
     std::shared_ptr<v3::MappingModule> mapping_module_;
 
     // ── 状态与生命周期 ──────────────────────────────────────────────────────

@@ -123,36 +123,46 @@ void AutoMapSystem::deferredSetupModules() {
 
     v3_context_->attachNode(shared_from_this());
 
-    // 注册并启动所有微内核模块（顺序：前端→GPS→回环→可视化→优化→建图调度）
+    // 注册并启动所有微内核模块（顺序：前端→动态过滤→GPS→回环→可视化→优化→建图调度）
     RCLCPP_INFO(get_logger(), "[PIPELINE][SYS] step=08a ctor+register FrontEndModule");
     frontend_module_ = std::make_shared<v3::FrontEndModule>(
         v3_context_->eventBus(), v3_context_->mapRegistry(), shared_from_this());
     v3_context_->registerModule(frontend_module_);
 
-    RCLCPP_INFO(get_logger(), "[PIPELINE][SYS] step=08b ctor+register GPSModule");
+    RCLCPP_INFO(get_logger(), "[PIPELINE][SYS] step=08b ctor+register DynamicFilterModule");
+    dynamic_filter_module_ = std::make_shared<v3::DynamicFilterModule>(
+        v3_context_->eventBus(), v3_context_->mapRegistry(), shared_from_this());
+    v3_context_->registerModule(dynamic_filter_module_);
+
+    RCLCPP_INFO(get_logger(), "[PIPELINE][SYS] step=08c ctor+register GPSModule");
     gps_module_ = std::make_shared<v3::GPSModule>(
         v3_context_->eventBus(), v3_context_->mapRegistry(), shared_from_this());
     v3_context_->registerModule(gps_module_);
 
-    RCLCPP_INFO(get_logger(), "[PIPELINE][SYS] step=08c ctor+register LoopModule");
+    RCLCPP_INFO(get_logger(), "[PIPELINE][SYS] step=08d ctor+register LoopModule");
     loop_module_ = std::make_shared<v3::LoopModule>(
         v3_context_->eventBus(), v3_context_->mapRegistry(), shared_from_this());
     v3_context_->registerModule(loop_module_);
 
-    RCLCPP_INFO(get_logger(), "[PIPELINE][SYS] step=08d ctor+register VisualizationModule");
+    RCLCPP_INFO(get_logger(), "[PIPELINE][SYS] step=08e ctor+register VisualizationModule");
     viz_module_ = std::make_shared<v3::VisualizationModule>(
         v3_context_->eventBus(), v3_context_->mapRegistry(), shared_from_this());
     v3_context_->registerModule(viz_module_);
 
-    RCLCPP_INFO(get_logger(), "[PIPELINE][SYS] step=08e ctor+register OptimizerModule");
+    RCLCPP_INFO(get_logger(), "[PIPELINE][SYS] step=08f ctor+register OptimizerModule");
     optimizer_module_ = std::make_shared<v3::OptimizerModule>(
         v3_context_->eventBus(), v3_context_->mapRegistry(), shared_from_this());
     v3_context_->registerModule(optimizer_module_);
 
-    RCLCPP_INFO(get_logger(), "[PIPELINE][SYS] step=08f ctor+register MappingModule (SubMap+HBA)");
+    RCLCPP_INFO(get_logger(), "[PIPELINE][SYS] step=08g ctor+register MappingModule (SubMap+HBA)");
     mapping_module_ = std::make_shared<v3::MappingModule>(
         v3_context_->eventBus(), v3_context_->mapRegistry(), shared_from_this());
     v3_context_->registerModule(mapping_module_);
+
+    const auto& cfg = ConfigManager::instance();
+    RCLCPP_INFO(get_logger(),
+        "[V3][SELF_CHECK][BOOT] contract.strict_mode=%d frame_policy=%s defense.dynamic_filter_publish_guard=on defense.mapping_prequeue_guard=on defense.mapping_process_guard=on defense.hard_capacity=on",
+        cfg.contractStrictMode() ? 1 : 0, cfg.contractFramePolicy().c_str());
 
     state_ = SystemState::MAPPING;
     RCLCPP_INFO(get_logger(), "[PIPELINE][SYS] step=09 state=MAPPING === AutoMapSystem V3 Architecture Ready === (grep PIPELINE)");

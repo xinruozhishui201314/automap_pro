@@ -362,6 +362,8 @@ TeaserMatcher::Result TeaserMatcher::match(
         ALOG_INFO(MOD, "[tid={}] step=svd_fallback_low_corrs corrs={} (fundamental fix: no TEASER, no crash)", tid, corr_count);
         try {
             runSvdRegistration(src, tgt, corrs, result, max_rmse_);
+            result.used_teaser = false;
+            result.geom_path = TeaserMatcher::GeomPath::SVD_FALLBACK;
             ALOG_INFO(MOD, "[tid={}] step=svd_fallback_done rmse={:.3f}m success={}", tid, result.rmse, result.success);
         } catch (const std::exception& e) {
             ALOG_ERROR(MOD, "[tid={}] step=svd_fallback_exception msg={}", tid, e.what());
@@ -371,6 +373,8 @@ TeaserMatcher::Result TeaserMatcher::match(
             return result;
         }
     } else {
+    result.used_teaser = true;
+    result.geom_path = TeaserMatcher::GeomPath::TEASER;
 
     teaser::PointCloud src_pts, tgt_pts;
     std::vector<std::pair<int, int>> teaser_corrs;
@@ -589,6 +593,8 @@ TeaserMatcher::Result TeaserMatcher::match(
     ALOG_DEBUG(MOD, "[tid={}] step=svd_fallback TEASER disabled, using SVD corrs={}", tid, corrs.size());
     try {
         runSvdRegistration(src, tgt, corrs, result, max_rmse_);
+        result.used_teaser = false;
+        result.geom_path = TeaserMatcher::GeomPath::SVD_FALLBACK;
         ALOG_INFO(MOD, "[tid={}] step=svd_done rmse={:.3f}m success={}", tid, result.rmse, result.success);
     } catch (const std::exception& e) {
         ALOG_ERROR(MOD, "[tid={}] step=svd_exception msg={}", tid, e.what());
@@ -619,6 +625,11 @@ TeaserMatcher::Result TeaserMatcher::match(
     ALOG_INFO(MOD, "[TEASER_EXIT] result={} success={} inlier_ratio={:.4f} rmse={:.4f}m corrs={} (若 FAIL 见上方 [LOOP_COMPUTE][TEASER] reason= 或 [TEASER_RESULT] FAIL)",
               result.success ? "PASS" : "FAIL", result.success ? 1 : 0,
               result.inlier_ratio, result.rmse, result.num_correspondences);
+    ALOG_INFO(MOD, "[TEASER_PATH] used_teaser={} geom_path={} corrs={}",
+              result.used_teaser ? 1 : 0,
+              result.geom_path == TeaserMatcher::GeomPath::TEASER ? "TEASER" :
+              (result.geom_path == TeaserMatcher::GeomPath::SVD_FALLBACK ? "SVD_FALLBACK" : "UNKNOWN"),
+              result.num_correspondences);
     ALOG_INFO(MOD, "[LOOP_STEP][TEASER] match_exit success={} inliers≈{} corrs={} rmse={:.4f}m (几何验证完成，success=1 表示回环候选通过 TEASER)",
               result.success, static_cast<int>(result.inlier_ratio * std::max(0, result.num_correspondences)),
               result.num_correspondences, result.rmse);

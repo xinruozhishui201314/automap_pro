@@ -1,4 +1,5 @@
 #include "automap_pro/backend/hba_optimizer.h"
+#include "automap_pro/backend/gps_constraint_policy.h"
 #include "automap_pro/backend/gtsam_guard.h"
 #include "automap_pro/core/config_manager.h"
 #include "automap_pro/core/logger.h"
@@ -11,6 +12,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <chrono>
 #include <algorithm>
+#include <atomic>
 #include <string>
 #include <cmath>
 #include <cstdint>
@@ -35,6 +37,9 @@
 
 namespace automap_pro {
 namespace {
+std::atomic<uint64_t> g_hba_loop_added_total{0};
+std::atomic<uint64_t> g_hba_gps_added_total{0};
+
 // 与 ConfigManager::gpsLeverArmImu 同源；主配置未给出非零杆臂时，按主 YAML 所在目录回退 sensor_config/gps_imu_extrinsic.yaml（避免依赖进程 CWD）
 void resolveGpsLeverArmForHba(Eigen::Vector3d& lever_arm) {
     lever_arm = Eigen::Vector3d::Zero();
@@ -226,9 +231,15 @@ void HBAOptimizer::triggerAsync(
 
     // 解析回环约束中的局部索引为全局 ID
     std::vector<LoopConstraint::Ptr> resolved_loops;
+    size_t loops_total = 0;
+    size_t loops_already_kf = 0;
+    size_t loops_intra_resolved = 0;
+    size_t loops_inter_resolved = 0;
+    size_t loops_unresolved = 0;
+    size_t loops_degenerate_same_node = 0;
     for (const auto& lc : loops) {
         if (!lc) continue;
-        
+        loops_total++;
         // 创建副本，避免修改原始回环数据（虽然是 shared_ptr，但为了安全建议新建）
         auto resolved_lc = std::make_shared<LoopConstraint>(*lc);
         bool resolved = false;
@@ -236,6 +247,7 @@ void HBAOptimizer::triggerAsync(
         // 情况1：已经是关键帧级回环（已有全局 ID）
         if (lc->keyframe_global_id_i >= 0 && lc->keyframe_global_id_j >= 0) {
             resolved = true;
+            loops_already_kf++;
         }
         // 情况2：子图内回环（submap_i == submap_j）
         else if (lc->submap_i == lc->submap_j) {
@@ -247,6 +259,7 @@ void HBAOptimizer::triggerAsync(
                     resolved_lc->keyframe_global_id_i = sm_kfs[lc->keyframe_i]->id;
                     resolved_lc->keyframe_global_id_j = sm_kfs[lc->keyframe_j]->id;
                     resolved = true;
+                    loops_intra_resolved++;
                 }
             }
         }
@@ -258,17 +271,29 @@ void HBAOptimizer::triggerAsync(
                 resolved_lc->keyframe_global_id_i = it_i->second;
                 resolved_lc->keyframe_global_id_j = it_j->second;
                 resolved = true;
+                loops_inter_resolved++;
             }
         }
 
+        if (resolved && resolved_lc->keyframe_global_id_i == resolved_lc->keyframe_global_id_j) {
+            loops_degenerate_same_node++;
+            RCLCPP_WARN(rclcpp::get_logger("automap_system"),
+                "[HBA][LOOP_RESOLVE] drop degenerate loop resolved to same keyframe id=%d (sm%d/kf%d <-> sm%d/kf%d)",
+                resolved_lc->keyframe_global_id_i, lc->submap_i, lc->keyframe_i, lc->submap_j, lc->keyframe_j);
+            continue;
+        }
         if (resolved) {
             resolved_loops.push_back(resolved_lc);
         } else {
+            loops_unresolved++;
             RCLCPP_DEBUG(rclcpp::get_logger("automap_system"),
                 "[HBA][LOOP_RESOLVE] failed to resolve loop sm%d(kf%d) <-> sm%d(kf%d)",
                 lc->submap_i, lc->keyframe_i, lc->submap_j, lc->keyframe_j);
         }
     }
+    RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+        "[HBA][LOOP_RESOLVE] total=%zu resolved=%zu already_kf=%zu intra=%zu inter=%zu unresolved=%zu degenerate_same_node=%zu",
+        loops_total, resolved_loops.size(), loops_already_kf, loops_intra_resolved, loops_inter_resolved, loops_unresolved, loops_degenerate_same_node);
 
     size_t kf_count = kfs.size();
     size_t sm_count = all_submaps.size();
@@ -344,7 +369,7 @@ void HBAOptimizer::onGPSAligned(
 }
 
 void HBAOptimizer::setGPSAlignedState(const GPSAlignResult& align_result) {
-    gps_aligned_      = true;
+    gps_aligned_      = align_result.success;
     gps_align_result_ = align_result;
 }
 
@@ -501,8 +526,7 @@ HBAResult HBAOptimizer::runHBA(const PendingTask& task) {
     if (task.enable_gps && gps_aligned_) {
         for (const auto& kf : task.keyframes) {
             if (kf->has_valid_gps &&
-                kf->gps.quality != GPSQuality::INVALID &&
-                kf->gps.quality != GPSQuality::LOW) {
+                gpsQualityAcceptedByPolicy(kf->gps.quality, cfg)) {
                 hba_api::Config::GPSEntry entry;
                 entry.timestamp = kf->gps.timestamp;
                 entry.lat       = kf->gps.latitude;
@@ -779,6 +803,7 @@ HBAResult HBAOptimizer::runGTSAMFallback(const PendingTask& task) {
             }
         }
         if (loop_factors_added > 0) {
+            g_hba_loop_added_total.fetch_add(loop_factors_added, std::memory_order_relaxed);
             RCLCPP_INFO(rclcpp::get_logger("automap_system"),
                 "[HBA][GTSAM][BACKEND] Loop factors added to HBA graph count=%zu avg_info_norm=%.2e", 
                 loop_factors_added, total_loop_info_norm / loop_factors_added);
@@ -803,13 +828,25 @@ HBAResult HBAOptimizer::runGTSAMFallback(const PendingTask& task) {
         }
 
         size_t gps_factors_added = 0;
+        size_t gps_candidates_total = sorted_kfs.size();
+        size_t gps_reject_no_valid = 0;
+        size_t gps_reject_quality = 0;
+        size_t gps_reject_non_finite_pos = 0;
+        size_t gps_reject_non_finite_cov = 0;
         if (task.enable_gps && gps_aligned_) {
             for (size_t i = 0; i < sorted_kfs.size(); ++i) {
                 const auto& kf = sorted_kfs[i];
-                if (!kf->has_valid_gps || kf->gps.quality == GPSQuality::INVALID || kf->gps.quality == GPSQuality::LOW)
+                if (!kf->has_valid_gps) {
+                    gps_reject_no_valid++;
                     continue;
+                }
+                if (!gpsQualityAcceptedByPolicy(kf->gps.quality, ConfigManager::instance())) {
+                    gps_reject_quality++;
+                    continue;
+                }
                 const auto& pos_enu = kf->gps.position_enu;
                 if (!pos_enu.allFinite()) {
+                    gps_reject_non_finite_pos++;
                     RCLCPP_WARN(rclcpp::get_logger("automap_system"),
                         "[HBA][GTSAM] skip GPS factor kf=%zu: non-finite position_enu", i);
                     continue;
@@ -824,6 +861,7 @@ HBAResult HBAOptimizer::runGTSAMFallback(const PendingTask& task) {
                 gtsam::Point3 pt(pos_map.x(), pos_map.y(), pos_map.z());
                 Eigen::Matrix3d c = kf->gps.covariance;
                 if (!c.allFinite()) {
+                    gps_reject_non_finite_cov++;
                     RCLCPP_WARN(rclcpp::get_logger("automap_system"),
                         "[HBA][GTSAM] skip GPS factor kf=%zu: non-finite covariance", i);
                     continue;
@@ -846,10 +884,24 @@ HBAResult HBAOptimizer::runGTSAMFallback(const PendingTask& task) {
                 gps_factors_added++;
             }
             if (gps_factors_added > 0) {
+                g_hba_gps_added_total.fetch_add(gps_factors_added, std::memory_order_relaxed);
                 RCLCPP_INFO(rclcpp::get_logger("automap_system"),
                     "[HBA][GTSAM][BACKEND] GPS positions in map frame (enu_to_map applied) gps_factors=%zu",
                     gps_factors_added);
             }
+            RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                "[HBA][GTSAM][GPS_FILTER] candidates=%zu added=%zu reject_no_valid=%zu reject_quality=%zu reject_non_finite_pos=%zu reject_non_finite_cov=%zu",
+                gps_candidates_total, gps_factors_added, gps_reject_no_valid, gps_reject_quality, gps_reject_non_finite_pos, gps_reject_non_finite_cov);
+            RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                "[CONSTRAINT_KPI][HBA] loop_added=%zu gps_added=%zu gps_reject_quality=%zu gps_min_accepted_quality_level=%d total_loop_added=%lu total_gps_added=%lu",
+                loop_factors_added, gps_factors_added, gps_reject_quality,
+                ConfigManager::instance().gpsMinAcceptedQualityLevel(),
+                static_cast<unsigned long>(g_hba_loop_added_total.load(std::memory_order_relaxed)),
+                static_cast<unsigned long>(g_hba_gps_added_total.load(std::memory_order_relaxed)));
+        } else {
+            RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                "[HBA][GTSAM][GPS_FILTER] skipped task_enable_gps=%d gps_aligned=%d candidates=%zu",
+                task.enable_gps ? 1 : 0, gps_aligned_ ? 1 : 0, gps_candidates_total);
         }
 
         size_t n_factors = graph.size();

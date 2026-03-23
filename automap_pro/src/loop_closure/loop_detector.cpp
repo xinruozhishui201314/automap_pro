@@ -17,6 +17,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <future>
+#include <thread>
 
 namespace automap_pro {
 
@@ -54,9 +55,36 @@ LoopDetector::LoopDetector() {
     sc_num_candidates_ = cfg.scancontextNumCandidates();
     sc_exclude_recent_ = cfg.scancontextExcludeRecent();
     sc_tree_making_period_ = cfg.scancontextTreeMakingPeriod();
+    zero_accept_warn_consecutive_queries_ = cfg.loopZeroAcceptWarnConsecutiveQueries();
+    ot_preferred_flow_ = cfg.loopOtPreferredFlow();
+    allow_sc_fallback_ = cfg.loopAllowScFallback();
+    allow_descriptor_fallback_ = cfg.loopAllowDescriptorFallback();
+    allow_svd_geom_fallback_ = cfg.loopAllowSvdGeomFallback();
+    log_effective_flow_ = cfg.loopLogEffectiveFlow();
+    loop_flow_mode_ = cfg.loopFlowMode();
+    parallel_teaser_max_inflight_ = cfg.parallelTeaserMaxInflight();
 }
 
 LoopDetector::~LoopDetector() { stop(); }
+
+std::string LoopDetector::makeSubmapKey(uint64_t session_id, int submap_id) const {
+    return std::to_string(session_id) + ":" + std::to_string(submap_id);
+}
+
+double LoopDetector::submapRepresentativeTime(const SubMap::Ptr& submap) const {
+    if (!submap) return 0.0;
+    if (submap->t_start > 0.0 && submap->t_end >= submap->t_start) {
+        return 0.5 * (submap->t_start + submap->t_end);
+    }
+    if (!submap->keyframes.empty()) {
+        const auto& kf0 = submap->keyframes.front();
+        const auto& kf1 = submap->keyframes.back();
+        if (kf0 && kf1) return 0.5 * (kf0->timestamp + kf1->timestamp);
+        if (kf0) return kf0->timestamp;
+        if (kf1) return kf1->timestamp;
+    }
+    return 0.0;
+}
 
 void LoopDetector::init(rclcpp::Node::SharedPtr node) {
     node_ = node;
@@ -88,6 +116,14 @@ void LoopDetector::init(rclcpp::Node::SharedPtr node) {
     sc_num_candidates_ = cfg.scancontextNumCandidates();
     sc_exclude_recent_ = cfg.scancontextExcludeRecent();
     sc_tree_making_period_ = cfg.scancontextTreeMakingPeriod();
+    zero_accept_warn_consecutive_queries_ = cfg.loopZeroAcceptWarnConsecutiveQueries();
+    ot_preferred_flow_ = cfg.loopOtPreferredFlow();
+    allow_sc_fallback_ = cfg.loopAllowScFallback();
+    allow_descriptor_fallback_ = cfg.loopAllowDescriptorFallback();
+    allow_svd_geom_fallback_ = cfg.loopAllowSvdGeomFallback();
+    log_effective_flow_ = cfg.loopLogEffectiveFlow();
+    loop_flow_mode_ = cfg.loopFlowMode();
+    parallel_teaser_max_inflight_ = cfg.parallelTeaserMaxInflight();
 
     teaser_matcher_.applyConfig();
     RCLCPP_INFO(node->get_logger(),
@@ -120,7 +156,55 @@ void LoopDetector::init(rclcpp::Node::SharedPtr node) {
             loaded ? "OK" : "FAIL_or_SKIP",
             model_path.c_str(),
             loaded ? "LibTorch (overlapTransformer.pt)" : (use_scancontext_ ? "ScanContext" : "fallback"));
+        if (!loaded && !use_scancontext_ && cfg.loopAutoEnableScancontextOnOtFailure()) {
+            use_scancontext_ = true;
+            RCLCPP_WARN(node->get_logger(),
+                "[LOOP_HEALTH][DEGRADED->RECOVER] OT load failed and scancontext.disabled in config; auto-enable ScanContext to avoid fallback-only mode");
+        }
     }
+    const bool strict_mode = (loop_flow_mode_ == "strict");
+    if (log_effective_flow_) {
+        const bool ot_ready = overlap_infer_.isModelLoaded();
+        const char* retrieval_path =
+            ot_ready ? "OT" : (use_scancontext_ ? "ScanContext" : "DescriptorFallback");
+        RCLCPP_INFO(node->get_logger(),
+            "[LOOP_FLOW] effective_flow mode=%s ot_preferred=%d retrieval=%s allow_sc_fallback=%d allow_descriptor_fallback=%d allow_svd_geom_fallback=%d parallel_teaser_max_inflight=%d",
+            loop_flow_mode_.c_str(),
+            ot_preferred_flow_ ? 1 : 0, retrieval_path, allow_sc_fallback_ ? 1 : 0,
+            allow_descriptor_fallback_ ? 1 : 0, allow_svd_geom_fallback_ ? 1 : 0,
+            parallel_teaser_max_inflight_);
+    }
+    if (strict_mode && ot_preferred_flow_ && !overlap_infer_.isModelLoaded() &&
+        !allow_sc_fallback_ && !allow_descriptor_fallback_) {
+        loop_ot_unavailable_event_total_.fetch_add(1, std::memory_order_relaxed);
+        RCLCPP_ERROR(node->get_logger(),
+            "[LOOP_FLOW][STRICT] OT mandatory mode but model is unavailable. coarse matching is blocked until %s is loadable.",
+            cfg.overlapModelPath().c_str());
+    } else if (!strict_mode && ot_preferred_flow_ && !overlap_infer_.isModelLoaded()) {
+        loop_ot_unavailable_event_total_.fetch_add(1, std::memory_order_relaxed);
+        if (!use_scancontext_) {
+            use_scancontext_ = true;
+            RCLCPP_WARN(node->get_logger(),
+                "[LOOP_EVENT][OT_UNAVAILABLE] mode=safe_degraded action=enable_scancontext reason=ot_model_not_loaded model_path=%s",
+                cfg.overlapModelPath().c_str());
+        } else {
+            RCLCPP_WARN(node->get_logger(),
+                "[LOOP_EVENT][OT_UNAVAILABLE] mode=safe_degraded action=keep_scancontext reason=ot_model_not_loaded model_path=%s",
+                cfg.overlapModelPath().c_str());
+        }
+    }
+#ifndef USE_TEASER
+    if (strict_mode && !allow_svd_geom_fallback_) {
+        loop_teaser_unavailable_event_total_.fetch_add(1, std::memory_order_relaxed);
+        RCLCPP_ERROR(node->get_logger(),
+            "[LOOP_FLOW][STRICT] TEASER mandatory mode but USE_TEASER is OFF at build-time. geometric verification will be blocked.");
+    } else {
+        loop_teaser_unavailable_event_total_.fetch_add(1, std::memory_order_relaxed);
+        RCLCPP_WARN(node->get_logger(),
+            "[LOOP_EVENT][TEASER_UNAVAILABLE] mode=%s action=svd_fallback_allowed=%d reason=build_without_use_teaser",
+            loop_flow_mode_.c_str(), allow_svd_geom_fallback_ ? 1 : 0);
+    }
+#endif
 
     // 可选：外部 Python Service（Level 2，仅在 LibTorch 不可用时）
 #ifdef USE_OVERLAP_TRANSFORMER_MSGS
@@ -139,6 +223,9 @@ void LoopDetector::init(rclcpp::Node::SharedPtr node) {
     if (use_scancontext_) {
         ALOG_INFO(MOD, "[ScanContext] Enabled: dist_threshold=%.3f num_candidates=%d exclude_recent=%d",
                   sc_dist_threshold_, sc_num_candidates_, sc_exclude_recent_);
+    } else if (!overlap_infer_.isModelLoaded()) {
+        RCLCPP_ERROR(node->get_logger(),
+            "[LOOP_HEALTH][CRITICAL] OT unavailable and ScanContext disabled: loop detection is in weak fallback mode and may reject most candidates");
     }
 
     constraint_pub_ = node->create_publisher<automap_pro::msg::LoopConstraintMsg>(
@@ -215,7 +302,10 @@ void LoopDetector::addSubmap(const SubMap::Ptr& submap) {
     {
         std::lock_guard<std::mutex> lk(desc_mutex_);
         const size_t max_desc = ConfigManager::instance().loopMaxDescQueueSize();
-        while (desc_queue_.size() >= max_desc) desc_queue_.pop();  // 丢弃最低优先级，防无界堆积
+        while (desc_queue_.size() >= max_desc) {
+            desc_queue_.pop();  // 丢弃最低优先级，防无界堆积
+            loop_desc_queue_drop_total_.fetch_add(1, std::memory_order_relaxed);
+        }
         desc_queue_.push({submap, priority});
         qsize = desc_queue_.size();
         dbsize = dbSize();
@@ -257,21 +347,7 @@ void LoopDetector::descWorkerLoop() {
                     submap->id, queue_remaining, use_scancontext_ ? 1 : 0);
     }
 
-    if (use_scancontext_) {
-        submap->has_descriptor = true;
-        onDescriptorReady(submap);
-    } else {
-        size_t pts = submap->downsampled_cloud ? submap->downsampled_cloud->size() : 0u;
-        ALOG_INFO(MOD, "[LOOP_DESC][SUBMAP] phase=compute_enter submap_id={} pts={} (开始计算子图 OT 描述子)",
-                  submap->id, pts);
-        submap->overlap_descriptor = overlap_infer_.computeDescriptor(
-            submap->downsampled_cloud);
-        submap->overlap_descriptor_norm = submap->overlap_descriptor.norm();
-        submap->has_descriptor = true;
-        ALOG_INFO(MOD, "[LOOP_DESC][SUBMAP] phase=compute_done submap_id={} desc_norm={:.4f} (子图描述子就绪)",
-                  submap->id, submap->overlap_descriptor_norm);
-        onDescriptorReady(submap);
-    }
+    computeDescriptorAsync(submap);
     }
 }
 
@@ -397,8 +473,23 @@ void LoopDetector::onDescriptorReady(const SubMap::Ptr& submap) {
     auto t_retrieve_start = std::chrono::steady_clock::now();
     std::vector<OverlapTransformerInfer::Candidate> candidates;
 
-    // 根据配置选择候选检索方法（日志便于确认当前使用的描述子与推理状态）
-    if (use_scancontext_) {
+    // 根据配置选择候选检索方法（OT 优先 + 显式 fallback guard）
+    const bool ot_ready = overlap_infer_.isModelLoaded();
+    const bool use_sc_path = use_scancontext_ && (!ot_preferred_flow_ || !ot_ready || allow_sc_fallback_);
+    const bool use_desc_path = (!use_scancontext_) || (ot_preferred_flow_ && !ot_ready && !use_sc_path);
+    const char* retrieval_path = use_sc_path ? "ScanContext" : (ot_ready ? "OT" : "DescriptorFallback");
+
+    if (ot_preferred_flow_ && !ot_ready && !allow_sc_fallback_ && !allow_descriptor_fallback_) {
+        ALOG_WARN(MOD, "[LOOP_FLOW] query_id={} path=reject reason=ot_unavailable_and_fallbacks_disabled", submap->id);
+        return;
+    }
+    if (!ot_ready && use_desc_path && !allow_descriptor_fallback_) {
+        ALOG_WARN(MOD, "[LOOP_FLOW] query_id={} path=reject reason=descriptor_fallback_disabled", submap->id);
+        return;
+    }
+
+    if (use_sc_path) {
+        loop_sc_retrieval_total_.fetch_add(1, std::memory_order_relaxed);
         if (node()) {
             RCLCPP_INFO(node()->get_logger(), "[OT] retrieve: method=ScanContext submap_id=%d db_size=%zu top_k=%d",
                         submap->id, db_copy.size(), top_k_);
@@ -406,9 +497,10 @@ void LoopDetector::onDescriptorReady(const SubMap::Ptr& submap) {
         std::lock_guard<std::mutex> lk(sc_mutex_);
         candidates = retrieveUsingScanContext(submap, db_copy);
     } else {
+        loop_ot_retrieval_total_.fetch_add(1, std::memory_order_relaxed);
         if (node()) {
             RCLCPP_INFO(node()->get_logger(), "[OT] retrieve: method=%s submap_id=%d db_size=%zu top_k=%d",
-                        overlap_infer_.isModelLoaded() ? "LibTorch(overlapTransformer.pt)" : "fallback_descriptor",
+                        ot_ready ? "LibTorch(overlapTransformer.pt)" : "fallback_descriptor",
                         submap->id, db_copy.size(), top_k_);
         }
         candidates = overlap_infer_.retrieve(
@@ -422,6 +514,8 @@ void LoopDetector::onDescriptorReady(const SubMap::Ptr& submap) {
             submap->gps_center,
             submap->has_valid_gps);
     }
+    ALOG_INFO(MOD, "[LOOP_FLOW] query_id={} path={} ot_ready={} use_scancontext={} candidates={}",
+              submap->id, retrieval_path, ot_ready ? 1 : 0, use_scancontext_ ? 1 : 0, candidates.size());
     auto t_retrieve_end = std::chrono::steady_clock::now();
     double retrieve_ms = std::chrono::duration<double, std::milli>(t_retrieve_end - t_retrieve_start).count();
 
@@ -470,8 +564,7 @@ void LoopDetector::onDescriptorReady(const SubMap::Ptr& submap) {
         }
         if (cand.submap_id == submap->id) {
             same_submap_count++;
-            valid_candidates.push_back(cand);
-            ALOG_INFO(MOD, "[LOOP_STEP] stage=gap_filter_cand query_id=%d cand_idx=%zu target_id=%d score=%.3f gap=%d reason=same_submap PASS",
+            ALOG_INFO(MOD, "[LOOP_STEP] stage=gap_filter_cand query_id=%d cand_idx=%zu target_id=%d score=%.3f gap=%d reason=same_submap FILTERED (submap-level self loop is invalid)",
                 submap->id, c, cand.submap_id, cand.score, gap);
             continue;
         }
@@ -505,6 +598,46 @@ void LoopDetector::onDescriptorReady(const SubMap::Ptr& submap) {
         }
         return;
     }
+
+    // temporal gap 过滤：确保 loop_closure.min_temporal_gap_s 在主链路真实生效
+    std::vector<OverlapTransformerInfer::Candidate> temporal_filtered_candidates;
+    int filtered_by_temporal = 0;
+    const double query_time = submapRepresentativeTime(submap);
+    for (const auto& cand : valid_candidates) {
+        SubMap::Ptr target_submap;
+        for (const auto& sm : db_copy) {
+            if (sm && sm->id == cand.submap_id && sm->session_id == cand.session_id) {
+                target_submap = sm;
+                break;
+            }
+        }
+        if (!target_submap || min_temporal_gap_ <= 0.0) {
+            temporal_filtered_candidates.push_back(cand);
+            continue;
+        }
+        const double target_time = submapRepresentativeTime(target_submap);
+        const double dt = std::abs(query_time - target_time);
+        if (query_time > 0.0 && target_time > 0.0 && dt < min_temporal_gap_) {
+            filtered_by_temporal++;
+            ALOG_INFO(MOD,
+                      "[LOOP_STEP] stage=temporal_filter query_id={} target_id={} dt={:.2f}s min_temporal_gap_s={:.2f} FILTERED",
+                      submap->id, cand.submap_id, dt, min_temporal_gap_);
+            continue;
+        }
+        temporal_filtered_candidates.push_back(cand);
+    }
+    if (filtered_by_temporal > 0) {
+        ALOG_INFO(MOD,
+                  "[LOOP_STEP] stage=temporal_filter query_id={} filtered={} remain={} min_temporal_gap_s={:.2f}",
+                  submap->id, filtered_by_temporal, temporal_filtered_candidates.size(), min_temporal_gap_);
+    }
+    if (temporal_filtered_candidates.empty()) {
+        ALOG_WARN(MOD,
+                  "[LOOP_STEP] stage=temporal_filter ALL_FILTERED query_id={} min_temporal_gap_s={:.2f}",
+                  submap->id, min_temporal_gap_);
+        return;
+    }
+    valid_candidates.swap(temporal_filtered_candidates);
 
     // 【几何距离预筛】按两子图锚定位姿距离过滤，抑制重复结构导致的误检（相似但远距离的候选）
     Eigen::Vector3d query_pos = submap->pose_odom_anchor.translation();
@@ -614,7 +747,11 @@ void LoopDetector::onDescriptorReady(const SubMap::Ptr& submap) {
                 for (size_t tkf = 0; tkf < tsm->keyframe_scancontexts_.size(); ++tkf) {
                     const auto& tsc = tsm->keyframe_scancontexts_[tkf];
                     if (tsc.size() == 0) continue;
-                    auto res = sc_manager_.distanceBtnScanContext(query_sc, tsc);
+                    std::pair<double, int> res;
+                    {
+                        std::lock_guard<std::mutex> sc_lk(sc_mutex_);
+                        res = sc_manager_.distanceBtnScanContext(query_sc, tsc);
+                    }
                     if (res.first >= sc_dist_threshold_) continue;
                     // float score = std::max(0.f, 1.f - static_cast<float>(res.first / sc_dist_threshold_));
                     dists.push_back({static_cast<int>(tkf), res.first});
@@ -627,7 +764,10 @@ void LoopDetector::onDescriptorReady(const SubMap::Ptr& submap) {
                 }
             }
             if (kf_cands.empty()) continue;
-            while (match_queue_.size() >= max_match) match_queue_.pop();
+            while (match_queue_.size() >= max_match) {
+                match_queue_.pop();
+                loop_match_queue_drop_total_.fetch_add(1, std::memory_order_relaxed);
+            }
             CloudXYZIPtr kf_cloud_copy = std::make_shared<CloudXYZI>();
             *kf_cloud_copy = *query_kf_cloud;
             MatchTask kf_task;
@@ -712,7 +852,10 @@ void LoopDetector::onDescriptorReady(const SubMap::Ptr& submap) {
                 }
                 if (kf_cands.empty()) continue;
                 total_candidates_kf += static_cast<int>(kf_cands.size());
-                while (match_queue_.size() >= max_match) match_queue_.pop();
+                while (match_queue_.size() >= max_match) {
+                    match_queue_.pop();
+                    loop_match_queue_drop_total_.fetch_add(1, std::memory_order_relaxed);
+                }
                 CloudXYZIPtr kf_cloud_copy = std::make_shared<CloudXYZI>();
                 *kf_cloud_copy = *query_kf_cloud;
                 MatchTask kf_task;
@@ -747,7 +890,10 @@ void LoopDetector::onDescriptorReady(const SubMap::Ptr& submap) {
     {
         std::lock_guard<std::mutex> lk(match_mutex_);
         const size_t max_match = ConfigManager::instance().loopMaxMatchQueueSize();
-        while (match_queue_.size() >= max_match) match_queue_.pop();
+        while (match_queue_.size() >= max_match) {
+            match_queue_.pop();
+            loop_match_queue_drop_total_.fetch_add(1, std::memory_order_relaxed);
+        }
         MatchTask task;
         task.query = submap;
         task.query_cloud = query_cloud_copy;
@@ -883,6 +1029,18 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
             try {
                 res = teaser_matcher_.match(query_cloud, tgt_copy, Pose3d::Identity());
             } catch (...) { inter_kf_teaser_fail++; continue; }
+            if (res.used_teaser) {
+                loop_teaser_geom_total_.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                loop_svd_geom_total_.fetch_add(1, std::memory_order_relaxed);
+                if (!allow_svd_geom_fallback_) {
+                    loop_fallback_reject_total_.fetch_add(1, std::memory_order_relaxed);
+                    ALOG_WARN(MOD, "[INTER_KF][REJECT] sm_i=%d sm_j=%d geom_path=SVD_FALLBACK reason=svd_fallback_disabled",
+                              kfc.submap_id, task.query->id);
+                    inter_kf_teaser_fail++;
+                    continue;
+                }
+            }
 
             // 几何诊断：TEASER 估计的相对位姿 vs 里程计相对位姿（若差异大则 FPFH/对应点或误匹配）
             const double teaser_trans_m = res.T_tgt_src.translation().norm();
@@ -1133,19 +1291,51 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
             }
         }
         if (!works.empty()) {
-            std::vector<std::future<TeaserMatcher::Result>> futures;
-            for (CandWork& w : works) {
-                CloudXYZIPtr q = query_cloud;
-                CloudXYZIPtr t = w.target_cloud;
-                futures.push_back(std::async(std::launch::async, [this, q, t]() {
-                    return teaser_matcher_.match(q, t, Pose3d::Identity());
-                }));
-            }
+            const size_t max_inflight = static_cast<size_t>(std::max(1, parallel_teaser_max_inflight_));
             IcpRefiner icp_par;
-            for (size_t i = 0; i < works.size(); ++i) {
+            for (size_t batch_begin = 0; batch_begin < works.size(); batch_begin += max_inflight) {
+                const size_t batch_end = std::min(works.size(), batch_begin + max_inflight);
+                std::vector<size_t> work_indices;
+                std::vector<std::future<TeaserMatcher::Result>> futures;
+                work_indices.reserve(batch_end - batch_begin);
+                futures.reserve(batch_end - batch_begin);
+                for (size_t wi = batch_begin; wi < batch_end; ++wi) {
+                    CloudXYZIPtr q = query_cloud;
+                    CloudXYZIPtr t = works[wi].target_cloud;
+                    const auto inflight_now = loop_teaser_async_inflight_.fetch_add(1, std::memory_order_relaxed) + 1;
+                    uint64_t old_peak = loop_teaser_async_inflight_max_.load(std::memory_order_relaxed);
+                    while (inflight_now > old_peak &&
+                           !loop_teaser_async_inflight_max_.compare_exchange_weak(
+                               old_peak, inflight_now, std::memory_order_relaxed)) {
+                    }
+                    work_indices.push_back(wi);
+                    futures.push_back(std::async(std::launch::async, [this, q, t]() {
+                        const auto t0 = std::chrono::steady_clock::now();
+                        try {
+                            auto res = teaser_matcher_.match(q, t, Pose3d::Identity());
+                            const auto cost_ms = std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(
+                                                     std::chrono::steady_clock::now() - t0)
+                                                     .count();
+                            {
+                                std::lock_guard<std::mutex> lk(loop_metrics_mutex_);
+                                teaser_latency_samples_ms_.push_back(cost_ms);
+                                while (static_cast<int>(teaser_latency_samples_ms_.size()) > teaser_latency_window_size_) {
+                                    teaser_latency_samples_ms_.pop_front();
+                                }
+                            }
+                            loop_teaser_async_inflight_.fetch_sub(1, std::memory_order_relaxed);
+                            return res;
+                        } catch (...) {
+                            loop_teaser_async_inflight_.fetch_sub(1, std::memory_order_relaxed);
+                            throw;
+                        }
+                    }));
+                }
+                for (size_t fi = 0; fi < futures.size(); ++fi) {
+                    const size_t i = work_indices[fi];
                 TeaserMatcher::Result teaser_res;
                 try {
-                    teaser_res = futures[i].get();
+                    teaser_res = futures[fi].get();
                 } catch (const std::exception& e) {
                     ALOG_ERROR(MOD, "[tid={}] parallel_teaser candidate {} exception: {}", tid, works[i].cand.submap_id, e.what());
                     ALOG_INFO(MOD, "[LOOP_COMPUTE] query_id={} target_id={} result=exception reason=teaser_exception what={} (parallel)",
@@ -1175,6 +1365,17 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
                 if (node()) {
                     RCLCPP_INFO(node()->get_logger(), "[LOOP_COMPUTE] query_id=%d target_id=%d success=%d inliers=%d corrs=%d inlier_ratio=%.3f reason=%s (parallel)",
                                 query->id, works[i].cand.submap_id, teaser_res.success ? 1 : 0, inliers_approx, teaser_res.num_correspondences, teaser_res.inlier_ratio, reason_str);
+                }
+                if (teaser_res.used_teaser) {
+                    loop_teaser_geom_total_.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    loop_svd_geom_total_.fetch_add(1, std::memory_order_relaxed);
+                    if (!allow_svd_geom_fallback_) {
+                        loop_fallback_reject_total_.fetch_add(1, std::memory_order_relaxed);
+                        ALOG_WARN(MOD, "[LOOP_FLOW] query_id={} target_id={} geom_path=SVD_FALLBACK reject=1 reason=svd_fallback_disabled (parallel)",
+                                  query->id, works[i].cand.submap_id);
+                        continue;
+                    }
                 }
                 if (!teaser_res.success || teaser_res.inlier_ratio < min_inlier_ratio_) {
                     count_reject_success_or_inlier++;
@@ -1240,12 +1441,17 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
                 loop_detected_count_++;
                 for (auto& cb : loop_cbs_) cb(lc);
             }
+            }
             ALOG_INFO(MOD, "[TEASER_SUMMARY] query_id={} total_candidates={} reject_success_or_inlier={} reject_rmse={} reject_exception={} accepted={} (若 accepted=0 则本 query 所有回环被 TEASER 拒绝，见上方 [TEASER_REJECT] primary_reason 或 grep LOOP_COMPUTE][TEASER] reason=)",
                       query->id, static_cast<int>(works.size()), count_reject_success_or_inlier, count_reject_rmse, count_exception, count_accepted);
             if (node()) {
                 RCLCPP_INFO(node()->get_logger(), "[TEASER_SUMMARY] query_id=%d total=%zu reject_success_or_inlier=%d reject_rmse=%d reject_exception=%d accepted=%d (分析回环全被拒: grep TEASER_REJECT)",
                             query->id, works.size(), count_reject_success_or_inlier, count_reject_rmse, count_exception, count_accepted);
             }
+            updateLoopHealthKpi(query->id, static_cast<int>(works.size()), count_accepted);
+        } else {
+            ALOG_WARN(MOD, "[LOOP_FLOW] query_id={} parallel_teaser=on but no valid work items (empty target clouds or stale candidates)",
+                      query->id);
         }
         return;
     }
@@ -1332,6 +1538,17 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
             RCLCPP_INFO(node()->get_logger(), "[LOOP_COMPUTE] query_id=%d target_id=%d success=%d inliers=%d corrs=%d inlier_ratio=%.3f rmse=%.4f reason=%s",
                         query->id, target->id, teaser_res.success ? 1 : 0, inliers_approx, teaser_res.num_correspondences,
                         teaser_res.inlier_ratio, teaser_res.rmse, reason_str);
+        }
+        if (teaser_res.used_teaser) {
+            loop_teaser_geom_total_.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            loop_svd_geom_total_.fetch_add(1, std::memory_order_relaxed);
+            if (!allow_svd_geom_fallback_) {
+                loop_fallback_reject_total_.fetch_add(1, std::memory_order_relaxed);
+                ALOG_WARN(MOD, "[LOOP_FLOW] query_id={} target_id={} geom_path=SVD_FALLBACK reject=1 reason=svd_fallback_disabled",
+                          query->id, target->id);
+                continue;
+            }
         }
         ALOG_DEBUG(MOD, "[tid={}] step=teaser_result query_id={} target_id={} success={} inlier={:.2f} rmse={:.3f}m ms={:.1f}",
                    tid, query->id, target->id, teaser_res.success, teaser_res.inlier_ratio, teaser_res.rmse, teaser_ms);
@@ -1420,6 +1637,7 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
         RCLCPP_INFO(node()->get_logger(), "[TEASER_SUMMARY] query_id=%d total=%zu reject_success_or_inlier=%d reject_rmse=%d reject_exception=%d accepted=%d (分析回环全被拒: grep TEASER_REJECT)",
                     query->id, valid_candidates.size(), count_reject_success_or_inlier, count_reject_rmse, count_exception, count_accepted);
     }
+    updateLoopHealthKpi(query->id, static_cast<int>(valid_candidates.size()), count_accepted);
 }
 
 void LoopDetector::addToDatabase(const SubMap::Ptr& submap) {
@@ -1440,10 +1658,23 @@ void LoopDetector::addToDatabase(const SubMap::Ptr& submap) {
 void LoopDetector::clearCurrentSessionDB() {
     std::unique_lock<std::shared_mutex> lk(db_mutex_);
     uint64_t cur_session = db_submaps_.empty() ? 0 : db_submaps_.back()->session_id;
+    std::vector<std::string> removed_keys;
+    for (const auto& sm : db_submaps_) {
+        if (sm && sm->session_id == cur_session) {
+            removed_keys.push_back(makeSubmapKey(sm->session_id, sm->id));
+        }
+    }
     db_submaps_.erase(
         std::remove_if(db_submaps_.begin(), db_submaps_.end(),
             [cur_session](const SubMap::Ptr& sm) { return sm->session_id == cur_session; }),
         db_submaps_.end());
+    lk.unlock();
+
+    // 同步清理 SC 索引映射，避免 sc_idx 与 db_copy 的生命周期漂移
+    std::lock_guard<std::mutex> sc_lk(sc_mutex_);
+    for (const auto& key : removed_keys) {
+        sc_submap_to_index_.erase(key);
+    }
 }
 
 size_t LoopDetector::dbSize() const {
@@ -1469,6 +1700,23 @@ std::vector<std::pair<int, Eigen::VectorXf>> LoopDetector::exportDescriptorDB() 
 
 void LoopDetector::publishLoopConstraint(const LoopConstraint::Ptr& lc) {
     if (!constraint_pub_) return;
+    if (!lc) return;
+    // 子图级同节点自回环（例如 sm_i==sm_j 且无有效 keyframe 对）会在后端退化为 same_node，被 iSAM2 丢弃。
+    // 在发布侧提前拦截，保证“发布=可入图”语义一致。
+    if (lc->submap_i == lc->submap_j) {
+        const bool has_kf_pair = (lc->keyframe_i >= 0 && lc->keyframe_j >= 0);
+        if (!has_kf_pair || lc->keyframe_i == lc->keyframe_j) {
+            ALOG_WARN(MOD,
+                "[LOOP_REJECTED] publishLoopConstraint reject self-loop sm_i=%d sm_j=%d kf_i=%d kf_j=%d reason=degenerate_same_submap",
+                lc->submap_i, lc->submap_j, lc->keyframe_i, lc->keyframe_j);
+            if (node()) {
+                RCLCPP_WARN(node()->get_logger(),
+                    "[LOOP_REJECTED] publish skip degenerate same-submap loop sm_i=%d sm_j=%d kf_i=%d kf_j=%d",
+                    lc->submap_i, lc->submap_j, lc->keyframe_i, lc->keyframe_j);
+            }
+            return;
+        }
+    }
     automap_pro::msg::LoopConstraintMsg msg;
     msg.header.stamp  = node() ? node()->now() : rclcpp::Clock().now();
     msg.submap_i      = lc->submap_i;
@@ -1479,6 +1727,22 @@ void LoopDetector::publishLoopConstraint(const LoopConstraint::Ptr& lc) {
     msg.inlier_ratio  = lc->inlier_ratio;
     msg.rmse          = lc->rmse;
     msg.is_inter_session = lc->is_inter_session;
+    // 完整发布回环位姿测量，避免 ROS 消费者丢失 delta_T 语义
+    const Eigen::Vector3d t = lc->delta_T.translation();
+    const Eigen::Quaterniond q(lc->delta_T.rotation());
+    msg.delta_pose.position.x = t.x();
+    msg.delta_pose.position.y = t.y();
+    msg.delta_pose.position.z = t.z();
+    msg.delta_pose.orientation.x = q.x();
+    msg.delta_pose.orientation.y = q.y();
+    msg.delta_pose.orientation.z = q.z();
+    msg.delta_pose.orientation.w = q.w();
+    switch (lc->status) {
+        case LoopStatus::ACCEPTED: msg.status = "ACCEPTED"; break;
+        case LoopStatus::REJECTED: msg.status = "REJECTED"; break;
+        case LoopStatus::PENDING:
+        default: msg.status = "PENDING"; break;
+    }
     // 信息矩阵扁平化
     for (int i = 0; i < 6; ++i)
         for (int j = 0; j < 6; ++j)
@@ -1488,6 +1752,85 @@ void LoopDetector::publishLoopConstraint(const LoopConstraint::Ptr& lc) {
         RCLCPP_INFO(node()->get_logger(),
             "[LOOP_ACCEPTED] loop_constraint published sm_i=%d sm_j=%d score=%.3f (回环入图可减轻点云结构重影；grep LOOP_ACCEPTED 统计入图回环数)",
             lc->submap_i, lc->submap_j, lc->overlap_score);
+    }
+}
+
+void LoopDetector::updateLoopHealthKpi(int query_id, int candidates, int accepted) {
+    const uint64_t query_total = loop_query_total_.fetch_add(1, std::memory_order_relaxed) + 1;
+    loop_candidate_total_.fetch_add(static_cast<uint64_t>(std::max(0, candidates)), std::memory_order_relaxed);
+    loop_accept_total_.fetch_add(static_cast<uint64_t>(std::max(0, accepted)), std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lk(loop_metrics_mutex_);
+        query_accept_window_.push_back(accepted > 0 ? 1 : 0);
+        while (static_cast<int>(query_accept_window_.size()) > query_accept_window_size_) {
+            query_accept_window_.pop_front();
+        }
+    }
+    int zero_streak = 0;
+    if (accepted == 0) {
+        zero_streak = consecutive_zero_accept_queries_.fetch_add(1, std::memory_order_relaxed) + 1;
+    } else {
+        consecutive_zero_accept_queries_.store(0, std::memory_order_relaxed);
+    }
+
+    if (node() && (query_total % 10 == 0 || accepted > 0)) {
+        const uint64_t cand_total = loop_candidate_total_.load(std::memory_order_relaxed);
+        const uint64_t accept_total = loop_accept_total_.load(std::memory_order_relaxed);
+        const uint64_t ot_retrieval_total = loop_ot_retrieval_total_.load(std::memory_order_relaxed);
+        const uint64_t sc_retrieval_total = loop_sc_retrieval_total_.load(std::memory_order_relaxed);
+        const uint64_t teaser_geom_total = loop_teaser_geom_total_.load(std::memory_order_relaxed);
+        const uint64_t svd_geom_total = loop_svd_geom_total_.load(std::memory_order_relaxed);
+        const uint64_t fallback_reject_total = loop_fallback_reject_total_.load(std::memory_order_relaxed);
+        const uint64_t desc_queue_drop_total = loop_desc_queue_drop_total_.load(std::memory_order_relaxed);
+        const uint64_t match_queue_drop_total = loop_match_queue_drop_total_.load(std::memory_order_relaxed);
+        const uint64_t inflight_now = loop_teaser_async_inflight_.load(std::memory_order_relaxed);
+        const uint64_t inflight_peak = loop_teaser_async_inflight_max_.load(std::memory_order_relaxed);
+        const uint64_t ot_unavail_events = loop_ot_unavailable_event_total_.load(std::memory_order_relaxed);
+        const uint64_t teaser_unavail_events = loop_teaser_unavailable_event_total_.load(std::memory_order_relaxed);
+        const double accept_ratio = cand_total > 0 ? static_cast<double>(accept_total) / static_cast<double>(cand_total) : 0.0;
+        double accept_ratio_window = 0.0;
+        double teaser_p95_ms = 0.0;
+        {
+            std::lock_guard<std::mutex> lk(loop_metrics_mutex_);
+            if (!query_accept_window_.empty()) {
+                uint64_t window_accepted = 0;
+                for (uint8_t v : query_accept_window_) window_accepted += static_cast<uint64_t>(v);
+                accept_ratio_window = static_cast<double>(window_accepted) / static_cast<double>(query_accept_window_.size());
+            }
+            if (!teaser_latency_samples_ms_.empty()) {
+                std::vector<double> sorted(teaser_latency_samples_ms_.begin(), teaser_latency_samples_ms_.end());
+                std::sort(sorted.begin(), sorted.end());
+                const size_t idx = static_cast<size_t>(std::floor(0.95 * static_cast<double>(sorted.size() - 1)));
+                teaser_p95_ms = sorted[idx];
+            }
+        }
+        RCLCPP_INFO(node()->get_logger(),
+            "[CONSTRAINT_KPI][LOOP] query_total=%lu candidate_total=%lu accepted_total=%lu accept_ratio=%.4f accept_ratio_window=%.4f retrieval_ot=%lu retrieval_sc=%lu geom_teaser=%lu geom_svd=%lu fallback_reject=%lu desc_queue_drop=%lu match_queue_drop=%lu teaser_inflight_now=%lu teaser_inflight_peak=%lu teaser_p95_ms=%.2f ot_unavailable_events=%lu teaser_unavailable_events=%lu last_query=%d last_candidates=%d last_accepted=%d zero_accept_streak=%d",
+            static_cast<unsigned long>(query_total),
+            static_cast<unsigned long>(cand_total),
+            static_cast<unsigned long>(accept_total),
+            accept_ratio,
+            accept_ratio_window,
+            static_cast<unsigned long>(ot_retrieval_total),
+            static_cast<unsigned long>(sc_retrieval_total),
+            static_cast<unsigned long>(teaser_geom_total),
+            static_cast<unsigned long>(svd_geom_total),
+            static_cast<unsigned long>(fallback_reject_total),
+            static_cast<unsigned long>(desc_queue_drop_total),
+            static_cast<unsigned long>(match_queue_drop_total),
+            static_cast<unsigned long>(inflight_now),
+            static_cast<unsigned long>(inflight_peak),
+            teaser_p95_ms,
+            static_cast<unsigned long>(ot_unavail_events),
+            static_cast<unsigned long>(teaser_unavail_events),
+            query_id, candidates, accepted, zero_streak);
+    }
+
+    if (node() && zero_accept_warn_consecutive_queries_ > 0 &&
+        zero_streak >= zero_accept_warn_consecutive_queries_) {
+        RCLCPP_WARN(node()->get_logger(),
+            "[LOOP_HEALTH][WATCHDOG] consecutive_zero_accept_queries=%d threshold=%d (query_id=%d). Check OT model/ScanContext and TEASER thresholds.",
+            zero_streak, zero_accept_warn_consecutive_queries_, query_id);
     }
 }
 
@@ -1569,7 +1912,11 @@ void LoopDetector::prepareIntraSubmapDescriptors(const SubMap::Ptr& submap) {
         auto t0 = std::chrono::steady_clock::now();
         if (use_sc) {
             // 回环强制使用 ScanContext 计算描述子（不使用 fallback）
-            Eigen::MatrixXd sc = sc_manager_.makeScancontext(*cloud_ds);
+            Eigen::MatrixXd sc;
+            {
+                std::lock_guard<std::mutex> sc_lk(sc_mutex_);
+                sc = sc_manager_.makeScancontext(*cloud_ds);
+            }
             submap->keyframe_scancontexts_.push_back(sc);
             submap->keyframe_descriptors.push_back(Eigen::VectorXf::Zero(256));  // 占位，保持 size 一致
         } else {
@@ -1643,7 +1990,12 @@ void LoopDetector::ensureIntraSubmapDescriptorsUpTo(const SubMap::Ptr& submap, i
         voxel.setInputCloud(kf->cloud_body);
         voxel.filter(*cloud_ds);
         if (use_sc) {
-            submap->keyframe_scancontexts_.push_back(sc_manager_.makeScancontext(*cloud_ds));
+            Eigen::MatrixXd sc;
+            {
+                std::lock_guard<std::mutex> sc_lk(sc_mutex_);
+                sc = sc_manager_.makeScancontext(*cloud_ds);
+            }
+            submap->keyframe_scancontexts_.push_back(sc);
             submap->keyframe_descriptors.push_back(Eigen::VectorXf::Zero(256));
         } else {
             ALOG_INFO(MOD, "[OT_CRASH_LOC] step=intra_about_to_compute submap_id={} kf_idx={} pts={} tid={} lwp={} (崩溃时本条为当前关键帧)",
@@ -1847,7 +2199,11 @@ std::vector<LoopConstraint::Ptr> LoopDetector::detectIntraSubmapLoop(
                 ALOG_INFO(MOD, "[INTRA_LOOP][FILTER] SC_EMPTY: submap_id={} query_idx={} cand_idx={} (SKIP)", submap->id, query_keyframe_idx, i);
                 continue;
             }
-            std::pair<double, int> sc_result = sc_manager_.distanceBtnScanContext(query_sc, cand_sc);
+            std::pair<double, int> sc_result;
+            {
+                std::lock_guard<std::mutex> sc_lk(sc_mutex_);
+                sc_result = sc_manager_.distanceBtnScanContext(query_sc, cand_sc);
+            }
             double sc_dist = sc_result.first;
             if (sc_dist > sc_dist_threshold_) {
                 desc_filtered++;
@@ -2187,6 +2543,15 @@ std::vector<OverlapTransformerInfer::Candidate> LoopDetector::retrieveUsingScanC
 
     // 生成当前帧的 ScanContext
     sc_manager_.makeAndSaveScancontextAndKeys(scan_down);
+    const std::string query_key = makeSubmapKey(submap->session_id, submap->id);
+    const int latest_sc_idx = static_cast<int>(sc_manager_.polarcontexts_.size()) - 1;
+    if (latest_sc_idx >= 0) {
+        sc_submap_to_index_[query_key] = latest_sc_idx;
+        if (sc_index_to_submap_.size() <= static_cast<size_t>(latest_sc_idx)) {
+            sc_index_to_submap_.resize(static_cast<size_t>(latest_sc_idx) + 1);
+        }
+        sc_index_to_submap_[latest_sc_idx] = query_key;
+    }
     ALOG_INFO(MOD, "[ScanContext] SC generated: query_id=%d total_sc=%zu",
               submap->id, sc_manager_.polarcontexts_.size());
 
@@ -2322,11 +2687,22 @@ std::vector<OverlapTransformerInfer::Candidate> LoopDetector::retrieveUsingScanC
             continue;
         }
 
-        // 从 db_copy 中找到对应的子图
-        // SCManager 中的索引 sc_idx 对应 db_copy[sc_idx]
-        // 因为每次添加 SubMap 时都会同时添加 ScanContext
-        if (sc_idx >= 0 && sc_idx < (int)db_copy.size()) {
-            const auto& matched_submap = db_copy[sc_idx];
+        // 从 SC 索引映射到 submap key，再从 db_copy 找到同 key 子图（不再依赖 db_copy[sc_idx] 隐式对齐）
+        if (sc_idx >= 0 && sc_idx < static_cast<int>(sc_index_to_submap_.size())) {
+            const auto& target_key = sc_index_to_submap_[sc_idx];
+            SubMap::Ptr matched_submap;
+            for (const auto& sm : db_copy) {
+                if (!sm) continue;
+                if (makeSubmapKey(sm->session_id, sm->id) == target_key) {
+                    matched_submap = sm;
+                    break;
+                }
+            }
+            if (!matched_submap) {
+                ALOG_WARN(MOD, "[ScanContext] sc_idx=%d key=%s not found in db_copy, skip",
+                          sc_idx, target_key.c_str());
+                continue;
+            }
 
             // 过滤：排除同一子图
             if (matched_submap->id == submap->id && matched_submap->session_id == submap->session_id) {

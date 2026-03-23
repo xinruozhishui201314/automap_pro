@@ -16,6 +16,9 @@
 #include <atomic>
 #include <vector>
 #include <functional>
+#include <deque>
+#include <unordered_map>
+#include <string>
 #include <rclcpp/rclcpp.hpp>
 
 #ifdef USE_OVERLAP_TRANSFORMER_MSGS
@@ -162,6 +165,8 @@ private:
     // ── ScanContext 回环检索 ─────────────────────────────────────────────
     SCManager               sc_manager_;
     mutable std::mutex     sc_mutex_;  // 保护 SCManager 的并发访问
+    std::unordered_map<std::string, int> sc_submap_to_index_;  // key=session_id:submap_id -> SC 索引
+    std::vector<std::string> sc_index_to_submap_;              // SC 索引 -> key
     bool                    use_scancontext_ = false;
     double                  sc_dist_threshold_ = 0.13;
     int                     sc_num_candidates_ = 5;
@@ -179,6 +184,27 @@ private:
 
     // ── 数据流统计（低频日志）─────────────────────────────────────────────
     std::atomic<int> loop_detected_count_{0};
+    std::atomic<uint64_t> loop_query_total_{0};
+    std::atomic<uint64_t> loop_candidate_total_{0};
+    std::atomic<uint64_t> loop_accept_total_{0};
+    std::atomic<uint64_t> loop_ot_retrieval_total_{0};
+    std::atomic<uint64_t> loop_sc_retrieval_total_{0};
+    std::atomic<uint64_t> loop_teaser_geom_total_{0};
+    std::atomic<uint64_t> loop_svd_geom_total_{0};
+    std::atomic<uint64_t> loop_fallback_reject_total_{0};
+    std::atomic<uint64_t> loop_desc_queue_drop_total_{0};
+    std::atomic<uint64_t> loop_match_queue_drop_total_{0};
+    std::atomic<uint64_t> loop_ot_unavailable_event_total_{0};
+    std::atomic<uint64_t> loop_teaser_unavailable_event_total_{0};
+    std::atomic<uint64_t> loop_teaser_async_inflight_{0};
+    std::atomic<uint64_t> loop_teaser_async_inflight_max_{0};
+    std::atomic<int> consecutive_zero_accept_queries_{0};
+    int zero_accept_warn_consecutive_queries_ = 8;
+    mutable std::mutex loop_metrics_mutex_;
+    std::deque<double> teaser_latency_samples_ms_;
+    std::deque<uint8_t> query_accept_window_;
+    int query_accept_window_size_ = 100;
+    int teaser_latency_window_size_ = 200;
 
     // ── 线程控制 ─────────────────────────────────────────────────────────
     std::atomic<bool> running_{false};
@@ -199,6 +225,13 @@ private:
     double max_rmse_           = 0.3;
     bool   use_icp_refine_     = true;
     int    worker_thread_num_  = 2;
+    bool ot_preferred_flow_ = true;
+    bool allow_sc_fallback_ = true;
+    bool allow_descriptor_fallback_ = true;
+    bool allow_svd_geom_fallback_ = true;
+    bool log_effective_flow_ = true;
+    std::string loop_flow_mode_ = "safe_degraded";
+    int parallel_teaser_max_inflight_ = 4;
 
     std::vector<LoopConstraintCallback> loop_cbs_;
 
@@ -237,6 +270,9 @@ private:
     void computeDescriptorAsync(const SubMap::Ptr& submap);
     void onDescriptorReady(const SubMap::Ptr& submap);
     void processMatchTask(const MatchTask& task);
+    void updateLoopHealthKpi(int query_id, int candidates, int accepted);
+    std::string makeSubmapKey(uint64_t session_id, int submap_id) const;
+    double submapRepresentativeTime(const SubMap::Ptr& submap) const;
 
     // ScanContext 候选检索
     std::vector<OverlapTransformerInfer::Candidate> retrieveUsingScanContext(

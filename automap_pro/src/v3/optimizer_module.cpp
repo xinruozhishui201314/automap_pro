@@ -1,11 +1,18 @@
 #include "automap_pro/v3/optimizer_module.h"
+#include "automap_pro/backend/gps_constraint_policy.h"
 #include "automap_pro/core/config_manager.h"
 #include "automap_pro/core/logger.h"
 #include "automap_pro/core/metrics.h"
+#include "automap_pro/v3/map_registry.h"
 #include <algorithm>
+#include <atomic>
 #include <vector>
 
 namespace {
+std::atomic<uint64_t> g_gps_kf_candidates_total{0};
+std::atomic<uint64_t> g_gps_kf_added_total{0};
+std::atomic<uint64_t> g_gps_kf_reject_quality_total{0};
+
 uint64_t computeBatchHash(const std::unordered_map<int, automap_pro::Pose3d>& sm_poses,
                           const std::unordered_map<uint64_t, automap_pro::Pose3d>& kf_poses) {
     uint64_t h = 1469598103934665603ull;
@@ -25,6 +32,9 @@ uint64_t computeBatchHash(const std::unordered_map<int, automap_pro::Pose3d>& sm
         mix(static_cast<uint64_t>(pose.translation().x() * 1000.0));
         mix(static_cast<uint64_t>(pose.translation().y() * 1000.0));
         mix(static_cast<uint64_t>(pose.translation().z() * 1000.0));
+        mix(static_cast<uint64_t>(pose.linear()(0, 0) * 1e6));
+        mix(static_cast<uint64_t>(pose.linear()(1, 1) * 1e6));
+        mix(static_cast<uint64_t>(pose.linear()(2, 2) * 1e6));
     }
     std::vector<uint64_t> kf_ids;
     kf_ids.reserve(kf_poses.size());
@@ -36,6 +46,9 @@ uint64_t computeBatchHash(const std::unordered_map<int, automap_pro::Pose3d>& sm
         mix(static_cast<uint64_t>(pose.translation().x() * 1000.0));
         mix(static_cast<uint64_t>(pose.translation().y() * 1000.0));
         mix(static_cast<uint64_t>(pose.translation().z() * 1000.0));
+        mix(static_cast<uint64_t>(pose.linear()(0, 0) * 1e6));
+        mix(static_cast<uint64_t>(pose.linear()(1, 1) * 1e6));
+        mix(static_cast<uint64_t>(pose.linear()(2, 2) * 1e6));
     }
     return h;
 }
@@ -69,10 +82,53 @@ OptimizerModule::OptimizerModule(EventBus::Ptr event_bus, MapRegistry::Ptr map_r
         RCLCPP_DEBUG(node_->get_logger(),
             "[V3][DIAG] step=Optimizer_poseCallback_enter sm=%zu kf=%zu (grep V3 DIAG)",
             res.submap_poses.size(), res.keyframe_poses.size());
-        uint64_t batch_hash = computeBatchHash(res.submap_poses, res.keyframe_poses);
-        uint64_t version = map_registry_->updatePoses(
-            res.submap_poses, res.keyframe_poses, res.pose_frame, "OptimizerModule",
-            static_cast<uint32_t>(OptimizationTransformFlags::NONE), batch_hash);
+        const auto try_publish = [this, &res](uint64_t source_alignment_epoch) -> uint64_t {
+            std::unordered_map<int, Pose3d> sm_updates = res.submap_poses;
+            std::unordered_map<uint64_t, Pose3d> kf_updates = res.keyframe_poses;
+            PoseFrame output_frame = res.pose_frame;
+            uint32_t transform_flags = static_cast<uint32_t>(OptimizationTransformFlags::NONE);
+
+            // Keep Optimizer->MapRegistry contract consistent with Mapping gateway:
+            // once GPS aligned, convert ODOM results to MAP before writing into SSoT.
+            if (map_registry_->isGPSAligned() && output_frame != PoseFrame::MAP) {
+                Eigen::Matrix3d R_enu_to_map = Eigen::Matrix3d::Identity();
+                Eigen::Vector3d t_enu_to_map = Eigen::Vector3d::Zero();
+                map_registry_->getGPSTransform(R_enu_to_map, t_enu_to_map);
+
+                Pose3d T_map_odom = Pose3d::Identity();
+                T_map_odom.linear() = R_enu_to_map;
+                T_map_odom.translation() = t_enu_to_map;
+                if (!T_map_odom.matrix().allFinite()) {
+                    RCLCPP_ERROR(node_->get_logger(),
+                        "[V3][CONTRACT] Reject optimizer result: non-finite GPS transform while converting ODOM->MAP");
+                    METRICS_INCREMENT(metrics::FRAME_MISMATCH_TOTAL);
+                    return map_registry_->getVersion();
+                }
+
+                for (auto& [id, pose] : sm_updates) pose = T_map_odom * pose;
+                for (auto& [id, pose] : kf_updates) pose = T_map_odom * pose;
+                output_frame = PoseFrame::MAP;
+                transform_flags |= static_cast<uint32_t>(OptimizationTransformFlags::MAP_COMPENSATION_APPLIED);
+            }
+            uint64_t batch_hash = computeBatchHash(sm_updates, kf_updates);
+            return map_registry_->updatePoses(
+                sm_updates, kf_updates, output_frame, "OptimizerModule", source_alignment_epoch,
+                transform_flags, batch_hash);
+        };
+
+        const uint64_t source_alignment_epoch = map_registry_->getAlignmentEpoch();
+        const uint64_t version_before = map_registry_->getVersion();
+        uint64_t version = try_publish(source_alignment_epoch);
+        if (version == version_before &&
+            (!res.submap_poses.empty() || !res.keyframe_poses.empty()) &&
+            map_registry_->getAlignmentEpoch() != source_alignment_epoch) {
+            const uint64_t retry_epoch = map_registry_->getAlignmentEpoch();
+            RCLCPP_WARN(node_->get_logger(),
+                "[V3][CONTRACT] Optimizer publish epoch-race detected, retry once: epoch=%lu -> %lu",
+                static_cast<unsigned long>(source_alignment_epoch),
+                static_cast<unsigned long>(retry_epoch));
+            version = try_publish(retry_epoch);
+        }
         RCLCPP_DEBUG(node_->get_logger(),
             "[V3][DIAG] step=Optimizer_poseCallback_done version=%lu (grep V3 DIAG)",
             static_cast<unsigned long>(version));
@@ -200,8 +256,14 @@ void OptimizerModule::processGPSBatchKF(const OptTaskItem& task) {
     const Eigen::Vector3d& t = task.t_enu_to_map;
     auto all_kfs = map_registry_->getAllKeyFrames();
     std::vector<IncrementalOptimizer::GPSFactorItemKF> factors;
+    size_t reject_quality = 0;
+    const auto& cfg = ConfigManager::instance();
     for (const auto& kf : all_kfs) {
         if (!kf || !kf->has_valid_gps) continue;
+        if (!gpsQualityAcceptedByPolicy(kf->gps.quality, cfg)) {
+            reject_quality++;
+            continue;
+        }
         if (!kf->gps.position_enu.allFinite() || !kf->gps.covariance.allFinite()) continue;
         Eigen::Vector3d pos_map = R * kf->gps.position_enu + t;
         factors.push_back({static_cast<int>(kf->id), pos_map, kf->gps.covariance});
@@ -211,6 +273,13 @@ void OptimizerModule::processGPSBatchKF(const OptTaskItem& task) {
             "[V3][DIAG] step=processGPSBatchKF factors=0 (no KF with valid GPS)");
         return;
     }
+    g_gps_kf_candidates_total.fetch_add(all_kfs.size(), std::memory_order_relaxed);
+    g_gps_kf_added_total.fetch_add(factors.size(), std::memory_order_relaxed);
+    g_gps_kf_reject_quality_total.fetch_add(reject_quality, std::memory_order_relaxed);
+    RCLCPP_INFO(node_->get_logger(),
+        "[CONSTRAINT_KPI][GPS_KF] mode=batch candidates=%zu added=%zu reject_quality=%zu min_accepted_quality_level=%d total_added=%lu",
+        all_kfs.size(), factors.size(), reject_quality, cfg.gpsMinAcceptedQualityLevel(),
+        static_cast<unsigned long>(g_gps_kf_added_total.load(std::memory_order_relaxed)));
     optimizer_.addGPSFactorsForKeyFramesBatch(factors);
     RCLCPP_DEBUG(node_->get_logger(),
         "[V3][DIAG] step=processGPSBatchKF done count=%zu (grep V3 DIAG)", factors.size());
@@ -237,9 +306,19 @@ void OptimizerModule::processKeyframeCreate(const OptTaskItem& task) {
     }
     
     // 3. 添加 GPS 因子 (如果已对齐)，pos_map = R_enu_to_map * position_enu + t_enu_to_map
-    if (task.gps_aligned && kf->has_valid_gps) {
+    if (task.gps_aligned && kf->has_valid_gps &&
+        gpsQualityAcceptedByPolicy(kf->gps.quality, ConfigManager::instance())) {
         Eigen::Vector3d pos_map = task.gps_transform_R * kf->gps.position_enu + task.gps_transform_t;
         optimizer_.addGPSFactorForKeyFrame(kf->id, pos_map, kf->gps.covariance);
+        g_gps_kf_candidates_total.fetch_add(1, std::memory_order_relaxed);
+        g_gps_kf_added_total.fetch_add(1, std::memory_order_relaxed);
+    } else if (task.gps_aligned && kf->has_valid_gps) {
+        g_gps_kf_candidates_total.fetch_add(1, std::memory_order_relaxed);
+        g_gps_kf_reject_quality_total.fetch_add(1, std::memory_order_relaxed);
+        RCLCPP_INFO(node_->get_logger(),
+            "[CONSTRAINT] step=gps_kf kf_id=%lu result=skip reason=quality_below_policy quality=%d min=%d",
+            static_cast<unsigned long>(kf->id), static_cast<int>(kf->gps.quality),
+            ConfigManager::instance().gpsMinAcceptedQualityLevel());
     }
 }
 

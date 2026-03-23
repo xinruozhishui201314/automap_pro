@@ -10,12 +10,20 @@ namespace automap_pro {
 
 class TeaserMatcher {
 public:
+    enum class GeomPath : int {
+        UNKNOWN = 0,
+        TEASER = 1,
+        SVD_FALLBACK = 2
+    };
+
     struct Result {
         bool    success       = false;
         Pose3d  T_tgt_src     = Pose3d::Identity();
         float   inlier_ratio  = 0.0f;
         float   rmse          = 1e6f;
         int     num_correspondences = 0;
+        bool    used_teaser   = false;
+        GeomPath geom_path    = GeomPath::UNKNOWN;
     };
 
     explicit TeaserMatcher();

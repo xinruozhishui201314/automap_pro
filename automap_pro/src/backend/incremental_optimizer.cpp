@@ -40,6 +40,12 @@ static gtsam::Symbol KF(int id) { return gtsam::Symbol('x', id); }
 namespace {
 // 平移合理范围（米），超出视为异常输入，避免 GTSAM 数值问题
 constexpr double kMaxReasonableTranslationNorm = 1e6;
+std::atomic<uint64_t> g_loop_added_total{0};
+std::atomic<uint64_t> g_loop_rejected_same_node_total{0};
+std::atomic<uint64_t> g_loop_rejected_node_missing_total{0};
+std::atomic<uint64_t> g_gps_kf_added_total{0};
+std::atomic<uint64_t> g_gps_kf_deferred_total{0};
+std::atomic<uint64_t> g_gps_kf_rejected_total{0};
 
 struct ConstraintValidation {
     bool all_keys_exist = true;
@@ -515,24 +521,36 @@ OptimizationResult IncrementalOptimizer::addLoopFactor(
 
         // 同节点回环无效：BetweenFactor(from, to) 当 from==to 时退化，且易导致 commitAndUpdate 异常
         if (from == to) {
+            const uint64_t rejected = g_loop_rejected_same_node_total.fetch_add(1, std::memory_order_relaxed) + 1;
             BACKEND_STEP("step=addLoopFactor_skip from=%d to=%d reason=same_node", from, to);
             CONSTRAINT_LOG("step=loop_inter from=%d to=%d result=skip reason=same_node (grep CONSTRAINT 定位)", from, to);
+            RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                "[CONSTRAINT_KPI][ISAM2] loop_added=%lu loop_reject_same_node=%lu loop_reject_node_missing=%lu",
+                static_cast<unsigned long>(g_loop_added_total.load(std::memory_order_relaxed)),
+                static_cast<unsigned long>(rejected),
+                static_cast<unsigned long>(g_loop_rejected_node_missing_total.load(std::memory_order_relaxed)));
             ALOG_DEBUG(MOD, "addLoopFactor: from==to=%d (same node), skip degenerate loop", from);
             RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-                "[IncrementalOptimizer][BACKEND][LOOP] skip addLoopFactor from=%d to=%d (same node, invalid Between factor; grep BACKEND LOOP)",
-                from, to);
+                "[IncrementalOptimizer][BACKEND][LOOP] skip addLoopFactor from=%d to=%d (same node, invalid Between factor) stats: rejected_same_node_total=%lu",
+                from, to, static_cast<unsigned long>(rejected));
             return OptimizationResult{};
         }
 
         // ✅ 修复：显式检查节点存在性
         if (node_exists_.find(from) == node_exists_.end() ||
             node_exists_.find(to) == node_exists_.end()) {
+            const uint64_t rejected = g_loop_rejected_node_missing_total.fetch_add(1, std::memory_order_relaxed) + 1;
             BACKEND_STEP("step=addLoopFactor_skip from=%d to=%d reason=node_not_in_graph", from, to);
             CONSTRAINT_LOG("step=loop_inter from=%d to=%d result=skip reason=node_not_in_graph", from, to);
+            RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                "[CONSTRAINT_KPI][ISAM2] loop_added=%lu loop_reject_same_node=%lu loop_reject_node_missing=%lu",
+                static_cast<unsigned long>(g_loop_added_total.load(std::memory_order_relaxed)),
+                static_cast<unsigned long>(g_loop_rejected_same_node_total.load(std::memory_order_relaxed)),
+                static_cast<unsigned long>(rejected));
             ALOG_DEBUG(MOD, "addLoopFactor: from=%d or to=%d not exists, skip", from, to);
             RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-                "[IncrementalOptimizer][BACKEND][LOOP] skip addLoopFactor from=%d to=%d (node not in graph, grep BACKEND LOOP 定位)",
-                from, to);
+                "[IncrementalOptimizer][BACKEND][LOOP] skip addLoopFactor from=%d to=%d (node not in graph) stats: rejected_node_missing_total=%lu",
+                from, to, static_cast<unsigned long>(rejected));
             return OptimizationResult{};
         }
 
@@ -570,11 +588,20 @@ OptimizationResult IncrementalOptimizer::addLoopFactor(
         pending_graph_.add(gtsam::BetweenFactor<gtsam::Pose3>(
             SM(from), SM(to), toPose3(rel), robust_noise));
         factor_count_++;
+        const uint64_t added = g_loop_added_total.fetch_add(1, std::memory_order_relaxed) + 1;
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[CONSTRAINT_KPI][ISAM2] loop_added=%lu loop_reject_same_node=%lu loop_reject_node_missing=%lu",
+            static_cast<unsigned long>(added),
+            static_cast<unsigned long>(g_loop_rejected_same_node_total.load(std::memory_order_relaxed)),
+            static_cast<unsigned long>(g_loop_rejected_node_missing_total.load(std::memory_order_relaxed)));
         CONSTRAINT_LOG("step=loop_inter from=%d to=%d result=ok factor_count=%d (子图间回环，即将 commit)", from, to, factor_count_);
         BACKEND_STEP("step=addLoopFactor_added from=%d to=%d pending_factors=%zu invoking_commit", from, to, pending_graph_.size());
         RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-            "[IncrementalOptimizer][BACKEND][LOOP] loop constraint added to graph from=%d to=%d (grep for verification)",
-            from, to);
+            "[IncrementalOptimizer][BACKEND][LOOP] loop constraint added to graph from=%d to=%d stats: added_total=%lu rejected_same_node_total=%lu rejected_node_missing_total=%lu",
+            from, to,
+            static_cast<unsigned long>(added),
+            static_cast<unsigned long>(g_loop_rejected_same_node_total.load(std::memory_order_relaxed)),
+            static_cast<unsigned long>(g_loop_rejected_node_missing_total.load(std::memory_order_relaxed)));
         RCLCPP_INFO(rclcpp::get_logger("automap_system"),
             "[LOOP_ACCEPTED] addLoopFactor success from=%d to=%d (点云重影排查：无此条=零回环=结构重影；grep LOOP_ACCEPTED)",
             from, to);
@@ -1306,6 +1333,12 @@ void IncrementalOptimizer::addGPSFactorForKeyFrame(int kf_id, const Eigen::Vecto
         BACKEND_TRACE("addGPSFactorForKeyFrame DEFER kf_id=%d reason=kf_not_in_graph pending=%zu", kf_id, pending_gps_factors_kf_.size() + 1);
         BACKEND_STEP("step=addGPSFactorForKeyFrame_defer kf_id=%d reason=kf_not_in_graph pending_kf=%zu", kf_id, pending_gps_factors_kf_.size() + 1);
         CONSTRAINT_LOG("step=gps_kf kf_id=%d result=defer reason=kf_not_in_graph pending=%zu", kf_id, pending_gps_factors_kf_.size() + 1);
+        const uint64_t deferred = g_gps_kf_deferred_total.fetch_add(1, std::memory_order_relaxed) + 1;
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[CONSTRAINT_KPI][GPS_KF][ISAM2] added=%lu deferred=%lu rejected=%lu",
+            static_cast<unsigned long>(g_gps_kf_added_total.load(std::memory_order_relaxed)),
+            static_cast<unsigned long>(deferred),
+            static_cast<unsigned long>(g_gps_kf_rejected_total.load(std::memory_order_relaxed)));
         RCLCPP_DEBUG(rclcpp::get_logger("automap_system"),
             "[IncrementalOptimizer][BACKEND][GPS_KF] addGPSFactorForKeyFrame: kf_id=%d not in keyframe_node_exists_, defer",
             kf_id);
@@ -1329,6 +1362,12 @@ void IncrementalOptimizer::addGPSFactorForKeyFrame(int kf_id, const Eigen::Vecto
     if (!current_estimate_.exists(KF(kf_id))) {
         BACKEND_STEP("step=addGPSFactorForKeyFrame_defer kf_id=%d reason=not_in_estimate pending_kf=%zu", kf_id, pending_gps_factors_kf_.size() + 1);
         CONSTRAINT_LOG("step=gps_kf kf_id=%d result=defer reason=not_in_estimate pending=%zu", kf_id, pending_gps_factors_kf_.size() + 1);
+        const uint64_t deferred = g_gps_kf_deferred_total.fetch_add(1, std::memory_order_relaxed) + 1;
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[CONSTRAINT_KPI][GPS_KF][ISAM2] added=%lu deferred=%lu rejected=%lu",
+            static_cast<unsigned long>(g_gps_kf_added_total.load(std::memory_order_relaxed)),
+            static_cast<unsigned long>(deferred),
+            static_cast<unsigned long>(g_gps_kf_rejected_total.load(std::memory_order_relaxed)));
         RCLCPP_DEBUG(rclcpp::get_logger("automap_system"),
             "[IncrementalOptimizer][BACKEND][GPS_KF] addGPSFactorForKeyFrame: kf_id=%d not in current_estimate_, defer",
             kf_id);
@@ -1350,6 +1389,12 @@ void IncrementalOptimizer::addGPSFactorForKeyFrame(int kf_id, const Eigen::Vecto
     // 验证 GPS 数据有效性
     if (!pos_map.allFinite() || !cov3x3.allFinite()) {
         CONSTRAINT_LOG("step=gps_kf kf_id=%d result=skip reason=pos_or_cov_non_finite", kf_id);
+        const uint64_t rejected = g_gps_kf_rejected_total.fetch_add(1, std::memory_order_relaxed) + 1;
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[CONSTRAINT_KPI][GPS_KF][ISAM2] added=%lu deferred=%lu rejected=%lu",
+            static_cast<unsigned long>(g_gps_kf_added_total.load(std::memory_order_relaxed)),
+            static_cast<unsigned long>(g_gps_kf_deferred_total.load(std::memory_order_relaxed)),
+            static_cast<unsigned long>(rejected));
         RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
             "[IncrementalOptimizer][BACKEND][GPS_KF] addGPSFactorForKeyFrame: kf_id=%d non-finite input, skip. "
             "pos_finite=%d cov_finite=%d",
@@ -1369,6 +1414,12 @@ void IncrementalOptimizer::addGPSFactorForKeyFrame(int kf_id, const Eigen::Vecto
     BACKEND_TRACE("addGPSFactorForKeyFrame ADD kf_id=%d factor_count=%d", kf_id, factor_count_);
     BACKEND_STEP("step=addGPSFactorForKeyFrame_added kf_id=%d pending_factors=%zu result=ok", kf_id, pending_graph_.size());
     CONSTRAINT_LOG("step=gps_kf kf_id=%d result=ok factor_count=%d (关键帧级 GPS 约束)", kf_id, factor_count_);
+    const uint64_t added = g_gps_kf_added_total.fetch_add(1, std::memory_order_relaxed) + 1;
+    RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+        "[CONSTRAINT_KPI][GPS_KF][ISAM2] added=%lu deferred=%lu rejected=%lu",
+        static_cast<unsigned long>(added),
+        static_cast<unsigned long>(g_gps_kf_deferred_total.load(std::memory_order_relaxed)),
+        static_cast<unsigned long>(g_gps_kf_rejected_total.load(std::memory_order_relaxed)));
 
     RCLCPP_INFO(rclcpp::get_logger("automap_system"),
         "[IncrementalOptimizer][BACKEND][GPS_KF] GPS factor added to graph kf_id=%d "

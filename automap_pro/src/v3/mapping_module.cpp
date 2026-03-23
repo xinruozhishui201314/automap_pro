@@ -34,6 +34,9 @@ uint64_t computeBatchHash(const std::unordered_map<int, Pose3d>& sm_poses,
         mix(static_cast<uint64_t>(pose.translation().x() * 1000.0));
         mix(static_cast<uint64_t>(pose.translation().y() * 1000.0));
         mix(static_cast<uint64_t>(pose.translation().z() * 1000.0));
+        mix(static_cast<uint64_t>(pose.linear()(0, 0) * 1e6));
+        mix(static_cast<uint64_t>(pose.linear()(1, 1) * 1e6));
+        mix(static_cast<uint64_t>(pose.linear()(2, 2) * 1e6));
     }
     std::vector<uint64_t> kf_ids;
     kf_ids.reserve(kf_poses.size());
@@ -45,6 +48,9 @@ uint64_t computeBatchHash(const std::unordered_map<int, Pose3d>& sm_poses,
         mix(static_cast<uint64_t>(pose.translation().x() * 1000.0));
         mix(static_cast<uint64_t>(pose.translation().y() * 1000.0));
         mix(static_cast<uint64_t>(pose.translation().z() * 1000.0));
+        mix(static_cast<uint64_t>(pose.linear()(0, 0) * 1e6));
+        mix(static_cast<uint64_t>(pose.linear()(1, 1) * 1e6));
+        mix(static_cast<uint64_t>(pose.linear()(2, 2) * 1e6));
     }
     return h;
 }
@@ -54,6 +60,7 @@ MappingModule::MappingModule(EventBus::Ptr event_bus, MapRegistry::Ptr map_regis
     : ModuleBase("MappingModule", event_bus, map_registry), node_(node) {
     
     current_session_id_ = static_cast<uint64_t>(std::chrono::system_clock::now().time_since_epoch().count());
+    processed_alignment_epoch_.store(map_registry_->getAlignmentEpoch());
 
     RCLCPP_INFO(node_->get_logger(), "[PIPELINE][MAP] ctor step=SubMapManager::init");
     sm_manager_.init(node_);
@@ -108,41 +115,30 @@ MappingModule::MappingModule(EventBus::Ptr event_bus, MapRegistry::Ptr map_regis
             return;
         }
 
-        OptimizationResultEvent ev;
-        ev.version = map_registry_->getVersion() + 1;
-        static std::atomic<uint64_t> hba_event_seq{1};
-        ev.event_id = hba_event_seq.fetch_add(1, std::memory_order_relaxed);
-        ev.submap_poses.clear();
-        ev.keyframe_poses = std::move(kf_updates);
-        ev.source_module = "HBAOptimizer";
-        ev.transform_applied_flags = static_cast<uint32_t>(OptimizationTransformFlags::NONE);
-        ev.batch_hash = computeBatchHash(ev.submap_poses, ev.keyframe_poses);
-        ev.pose_frame = result.pose_frame;
-        if (!ev.isValid()) {
-            RCLCPP_ERROR(node_->get_logger(),
-                "[V3][CONTRACT] Reject HBA event publish: invalid OptimizationResultEvent");
-            METRICS_INCREMENT(metrics::FRAME_MISMATCH_TOTAL);
-            return;
-        }
+        const uint64_t source_alignment_epoch = map_registry_->getAlignmentEpoch();
+        const uint64_t batch_hash = computeBatchHash({}, kf_updates);
+        const uint64_t version = map_registry_->updatePoses(
+            {}, kf_updates, result.pose_frame, "HBAOptimizer", source_alignment_epoch,
+            static_cast<uint32_t>(OptimizationTransformFlags::NONE), batch_hash);
         RCLCPP_INFO(node_->get_logger(),
-            "[V3][HBA->GATEWAY] Publishing OptimizationResultEvent: event_id=%lu version=%lu pose_frame=%d gps_aligned=%d kf=%zu batch_hash=%lu",
-            static_cast<unsigned long>(ev.event_id),
-            static_cast<unsigned long>(ev.version),
-            static_cast<int>(ev.pose_frame),
-            gps_aligned_.load() ? 1 : 0,
-            ev.keyframe_poses.size(),
-            static_cast<unsigned long>(ev.batch_hash));
-        event_bus_->publish(ev);
-        RCLCPP_INFO(node_->get_logger(),
-            "[V3][MappingModule] HBA results published as OptimizationResultEvent (pose_frame=%d, kf=%zu)",
-            static_cast<int>(ev.pose_frame), ev.keyframe_poses.size());
+            "[V3][HBA->REGISTRY] Applied HBA poses via MapRegistry: version=%lu pose_frame=%d kf=%zu epoch=%lu",
+            static_cast<unsigned long>(version),
+            static_cast<int>(result.pose_frame),
+            kf_updates.size(),
+            static_cast<unsigned long>(source_alignment_epoch));
     });
 
     RCLCPP_INFO(node_->get_logger(), "[PIPELINE][MAP] ctor step=HBAOptimizer init+start+callback OK");
 
-    // 订阅同步帧
-    onEvent<SyncedFrameEvent>([this](const SyncedFrameEvent& ev) {
+    // 订阅动态过滤后的帧
+    onEvent<FilteredFrameEventRequiredDs>([this](const FilteredFrameEventRequiredDs& ev) {
         if (!running_.load()) return;
+        if (!ev.isValid()) {
+            RCLCPP_ERROR_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000,
+                "[V3][CONTRACT] Reject invalid FilteredFrameEventRequiredDs before queueing");
+            METRICS_INCREMENT(metrics::FRAME_MISMATCH_TOTAL);
+            return;
+        }
         std::lock_guard<std::mutex> lock(queue_mutex_);
         frame_queue_.push_back(ev);
         cv_.notify_one();
@@ -210,7 +206,9 @@ MappingModule::MappingModule(EventBus::Ptr event_bus, MapRegistry::Ptr map_regis
         hba_optimizer_.triggerAsync(all_frozen, loops, ev.wait_for_result, "ManualRequest");
     });
     RCLCPP_INFO(node_->get_logger(),
-                "[PIPELINE][MAP] ctor OK events=SyncedFrame+GPSAligned+OptResult+Loop+SaveMap+GlobalMap+HBA");
+                "[PIPELINE][MAP] ctor OK events=FilteredFrame+GPSAligned+OptResult+Loop+SaveMap+GlobalMap+HBA");
+    RCLCPP_INFO(node_->get_logger(),
+                "[V3][SELF_CHECK][CONTRACT] module=Mapping prequeue_valid_guard=on process_entry_guard=on safe_cloud_ds_fallback=on required_ds_subscription=on");
 }
 
 void MappingModule::start() {
@@ -242,7 +240,7 @@ void MappingModule::run() {
     
     while (running_) {
         updateHeartbeat();
-        SyncedFrameEvent event;
+        FilteredFrameEventRequiredDs event;
         OptimizationResultEvent opt_ev;
         GPSAlignedEvent gps_ev;
         Command cmd;
@@ -258,25 +256,27 @@ void MappingModule::run() {
             });
             if (!running_) break;
             
-            // 优先处理优化结果和对齐事件，确保新帧基于最新的地图坐标系
-            if (!pose_opt_queue_.empty()) {
-                opt_ev = pose_opt_queue_.front();
-                pose_opt_queue_.pop_front();
-                has_opt = true;
-            } else if (!gps_event_queue_.empty()) {
+            // 优先处理 GPS 对齐状态切换，避免在高频优化事件下饥饿。
+            if (!gps_event_queue_.empty()) {
                 gps_ev = gps_event_queue_.front();
                 gps_event_queue_.pop_front();
                 has_gps_ev = true;
+            } else if (!pose_opt_queue_.empty()) {
+                opt_ev = pose_opt_queue_.front();
+                pose_opt_queue_.pop_front();
+                has_opt = true;
             } else if (!command_queue_.empty()) {
                 cmd = command_queue_.front();
                 command_queue_.pop_front();
                 has_cmd = true;
             } else if (!frame_queue_.empty()) {
-                // 🏛️ [修复] 确定性因果序屏障：检查地图版本是否已在 Mapping 模块本地处理完成
+            // 🏛️ [修复] 确定性因果序屏障：检查地图版本与对齐世代是否已在 Mapping 模块本地处理完成
                 const uint64_t target_version = frame_queue_.front().ref_map_version;
-                const uint64_t current_version = processed_map_version_.load();
+                const uint64_t target_epoch = frame_queue_.front().ref_alignment_epoch;
+                const uint64_t registry_version = map_registry_->getVersion();
+                const uint64_t current_epoch = processed_alignment_epoch_.load();
                 
-                if (target_version <= current_version) {
+                if (target_epoch == current_epoch && target_version <= registry_version) {
                     event = frame_queue_.front();
                     frame_queue_.pop_front();
                     has_frame = true;
@@ -290,16 +290,16 @@ void MappingModule::run() {
                     
                     if (now_s - last_barrier_wait_start_time_ > 5.0) {
                         RCLCPP_ERROR(node_->get_logger(),
-                            "[CRITICAL_V3][MappingModule] Version barrier TIMEOUT (5s)! Drop blocked frame: target_ref=%lu current=%lu. "
-                            "OptimizerModule might be hung or severely congested.", target_version, current_version);
+                            "[CRITICAL_V3][MappingModule] Barrier TIMEOUT (5s)! Drop blocked frame: target_ref=%lu registry_version=%lu target_epoch=%lu current_epoch=%lu.",
+                            target_version, registry_version, target_epoch, current_epoch);
                         frame_queue_.pop_front();
                         METRICS_INCREMENT(metrics::STALE_VERSION_DROP_TOTAL);
                         last_barrier_wait_start_time_ = -1.0;
                     } else {
                         // 地图版本尚未追上，本轮循环跳过处理新帧，等待优化结果入队并处理
                         RCLCPP_DEBUG_THROTTLE(node_->get_logger(), *node_->get_clock(), 1000,
-                            "[V3][MappingModule] Frame blocked by LOCAL version barrier: frame_ref=%lu processed=%lu (waiting...)",
-                            target_version, current_version);
+                            "[V3][MappingModule] Frame blocked by LOCAL barrier: frame_ref=%lu registry_version=%lu frame_epoch=%lu local_epoch=%lu (waiting...)",
+                            target_version, registry_version, target_epoch, current_epoch);
                     }
                 }
             }
@@ -338,14 +338,28 @@ void MappingModule::run() {
     }
 }
 
-void MappingModule::processFrame(const SyncedFrameEvent& event) {
+void MappingModule::processFrame(const FilteredFrameEventRequiredDs& event) {
+    // 最后防线：即使上游是 RequiredDs 契约，这里仍做保护，彻底避免裸解引用
+    if (!event.cloud || event.cloud->empty()) {
+        RCLCPP_ERROR(node_->get_logger(), "[V3][CONTRACT] Reject frame: cloud is null/empty");
+        METRICS_INCREMENT(metrics::FRAME_MISMATCH_TOTAL);
+        return;
+    }
+    CloudXYZIPtr safe_cloud_ds = (event.cloud_ds && !event.cloud_ds->empty()) ? event.cloud_ds : event.cloud;
+    if (!safe_cloud_ds || safe_cloud_ds->empty()) {
+        RCLCPP_ERROR(node_->get_logger(), "[V3][CONTRACT] Reject frame: cloud_ds fallback failed");
+        METRICS_INCREMENT(metrics::FRAME_MISMATCH_TOTAL);
+        return;
+    }
+
     if (!kf_manager_.shouldCreateKeyFrame(event.T_odom_b, event.timestamp)) {
         return;
     }
     RCLCPP_INFO(node_->get_logger(),
-        "[V3][CONTRACT] processFrame ingress ts=%.3f pose_frame=%d cloud_frame=%s has_gps=%d ref_map_version=%lu",
+        "[V3][CONTRACT] processFrame ingress ts=%.3f pose_frame=%d cloud_frame=%s has_gps=%d ref_map_version=%lu ref_alignment_epoch=%lu",
         event.timestamp, static_cast<int>(event.pose_frame), event.cloud_frame.c_str(),
-        event.has_gps ? 1 : 0, static_cast<unsigned long>(event.ref_map_version));
+        event.has_gps ? 1 : 0, static_cast<unsigned long>(event.ref_map_version),
+        static_cast<unsigned long>(event.ref_alignment_epoch));
 
     // 🏛️ [点云契约] 明确校验点云坐标系语义，禁止隐式混用
     if (event.cloud_frame != "body" && event.cloud_frame != "world") {
@@ -377,14 +391,14 @@ void MappingModule::processFrame(const SyncedFrameEvent& event) {
     // Mapping 模块后续会再次应用 T_map_odom 变换到世界系，导致双重变换。
     // 因此这里先变换回 body 系。
     CloudXYZIPtr cloud = event.cloud;
-    CloudXYZIPtr cloud_ds = event.cloud_ds;
+    CloudXYZIPtr cloud_ds = safe_cloud_ds;
     if (event.cloud_frame == "world") {
         CloudXYZIPtr body_cloud(new CloudXYZI());
         pcl::transformPointCloud(*event.cloud, *body_cloud, event.T_odom_b.inverse().cast<float>());
         cloud = body_cloud;
 
         CloudXYZIPtr body_cloud_ds(new CloudXYZI());
-        pcl::transformPointCloud(*event.cloud_ds, *body_cloud_ds, event.T_odom_b.inverse().cast<float>());
+        pcl::transformPointCloud(*safe_cloud_ds, *body_cloud_ds, event.T_odom_b.inverse().cast<float>());
         cloud_ds = body_cloud_ds;
         
         RCLCPP_DEBUG(node_->get_logger(), 
@@ -392,7 +406,7 @@ void MappingModule::processFrame(const SyncedFrameEvent& event) {
             event.timestamp, static_cast<int>(event.pose_frame));
     }
     
-    // ── V3: 使用 SyncedFrameEvent 中的 GPS 观测 ──
+    // ── V3: 使用 FilteredFrameEventRequiredDs 中的 GPS 观测 ──
     GPSMeasurement gps = event.has_gps ? event.gps : GPSMeasurement();
     bool has_gps = event.has_gps;
     
@@ -487,20 +501,23 @@ void MappingModule::onSubmapFrozen(const SubMap::Ptr& submap) {
     event_bus_->publish(node_ev);
 
     // 子图间里程计因子：用冻结顺序上的「上一块」子图，避免 getFrozenSubmaps()（持 SubMapManager::mutex_，与 merge 长临界区死锁）
-    if (prev_frozen_for_odom_) {
-        auto prev = prev_frozen_for_odom_;
-        Pose3d rel = prev->pose_odom_anchor.inverse() * submap->pose_odom_anchor;
-        Mat66d info = computeOdomInfoMatrix(prev, submap, rel);
+    {
+        std::lock_guard<std::mutex> lk(prev_frozen_for_odom_mutex_);
+        if (prev_frozen_for_odom_) {
+            auto prev = prev_frozen_for_odom_;
+            Pose3d rel = prev->pose_odom_anchor.inverse() * submap->pose_odom_anchor;
+            Mat66d info = computeOdomInfoMatrix(prev, submap, rel);
 
-        GraphTaskEvent odom_ev;
-        odom_ev.task.type = OptTaskItem::Type::ODOM_FACTOR;
-        odom_ev.task.from_id = prev->id;
-        odom_ev.task.to_id = submap->id;
-        odom_ev.task.rel_pose = rel;
-        odom_ev.task.info_matrix = info;
-        event_bus_->publish(odom_ev);
+            GraphTaskEvent odom_ev;
+            odom_ev.task.type = OptTaskItem::Type::ODOM_FACTOR;
+            odom_ev.task.from_id = prev->id;
+            odom_ev.task.to_id = submap->id;
+            odom_ev.task.rel_pose = rel;
+            odom_ev.task.info_matrix = info;
+            event_bus_->publish(odom_ev);
+        }
+        prev_frozen_for_odom_ = submap;
     }
-    prev_frozen_for_odom_ = submap;
 
     // 强制更新
     GraphTaskEvent force_ev;
@@ -531,6 +548,47 @@ void MappingModule::onSubmapFrozen(const SubMap::Ptr& submap) {
 }
 
 void MappingModule::updateGPSAlignment(const GPSAlignedEvent& ev) {
+    const uint64_t local_epoch_before = processed_alignment_epoch_.load();
+    if (ev.alignment_epoch <= local_epoch_before) {
+        RCLCPP_WARN(node_->get_logger(),
+            "[V3][CONTRACT] Drop stale/duplicate GPSAlignedEvent: event_epoch=%lu local_epoch=%lu success=%d",
+            static_cast<unsigned long>(ev.alignment_epoch),
+            static_cast<unsigned long>(local_epoch_before),
+            ev.success ? 1 : 0);
+        return;
+    }
+
+    if (!ev.success) {
+        RCLCPP_WARN(node_->get_logger(),
+            "[V3][POSE_DIAG] GPS alignment event success=false: clearing Mapping/MapRegistry/HBA aligned state");
+        {
+            std::lock_guard<std::mutex> lk(gps_transform_mutex_);
+            gps_transform_R_ = Eigen::Matrix3d::Identity();
+            gps_transform_t_ = Eigen::Vector3d::Zero();
+            gps_aligned_.store(false);
+        }
+        uint64_t version = map_registry_->setGPSAligned(
+            false, Eigen::Matrix3d::Identity(), Eigen::Vector3d::Zero(), 0.0);
+        processed_map_version_.store(version);
+        const uint64_t new_epoch = map_registry_->getAlignmentEpoch();
+        processed_alignment_epoch_.store(new_epoch);
+        GPSAlignResult hba_align{};
+        hba_align.success = false;
+        hba_optimizer_.setGPSAlignedState(hba_align);
+        RCLCPP_INFO(node_->get_logger(),
+            "[V3][POSE_DIAG] MapRegistry version updated to %lu after GPS alignment cleared (epoch=%lu, event_epoch=%lu)",
+            static_cast<unsigned long>(version),
+            static_cast<unsigned long>(new_epoch),
+            static_cast<unsigned long>(ev.alignment_epoch));
+        return;
+    }
+
+    if (!ev.isValid()) {
+        RCLCPP_WARN(node_->get_logger(),
+            "[V3][CONTRACT] Reject GPSAlignedEvent: success=true but payload invalid (NaN/Inf)");
+        return;
+    }
+
     RCLCPP_INFO(node_->get_logger(),
         "[V3][POSE_DIAG] GPS Alignment updated: rmse=%.3fm R_enu_map=[...], t_enu_map=[%.2f, %.2f, %.2f]",
         ev.rmse, ev.t_enu_to_map.x(), ev.t_enu_to_map.y(), ev.t_enu_to_map.z());
@@ -541,14 +599,16 @@ void MappingModule::updateGPSAlignment(const GPSAlignedEvent& ev) {
         gps_aligned_.store(true);
     }
 
-    // 🏛️ [SSoT 修复] 同步 GPS 对齐状态到 MapRegistry，确保全系统坐标系一致
+    // 🏛️ 单一写者：由本模块根据 GPSAlignedEvent 同步 MapRegistry（GPSModule 不再 setGPSAligned）
     uint64_t version = map_registry_->setGPSAligned(true, ev.R_enu_to_map, ev.t_enu_to_map, ev.rmse);
     processed_map_version_.store(version);
+    const uint64_t new_epoch = map_registry_->getAlignmentEpoch();
+    processed_alignment_epoch_.store(new_epoch);
 
     RCLCPP_INFO(node_->get_logger(),
-        "[V3][POSE_DIAG] MapRegistry version updated to %lu after GPS alignment", version);
+        "[V3][POSE_DIAG] MapRegistry version updated to %lu after GPS alignment (epoch=%lu, event_epoch=%lu)",
+        version, static_cast<unsigned long>(new_epoch), static_cast<unsigned long>(ev.alignment_epoch));
 
-    // 关键修复：同步 GPS 对齐状态到 HBA，避免 HBA 在对齐后仍以 gps=0 / ODOM 语义运行
     GPSAlignResult hba_align;
     hba_align.success = true;
     hba_align.R_enu_to_map = ev.R_enu_to_map;
@@ -598,26 +658,26 @@ void MappingModule::onPoseOptimized(const OptimizationResultEvent& ev) {
         static_cast<unsigned long>(ev.batch_hash));
     
     // 🏛️ [架构加固] 统一通过语义网关应用位姿
-    applyOptimizedPoses(ev.submap_poses, ev.keyframe_poses, ev.pose_frame, ev.version);
-    if (ev.source_module == "HBAOptimizer") {
+    const bool applied = applyOptimizedPoses(ev.submap_poses, ev.keyframe_poses, ev.pose_frame, ev.version);
+    if (applied && ev.source_module == "HBAOptimizer") {
         sm_manager_.rebuildMergedCloudFromOptimizedPoses();
     }
 }
 
-void MappingModule::applyOptimizedPoses(const std::unordered_map<int, Pose3d>& sm_poses, 
+bool MappingModule::applyOptimizedPoses(const std::unordered_map<int, Pose3d>& sm_poses, 
                                        const std::unordered_map<uint64_t, Pose3d>& kf_poses, 
                                        PoseFrame frame, uint64_t version) {
     const auto t0 = std::chrono::steady_clock::now();
     // 🏛️ [产品化加固] 状态守卫
-    if (!running_.load()) return;
+    if (!running_.load()) return false;
 
     // 🏛️ [版本隔离] 拒绝过时的优化结果覆盖新数据
-    if (version < processed_map_version_.load() && frame != PoseFrame::MAP) {
+    if (version < processed_map_version_.load()) {
         RCLCPP_WARN(node_->get_logger(), 
             "[V3][GATEWAY] Rejecting stale optimization result: version=%lu, current_version=%lu",
             version, processed_map_version_.load());
         METRICS_INCREMENT(metrics::STALE_VERSION_DROP_TOTAL);
-        return;
+        return false;
     }
 
     // 1. 语义校准：如果系统已 GPS 对齐，但输入是 ODOM，则自动补偿 T_map_odom
@@ -637,7 +697,7 @@ void MappingModule::applyOptimizedPoses(const std::unordered_map<int, Pose3d>& s
         // 🏛️ [熔断检查] 校验 T_map_odom 是否存在数值异常
         if (!T_map_odom.matrix().allFinite()) {
             RCLCPP_ERROR(node_->get_logger(), "[V3][CRASH_GUARD] Rejecting compensation: non-finite T_map_odom");
-            return;
+            return false;
         }
 
         // 🏛️ [熔断检查] 如果补偿量过大（平移 > 1000m），通常意味着 GPS 对齐异常
@@ -645,7 +705,7 @@ void MappingModule::applyOptimizedPoses(const std::unordered_map<int, Pose3d>& s
             RCLCPP_ERROR(node_->get_logger(), 
                 "[V3][CRASH_GUARD] ABORT apply: T_map_odom translation=%.1fm > 1000m. Refusing to destroy map structure!",
                 T_map_odom.translation().norm());
-            return;
+            return false;
         }
         RCLCPP_WARN(node_->get_logger(),
             "[V3][POSE_DIAG] ODOM->MAP compensation active: T_map_odom_t_norm=%.3f input_sm=%zu input_kf=%zu",
@@ -666,13 +726,13 @@ void MappingModule::applyOptimizedPoses(const std::unordered_map<int, Pose3d>& s
     for (const auto& [id, pose] : sm_to_apply) {
         if (!pose.matrix().allFinite()) {
             RCLCPP_ERROR(node_->get_logger(), "[V3][CRASH_GUARD] Found NaN in optimized submap pose %d! Rejecting batch.", id);
-            return;
+            return false;
         }
     }
     for (const auto& [id, pose] : kf_to_apply) {
         if (!pose.matrix().allFinite()) {
             RCLCPP_ERROR(node_->get_logger(), "[V3][CRASH_GUARD] Found NaN in optimized keyframe pose %lu! Rejecting batch.", id);
-            return;
+            return false;
         }
     }
 
@@ -710,6 +770,7 @@ void MappingModule::applyOptimizedPoses(const std::unordered_map<int, Pose3d>& s
         "[V3][PERF] applyOptimizedPoses done: version=%lu frame=%d sm=%zu kf=%zu elapsed=%ldms",
         static_cast<unsigned long>(version), static_cast<int>(frame),
         sm_to_apply.size(), kf_to_apply.size(), static_cast<long>(elapsed_ms));
+    return true;
 }
 
 bool MappingModule::shouldAcceptOptimizationEvent(const OptimizationResultEvent& ev) {
@@ -739,6 +800,18 @@ bool MappingModule::shouldAcceptOptimizationEvent(const OptimizationResultEvent&
             static_cast<unsigned long>(ev.event_id),
             static_cast<unsigned long>(ev.version),
             static_cast<unsigned long>(processed_map_version_.load()),
+            ev.source_module.c_str());
+        METRICS_INCREMENT(metrics::STALE_VERSION_DROP_TOTAL);
+        return false;
+    }
+    const uint64_t local_epoch = processed_alignment_epoch_.load();
+    if (ev.alignment_epoch != local_epoch) {
+        RCLCPP_WARN(node_->get_logger(),
+            "[V3][CONTRACT] Reject event by alignment_epoch mismatch: event_id=%lu version=%lu event_epoch=%lu local_epoch=%lu src=%s",
+            static_cast<unsigned long>(ev.event_id),
+            static_cast<unsigned long>(ev.version),
+            static_cast<unsigned long>(ev.alignment_epoch),
+            static_cast<unsigned long>(local_epoch),
             ev.source_module.c_str());
         METRICS_INCREMENT(metrics::STALE_VERSION_DROP_TOTAL);
         return false;

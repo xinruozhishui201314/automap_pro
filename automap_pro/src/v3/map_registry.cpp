@@ -38,6 +38,7 @@ void MapRegistry::addKeyFrame(KeyFrame::Ptr kf) {
     // 发送 KeyFrame 添加事件
     MapUpdateEvent event;
     event.version = ++next_version_;
+    current_version_.store(event.version);
     event.type = MapUpdateEvent::ChangeType::KEYFRAME_ADDED;
     event.affected_ids = {kf->id};
     event_bus_->publish(event);
@@ -103,6 +104,7 @@ void MapRegistry::addSubMap(SubMap::Ptr sm) {
     // 发送 SubMap 添加事件
     MapUpdateEvent event;
     event.version = ++next_version_;
+    current_version_.store(event.version);
     event.type = MapUpdateEvent::ChangeType::SUBMAP_ADDED;
     event.affected_ids = {sm->id};
     event_bus_->publish(event);
@@ -128,6 +130,7 @@ uint64_t MapRegistry::updatePoses(const std::unordered_map<int, Pose3d>& sm_upda
                                  const std::unordered_map<uint64_t, Pose3d>& kf_updates,
                                  PoseFrame pose_frame,
                                  const std::string& source_module,
+                                 uint64_t source_alignment_epoch,
                                  uint32_t transform_applied_flags,
                                  uint64_t batch_hash) {
     if (pose_frame == PoseFrame::UNKNOWN) {
@@ -171,10 +174,21 @@ uint64_t MapRegistry::updatePoses(const std::unordered_map<int, Pose3d>& sm_upda
     auto new_snapshot = std::make_shared<PoseSnapshot>();
     new_snapshot->version = version;
 
+    uint64_t expected_epoch = 0;
     {
         std::lock_guard<std::mutex> kf_lock(kf_mutex_);
         std::lock_guard<std::mutex> sm_lock(sm_mutex_);
         std::lock_guard<std::mutex> gps_lock(gps_state_mutex_);
+        expected_epoch = alignment_epoch_.load(std::memory_order_relaxed);
+        if (source_alignment_epoch != expected_epoch) {
+            RCLCPP_ERROR(rclcpp::get_logger("automap_pro"),
+                "[V3][CONTRACT] Reject updatePoses: alignment_epoch mismatch source=%lu expected=%lu src=%s",
+                static_cast<unsigned long>(source_alignment_epoch),
+                static_cast<unsigned long>(expected_epoch),
+                source_module.c_str());
+            METRICS_INCREMENT(metrics::FRAME_MISMATCH_TOTAL);
+            return current_version_.load();
+        }
         
         // 1. 更新内部 KeyFrame/SubMap 对象 (SSoT)
         for (const auto& [id, pose] : sm_updates) {
@@ -214,6 +228,7 @@ uint64_t MapRegistry::updatePoses(const std::unordered_map<int, Pose3d>& sm_upda
         new_snapshot->R_enu_to_map = R_enu_to_map_;
         new_snapshot->t_enu_to_map = t_enu_to_map_;
         new_snapshot->gps_rmse = gps_rmse_;
+        new_snapshot->alignment_epoch = expected_epoch;
 
         // 3. 原子切换快照
         {
@@ -233,6 +248,7 @@ uint64_t MapRegistry::updatePoses(const std::unordered_map<int, Pose3d>& sm_upda
     OptimizationResultEvent result_ev;
     result_ev.version = version;
     result_ev.event_id = version;
+    result_ev.alignment_epoch = expected_epoch;
     result_ev.submap_poses = sm_updates;
     result_ev.keyframe_poses = kf_updates;
     result_ev.pose_frame = pose_frame; // 🏛️ [架构加固] 透传优化结果的坐标系语义
@@ -262,6 +278,7 @@ void MapRegistry::addConstraint(const LoopConstraint::Ptr& lc) {
     // 发送约束添加事件
     MapUpdateEvent event;
     event.version = ++next_version_;
+    current_version_.store(event.version);
     event.type = MapUpdateEvent::ChangeType::CONSTRAINT_ADDED;
     event_bus_->publish(event);
 }

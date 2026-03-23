@@ -405,12 +405,13 @@ void ConfigManager::load(const std::string& yaml_path) {
             perf_async_isam2_update_       = get<bool>("performance.async_isam2_update", false);
             perf_parallel_voxel_downsample_ = get<bool>("performance.parallel_voxel_downsample", true);
             perf_parallel_teaser_match_     = get<bool>("performance.parallel_teaser_match", true);
+            perf_parallel_teaser_max_inflight_ = get<int>("performance.parallel_teaser_max_inflight", 4);
             perf_max_optimization_queue_size_ = get<int>("performance.max_optimization_queue_size", 64);
             
             RCLCPP_INFO(rclcpp::get_logger("automap_system"), 
-                "[ConfigManager][PERF_CACHE] async_build=%d async_isam=%d parallel_voxel=%d parallel_teaser=%d",
+                "[ConfigManager][PERF_CACHE] async_build=%d async_isam=%d parallel_voxel=%d parallel_teaser=%d parallel_teaser_max_inflight=%d",
                 perf_async_global_map_build_, perf_async_isam2_update_, 
-                perf_parallel_voxel_downsample_, perf_parallel_teaser_match_);
+                perf_parallel_voxel_downsample_, perf_parallel_teaser_match_, perf_parallel_teaser_max_inflight_);
         } catch (...) {
             RCLCPP_WARN(rclcpp::get_logger("automap_system"), "[ConfigManager][PERF_CACHE] preload failed, using defaults");
         }
@@ -489,6 +490,17 @@ void ConfigManager::load(const std::string& yaml_path) {
                 lidarTopic().c_str(), imuTopic().c_str(), gpsEnabled() ? "true" : "false", gpsTopic().c_str(), cameraEnabled() ? "true" : "false");
             RCLCPP_INFO(L, "[ConfigManager][CONFIG_READ_BACK] frontend.odom_topic=%s frontend.cloud_topic=%s frontend.cloud_frame=%s",
                 fastLivoOdomTopic().c_str(), fastLivoCloudTopic().c_str(), frontendCloudFrame().c_str());
+            RCLCPP_INFO(L, "[ConfigManager][CONFIG_READ_BACK] dynamic_filter.enabled=%s dynamic_filter.shadow_mode=%s dynamic_filter.queue_max_size=%d dynamic_filter.voxel_size=%.2f dynamic_filter.min_static_observations=%d",
+                dynamicFilterEnabled() ? "true" : "false",
+                dynamicFilterShadowMode() ? "true" : "false",
+                dynamicFilterQueueMaxSize(),
+                dynamicFilterVoxelSize(),
+                dynamicFilterMinStaticObservations());
+            RCLCPP_INFO(L, "[ConfigManager][CONFIG_READ_BACK] dynamic_filter.fault_injection.enabled=%s mode=%s every_n_frames=%d max_count=%d",
+                dynamicFilterFaultInjectionEnabled() ? "true" : "false",
+                dynamicFilterFaultInjectionMode().c_str(),
+                dynamicFilterFaultInjectionEveryNFrames(),
+                dynamicFilterFaultInjectionMaxCount());
             RCLCPP_INFO(L, "[ConfigManager][CONFIG_READ_BACK] keyframe.min_translation=%.2f keyframe.min_rotation_deg=%.1f keyframe.max_interval=%.2f keyframe.retain_cloud_body=%s",
                 kfMinTranslation(), kfMinRotationDeg(), kfMaxInterval(), retainCloudBody() ? "true" : "false");
             RCLCPP_INFO(L, "[ConfigManager][CONFIG_READ_BACK] submap.max_keyframes=%d submap.match_resolution=%.2f",
@@ -497,6 +509,16 @@ void ConfigManager::load(const std::string& yaml_path) {
                 overlapThreshold(), loopTopK(), loopMinSubmapGap(), loopMinTemporalGap());
             RCLCPP_INFO(L, "[ConfigManager][CONFIG_READ_BACK] loop_closure.geo_prefilter_max_distance_m=%.1f loop_closure.geo_prefilter_skip_above_score=%.2f (skip_above: 0=off)",
                 loopGeoPrefilterMaxDistanceM(), loopGeoPrefilterSkipAboveScore());
+            RCLCPP_INFO(L, "[ConfigManager][CONFIG_READ_BACK] loop_closure.ot_preferred_flow=%s loop_closure.allow_sc_fallback=%s loop_closure.allow_descriptor_fallback=%s loop_closure.allow_svd_geom_fallback=%s loop_closure.log_effective_flow=%s",
+                loopOtPreferredFlow() ? "true" : "false",
+                loopAllowScFallback() ? "true" : "false",
+                loopAllowDescriptorFallback() ? "true" : "false",
+                loopAllowSvdGeomFallback() ? "true" : "false",
+                loopLogEffectiveFlow() ? "true" : "false");
+            RCLCPP_INFO(L, "[ConfigManager][CONFIG_READ_BACK] loop_closure.flow_mode=%s",
+                loopFlowMode().c_str());
+            RCLCPP_INFO(L, "[ConfigManager][CONFIG_READ_BACK] loop_closure.auto_enable_scancontext_on_ot_failure=%s loop_closure.zero_accept_warn_consecutive_queries=%d",
+                loopAutoEnableScancontextOnOtFailure() ? "true" : "false", loopZeroAcceptWarnConsecutiveQueries());
             RCLCPP_INFO(L, "[ConfigManager][CONFIG_READ_BACK] loop_closure.teaser: noise_bound=%.2f voxel_size=%.2f max_points=%d min_inlier_ratio=%.2f min_safe_inliers=%d max_rmse_m=%.2f icp_refine=%s",
                 teaserNoiseBound(), teaserVoxelSize(), teaserMaxPoints(), teaserMinInlierRatio(), teaserMinSafeInliers(), teaserMaxRMSE(), teaserICPRefine() ? "true" : "false");
             RCLCPP_INFO(L, "[ConfigManager][CONFIG_READ_BACK] loop_closure.pose_consistency: max_trans_diff_m=%.1f max_rot_diff_deg=%.1f (0=off)",
@@ -509,6 +531,8 @@ void ConfigManager::load(const std::string& yaml_path) {
                 mapVoxelSize(), mapFrameConfigPath().c_str());
             RCLCPP_INFO(L, "[ConfigManager][CONFIG_READ_BACK] gps.align_min_points=%d gps.keyframe_match_window_s=%.2f gps.keyframe_max_hdop=%.2f gps_cached=%s",
                 gpsAlignMinPoints(), gpsKeyframeMatchWindowS(), gpsKeyframeMaxHdop(), gps_cached_ ? "true" : "false");
+            RCLCPP_INFO(L, "[ConfigManager][CONFIG_READ_BACK] gps.min_accepted_quality_level=%d (0=INVALID..4=EXCELLENT)",
+                gpsMinAcceptedQualityLevel());
             {
                 Eigen::Vector3d la = gpsLeverArmImu();
                 RCLCPP_INFO(L, "[ConfigManager][CONFIG_READ_BACK] gps.lever_arm_imu=[%.4f, %.4f, %.4f] (HBA GPS antenna vs IMU, m)",
@@ -516,6 +540,8 @@ void ConfigManager::load(const std::string& yaml_path) {
             }
             RCLCPP_INFO(L, "[ConfigManager][CONFIG_READ_BACK] performance.async_global_map_build=%s performance.async_isam2_update=%s",
                 get<bool>("performance.async_global_map_build", true) ? "true" : "false", get<bool>("performance.async_isam2_update", false) ? "true" : "false");
+            RCLCPP_INFO(L, "[ConfigManager][CONFIG_READ_BACK] performance.parallel_teaser_match=%s performance.parallel_teaser_max_inflight=%d",
+                parallelTeaserMatch() ? "true" : "false", parallelTeaserMaxInflight());
             RCLCPP_INFO(L, "[ConfigManager][CONFIG_READ_BACK] =========================================== (file=%s)", yaml_path.c_str());
         } catch (const std::exception& e) {
             RCLCPP_WARN(rclcpp::get_logger("automap_system"), "[ConfigManager][CONFIG_READ_BACK] dump failed: %s", e.what());
@@ -664,7 +690,8 @@ std::string ConfigManager::overlapModelPath() const {
     if (it != flat_params_cache_.end() && !it->second.empty()) {
         path = it->second;
     } else {
-        path = get<std::string>("loop_closure.overlap_transformer.model_path", "");
+        path = get<std::string>("loop_closure.overlap_transformer.model_path",
+                                "${CMAKE_CURRENT_SOURCE_DIR}/models/overlapTransformer.pt");
     }
     if (path.empty()) return path;
     const std::string var = "${CMAKE_CURRENT_SOURCE_DIR}";

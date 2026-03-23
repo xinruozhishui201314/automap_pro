@@ -4,8 +4,42 @@
 #include "automap_pro/core/utils.h"
 #include <pcl_conversions/pcl_conversions.h>
 #include <chrono>
+#include <cmath>
 
 namespace automap_pro::v3 {
+namespace {
+
+GPSQuality qualityFromHdopAndSats(double hdop, int sats) {
+    if (sats < 4 || !std::isfinite(hdop)) return GPSQuality::INVALID;
+    if (hdop <= 1.0) return GPSQuality::EXCELLENT;
+    if (hdop <= 2.0) return GPSQuality::HIGH;
+    if (hdop <= 5.0) return GPSQuality::MEDIUM;
+    if (hdop <= 20.0) return GPSQuality::LOW;
+    return GPSQuality::INVALID;
+}
+
+Eigen::Matrix3d covarianceFromGpsQuality(GPSQuality q) {
+    const auto& cfg = ConfigManager::instance();
+    Eigen::Vector3d sigmas = Eigen::Vector3d::Ones();
+    switch (q) {
+        case GPSQuality::EXCELLENT: sigmas = cfg.gpsCovExcellent(); break;
+        case GPSQuality::HIGH:      sigmas = cfg.gpsCovHigh(); break;
+        case GPSQuality::MEDIUM:    sigmas = cfg.gpsCovMedium(); break;
+        case GPSQuality::LOW:       sigmas = cfg.gpsCovLow(); break;
+        default:
+            return Eigen::Matrix3d::Identity() * 1e6;
+    }
+    if (!sigmas.allFinite() || (sigmas.array() < 0.0).any()) {
+        return Eigen::Matrix3d::Identity() * 1e6;
+    }
+    Eigen::Matrix3d cov = Eigen::Matrix3d::Zero();
+    cov(0, 0) = sigmas(0) * sigmas(0);
+    cov(1, 1) = sigmas(1) * sigmas(1);
+    cov(2, 2) = sigmas(2) * sigmas(2);
+    return cov;
+}
+
+} // namespace
 
 FrontEndModule::FrontEndModule(EventBus::Ptr event_bus, MapRegistry::Ptr map_registry, rclcpp::Node::SharedPtr node)
     : ModuleBase("FrontEndModule", event_bus, map_registry), node_(node) {
@@ -106,6 +140,7 @@ void FrontEndModule::run() {
         event.pose_frame = PoseFrame::ODOM; // 🏛️ [架构契约] 显式标注前端产出为 ODOM 系
         event.cloud_frame = ConfigManager::instance().frontendCloudFrame();
         event.ref_map_version = map_registry_->getVersion();
+        event.ref_alignment_epoch = map_registry_->getAlignmentEpoch();
 
         if (event.isValid()) {
             event_bus_->publish(event);
@@ -164,7 +199,9 @@ void FrontEndModule::onGPS(double ts, double lat, double lon, double alt, double
     m.altitude = alt;
     m.hdop = hdop;
     m.num_satellites = sats;
-    m.is_valid = (sats >= 4 && hdop < 10.0); // 这里的阈值可以根据需要调整
+    m.quality = qualityFromHdopAndSats(hdop, sats);
+    m.is_valid = (m.quality >= GPSQuality::MEDIUM);
+    m.covariance = covarianceFromGpsQuality(m.quality);
 
     if (m.is_valid) {
         map_registry_->setGPSOrigin(lat, lon, alt);
@@ -172,12 +209,12 @@ void FrontEndModule::onGPS(double ts, double lat, double lon, double alt, double
         double olat, olon, oalt;
         if (map_registry_->getGPSOrigin(olat, olon, oalt)) {
             m.position_enu = utils::wgs84ToEnu(lat, lon, alt, olat, olon, oalt);
-            
-            // 简单的协方差估算
-            double sigma = std::max(0.1, hdop * 0.5);
-            m.covariance = Eigen::Matrix3d::Identity() * (sigma * sigma);
         }
     }
+    RCLCPP_DEBUG(node_->get_logger(),
+        "[V3][GPS_DIAG] ts=%.3f sats=%d hdop=%.3f quality=%d valid=%d cov_diag=[%.3f,%.3f,%.3f]",
+        ts, sats, hdop, static_cast<int>(m.quality), m.is_valid ? 1 : 0,
+        m.covariance(0, 0), m.covariance(1, 1), m.covariance(2, 2));
 
     gpsCacheAdd(ts, m);
 }

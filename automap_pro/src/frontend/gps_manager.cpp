@@ -476,6 +476,22 @@ void GPSManager::try_align() {
         state_ = GPSAlignState::NOT_ALIGNED;
         good_sample_count_ = 0;
         result.message = "RMSE too high: " + std::to_string(result.rmse_m) + "m > " + std::to_string(rmse_accept_thresh_) + "m";
+        result.success = false;
+        std::vector<AlignCallback> cbs = align_cbs_;
+        GPSAlignResult fail_copy = result;
+        const size_t num_cbs = cbs.size();
+        lk.unlock();
+        ALOG_INFO(MOD, "[GPS_ALIGN] try_align failure_callbacks_enter num_callbacks={}", num_cbs);
+        for (auto& cb : cbs) {
+            try {
+                cb(fail_copy);
+            } catch (const std::exception& e) {
+                ALOG_ERROR(MOD, "[GPS_CALLBACK] align failure callback exception: {}", e.what());
+            } catch (...) {
+                ALOG_ERROR(MOD, "[GPS_CALLBACK] align failure callback unknown exception");
+            }
+        }
+        ALOG_INFO(MOD, "[GPS_ALIGN] try_align failure_callbacks_done");
     }
 }
 

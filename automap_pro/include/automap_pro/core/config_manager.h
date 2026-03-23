@@ -113,6 +113,49 @@ public:
     bool        useComposableNode()  const { return get<bool>("frontend.use_composable_node", true); }
     /** 前端发布的点云坐标系：body=雷达/body 系，需用 T_w_b 变换到世界；world=camera_init/世界系（fast_livo 默认），需先转 body 再建图，否则会双重变换导致全局图错乱 */
     std::string frontendCloudFrame() const { return get<std::string>("frontend.cloud_frame", "world"); }
+    
+    // ── 动态点过滤（DUFOMap 风格在线模块）────────────────────────────
+    bool   dynamicFilterEnabled() const { return get<bool>("dynamic_filter.enabled", false); }
+    bool   dynamicFilterShadowMode() const { return get<bool>("dynamic_filter.shadow_mode", true); }
+    bool   dynamicFilterDropIfQueueFull() const { return get<bool>("dynamic_filter.drop_if_queue_full", true); }
+    int    dynamicFilterQueueMaxSize() const {
+        int v = get<int>("dynamic_filter.queue_max_size", 512);
+        return std::max(64, std::min(10000, v));
+    }
+    int    dynamicFilterMinStaticObservations() const {
+        int v = get<int>("dynamic_filter.min_static_observations", 2);
+        return std::max(1, std::min(20, v));
+    }
+    int    dynamicFilterVoxelCapacity() const {
+        int v = get<int>("dynamic_filter.voxel_capacity", 200000);
+        return std::max(10000, std::min(2000000, v));
+    }
+    double dynamicFilterVoxelSize() const {
+        double v = get<double>("dynamic_filter.voxel_size", 0.30);
+        return std::max(0.05, std::min(2.0, v));
+    }
+    double dynamicFilterMinRangeM() const {
+        double v = get<double>("dynamic_filter.min_range_m", 0.2);
+        return std::max(0.0, std::min(10.0, v));
+    }
+    double dynamicFilterMaxRangeM() const {
+        double v = get<double>("dynamic_filter.max_range_m", 80.0);
+        return std::max(1.0, std::min(300.0, v));
+    }
+    bool   dynamicFilterFaultInjectionEnabled() const {
+        return get<bool>("dynamic_filter.fault_injection.enabled", false);
+    }
+    std::string dynamicFilterFaultInjectionMode() const {
+        return get<std::string>("dynamic_filter.fault_injection.mode", "none");
+    }
+    int    dynamicFilterFaultInjectionEveryNFrames() const {
+        int v = get<int>("dynamic_filter.fault_injection.every_n_frames", 0);
+        return std::max(0, std::min(100000, v));
+    }
+    int    dynamicFilterFaultInjectionMaxCount() const {
+        int v = get<int>("dynamic_filter.fault_injection.max_count", 0);
+        return std::max(0, std::min(100000, v));
+    }
 
     // ── 关键帧 ────────────────────────────────────────────
     double kfMinTranslation()   const { return get<double>("keyframe.min_translation", 0.5); }
@@ -190,6 +233,11 @@ public:
     double gpsFactorQualityScaleLow() const {
         double v = gps_cached_ ? gps_factor_quality_scale_low_ : get<double>("gps.factor_quality_scale_low", 0.25);
         return std::max(0.1, v);
+    }
+    /** GPS 因子准入最小质量等级（0~4，对应 INVALID..EXCELLENT）。默认 3=HIGH，2=MEDIUM 更宽松。 */
+    int gpsMinAcceptedQualityLevel() const {
+        int v = get<int>("gps.min_accepted_quality_level", 3);
+        return std::max(0, std::min(4, v));
     }
     // ── GPS 延迟补偿（对齐后历史帧/回环帧补偿）────────────────────────────────────
     bool   gpsDelayedCompensationEnabled() const { return get<bool>("gps.delayed_compensation.enabled", true); }
@@ -271,6 +319,38 @@ public:
         return std::max(0.0, std::min(1.0, v));
     }
     int    loopWorkerThreads()  const { return get<int>("loop_closure.worker_threads", 2); }
+    /** OT 不可用且 scancontext=false 时，是否自动切到 ScanContext 防止静默退化。默认 true */
+    bool   loopAutoEnableScancontextOnOtFailure() const {
+        return get<bool>("loop_closure.auto_enable_scancontext_on_ot_failure", false);
+    }
+    /** 回环链路偏好：true=优先 OT->TEASER（但允许 fallback）；false=保持现状。 */
+    bool   loopOtPreferredFlow() const {
+        return get<bool>("loop_closure.ot_preferred_flow", true);
+    }
+    /** 回环链路模式：strict=严格 OT->TEASER；safe_degraded=OT 不可用时受控降级。 */
+    std::string loopFlowMode() const {
+        return get<std::string>("loop_closure.flow_mode", "safe_degraded");
+    }
+    /** 允许 ScanContext 作为 OT 检索后备。 */
+    bool   loopAllowScFallback() const {
+        return get<bool>("loop_closure.allow_sc_fallback", false);
+    }
+    /** 允许 descriptor fallback（OT模型不可用时的直方图描述子）。 */
+    bool   loopAllowDescriptorFallback() const {
+        return get<bool>("loop_closure.allow_descriptor_fallback", false);
+    }
+    /** 允许几何阶段 SVD fallback（TEASER 未参与）。 */
+    bool   loopAllowSvdGeomFallback() const {
+        return get<bool>("loop_closure.allow_svd_geom_fallback", false);
+    }
+    /** 是否输出 effective_flow 一致性日志。 */
+    bool   loopLogEffectiveFlow() const {
+        return get<bool>("loop_closure.log_effective_flow", true);
+    }
+    /** 回环健康看门狗：连续多少个 query accepted=0 触发 WARN。<=0 关闭。默认 8 */
+    int    loopZeroAcceptWarnConsecutiveQueries() const {
+        return get<int>("loop_closure.zero_accept_warn_consecutive_queries", 8);
+    }
 
     // ── 子图内回环检测配置 ─────────────────────────────────────────────────
     /** 子图内回环检测：关键帧之间最小时间间隔（秒） */
@@ -358,7 +438,7 @@ public:
     bool   teaserICPRefine()    const { return get<bool>("loop_closure.teaser.icp_refine", true); }
 
     // ── ScanContext ────────────────────────────────────────────────────────
-    bool   scancontextEnabled()        const { return get<bool>("loop_closure.scancontext.enabled", true); }
+    bool   scancontextEnabled()        const { return get<bool>("loop_closure.scancontext.enabled", false); }
     double scancontextDistThreshold()  const { return get<double>("loop_closure.scancontext.dist_threshold", 0.13); }
     int    scancontextNumCandidates()  const { return get<int>("loop_closure.scancontext.num_candidates", 5); }
     int    scancontextExcludeRecent()  const { return get<int>("loop_closure.scancontext.exclude_recent", 50); }
@@ -436,6 +516,7 @@ public:
     bool asyncIsam2Update() const { return perf_async_isam2_update_; }
     bool parallelVoxelDownsample() const { return perf_parallel_voxel_downsample_; }
     bool parallelTeaserMatch() const { return perf_parallel_teaser_match_; }
+    int parallelTeaserMaxInflight() const { return std::max(1, perf_parallel_teaser_max_inflight_); }
     int maxOptimizationQueueSize() const { return perf_max_optimization_queue_size_; }
 
     // ── iSAM2 ─────────────────────────────────────────────
@@ -492,6 +573,7 @@ private:
     bool perf_async_isam2_update_{false};
     bool perf_parallel_voxel_downsample_{true};
     bool perf_parallel_teaser_match_{true};
+    int  perf_parallel_teaser_max_inflight_{4};
     int  perf_max_optimization_queue_size_{64};
 
     YAML::Node cfg_;

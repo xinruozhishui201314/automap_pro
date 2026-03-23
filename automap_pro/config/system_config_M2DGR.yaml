@@ -60,6 +60,7 @@ performance:
   async_isam2_update: false
   parallel_voxel_downsample: true   # 体素下采样内部并行（OMP=1 时仍单线程；高资源建议 true）
   parallel_teaser_match: true      # 多候选 TEASER 并行，多核明显提速
+  parallel_teaser_max_inflight: 4  # 并发限流：并行 TEASER 最大 in-flight
   max_optimization_queue_size: 128 # 高资源可 128，减少优化任务丢弃
 
 # ┌─────────────────────────────────────────────────────────────────────────────
@@ -94,6 +95,27 @@ frontend:
   cloud_topic:   "/cloud_registered"
   kf_info_topic: "/fast_livo/keyframe_info"
   cloud_frame:   "world"   # body | world；fast_livo 默认 world
+
+# ── 2.2b 动态点过滤（FrontEnd->DynamicFilter->Mapping）──────────────────────
+dynamic_filter:
+  enabled: true
+  # true: 仅旁路统计，不替换 Mapping 输入；false: 使用过滤后的点云进入 Mapping
+  shadow_mode: false
+  queue_max_size: 1024
+  drop_if_queue_full: true
+  # 时序体素稳定性判据：同体素累计命中次数 >= min_static_observations 才认为静态
+  min_static_observations: 2
+  voxel_size: 0.30
+  voxel_capacity: 300000
+  min_range_m: 0.20
+  max_range_m: 80.0
+  # 故障注入（默认关闭）：用于验证契约拒绝路径是否生效
+  fault_injection:
+    enabled: false
+    # none | null_cloud_ds | invalid_cloud_frame | null_cloud | nan_timestamp
+    mode: "none"
+    every_n_frames: 0
+    max_count: 0
 
 # ── 2.3 关键帧选取 ───────────────────────────────────────────────────────────
 keyframe:
@@ -267,6 +289,8 @@ gps:
   factor_quality_scale_high:      1.0
   factor_quality_scale_medium:    0.4   # ⬆️ 提高（0.3→0.4）
   factor_quality_scale_low:       0.3    # ⬆️ 提高（0.25→0.3）
+  # GPS 因子准入最小质量（0~4=INVALID..EXCELLENT）。3=仅 HIGH/EXCELLENT；2=允许 MEDIUM。
+  min_accepted_quality_level: 2
 
   delayed_compensation:
     enabled:                 true
@@ -354,6 +378,22 @@ loop_closure:
     exclude_recent:   3
     tree_making_period: 30
     min_history_for_search: 3
+  # OT 模型加载失败且 scancontext.enabled=false 时，自动切换到 ScanContext，避免静默退化到弱 fallback。
+  auto_enable_scancontext_on_ot_failure: false
+  # 主链路偏好：优先使用 OT 检索 + TEASER 几何验证（保留 fallback 的前提下）。
+  ot_preferred_flow: true
+  # 链路模式：strict=严格 OT->TEASER；safe_degraded=OT 失效时受控降级并告警。
+  flow_mode: safe_degraded
+  # 允许 OT 不可用时使用 ScanContext 回退（preferred 模式建议 true）。
+  allow_sc_fallback: false
+  # 允许 OT 不可用时使用 descriptor fallback（直方图描述子）。
+  allow_descriptor_fallback: false
+  # 允许几何阶段 SVD 回退（corrs<20 或未编译 TEASER 时）。
+  allow_svd_geom_fallback: false
+  # 输出 effective_flow 与路径观测日志，便于运行期核验实际链路。
+  log_effective_flow: true
+  # 回环健康看门狗：连续 N 次 query accepted=0 触发告警（<=0 关闭）。
+  zero_accept_warn_consecutive_queries: 8
 
 # ── 3.4 后端优化（ISAM2、HBA）────────────────────────────────────────────────
 # HBA 键与 params_from_system_config.get_hba_params / get_hba_cal_mme_params / get_hba_visualize_params 一致

@@ -25,15 +25,22 @@ public:
         gps_manager_.applyConfig();
         
         // 注册对齐回调
+        // 对齐状态写入 MapRegistry 的唯一入口：MappingModule::updateGPSAlignment（避免与 GPSModule 双写）
         gps_manager_.registerAlignCallback([this](const GPSAlignResult& r) {
-            // 更新 SSoT
-            map_registry_->setGPSAligned(r.success, r.R_enu_to_map, r.t_enu_to_map, r.rmse_m);
-
             GPSAlignedEvent event;
-            event.R_enu_to_map = r.R_enu_to_map;
-            event.t_enu_to_map = r.t_enu_to_map;
-            event.rmse = r.rmse_m;
-            
+            event.success = r.success;
+            const uint64_t current_epoch = map_registry_->getAlignmentEpoch();
+            event.alignment_epoch = current_epoch + 1;
+            if (r.success) {
+                event.R_enu_to_map = r.R_enu_to_map;
+                event.t_enu_to_map = r.t_enu_to_map;
+                event.rmse = r.rmse_m;
+            } else {
+                event.R_enu_to_map = Eigen::Matrix3d::Identity();
+                event.t_enu_to_map = Eigen::Vector3d::Zero();
+                event.rmse = 0.0;
+            }
+
             if (event.isValid()) {
                 RCLCPP_DEBUG(node_->get_logger(),
                     "[V3][DIAG] step=GPSAlignedEvent_publish success=%d rmse=%.3fm (grep V3 DIAG)",

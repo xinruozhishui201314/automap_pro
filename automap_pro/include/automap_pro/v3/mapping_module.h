@@ -15,7 +15,7 @@ namespace automap_pro::v3 {
  * @brief 建图调度模块 (MappingModule)
  * 
  * 职责：
- * 1. 订阅 SyncedFrameEvent，执行关键帧创建逻辑
+ * 1. 订阅 FilteredFrameEventRequiredDs，执行关键帧创建逻辑
  * 2. 管理 KeyFrameManager 和 SubMapManager
  * 3. 处理子图冻结事件 (onSubmapFrozen)，生成子图因子任务
  * 4. 管理 HBA 优化触发逻辑
@@ -35,7 +35,7 @@ protected:
     void run() override;
 
 private:
-    void processFrame(const SyncedFrameEvent& event);
+    void processFrame(const FilteredFrameEventRequiredDs& event);
     void onSubmapFrozen(const SubMap::Ptr& submap);
 
     // 🏛️ 生产级命令处理 (Command Handlers)
@@ -52,7 +52,7 @@ private:
      * @brief 🏛️ [架构加固] 统一位姿应用网关
      * 处理坐标系补偿 (ODOM -> MAP) 并分发到各个管理器
      */
-    void applyOptimizedPoses(const std::unordered_map<int, Pose3d>& sm_poses, 
+    bool applyOptimizedPoses(const std::unordered_map<int, Pose3d>& sm_poses, 
                              const std::unordered_map<uint64_t, Pose3d>& kf_poses, 
                              PoseFrame frame, uint64_t version);
     bool shouldAcceptOptimizationEvent(const OptimizationResultEvent& ev);
@@ -67,7 +67,7 @@ private:
     // 成员变量 (SSoT: Managers moved to MapRegistry)
     HBAOptimizer hba_optimizer_;
 
-    std::deque<SyncedFrameEvent> frame_queue_;
+    std::deque<FilteredFrameEventRequiredDs> frame_queue_;
     std::deque<OptimizationResultEvent> pose_opt_queue_;
     std::deque<GPSAlignedEvent> gps_event_queue_;
     
@@ -93,6 +93,7 @@ private:
     
     // 🏛️ 生产级版本控制：本地已应用的最新的地图版本
     std::atomic<uint64_t> processed_map_version_{0};
+    std::atomic<uint64_t> processed_alignment_epoch_{0};
     double last_barrier_wait_start_time_ = -1.0; // 🏛️ [P1 稳定性] 屏障超时计时器
     uint64_t last_applied_version_{0};
     uint64_t last_applied_batch_hash_{0};
@@ -105,6 +106,7 @@ private:
 
     /// 上一次已冻结子图（仅用于子图间 ODOM 因子）。禁止在冻结回调里调用 getFrozenSubmaps()（会与 merge 持锁竞态）。
     SubMap::Ptr prev_frozen_for_odom_;
+    mutable std::mutex prev_frozen_for_odom_mutex_;
     
     // 回环缓存（临时，用于 HBA）
     std::vector<LoopConstraint::Ptr> loop_constraints_;

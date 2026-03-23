@@ -71,6 +71,7 @@ public:
                          const std::unordered_map<uint64_t, Pose3d>& kf_updates,
                          PoseFrame pose_frame,
                          const std::string& source_module,
+                         uint64_t source_alignment_epoch,
                          uint32_t transform_applied_flags = static_cast<uint32_t>(OptimizationTransformFlags::NONE),
                          uint64_t batch_hash = 0);
 
@@ -78,6 +79,7 @@ public:
      * @brief 获取当前版本号
      */
     uint64_t getVersion() const { return current_version_.load(); }
+    uint64_t getAlignmentEpoch() const { return alignment_epoch_.load(); }
 
     // --- 拓扑结构 ---
 
@@ -95,6 +97,8 @@ public:
         R_enu_to_map_ = R;
         t_enu_to_map_ = t;
         gps_rmse_ = rmse;
+        alignment_epoch_.fetch_add(1, std::memory_order_relaxed);
+        const uint64_t current_epoch = alignment_epoch_.load(std::memory_order_relaxed);
 
         // 🏛️ 同步更新快照
         std::lock_guard<std::mutex> snap_lk(snapshot_mutex_);
@@ -103,6 +107,7 @@ public:
         new_snap->R_enu_to_map = R;
         new_snap->t_enu_to_map = t;
         new_snap->gps_rmse = rmse;
+        new_snap->alignment_epoch = current_epoch;
         
         uint64_t version = ++next_version_;
         new_snap->version = version;
@@ -116,7 +121,10 @@ public:
         R = R_enu_to_map_;
         t = t_enu_to_map_;
     }
-    double getGPSRMSE() const { return gps_rmse_; }
+    double getGPSRMSE() const {
+        std::lock_guard<std::mutex> lk(gps_state_mutex_);
+        return gps_rmse_;
+    }
 
     // --- GPS 原点 ---
     void setGPSOrigin(double lat, double lon, double alt) {
@@ -167,6 +175,7 @@ private:
     // GPS 状态缓存（需同步读写，避免竞态）
     mutable std::mutex gps_state_mutex_;
     std::atomic<bool> gps_aligned_{false};
+    std::atomic<uint64_t> alignment_epoch_{1};
     Eigen::Matrix3d R_enu_to_map_ = Eigen::Matrix3d::Identity();
     Eigen::Vector3d t_enu_to_map_ = Eigen::Vector3d::Zero();
     double gps_rmse_ = 0.0;
@@ -198,12 +207,17 @@ struct RawGPSEvent {
 };
 
 struct GPSAlignedEvent {
+    /** 与 GPSAlignResult::success 一致；MapRegistry 对齐态仅由 MappingModule 根据本字段写入 */
+    bool success = false;
+    uint64_t alignment_epoch = 0;
     Eigen::Matrix3d R_enu_to_map;
     Eigen::Vector3d t_enu_to_map;
-    double rmse;
+    double rmse = 0.0;
 
     bool isValid() const {
-        return R_enu_to_map.allFinite() && t_enu_to_map.allFinite() && std::isfinite(rmse);
+        if (!R_enu_to_map.allFinite() || !t_enu_to_map.allFinite()) return false;
+        if (success) return std::isfinite(rmse);
+        return true;
     }
 };
 
@@ -229,6 +243,7 @@ struct IntraLoopTaskEvent {
 struct OptimizationResultEvent {
     uint64_t version;
     uint64_t event_id = 0;
+    uint64_t alignment_epoch = 0;
     std::unordered_map<int, Pose3d> submap_poses;
     std::unordered_map<uint64_t, Pose3d> keyframe_poses;
     std::string source_module = "unknown";
@@ -237,7 +252,7 @@ struct OptimizationResultEvent {
     PoseFrame pose_frame = PoseFrame::MAP; // 🏛️ [架构加固] 显式标注位姿坐标系
 
     bool isValid() const {
-        if (event_id == 0 || version == 0) return false;
+        if (event_id == 0 || version == 0 || alignment_epoch == 0) return false;
         if (pose_frame == PoseFrame::UNKNOWN) return false;
         if (source_module.empty()) return false;
         for (const auto& [id, pose] : submap_poses) if (!pose.matrix().allFinite()) return false;
@@ -284,18 +299,101 @@ struct SyncedFrameEvent {
     // 🏛️ 生产级确定性：本帧依赖的地图版本
     // MappingModule 必须等待 MapRegistry 达到此版本后才处理本帧，确保坐标系一致
     uint64_t ref_map_version = 0;
+    uint64_t ref_alignment_epoch = 0;
 
     bool isValid() const {
         if (!std::isfinite(timestamp)) return false;
         if (!cloud || cloud->empty()) return false;
         if (!T_odom_b.matrix().allFinite()) return false;
         if (!covariance.allFinite()) return false;
+        if (ref_alignment_epoch == 0) return false;
         if (pose_frame == PoseFrame::UNKNOWN) return false;
         if (cloud_frame != "body" && cloud_frame != "world") return false;
         if (has_gps) {
             if (!gps.position_enu.allFinite()) return false;
             if (!gps.covariance.allFinite()) return false;
         }
+        return true;
+    }
+};
+
+enum class FilterFallbackReason : uint8_t {
+    NONE = 0,
+    EMPTY_STATIC,
+    INPUT_INVALID,
+    CLOUD_FRAME_UNSUPPORTED,
+    FILTER_DISABLED,
+    SHADOW_MODE,
+    INTERNAL_ERROR
+};
+
+inline const char* toString(FilterFallbackReason r) {
+    switch (r) {
+        case FilterFallbackReason::NONE: return "none";
+        case FilterFallbackReason::EMPTY_STATIC: return "empty_static";
+        case FilterFallbackReason::INPUT_INVALID: return "input_invalid";
+        case FilterFallbackReason::CLOUD_FRAME_UNSUPPORTED: return "cloud_frame_unsupported";
+        case FilterFallbackReason::FILTER_DISABLED: return "filter_disabled";
+        case FilterFallbackReason::SHADOW_MODE: return "shadow_mode";
+        case FilterFallbackReason::INTERNAL_ERROR: return "internal_error";
+        default: return "unknown";
+    }
+}
+
+/**
+ * @brief 动态过滤后的帧事件（可选 cloud_ds）
+ * 用于模块内部与兼容链路，消费者必须显式处理 cloud_ds 为空的降级逻辑。
+ */
+struct FilteredFrameEventOptionalDs {
+    double timestamp;
+    CloudXYZIPtr cloud;
+    CloudXYZIPtr cloud_ds;
+    Pose3d T_odom_b;
+    Mat66d covariance;
+    PoseFrame pose_frame = PoseFrame::ODOM;
+    std::string cloud_frame = "body";
+    LivoKeyFrameInfo kf_info;
+    bool has_gps = false;
+    GPSMeasurement gps;
+    uint64_t ref_map_version = 0;
+    uint64_t ref_alignment_epoch = 0;
+
+    // filtering diagnostics
+    bool filter_executed = false;
+    bool filtered_output_used = false;
+    FilterFallbackReason fallback_reason = FilterFallbackReason::NONE;
+    double dynamic_ratio = 0.0;
+    double filter_latency_ms = 0.0;
+    size_t input_points = 0;
+    size_t output_points = 0;
+
+    bool isValid() const {
+        if (!std::isfinite(timestamp)) return false;
+        if (!cloud || cloud->empty()) return false;
+        if (!T_odom_b.matrix().allFinite()) return false;
+        if (!covariance.allFinite()) return false;
+        if (ref_alignment_epoch == 0) return false;
+        if (pose_frame == PoseFrame::UNKNOWN) return false;
+        if (cloud_frame != "body" && cloud_frame != "world") return false;
+        if (filtered_output_used && !filter_executed) return false;
+        if (!std::isfinite(dynamic_ratio) || dynamic_ratio < 0.0 || dynamic_ratio > 1.0) return false;
+        if (!std::isfinite(filter_latency_ms) || filter_latency_ms < 0.0) return false;
+        if (has_gps) {
+            if (!gps.position_enu.allFinite()) return false;
+            if (!gps.covariance.allFinite()) return false;
+        }
+        return true;
+    }
+};
+
+/**
+ * @brief 动态过滤后的帧事件（强契约：cloud_ds 必填）
+ * MappingModule 仅订阅此类型，禁止默认可空+隐式假设非空。
+ */
+struct FilteredFrameEventRequiredDs : public FilteredFrameEventOptionalDs {
+    bool isValid() const {
+        if (!FilteredFrameEventOptionalDs::isValid()) return false;
+        if (!cloud_ds || cloud_ds->empty()) return false;
         return true;
     }
 };

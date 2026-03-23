@@ -279,6 +279,7 @@ struct SessionInfo {
 // ─────────────────────────────────────────────────────────────────────────────
 struct PoseSnapshot {
     uint64_t version = 0;
+    uint64_t alignment_epoch = 1;
     std::unordered_map<int, Pose3d> submap_poses;
     std::unordered_map<uint64_t, Pose3d> keyframe_poses;
     

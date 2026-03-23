@@ -520,6 +520,7 @@ add_library(automap_system_component SHARED
   src/system/modules/tasks_and_utils.cpp
   src/v3/map_registry.cpp
   src/v3/frontend_module.cpp
+  src/v3/dynamic_filter_module.cpp
   src/v3/mapping_module.cpp
   src/v3/optimizer_module.cpp
   src/system/frame_processor.cpp
