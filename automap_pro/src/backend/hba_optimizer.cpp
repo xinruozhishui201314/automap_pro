@@ -125,7 +125,10 @@ void HBAOptimizer::start() {
 void HBAOptimizer::stop() {
     running_ = false;
     queue_cv_.notify_all();
-    if (worker_thread_.joinable()) worker_thread_.join();
+    // 🏛️ [修复] 使用带超时的 join，防止 HBA 优化任务（可能耗时较长）在程序退出时造成阻塞
+    // 理由：AutoMapSystem 析构时会调用此函数。若 HBA 正在运行且 keyframe 数量巨大，
+    // 原生的 join() 会导致整个进程卡死在此处，无法完成最后的日志落地。
+    stopJoinWithTimeout(std::chrono::seconds(5));
 }
 
 void HBAOptimizer::stopJoinWithTimeout(std::chrono::milliseconds max_join) {

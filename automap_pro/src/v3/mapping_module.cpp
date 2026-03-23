@@ -26,7 +26,29 @@ MappingModule::MappingModule(EventBus::Ptr event_bus, MapRegistry::Ptr map_regis
 
     hba_optimizer_.init();
     hba_optimizer_.start();
-    RCLCPP_INFO(node_->get_logger(), "[PIPELINE][MAP] ctor step=HBAOptimizer init+start OK");
+    
+    // 🏛️ [修复] 恢复 V3 架构中遗失的 HBA 结果处理逻辑
+    hba_optimizer_.registerDoneCallback([this](const HBAResult& result) {
+        if (!result.success) return;
+        
+        RCLCPP_INFO(node_->get_logger(), "[V3][MappingModule] HBA optimization finished, applying results...");
+        
+        // 1. 将优化位姿写回所有关键帧与子图锚点
+        sm_manager_.updateAllFromHBA(result);
+        
+        // 2. 根据新位姿重建各子图的合并点云，彻底消除“轨迹已纠偏、点云仍杂乱”的重影现象
+        sm_manager_.rebuildMergedCloudFromOptimizedPoses();
+        
+        // 3. 异步触发一次全局地图构建，使 RViz 显示立即同步到优化后的状态
+        GlobalMapBuildRequestEvent build_ev;
+        build_ev.voxel_size = ConfigManager::instance().mapVoxelSize();
+        build_ev.async = true;
+        event_bus_->publish(build_ev);
+        
+        RCLCPP_INFO(node_->get_logger(), "[V3][MappingModule] HBA results applied and map refresh triggered");
+    });
+
+    RCLCPP_INFO(node_->get_logger(), "[PIPELINE][MAP] ctor step=HBAOptimizer init+start+callback OK");
 
     // 订阅同步帧
     onEvent<SyncedFrameEvent>([this](const SyncedFrameEvent& ev) {

@@ -62,6 +62,18 @@ AutoMapSystem::~AutoMapSystem() {
     RCLCPP_INFO(get_logger(), "[PIPELINE][SYS][SHUTDOWN] destructor begin (grep PIPELINE|SHUTDOWN)");
     shutdown_requested_.store(true);
 
+    // 🏛️ [修复] 关键变更：先保存地图，再停止模块
+    // 理由：stopAll() 会立即终止所有 Module 的工作循环。若先 stopAll()，
+    // 后续的 saveMapToFiles() 发出的 SaveMapRequestEvent 将由 MappingModule 处理，
+    // 如果 MappingModule 已经停止，任务将永远无法被执行，导致点云数据丢失。
+    std::string out_dir = getOutputDir();
+    RCLCPP_INFO(get_logger(), "[PIPELINE][SYS][SHUTDOWN] step=saveMapToFiles PRIORITY_SAVE out_dir=%s", out_dir.c_str());
+    saveMapToFiles(out_dir);
+
+    // 🏛️ [安全策略] 给保存预留一点时间，让 MappingModule::run 循环能处理保存任务
+    // 注意：MappingModule::handleSaveMap 会在 worker thread 执行，这里主线程稍等即可。
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
     if (v3_context_) {
         RCLCPP_INFO(get_logger(), "[PIPELINE][SYS][SHUTDOWN] step=stop V3Context::stopAll (all V3 modules)");
         v3_context_->stopAll();
@@ -71,10 +83,6 @@ AutoMapSystem::~AutoMapSystem() {
     HealthMonitor::instance().stop();
     ErrorMonitor::instance().stop();
 
-    // 自动保存
-    std::string out_dir = getOutputDir();
-    RCLCPP_INFO(get_logger(), "[PIPELINE][SYS][SHUTDOWN] step=saveMapToFiles out_dir=%s", out_dir.c_str());
-    saveMapToFiles(out_dir);
     RCLCPP_INFO(get_logger(), "[PIPELINE][SYS][SHUTDOWN] destructor end");
 }
 

@@ -1755,6 +1755,35 @@ OptimizationResult IncrementalOptimizer::commitAndUpdate() {
         ~Guard() { flag->store(false, std::memory_order_release); }
     } guard{&optimization_in_progress_};
 
+    // 🏛️ [修复] 预处理加固：剔除引用了既不在 isam2_ 内部、也不在待提交 values 中的节点的因子。
+    // 理由：这种因子的存在会导致 logAllConstraintsAndValidate 报 keys_exist=0 错误，从而导致优化中止。
+    // 通过在此处剔除，可以确保后续 isam2_.update 接收到的是拓扑完备的子图。
+    {
+        gtsam::NonlinearFactorGraph filtered;
+        int dropped_factors = 0;
+        for (const auto& f : pending_graph_) {
+            if (!f) continue;
+            bool all_keys_ok = true;
+            for (gtsam::Key k : f->keys()) {
+                if (!current_estimate_.exists(k) && !pending_values_.exists(k)) {
+                    all_keys_ok = false;
+                    break;
+                }
+            }
+            if (all_keys_ok) {
+                filtered.add(f);
+            } else {
+                dropped_factors++;
+            }
+        }
+        if (dropped_factors > 0) {
+            RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+                "[IncrementalOptimizer][BACKEND][FIX] Dropped %d factors referencing MISSING nodes (grep BACKEND FIX)",
+                dropped_factors);
+            pending_graph_ = filtered;
+        }
+    }
+
     const size_t pf = pending_graph_.size();
     const size_t pv = pending_values_.size();
     std::string params = "pending_factors=" + std::to_string(pf) + " pending_values=" + std::to_string(pv);

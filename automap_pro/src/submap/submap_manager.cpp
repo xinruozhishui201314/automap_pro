@@ -566,6 +566,10 @@ void SubMapManager::mergeCloudToSubmap(SubMap::Ptr& sm, const KeyFrame::Ptr& kf)
         return;
     }
 
+    // 与 updateSubmapPose / batchUpdateSubmapPoses 一致：整段合并必须串行访问 merged_cloud。
+    // 此前仅在 transform/append 段持锁，pre-merge voxel 无锁，与后端原地 transform merged_cloud 并发 → 数据竞争、堆损坏、malloc abort。
+    std::lock_guard<std::mutex> lk(mutex_);
+
     // 合并前先检查是否需要降采样（带超时；每步打 STEP+file+line 精确定位到行）
     if (sm->merged_cloud && sm->merged_cloud->size() > kDownsampleThreshold) {
         size_t old_pts = sm->merged_cloud->size();
@@ -632,10 +636,6 @@ void SubMapManager::mergeCloudToSubmap(SubMap::Ptr& sm, const KeyFrame::Ptr& kf)
     auto t_tf = Clock::now();
     CloudXYZIPtr world_cloud = getCloudFromPool();
     Eigen::Affine3f T_wf;
-
-    // 🏛️ [修复] 线程安全与坐标系一致性：持有 mutex_ 保护 merged_cloud 免受 updateSubmapPose 并发修改
-    // 且在此处现场读取 T_map_b_optimized（与全局图/轨迹一致），配合 MappingModule::updateGPSAlignment 的子图冻结逻辑
-    std::lock_guard<std::mutex> lk(mutex_);
 
     // 与 buildGlobalMap 主路径一致：body→world 使用 T_map_b_optimized（创建时初值=T_odom_b），
     // 避免后端优化后仍用 T_odom_b 合并导致 merged_cloud 与 optimized_path/global_map 错位。
