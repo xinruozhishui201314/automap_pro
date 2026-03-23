@@ -131,6 +131,9 @@ public:
     double submapMaxTemporal()  const { return get<double>("submap.max_temporal_s", 60.0); }
     double submapMatchRes()     const { return std::max(0.2, get<double>("submap.match_resolution", 0.4)); }
     double submapMergeRes()     const { return std::max(0.2, get<double>("submap.merge_resolution", 0.2)); }
+    /** 子图重建点云的阈值：当位姿跳变超过此值时触发 rebuild (trans_m, rot_deg) */
+    double submapRebuildThreshTrans() const { return get<double>("submap.rebuild_threshold_trans_m", 2.0); }
+    double submapRebuildThreshRot()   const { return get<double>("submap.rebuild_threshold_rot_deg", 5.0); }
 
     // ── GPS 延迟对齐（load() 时一次性读入缓存，getter 仅返回缓存值，保证与日志一致）──────────────────────
     int    gpsAlignMinPoints()  const { return gps_cached_ ? gps_align_min_points_  : get<int>("gps.align_min_points", 50); }
@@ -399,6 +402,13 @@ public:
         int v = get<int>("backend.publish_global_map_every_n_processed", 100);
         return std::max(50, std::min(1000, v));
     }
+    /** 关键帧之间里程计因子的噪声参数 (trans_m, rot_rad) */
+    double kfOdomTransNoise() const { return get<double>("backend.keyframe_odom_trans_noise", 0.005); }
+    double kfOdomRotNoise()   const { return get<double>("backend.keyframe_odom_rot_noise",   0.01); }
+    /** 子图之间里程计因子的噪声参数 (trans_m, rot_rad) */
+    double smOdomTransNoise() const { return get<double>("backend.submap_odom_trans_noise", 0.01); }
+    double smOdomRotNoise()   const { return get<double>("backend.submap_odom_rot_noise",   0.05); }
+
     /** 子图冻结时合并 forceUpdate：先 flush 所有 pending GPS 再统一一次 forceUpdate，减少 ISAM2 调用次数（默认 false 保持原 3 次）。见 BACKEND_FURTHER_OPTIMIZATION_OPPORTUNITIES.md */
     bool backendForceUpdateCoalesceOnSubmapFreeze() const {
         return get<bool>("backend.force_update_coalesce_on_submap_freeze", false);
@@ -539,15 +549,17 @@ private:
             YAML::Node node = cfg_;
             std::istringstream ss(key);
             std::string token;
+            bool found = true;
             while (std::getline(ss, token, '.')) {
-                if (!node.IsMap() || !node[token]) break;
+                if (!node.IsMap() || !node[token].IsDefined() || node[token].IsNull()) {
+                    found = false;
+                    break;
+                }
                 node = node[token];
             }
-            if (!ss.eof()) { /* 未消费完 token，路径中断，走 flat 回退 */ }
-            else {
+            if (found) {
                 try {
-                    T v = node.as<T>();
-                    return v;
+                    return node.as<T>();
                 } catch (...) {}
             }
         } catch (...) {}

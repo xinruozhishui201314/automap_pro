@@ -208,7 +208,7 @@ void interpolate_pose(std::vector<mypcl::pose> &pose_vec_orig, std::vector<mypcl
     int count = 0;
     for(int i = 0; i < pose_vec_tran.size(); i++)
     {
-        if (i == index_interpolate[k])
+        if (k < index_interpolate.size() && i == index_interpolate[k])
         {
             // RCLCPP_INFO(rclcpp::get_logger("hba"), "val=%ld\n", tran_pc[i - 1]->points.size());
             pcl::PointCloud<PointType>::Ptr pc_in(new pcl::PointCloud<PointType>);
@@ -221,12 +221,12 @@ void interpolate_pose(std::vector<mypcl::pose> &pose_vec_orig, std::vector<mypcl
             Eigen::Matrix3d R_rel = R_to.transpose() * R_from;
             Eigen::Vector3d t_rel = R_to.transpose() * (pose_vec_tran[i - 1].t - pose_vec_tran[i].t);
 
-            for(size_t i = 0; i < pc_in->points.size(); i++)
+            for(size_t i_pt = 0; i_pt < pc_in->points.size(); i_pt++)
             {
-                Eigen::Vector3d pt_cur(pc_in->points[i].x, pc_in->points[i].y, pc_in->points[i].z);
+                Eigen::Vector3d pt_cur(pc_in->points[i_pt].x, pc_in->points[i_pt].y, pc_in->points[i_pt].z);
                 Eigen::Vector3d pt_to;
                 pt_to = R_rel * pt_cur + t_rel;
-                temp_pc->points.push_back(pcl::PointXYZI(pt_to.x(), pt_to.y(), pt_to.z(), pc_in->points[i].intensity));
+                temp_pc->points.push_back(pcl::PointXYZI(pt_to.x(), pt_to.y(), pt_to.z(), pc_in->points[i_pt].intensity));
             }
             tran_pc.push_back(temp_pc);
 
@@ -255,7 +255,7 @@ std::vector<mypcl::pose> write_back_pose(std::vector<mypcl::pose> lio_tran_pose)
     std::vector<mypcl::pose> lio_pose;
     for (int i = 0; i < lio_tran_pose.size(); i++)
     {
-        if(i == index_interpolate[k])
+        if(k < index_interpolate.size() && i == index_interpolate[k])
         {
             k++;
             continue;

@@ -214,7 +214,7 @@ void HBAOptimizer::triggerAsync(
         sm_id_to_ptr[sm->id] = sm;
         for (const auto& kf : sm->keyframes) {
             if (kf && kf->cloud_body && !kf->cloud_body->empty() && 
-                kf->T_w_b.translation().allFinite() && kf->T_w_b.rotation().matrix().allFinite()) {
+                kf->T_odom_b.translation().allFinite() && kf->T_odom_b.rotation().matrix().allFinite()) {
                 sm_id_to_anchor_kf_id[sm->id] = kf->id;
                 break; // 找到第一个有效的关键帧作为该子图在 HBA 中的锚点
             }
@@ -426,8 +426,8 @@ HBAResult HBAOptimizer::runHBA(const PendingTask& task) {
             empty_cloud_count++;
             continue;
         }
-        const auto& t = kf->T_w_b.translation();
-        const auto& R = kf->T_w_b.rotation();
+        const auto& t = kf->T_odom_b.translation();
+        const auto& R = kf->T_odom_b.rotation();
         if (!t.allFinite() || !R.allFinite()) {
             invalid_pose_count++;
             continue;
@@ -522,8 +522,8 @@ HBAResult HBAOptimizer::runHBA(const PendingTask& task) {
     for (const auto& kf : sorted_kfs) {
         hba_api::KeyFrameInput input;
         input.timestamp   = kf->timestamp;
-        input.rotation    = Eigen::Quaterniond(kf->T_w_b.rotation());
-        input.translation = kf->T_w_b.translation();
+        input.rotation    = Eigen::Quaterniond(kf->T_odom_b.rotation());
+        input.translation = kf->T_odom_b.translation();
         // 使用 cloud_body（body 系下），HBA 内部会用位姿变换到世界系
         if (kf->cloud_body && !kf->cloud_body->empty()) {
             // 转换 CloudXYZI → CloudXYZIN（HBA 需要 PointXYZINormal）
@@ -634,8 +634,8 @@ HBAResult HBAOptimizer::runGTSAMFallback(const PendingTask& task) {
 
     // 约束合理性：所有关键帧位姿有限且平移在合理范围内，否则不进入 GTSAM 避免崩溃
     auto poseForInitial = [](const KeyFrame::Ptr& kf) -> Pose3d {
-        const Pose3d& o = kf->T_w_b_optimized;
-        const Pose3d& t = kf->T_w_b;
+        const Pose3d& o = kf->T_map_b_optimized;
+        const Pose3d& t = kf->T_odom_b;
         if ((o.translation() - t.translation()).norm() > 1e-9 || !o.rotation().isApprox(t.rotation()))
             return o;
         return t;
@@ -700,11 +700,11 @@ HBAResult HBAOptimizer::runGTSAMFallback(const PendingTask& task) {
                 graph.add(gtsam::PriorFactor<gtsam::Pose3>(KF(0), toGtsamPose3(pose_i), robust_noise));
                 factor_type_log.push_back("Prior(k0)");
             } else {
-                // 🔧 [修复] 关键点：BetweenFactor 的测量值必须始终使用原始里程计 (T_w_b)，
+                // 🔧 [修复] 关键点：BetweenFactor 的测量值必须始终使用原始里程计 (T_odom_b)，
                 // 而非初始值 (poseForInitial 可能返回已优化的位姿)。
                 // 否则会产生“自引用”逻辑错误：将“上次优化的结果”作为“本次优化的真实测量”，
                 // 导致轨迹无法纠偏且误差不断累积（重影根因）。
-                Pose3d rel = sorted_kfs[i - 1]->T_w_b.inverse() * sorted_kfs[i]->T_w_b;
+                Pose3d rel = sorted_kfs[i - 1]->T_odom_b.inverse() * sorted_kfs[i]->T_odom_b;
                 auto between_noise = gtsam::noiseModel::Diagonal::Variances(between_var6);
                 graph.add(gtsam::BetweenFactor<gtsam::Pose3>(KF(i - 1), KF(i), toGtsamPose3(rel), between_noise));
                 factor_type_log.push_back("Between(k" + std::to_string(i - 1) + "-k" + std::to_string(i) + ")");
@@ -723,8 +723,8 @@ HBAResult HBAOptimizer::runGTSAMFallback(const PendingTask& task) {
             
             if (it_i != kf_id_to_idx.end() && it_j != kf_id_to_idx.end()) {
                 // 详细记录回环因子的测量值 vs 当前位姿，识别潜在重影风险
-                Pose3d pose_i = sorted_kfs[it_i->second]->T_w_b;
-                Pose3d pose_j = sorted_kfs[it_j->second]->T_w_b;
+                Pose3d pose_i = sorted_kfs[it_i->second]->T_odom_b;
+                Pose3d pose_j = sorted_kfs[it_j->second]->T_odom_b;
                 Pose3d current_rel = pose_i.inverse() * pose_j;
                 double trans_diff = (current_rel.translation() - lc->delta_T.translation()).norm();
                 double rot_diff = Eigen::AngleAxisd(current_rel.rotation().inverse() * lc->delta_T.rotation()).angle() * 180.0 / M_PI;
@@ -762,12 +762,12 @@ HBAResult HBAOptimizer::runGTSAMFallback(const PendingTask& task) {
                 if (idx >= n_kf_init) continue;
                 const auto& kf = sorted_kfs[idx];
                 Pose3d p_init = poseForInitial(kf);
-                const auto& to = kf->T_w_b_optimized.translation();
-                const auto& td = kf->T_w_b.translation();
+                const auto& to = kf->T_map_b_optimized.translation();
+                const auto& td = kf->T_odom_b.translation();
                 bool used_opt = (p_init.translation() - to).norm() < 1e-9;
                 RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-                    "[HBA][POSE_DIAG] initial idx=%zu kf_id=%lu source=%s trans=[%.4f,%.4f,%.4f] | T_w_b_odom=[%.4f,%.4f,%.4f] T_w_b_opt=[%.4f,%.4f,%.4f]",
-                    idx, kf->id, used_opt ? "T_w_b_optimized" : "T_w_b",
+                    "[HBA][POSE_DIAG] initial idx=%zu kf_id=%lu source=%s trans=[%.4f,%.4f,%.4f] | T_odom_b=[%.4f,%.4f,%.4f] T_map_b_opt=[%.4f,%.4f,%.4f]",
+                    idx, kf->id, used_opt ? "T_map_b_optimized" : "T_odom_b",
                     p_init.translation().x(), p_init.translation().y(), p_init.translation().z(),
                     td.x(), td.y(), td.z(), to.x(), to.y(), to.z());
             }
@@ -787,8 +787,10 @@ HBAResult HBAOptimizer::runGTSAMFallback(const PendingTask& task) {
                 }
                 // 与 iSAM2 一致：由于地图已整体变换到 ENU 系，GPS 观测直接使用 ENU 坐标即可
                 // 🔧 [修复] GPS 杠臂补偿 (Lever-arm Compensation)
-                // 原理：pos_imu = pos_gps_antenna - R_enu_imu * p_lever_arm
-                Eigen::Vector3d pos_map = pos_enu - kf->T_w_b.rotation() * lever_arm_;
+                // 原理：pos_imu = pos_gps_antenna - R_map_body * p_lever_arm
+                // 注意：必须使用地图坐标系下的姿态 (T_map_b_optimized) 而非原始里程计 (T_odom_b)，
+                // 否则当系统存在较大的对齐偏角时，补偿方向会完全错位导致重影。
+                Eigen::Vector3d pos_map = pos_enu - kf->T_map_b_optimized.rotation() * lever_arm_;
                 
                 gtsam::Point3 pt(pos_map.x(), pos_map.y(), pos_map.z());
                 Eigen::Matrix3d c = kf->gps.covariance;
@@ -950,18 +952,18 @@ HBAResult HBAOptimizer::runGTSAMFallback(const PendingTask& task) {
 
         logFactorErrors(graph_copy, optimized, "AFTER");
 
-        // [GHOSTING_DIAG] 写回前抽样记录 T_w_b vs 即将写回的 T_w_b_optimized，便于定位重影是否来自写回不一致
+        // [GHOSTING_DIAG] 写回前抽样记录 T_odom_b vs 即将写回的 T_map_b_optimized，便于定位重影是否来自写回不一致
         const size_t kSampleStep = std::max<size_t>(1, sorted_kfs.size() / 8);
         for (size_t i = 0; i < sorted_kfs.size(); ++i) {
             if (i % kSampleStep == 0 && optimized.exists(KF(i))) {
                 const auto& kf = sorted_kfs[i];
                 Pose3d new_pose = fromGtsamPose3(optimized.at<gtsam::Pose3>(KF(i)));
-                double trans_diff = (new_pose.translation() - kf->T_w_b.translation()).norm();
-                double rot_diff = Eigen::AngleAxisd(new_pose.linear() * kf->T_w_b.linear().transpose()).angle() * 180.0 / M_PI;
+                double trans_diff = (new_pose.translation() - kf->T_odom_b.translation()).norm();
+                double rot_diff = Eigen::AngleAxisd(new_pose.linear() * kf->T_odom_b.linear().transpose()).angle() * 180.0 / M_PI;
                 RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-                    "[HBA][GHOSTING_DIAG] pre_writeback kf_id=%lu idx=%zu: T_w_b=[%.2f,%.2f,%.2f] -> T_w_b_optimized=[%.2f,%.2f,%.2f] trans_diff=%.3fm rot_diff=%.2fdeg",
+                    "[HBA][GHOSTING_DIAG] pre_writeback kf_id=%lu idx=%zu: T_odom_b=[%.2f,%.2f,%.2f] -> T_map_b_optimized=[%.2f,%.2f,%.2f] trans_diff=%.3fm rot_diff=%.2fdeg",
                     kf->id, i,
-                    kf->T_w_b.translation().x(), kf->T_w_b.translation().y(), kf->T_w_b.translation().z(),
+                    kf->T_odom_b.translation().x(), kf->T_odom_b.translation().y(), kf->T_odom_b.translation().z(),
                     new_pose.translation().x(), new_pose.translation().y(), new_pose.translation().z(),
                     trans_diff, rot_diff);
             }
@@ -1019,17 +1021,17 @@ HBAResult HBAOptimizer::runGTSAMFallback(const PendingTask& task) {
                 result.optimized_poses.push_back(new_pose);
             }
         }
-        // [POSE_DIAG] 写回由 updateAllFromHBA 持锁统一执行；此处用 result.optimized_poses 打首/中/尾与 T_w_b 的差值
+        // [POSE_DIAG] 写回由 updateAllFromHBA 持锁统一执行；此处用 result.optimized_poses 打首/中/尾与 T_odom_b 的差值
         for (size_t idx : {static_cast<size_t>(0), n_kf / 2, n_kf - 1}) {
             if (idx >= n_kf || idx >= result.optimized_poses.size()) continue;
             const auto& kf = sorted_kfs[idx];
             const auto& t_new = result.optimized_poses[idx].translation();
-            const auto& t_odom = kf->T_w_b.translation();
+            const auto& t_odom = kf->T_odom_b.translation();
             double trans_diff = (t_new - t_odom).norm();
             double yaw_new = std::atan2(result.optimized_poses[idx].rotation()(1, 0), result.optimized_poses[idx].rotation()(0, 0)) * 180.0 / M_PI;
-            double yaw_odom = std::atan2(kf->T_w_b.rotation()(1, 0), kf->T_w_b.rotation()(0, 0)) * 180.0 / M_PI;
+            double yaw_odom = std::atan2(kf->T_odom_b.rotation()(1, 0), kf->T_odom_b.rotation()(0, 0)) * 180.0 / M_PI;
             RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-                "[HBA][POSE_DIAG] writeback idx=%zu kf_id=%lu T_w_b_optimized=[%.4f,%.4f,%.4f] yaw=%.2fdeg | T_w_b_odom=[%.4f,%.4f,%.4f] yaw=%.2fdeg trans_diff=%.4fm",
+                "[HBA][POSE_DIAG] writeback idx=%zu kf_id=%lu T_map_b_optimized=[%.4f,%.4f,%.4f] yaw=%.2fdeg | T_odom_b=[%.4f,%.4f,%.4f] yaw=%.2fdeg trans_diff=%.4fm",
                 idx, kf->id, t_new.x(), t_new.y(), t_new.z(), yaw_new, t_odom.x(), t_odom.y(), t_odom.z(), yaw_odom, trans_diff);
         }
         RCLCPP_INFO(rclcpp::get_logger("automap_system"),
@@ -1073,8 +1075,8 @@ std::vector<KeyFrame::Ptr> HBAOptimizer::collectKeyFramesFromSubmaps(
             if (!kf) continue;
             if (!kf->cloud_body || kf->cloud_body->empty()) continue;
             // 检查位姿有效性：平移和旋转必须是有限的
-            const auto& t = kf->T_w_b.translation();
-            const auto& R = kf->T_w_b.rotation();
+            const auto& t = kf->T_odom_b.translation();
+            const auto& R = kf->T_odom_b.rotation();
             if (!t.allFinite() || !R.allFinite()) continue;
             kfs.push_back(kf);
         }

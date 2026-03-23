@@ -21,7 +21,8 @@ void LivoBridge::init(rclcpp::Node::SharedPtr node) {
     // 订阅端 depth 由配置控制，资源受限时可减小（system.subscription_odom_cloud_depth / subscription_gps_depth）
     const int odom_cloud_depth = cfg.subscriptionOdomCloudDepth();
     const int gps_depth = cfg.subscriptionGpsDepth();
-    auto odom_kfinfo_qos = rclcpp::QoS(rclcpp::KeepLast(odom_cloud_depth)).best_effort();
+    // V3: odom/kfinfo 与 cloud 同为 RELIABLE，避免 BEST_EFFORT 丢包导致 cloud 时刻在 odom 缓存中无法插值 → SyncedFrame 缺失、kf=0
+    auto odom_kfinfo_qos = rclcpp::QoS(rclcpp::KeepLast(odom_cloud_depth)).reliable();
     auto cloud_qos = rclcpp::QoS(rclcpp::KeepLast(odom_cloud_depth)).reliable();
     auto gps_qos = rclcpp::QoS(rclcpp::KeepLast(gps_depth)).reliable();
 
@@ -62,7 +63,7 @@ void LivoBridge::init(rclcpp::Node::SharedPtr node) {
 
     connected_ = true;
     RCLCPP_INFO(node->get_logger(),
-        "[LivoBridge][TOPIC] subscribe: odom=%s (KeepLast(%d) best_effort) cloud=%s (KeepLast(%d) reliable) kfinfo=%s gps=%s",
+        "[LivoBridge][TOPIC] subscribe: odom=%s (KeepLast(%d) reliable) cloud=%s (KeepLast(%d) reliable) kfinfo=%s gps=%s",
         cfg.fastLivoOdomTopic().c_str(), odom_cloud_depth,
         cfg.fastLivoCloudTopic().c_str(), odom_cloud_depth,
         cfg.fastLivoKFInfoTopic().c_str(),
@@ -81,7 +82,8 @@ void LivoBridge::init(rclcpp::Node::SharedPtr node, bool gps_enabled, const std:
     // 与 init(node) 一致：订阅 depth 由配置 system.subscription_odom_cloud_depth / subscription_gps_depth 控制
     const int odom_cloud_depth = cfg.subscriptionOdomCloudDepth();
     const int gps_depth = cfg.subscriptionGpsDepth();
-    auto odom_kfinfo_qos = rclcpp::QoS(rclcpp::KeepLast(odom_cloud_depth)).best_effort();
+    // V3: odom/kfinfo 与 cloud 同为 RELIABLE，避免 BEST_EFFORT 丢包导致 cloud 时刻在 odom 缓存中无法插值 → SyncedFrame 缺失、kf=0
+    auto odom_kfinfo_qos = rclcpp::QoS(rclcpp::KeepLast(odom_cloud_depth)).reliable();
     auto cloud_qos = rclcpp::QoS(rclcpp::KeepLast(odom_cloud_depth)).reliable();
     auto gps_qos = rclcpp::QoS(rclcpp::KeepLast(gps_depth)).reliable();
 
@@ -130,7 +132,7 @@ void LivoBridge::init(rclcpp::Node::SharedPtr node, bool gps_enabled, const std:
 
     connected_ = true;
     RCLCPP_INFO(node->get_logger(),
-        "[LivoBridge][TOPIC] subscribe: odom=%s (KeepLast(%d) best_effort) cloud=%s (KeepLast(%d) reliable) kfinfo=%s gps=%s",
+        "[LivoBridge][TOPIC] subscribe: odom=%s (KeepLast(%d) reliable) cloud=%s (KeepLast(%d) reliable) kfinfo=%s gps=%s",
         cfg.fastLivoOdomTopic().c_str(), odom_cloud_depth,
         cfg.fastLivoCloudTopic().c_str(), odom_cloud_depth,
         cfg.fastLivoKFInfoTopic().c_str(),

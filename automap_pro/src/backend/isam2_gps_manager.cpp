@@ -52,6 +52,13 @@ void ISAM2GPSManager::addGPSFactor(
     // 应用动态协方差调整
     Eigen::Matrix3d final_cov = applyDynamicCovariance(pos_map, cov3x3);
 
+    // 强化约束强度（如果配置允许）
+    const auto& cfg = ConfigManager::instance();
+    double weight = cfg.gpsFactorWeight();
+    if (weight > 0.0 && weight != 1.0) {
+        final_cov /= (weight * weight); // 协方差是标准差的平方
+    }
+
     // GPS 异常值检测
     auto outlier_result = detectOutlier(sm_id, pos_map, cov3x3, current_estimate);
     if (outlier_result.is_outlier) {

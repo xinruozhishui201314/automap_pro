@@ -60,7 +60,7 @@ bool FrameProcessor::pushFrame(double ts, const CloudXYZIPtr& cloud) {
 
     // 检查逻辑上限（从配置读取）
     if (ingress_size_.load(std::memory_order_relaxed) >= max_ingress_queue_size_) {
-        ALOG_WARN("FrameProcessor", "ingress_queue logical limit reached (%zu), dropping frame ts=%.3f", max_ingress_queue_size_, ts);
+        ALOG_WARN("FrameProcessor", "ingress_queue logical limit reached ({}), dropping frame ts={:.3f}", max_ingress_queue_size_, ts);
         return false;
     }
     
@@ -127,15 +127,16 @@ bool FrameProcessor::tryPopFrame(int timeout_ms, FrameToProcess& out_frame) {
 }
 
 void FrameProcessor::feederLoop() {
-    const std::atomic<bool>* shutdown = shutdown_flag_ ? shutdown_flag_ : &running_;
-
-    ALOG_INFO("FrameProcessor", "feeder thread started (max_ingress=%zu, max_frame=%zu)",
+    ALOG_INFO("FrameProcessor", "feeder thread started (max_ingress={}, max_frame={})",
               max_ingress_queue_size_, max_frame_queue_size_);
 
     static std::atomic<int64_t> total_voxel_time_ms{0};
     static std::atomic<int> processed_count{0};
 
-    while (!shutdown->load(std::memory_order_acquire)) {
+    while (running_.load(std::memory_order_acquire)) {
+        if (shutdown_flag_ && shutdown_flag_->load(std::memory_order_acquire)) {
+            break;
+        }
         FrameToProcess f;
         bool has_data = false;
 
@@ -147,11 +148,14 @@ void FrameProcessor::feederLoop() {
             // 没数据，进入等待
             std::unique_lock<std::mutex> lock(ingress_not_empty_mutex_);
             bool woke = ingress_not_empty_cv_.wait_for(
-                lock, std::chrono::milliseconds(500), [this, shutdown]() {
-                    return shutdown->load(std::memory_order_acquire) || !ingress_queue_.empty();
+                lock, std::chrono::milliseconds(500), [this]() {
+                    return !running_.load(std::memory_order_acquire) || 
+                           (shutdown_flag_ && shutdown_flag_->load(std::memory_order_acquire)) ||
+                           !ingress_queue_.empty();
                 });
 
-            if (shutdown->load(std::memory_order_acquire)) break;
+            if (!running_.load(std::memory_order_acquire)) break;
+            if (shutdown_flag_ && shutdown_flag_->load(std::memory_order_acquire)) break;
             if (!woke || !ingress_queue_.pop(f)) continue;
             ingress_size_.fetch_sub(1, std::memory_order_relaxed);
             has_data = true;
@@ -181,18 +185,18 @@ void FrameProcessor::feederLoop() {
                 processed_count.fetch_add(1);
 
                 if (timed_out) {
-                    ALOG_ERROR("FrameProcessor", "[COMPUTE_TIMEOUT] voxelDownsampleWithTimeout timed out seq=%d pts=%zu limit_ms=%d",
+                    ALOG_ERROR("FrameProcessor", "[COMPUTE_TIMEOUT] voxelDownsampleWithTimeout timed out seq={} pts={} limit_ms={}",
                                frame_seq, f.cloud->size(), voxel_timeout_ms);
                 }
                 if (frame_seq <= 5 || frame_seq % 100 == 0 || voxel_ms > 100.0 || timed_out) {
                     const int64_t avg_voxel = processed_count.load() > 0 ? total_voxel_time_ms.load() / processed_count.load() : 0;
-                    ALOG_INFO("FrameProcessor", "[%d] voxel: pts=%zu->%zu ms=%.1f avg=%ldms timeout=%d ingress_q=%zu frame_q=%zu",
+                    ALOG_INFO("FrameProcessor", "[{}] voxel: pts={}->{} ms={:.1f} avg={}ms timeout={} ingress_q={} frame_q={}",
                              frame_seq, f.cloud->size(), f.cloud_ds ? f.cloud_ds->size() : 0,
                              voxel_ms, avg_voxel, timed_out ? 1 : 0,
                              ingress_size_.load(), frame_queue_size_.load());
                 }
             } catch (const std::exception& e) {
-                ALOG_ERROR("FrameProcessor", "voxelDownsample exception: %s", e.what());
+                ALOG_ERROR("FrameProcessor", "voxelDownsample exception: {}", e.what());
                 f.cloud_ds = nullptr;
             }
         }
@@ -211,12 +215,12 @@ void FrameProcessor::feederLoop() {
                 if (frame_queue_.push(f)) {
                     frame_queue_size_.fetch_add(1, std::memory_order_relaxed);
                 }
-                ALOG_WARN("FrameProcessor", "frame_queue full, dropped oldest. total_drops=%d", backpressure_drop_count_.load());
+                ALOG_WARN("FrameProcessor", "frame_queue full, dropped oldest. total_drops={}", backpressure_drop_count_.load());
             }
         }
     }
 
-    ALOG_INFO("FrameProcessor", "feeder thread exiting (total_processed=%d)", processed_count.load());
+    ALOG_INFO("FrameProcessor", "feeder thread exiting (total_processed={})", processed_count.load());
 }
 
 CloudXYZIPtr FrameProcessor::downsample(const CloudXYZIPtr& cloud, float resolution) {

@@ -385,12 +385,42 @@ private:
         RCLCPP_INFO(this->get_logger(), 
                     "[MultiCameraManager] Loading calibration from: %s", filepath.c_str());
         
-        // TODO: 实现从标定文件加载参数的逻辑
-        // 可以支持多种格式：YAML、TXT等
-        
-        RCLCPP_WARN(this->get_logger(), 
-                     "[MultiCameraManager] Calibration file loading not implemented yet");
-        return false;
+        try {
+            cv::FileStorage fs(filepath, cv::FileStorage::READ);
+            if (!fs.isOpened()) {
+                RCLCPP_ERROR(this->get_logger(), "Failed to open calibration file: %s", filepath.c_str());
+                return false;
+            }
+
+            for (auto& [type, config] : camera_configs_) {
+                std::string prefix = cameraTypeToString(type);
+                cv::FileNode node = fs[prefix];
+                if (node.empty()) continue;
+
+                node["fx"] >> config.fx;
+                node["fy"] >> config.fy;
+                node["cx"] >> config.cx;
+                node["cy"] >> config.cy;
+                node["k1"] >> config.k1;
+                node["k2"] >> config.k2;
+                node["p1"] >> config.p1;
+                node["p2"] >> config.p2;
+                node["width"] >> config.width;
+                node["height"] >> config.height;
+                
+                cv::Mat R, t;
+                node["R"] >> R;
+                node["t"] >> t;
+                if (!R.empty()) config.R = R.clone();
+                if (!t.empty()) config.t = t.clone();
+
+                RCLCPP_INFO(this->get_logger(), "[MultiCameraManager] Loaded calibration for: %s", prefix.c_str());
+            }
+            return true;
+        } catch (const std::exception& e) {
+            RCLCPP_ERROR(this->get_logger(), "Error loading calibration file: %s", e.what());
+            return false;
+        }
     }
     
     /**

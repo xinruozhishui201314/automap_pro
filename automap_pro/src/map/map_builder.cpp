@@ -404,15 +404,15 @@ void MapBuilder::buildFromKeyFramesImpl(const std::vector<KeyFrame::Ptr>& keyfra
         
         if (!kf || !kf->cloud_body || kf->cloud_body->empty()) continue;
         
-        // 变换到世界坐标系（统一使用优化后位姿，保证 GPS/回环/HBA 后地图与轨迹一致）
-        CloudXYZI world_cloud;
-        transformCloudToWorld(kf->cloud_body, kf->T_w_b_optimized, world_cloud);
+        // 变换到地图坐标系（统一使用优化后位姿，保证 GPS/回环/HBA 后地图与轨迹一致）
+        CloudXYZI map_cloud;
+        transformCloudToMap(kf->cloud_body, kf->T_map_b_optimized, map_cloud);
         
         // 合并到基础地图
-        mergeCloud(std::make_shared<CloudXYZI>(world_cloud), base_map_);
+        mergeCloud(std::make_shared<CloudXYZI>(map_cloud), base_map_);
         
         // 同时添加到全局地图
-        global_map_->addCloud(kf->cloud_body, kf->T_w_b_optimized);
+        global_map_->addCloud(kf->cloud_body, kf->T_map_b_optimized);
         
         processed++;
         
@@ -435,15 +435,15 @@ void MapBuilder::buildFromSubmapsImpl(const std::vector<SubMap::Ptr>& submaps) {
         if (!sm) continue;
 
         // 重要：不要直接复用 sm->merged_cloud。
-        // merged_cloud 是冻结时用当时的 T_w_b 变换得到的“世界系点云”，后端优化后会变“旧位姿”。
-        // 这里统一从每个关键帧的 body 点云 + T_w_b_optimized 重投影，保证每次重建都反映最新位姿。
+        // merged_cloud 是冻结时用当时的 T_odom_b 变换得到的“局部系点云”，后端优化后会变“旧位姿”。
+        // 这里统一从每个关键帧的 body 点云 + T_map_b_optimized 重投影，保证每次重建都反映最新位姿。
         if (sm->keyframes.empty()) continue;
         for (const auto& kf : sm->keyframes) {
             if (!kf || !kf->cloud_body || kf->cloud_body->empty()) continue;
-            CloudXYZI world_cloud;
-            transformCloudToWorld(kf->cloud_body, kf->T_w_b_optimized, world_cloud);
-            if (!world_cloud.empty()) {
-                mergeCloud(std::make_shared<CloudXYZI>(world_cloud), base_map_);
+            CloudXYZI map_cloud;
+            transformCloudToMap(kf->cloud_body, kf->T_map_b_optimized, map_cloud);
+            if (!map_cloud.empty()) {
+                mergeCloud(std::make_shared<CloudXYZI>(map_cloud), base_map_);
             }
         }
     }
@@ -456,15 +456,15 @@ void MapBuilder::addKeyFrameImpl(const KeyFrame::Ptr& kf) {
     
     std::lock_guard<std::mutex> lk(mutex_);
     
-    // 变换到世界坐标系
-    CloudXYZI world_cloud;
-    transformCloudToWorld(kf->cloud_body, kf->T_w_b_optimized, world_cloud);
+    // 变换到地图坐标系
+    CloudXYZI map_cloud;
+    transformCloudToMap(kf->cloud_body, kf->T_map_b_optimized, map_cloud);
     
     // 合并到基础地图
-    mergeCloud(std::make_shared<CloudXYZI>(world_cloud), base_map_);
+    mergeCloud(std::make_shared<CloudXYZI>(map_cloud), base_map_);
     
     // 同时添加到全局地图
-    global_map_->addCloud(kf->cloud_body, kf->T_w_b_optimized);
+    global_map_->addCloud(kf->cloud_body, kf->T_map_b_optimized);
 }
 
 void MapBuilder::addSubmapImpl(const SubMap::Ptr& sm) {
@@ -476,7 +476,7 @@ void MapBuilder::addSubmapImpl(const SubMap::Ptr& sm) {
     mergeCloud(sm->merged_cloud, base_map_);
     
     // 将子图点云添加到全局地图
-    global_map_->addCloud(sm->downsampled_cloud, sm->pose_w_anchor_optimized);
+    global_map_->addCloud(sm->downsampled_cloud, sm->pose_map_anchor_optimized);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -564,9 +564,9 @@ void MapBuilder::cleanupMaps() {
 // 辅助函数
 // ─────────────────────────────────────────────────────────────────────────────
 
-void MapBuilder::transformCloudToWorld(const CloudXYZIPtr& cloud, const Pose3d& T_w_b,
+void MapBuilder::transformCloudToMap(const CloudXYZIPtr& cloud, const Pose3d& T_map_b,
                                       CloudXYZI& output) const {
-    Eigen::Affine3f T_f = T_w_b.cast<float>();
+    Eigen::Affine3f T_f = T_map_b.cast<float>();
     pcl::transformPointCloud(*cloud, output, T_f);
 }
 

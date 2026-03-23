@@ -515,15 +515,13 @@ ament_target_dependencies(automap_visualization ${AUTOMAP_AMENT_DEPS})
 add_library(automap_system_component SHARED
   src/system/modules/system_init.cpp
   src/system/modules/data_callbacks.cpp
-  src/system/modules/worker_threads.cpp
-  src/system/modules/keyframe_submap.cpp
   src/system/modules/service_handlers.cpp
-  src/system/modules/gps_processing.cpp
-  src/system/modules/loop_optimization.cpp
   src/system/modules/tasks_and_utils.cpp
-  src/system/modules/trajectory_log.cpp
+  src/v3/map_registry.cpp
+  src/v3/frontend_module.cpp
+  src/v3/mapping_module.cpp
+  src/v3/optimizer_module.cpp
   src/system/frame_processor.cpp
-  src/system/task_dispatcher.cpp
 )
 target_include_directories(automap_system_component PUBLIC ${AUTOMAP_INCLUDE_DIRS})
 target_link_libraries(automap_system_component

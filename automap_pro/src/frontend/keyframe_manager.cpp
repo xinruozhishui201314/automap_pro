@@ -64,7 +64,7 @@ bool KeyFrameManager::shouldCreateKeyFrame(const Pose3d& cur_pose, double timest
 }
 
 KeyFrame::Ptr KeyFrameManager::createKeyFrame(
-    const Pose3d& T_w_b,
+    const Pose3d& T_odom_b,
     const Mat66d& covariance,
     double timestamp,
     const CloudXYZIPtr& cloud_body,
@@ -80,8 +80,8 @@ KeyFrame::Ptr KeyFrameManager::createKeyFrame(
     kf->id             = next_id_.fetch_add(1);
     kf->session_id     = session_id;
     kf->timestamp      = timestamp;
-    kf->T_w_b          = T_w_b;
-    kf->T_w_b_optimized = T_w_b;
+    kf->T_odom_b       = T_odom_b;
+    kf->T_map_b_optimized = T_odom_b;
     kf->covariance     = covariance;
     kf->cloud_body     = cloud_body;
     kf->cloud_ds_body  = cloud_ds;
@@ -90,7 +90,7 @@ KeyFrame::Ptr KeyFrameManager::createKeyFrame(
     
     // 更新最后状态
     last_keyframe_ = kf;
-    last_pose_     = T_w_b;
+    last_pose_     = T_odom_b;
     last_ts_       = timestamp;
     has_last_      = true;
     kf_count_++;
@@ -110,7 +110,7 @@ void KeyFrameManager::addKeyFrame(KeyFrame::Ptr kf) {
     std::lock_guard<std::mutex> lk(mutex_);
     if (kf) {
         last_keyframe_ = kf;
-        last_pose_ = kf->T_w_b;
+        last_pose_ = kf->T_odom_b;
         last_ts_ = kf->timestamp;
         has_last_ = true;
         kf_count_++;

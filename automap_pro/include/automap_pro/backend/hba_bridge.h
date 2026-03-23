@@ -10,7 +10,7 @@ namespace automap_pro {
 
 /**
  * HBA-main 批处理桥接：导出 KeyFrame 序列为 HBA 所需 pose.json + pcd/，
- * 可选调用 HBA 可执行文件，读回 pose_trans.json 并写回 KeyFrame 的 T_w_b_optimized。
+ * 可选调用 HBA 可执行文件，读回 pose_trans.json 并写回 KeyFrame 的 T_map_b_optimized。
  */
 class HBABridge {
 public:
@@ -30,7 +30,7 @@ public:
         int pcd_name_fill_num = 4);
 
     /**
-     * 读取 pose_trans.json，按 keyframes 顺序写回 T_w_b_optimized。
+     * 读取 pose_trans.json，按 keyframes 顺序写回 T_map_b_optimized。
      * 若行数与 keyframes 不一致则返回 false。
      */
     static bool loadHBAResultAndApply(

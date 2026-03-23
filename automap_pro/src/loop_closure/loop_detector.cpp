@@ -507,7 +507,7 @@ void LoopDetector::onDescriptorReady(const SubMap::Ptr& submap) {
     }
 
     // 【几何距离预筛】按两子图锚定位姿距离过滤，抑制重复结构导致的误检（相似但远距离的候选）
-    Eigen::Vector3d query_pos = submap->pose_w_anchor.translation();
+    Eigen::Vector3d query_pos = submap->pose_odom_anchor.translation();
     std::vector<OverlapTransformerInfer::Candidate> geo_filtered_candidates;
     int filtered_by_geo = 0;
     for (const auto& cand : valid_candidates) {
@@ -520,7 +520,7 @@ void LoopDetector::onDescriptorReady(const SubMap::Ptr& submap) {
         }
         double geo_dist_m = -1.0;
         if (target_submap) {
-            geo_dist_m = (query_pos - target_submap->pose_w_anchor.translation()).norm();
+            geo_dist_m = (query_pos - target_submap->pose_odom_anchor.translation()).norm();
             ALOG_INFO(MOD, "[LOOP_CAND] query_id={} target_id={} score={:.3f} geo_dist={:.1f}m",
                       submap->id, cand.submap_id, cand.score, geo_dist_m);
         } else {
@@ -828,7 +828,7 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
         // 几何诊断：query 关键帧位姿（世界系）
         const KeyFrame::Ptr query_kf = (task.query_kf_idx >= 0 && task.query_kf_idx < static_cast<int>(task.query->keyframes.size()))
             ? task.query->keyframes[task.query_kf_idx] : nullptr;
-        const Pose3d T_w_query = query_kf ? query_kf->T_w_b : Pose3d::Identity();
+        const Pose3d T_w_query = query_kf ? query_kf->T_odom_b : Pose3d::Identity();
         const Eigen::Vector3d pos_w_query = T_w_query.translation();
 
         for (const auto& kfc : task.candidates_kf) {
@@ -860,7 +860,7 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
                     continue;
                 }
             }
-            const Pose3d T_w_target = target_kf ? target_kf->T_w_b : Pose3d::Identity();
+            const Pose3d T_w_target = target_kf ? target_kf->T_odom_b : Pose3d::Identity();
             const Eigen::Vector3d pos_w_target = T_w_target.translation();
             const double dist_world_m = (pos_w_query - pos_w_target).norm();
             const Pose3d T_tgt_src_odom = T_w_target.inverse() * T_w_query;  // target 系下 query 位姿
@@ -1000,10 +1000,16 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
             lc->overlap_score = kfc.score;
             lc->inlier_ratio = res.inlier_ratio;
             lc->rmse = static_cast<float>(res.rmse);
-            double info_scale = std::min(1e6, static_cast<double>(lc->inlier_ratio) / (static_cast<double>(lc->rmse) + 1e-3));
-            lc->information = Mat66d::Identity();
-            lc->information.block<3,3>(0,0) *= info_scale * 0.1;
-            lc->information.block<3,3>(3,3) *= info_scale;
+            // 修复: 使用更合理的信息矩阵计算，避免过度自信
+            // 之前的计算方式 lc->inlier_ratio / (lc->rmse + 1e-3f) 在 RMSE 极小时会导致权重过大
+            // 改进：增加 RMSE 偏置 (0.01m) 并调整旋转/平移比例，使之更均衡
+            double info_scale = 100.0 * lc->inlier_ratio / (lc->rmse + 0.01);
+            // 限制最大信息尺度，避免数值过大导致优化不稳定（1e4 对应约 1cm 精度）
+            info_scale = std::min(info_scale, 2e4);
+            Mat66d information = Mat66d::Identity();
+            information.block<3,3>(0,0) *= info_scale * 0.5;  // 适度增加平移权重 (0.1 -> 0.5)
+            information.block<3,3>(3,3) *= info_scale;        // 旋转权重保持比例
+            lc->information = information;
 
             // [GHOSTING_DIAG] 记录子图间回环信息矩阵强度
             RCLCPP_INFO(node()->get_logger(), 
@@ -1216,12 +1222,12 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
                 lc->is_inter_session = (query->session_id != target->session_id);
                 lc->status = LoopStatus::ACCEPTED;
                 // 修复: 使用更合理的信息矩阵计算，区分旋转和平移自由度
-                double info_scale = lc->inlier_ratio / (lc->rmse + 1e-3f);
+                double info_scale = 100.0 * lc->inlier_ratio / (lc->rmse + 0.01);
                 // 限制最大信息尺度，避免数值过大导致优化不稳定
-                info_scale = std::min(info_scale, 1e6);
+                info_scale = std::min(info_scale, 2e4);
                 Mat66d information = Mat66d::Identity();
-                information.block<3,3>(0,0) *= info_scale * 0.1;  // 平移自由度权重较小
-                information.block<3,3>(3,3) *= info_scale;        // 旋转自由度权重较大
+                information.block<3,3>(0,0) *= info_scale * 0.5;  // 适度增加平移权重 (0.1 -> 0.5)
+                information.block<3,3>(3,3) *= info_scale;        // 旋转权重保持比例
                 lc->information = information;
                 ALOG_INFO(MOD, "[LoopDetector][LOOP_OK] 回环约束已发布(parallel) query_id={} target_id={} inlier={:.3f} rmse={:.4f}m",
                           query->id, target->id, lc->inlier_ratio, lc->rmse);
@@ -1382,12 +1388,12 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
 
         // 信息矩阵：内点比率越高、RMSE越小 → 信息越大
         // 修复: 使用更合理的信息矩阵计算，区分旋转和平移自由度
-        double info_scale = lc->inlier_ratio / (lc->rmse + 1e-3f);
+        double info_scale = 100.0 * lc->inlier_ratio / (lc->rmse + 0.01);
         // 限制最大信息尺度，避免数值过大导致优化不稳定
-        info_scale = std::min(info_scale, 1e6);
+        info_scale = std::min(info_scale, 2e4);
         Mat66d information = Mat66d::Identity();
-        information.block<3,3>(0,0) *= info_scale * 0.1;  // 平移自由度权重较小
-        information.block<3,3>(3,3) *= info_scale;        // 旋转自由度权重较大
+        information.block<3,3>(0,0) *= info_scale * 0.5;  // 适度增加平移权重 (0.1 -> 0.5)
+        information.block<3,3>(3,3) *= info_scale;        // 旋转权重保持比例
         lc->information = information;
 
         ALOG_INFO(MOD, "[LoopDetector][LOOP_OK] 回环约束已发布 query_id={} target_id={} inlier={:.3f} rmse={:.4f}m score={:.3f}",
@@ -1681,10 +1687,10 @@ std::vector<LoopConstraint::Ptr> LoopDetector::detectIntraSubmapLoop(
     if (!submap || query_keyframe_idx < 0 ||
         static_cast<size_t>(query_keyframe_idx) >= submap->keyframes.size()) {
         ALOG_ERROR(MOD,
-            "[INTRA_LOOP][ERROR] INVALID_INPUT: submap_id=%d query_idx=%d kf_size=%zu "
-            "(reason: %s)",
+            "[INTRA_LOOP][ERROR] INVALID_INPUT: submap_id={} query_idx={} kf_size={} "
+            "(reason: {})",
             submap ? submap->id : -1, query_keyframe_idx,
-            submap ? submap->keyframes.size() : 0,
+            submap ? submap->keyframes.size() : 0u,
             !submap ? "submap_null" :
             query_keyframe_idx < 0 ? "negative_index" :
             "index_out_of_range");
@@ -1693,12 +1699,12 @@ std::vector<LoopConstraint::Ptr> LoopDetector::detectIntraSubmapLoop(
 
     const auto& query_kf = submap->keyframes[query_keyframe_idx];
     if (!query_kf) {
-        ALOG_ERROR(MOD, "[INTRA_LOOP][ERROR] query keyframe is null at idx=%d", query_keyframe_idx);
+        ALOG_ERROR(MOD, "[INTRA_LOOP][ERROR] query keyframe is null at idx={}", query_keyframe_idx);
         return results;
     }
 
     if (!query_kf->cloud_body) {
-        ALOG_ERROR(MOD, "[INTRA_LOOP][ERROR] query keyframe has no cloud: kf_id=%lu idx=%d pts=0",
+        ALOG_ERROR(MOD, "[INTRA_LOOP][ERROR] query keyframe has no cloud: kf_id={} idx={} pts=0",
                    query_kf->id, query_keyframe_idx);
         return results;
     }
@@ -1718,7 +1724,7 @@ std::vector<LoopConstraint::Ptr> LoopDetector::detectIntraSubmapLoop(
     if (use_sc) {
         if (submap->keyframe_scancontexts_.empty() || submap->keyframe_scancontexts_.size() != kf_count) {
             ALOG_WARN(MOD,
-                "[INTRA_LOOP][WARN] skip intra-loop: ScanContext not ready (sc_size=%zu, expected=%zu)",
+                "[INTRA_LOOP][WARN] skip intra-loop: ScanContext not ready (sc_size={}, expected={})",
                 submap->keyframe_scancontexts_.size(), kf_count);
             if (node()) {
                 RCLCPP_WARN(node()->get_logger(),
@@ -1730,7 +1736,7 @@ std::vector<LoopConstraint::Ptr> LoopDetector::detectIntraSubmapLoop(
     } else {
         if (submap->keyframe_descriptors.empty() || submap->keyframe_descriptors.size() != kf_count) {
             ALOG_WARN(MOD,
-                "[INTRA_LOOP][WARN] skip intra-loop: descriptors not ready (size=%zu, expected=%zu)",
+                "[INTRA_LOOP][WARN] skip intra-loop: descriptors not ready (size={}, expected={})",
                 submap->keyframe_descriptors.size(), kf_count);
             if (node()) {
                 RCLCPP_WARN(node()->get_logger(),
@@ -1746,16 +1752,16 @@ std::vector<LoopConstraint::Ptr> LoopDetector::detectIntraSubmapLoop(
         const auto& query_desc = submap->keyframe_descriptors[query_keyframe_idx];
         query_desc_norm = query_desc.norm();
         ALOG_INFO(MOD,
-            "[INTRA_LOOP][DEBUG] query_descriptor: kf_idx=%d kf_id=%lu norm=%.6f pts=%zu",
+            "[INTRA_LOOP][DEBUG] query_descriptor: kf_idx={} kf_id={} norm={:.6f} pts={}",
             query_keyframe_idx, query_kf->id, query_desc_norm, query_kf->cloud_body->size());
         if (query_desc_norm < 1e-6f) {
-            ALOG_ERROR(MOD, "[INTRA_LOOP][ERROR] query descriptor is zero: kf_idx=%d (skip)", query_keyframe_idx);
+            ALOG_ERROR(MOD, "[INTRA_LOOP][ERROR] query descriptor is zero: kf_idx={} (skip)", query_keyframe_idx);
             return results;
         }
     } else {
         const auto& query_sc = submap->keyframe_scancontexts_[query_keyframe_idx];
         if (query_sc.size() == 0) {
-            ALOG_ERROR(MOD, "[INTRA_LOOP][ERROR] query ScanContext is empty: kf_idx=%d (skip)", query_keyframe_idx);
+            ALOG_ERROR(MOD, "[INTRA_LOOP][ERROR] query ScanContext is empty: kf_idx={} (skip)", query_keyframe_idx);
             return results;
         }
     }
@@ -1767,9 +1773,9 @@ std::vector<LoopConstraint::Ptr> LoopDetector::detectIntraSubmapLoop(
         "[INTRA_LOOP][INFO] START_SEARCH: submap_id={} query_kf_idx={} query_ts={:.6f} "
         "query_pos=[{:.2f},{:.2f},{:.2f}] history_kf_count={}",
         submap->id, query_keyframe_idx, query_kf->timestamp,
-        query_kf->T_w_b.translation().x(),
-        query_kf->T_w_b.translation().y(),
-        query_kf->T_w_b.translation().z(),
+        query_kf->T_odom_b.translation().x(),
+        query_kf->T_odom_b.translation().y(),
+        query_kf->T_odom_b.translation().z(),
         submap->keyframes.size());
 
     // 检索历史关键帧（同一子图内）
@@ -1788,7 +1794,7 @@ std::vector<LoopConstraint::Ptr> LoopDetector::detectIntraSubmapLoop(
 
     for (int i = 0; i < query_keyframe_idx; ++i) {
         if (intra_submap_max_teaser_candidates_ > 0 && teaser_invoked >= intra_submap_max_teaser_candidates_) {
-            ALOG_DEBUG(MOD, "[INTRA_LOOP][CAP] TEASER invoked %d >= max %d, skip remaining candidates",
+            ALOG_DEBUG(MOD, "[INTRA_LOOP][CAP] TEASER invoked {} >= max {}, skip remaining candidates",
                        teaser_invoked, intra_submap_max_teaser_candidates_);
             break;
         }
@@ -1803,7 +1809,7 @@ std::vector<LoopConstraint::Ptr> LoopDetector::detectIntraSubmapLoop(
         if (temporal_gap < intra_submap_min_temporal_gap_) {
             temporal_filtered++;
             ALOG_INFO(MOD,
-                "[INTRA_LOOP][FILTER] TEMPORAL_GAP: submap_id=%d query_idx=%d cand_idx=%d cand_ts=%.3f gap=%.2fs < %.1fs (SKIP)",
+                "[INTRA_LOOP][FILTER] TEMPORAL_GAP: submap_id={} query_idx={} cand_idx={} cand_ts={:.3f} gap={:.2f}s < {:.1f}s (SKIP)",
                 submap->id, query_keyframe_idx, i, cand_kf->timestamp, temporal_gap, intra_submap_min_temporal_gap_);
             continue;
         }
@@ -1813,20 +1819,20 @@ std::vector<LoopConstraint::Ptr> LoopDetector::detectIntraSubmapLoop(
         if (index_gap < intra_submap_min_keyframe_gap_) {
             index_filtered++;
             ALOG_INFO(MOD,
-                "[INTRA_LOOP][FILTER] INDEX_GAP: submap_id=%d query_idx=%d cand_idx=%d gap=%d < %d (SKIP)",
+                "[INTRA_LOOP][FILTER] INDEX_GAP: submap_id={} query_idx={} cand_idx={} gap={} < {} (SKIP)",
                 submap->id, query_keyframe_idx, i, index_gap, intra_submap_min_keyframe_gap_);
             continue;
         }
 
         // 距离间隔过滤（避免过密帧）
         if (intra_submap_min_distance_gap_ > 0.0) {
-            const auto& query_pos = query_kf->T_w_b.translation();
-            const auto& cand_pos = cand_kf->T_w_b.translation();
+            const auto& query_pos = query_kf->T_odom_b.translation();
+            const auto& cand_pos = cand_kf->T_odom_b.translation();
             double dist_gap = (query_pos - cand_pos).norm();
             if (dist_gap < intra_submap_min_distance_gap_) {
                 distance_filtered++;
                 ALOG_INFO(MOD,
-                    "[INTRA_LOOP][FILTER] DISTANCE_GAP: submap_id=%d query_idx=%d cand_idx=%d dist=%.2fm < %.1fm (SKIP)",
+                    "[INTRA_LOOP][FILTER] DISTANCE_GAP: submap_id={} query_idx={} cand_idx={} dist={:.2f}m < {:.1f}m (SKIP)",
                     submap->id, query_keyframe_idx, i, dist_gap, intra_submap_min_distance_gap_);
                 continue;
             }
@@ -1838,7 +1844,7 @@ std::vector<LoopConstraint::Ptr> LoopDetector::detectIntraSubmapLoop(
             const auto& query_sc = submap->keyframe_scancontexts_[query_keyframe_idx];
             const auto& cand_sc = submap->keyframe_scancontexts_[i];
             if (query_sc.size() == 0 || cand_sc.size() == 0) {
-                ALOG_INFO(MOD, "[INTRA_LOOP][FILTER] SC_EMPTY: submap_id=%d query_idx=%d cand_idx=%d (SKIP)", submap->id, query_keyframe_idx, i);
+                ALOG_INFO(MOD, "[INTRA_LOOP][FILTER] SC_EMPTY: submap_id={} query_idx={} cand_idx={} (SKIP)", submap->id, query_keyframe_idx, i);
                 continue;
             }
             std::pair<double, int> sc_result = sc_manager_.distanceBtnScanContext(query_sc, cand_sc);
@@ -1846,7 +1852,7 @@ std::vector<LoopConstraint::Ptr> LoopDetector::detectIntraSubmapLoop(
             if (sc_dist > sc_dist_threshold_) {
                 desc_filtered++;
                 ALOG_INFO(MOD,
-                    "[INTRA_LOOP][FILTER] SC_DIST: submap_id=%d query_idx=%d cand_idx=%d sc_dist=%.4f > %.3f (SKIP)",
+                    "[INTRA_LOOP][FILTER] SC_DIST: submap_id={} query_idx={} cand_idx={} sc_dist={:.4f} > {:.3f} (SKIP)",
                     submap->id, query_keyframe_idx, i, sc_dist, sc_dist_threshold_);
                 continue;
             }
@@ -1856,7 +1862,7 @@ std::vector<LoopConstraint::Ptr> LoopDetector::detectIntraSubmapLoop(
             const auto& cand_desc = submap->keyframe_descriptors[i];
             float cand_desc_norm = cand_desc.norm();
             if (cand_desc_norm < 1e-6f) {
-                ALOG_INFO(MOD, "[INTRA_LOOP][FILTER] CAND_DESC_ZERO: submap_id=%d query_idx=%d cand_idx=%d (SKIP)", submap->id, query_keyframe_idx, i);
+                ALOG_INFO(MOD, "[INTRA_LOOP][FILTER] CAND_DESC_ZERO: submap_id={} query_idx={} cand_idx={} (SKIP)", submap->id, query_keyframe_idx, i);
                 continue;
             }
             float denominator = query_desc_norm * cand_desc_norm;
@@ -1865,7 +1871,7 @@ std::vector<LoopConstraint::Ptr> LoopDetector::detectIntraSubmapLoop(
             if (similarity < intra_submap_overlap_threshold_) {
                 desc_filtered++;
                 ALOG_INFO(MOD,
-                    "[INTRA_LOOP][FILTER] SIMILARITY: submap_id=%d query_idx=%d cand_idx=%d sim=%.4f < %.3f (SKIP)",
+                    "[INTRA_LOOP][FILTER] SIMILARITY: submap_id={} query_idx={} cand_idx={} sim={:.4f} < {:.3f} (SKIP)",
                     submap->id, query_keyframe_idx, i, similarity, intra_submap_overlap_threshold_);
                 continue;
             }
@@ -1873,12 +1879,12 @@ std::vector<LoopConstraint::Ptr> LoopDetector::detectIntraSubmapLoop(
 
         candidates_found++;
         ALOG_INFO(MOD,
-            "[INTRA_LOOP][CANDIDATE] FOUND: submap_id=%d query_idx=%d cand_idx=%d "
-            "sim=%.4f gap_idx=%d gap_time=%.2fs cand_kf_id=%lu cand_pos=[%.2f,%.2f,%.2f]",
+            "[INTRA_LOOP][CANDIDATE] FOUND: submap_id={} query_idx={} cand_idx={} "
+            "sim={:.4f} gap_idx={} gap_time={:.2f}s cand_kf_id={} cand_pos=[{:.2f},{:.2f},{:.2f}]",
             submap->id, query_keyframe_idx, i, similarity, index_gap, temporal_gap, cand_kf->id,
-            cand_kf->T_w_b.translation().x(),
-            cand_kf->T_w_b.translation().y(),
-            cand_kf->T_w_b.translation().z());
+            cand_kf->T_odom_b.translation().x(),
+            cand_kf->T_odom_b.translation().y(),
+            cand_kf->T_odom_b.translation().z());
 
         // ═══════════════════════════════════════════════════════════════════════
         // [INTRA_LOOP][DEBUG] 几何验证（TEASER++）开始
@@ -1889,8 +1895,8 @@ std::vector<LoopConstraint::Ptr> LoopDetector::detectIntraSubmapLoop(
         if (!query_cloud || !cand_cloud || query_cloud->empty() || cand_cloud->empty()) {
             empty_cloud_skipped++;
             ALOG_ERROR(MOD,
-                "[INTRA_LOOP][ERROR] EMPTY_CLOUD: query_idx=%d cand_idx=%d "
-                "query_valid=%s cand_valid=%s (SKIP)",
+                "[INTRA_LOOP][ERROR] EMPTY_CLOUD: query_idx={} cand_idx={} "
+                "query_valid={} cand_valid={} (SKIP)",
                 query_keyframe_idx, i,
                 query_cloud ? "valid" : "null",
                 cand_cloud ? "valid" : "null");
@@ -1899,8 +1905,8 @@ std::vector<LoopConstraint::Ptr> LoopDetector::detectIntraSubmapLoop(
 
         teaser_invoked++;
         ALOG_INFO(MOD,
-            "[INTRA_LOOP][TEASER_START] query_idx=%d cand_idx=%d "
-            "query_pts=%zu cand_pts=%zu invoked=%d",
+            "[INTRA_LOOP][TEASER_START] query_idx={} cand_idx={} "
+            "query_pts={} cand_pts={} invoked={}",
             query_keyframe_idx, i, query_cloud->size(), cand_cloud->size(), teaser_invoked);
 
         // TEASER++ 配准
@@ -1911,13 +1917,13 @@ std::vector<LoopConstraint::Ptr> LoopDetector::detectIntraSubmapLoop(
             teaser_success = teaser_res.success;
         } catch (const std::exception& e) {
             ALOG_ERROR(MOD,
-                "[INTRA_LOOP][EXCEPTION] TEASER_EXCEPTION: query_idx=%d cand_idx=%d exception='%s'",
+                "[INTRA_LOOP][EXCEPTION] TEASER_EXCEPTION: query_idx={} cand_idx={} exception='{}'",
                 query_keyframe_idx, i, e.what());
             teaser_failed++;
             continue;
         } catch (...) {
             ALOG_ERROR(MOD,
-                "[INTRA_LOOP][EXCEPTION] TEASER_UNKNOWN_EXCEPTION: query_idx=%d cand_idx=%d",
+                "[INTRA_LOOP][EXCEPTION] TEASER_UNKNOWN_EXCEPTION: query_idx={} cand_idx={}",
                 query_keyframe_idx, i);
             teaser_failed++;
             continue;
@@ -1926,7 +1932,7 @@ std::vector<LoopConstraint::Ptr> LoopDetector::detectIntraSubmapLoop(
         if (!teaser_success) {
             teaser_failed++;
             ALOG_WARN(MOD,
-                "[INTRA_LOOP][TEASER] FAILED_RETURN: query_idx=%d cand_idx=%d success=false (SKIP)",
+                "[INTRA_LOOP][TEASER] FAILED_RETURN: query_idx={} cand_idx={} success=false (SKIP)",
                 query_keyframe_idx, i);
             continue;
         }
@@ -1934,7 +1940,7 @@ std::vector<LoopConstraint::Ptr> LoopDetector::detectIntraSubmapLoop(
         if (!teaser_res.success) {
             teaser_failed++;
             ALOG_WARN(MOD,
-                "[INTRA_LOOP][TEASER] INVALID_RESULT: query_idx=%d cand_idx=%d is_valid=false (SKIP)",
+                "[INTRA_LOOP][TEASER] INVALID_RESULT: query_idx={} cand_idx={} is_valid=false (SKIP)",
                 query_keyframe_idx, i);
             continue;
         }
@@ -1943,8 +1949,8 @@ std::vector<LoopConstraint::Ptr> LoopDetector::detectIntraSubmapLoop(
         if (teaser_res.inlier_ratio < min_inlier_ratio_) {
             teaser_rejected_inlier++;
             ALOG_INFO(MOD,
-                "[INTRA_LOOP][TEASER] REJECT_INLIER: submap_id=%d query_idx=%d cand_idx=%d "
-                "inlier_ratio=%.4f inliers≈%d corrs=%d < min_ratio=%.3f (SKIP)",
+                "[INTRA_LOOP][TEASER] REJECT_INLIER: submap_id={} query_idx={} cand_idx={} "
+                "inlier_ratio={:.4f} inliers≈{} corrs={} < min_ratio={:.3f} (SKIP)",
                 submap->id, query_keyframe_idx, i, teaser_res.inlier_ratio,
                 static_cast<int>(teaser_res.inlier_ratio * std::max(0, teaser_res.num_correspondences)),
                 teaser_res.num_correspondences, min_inlier_ratio_);
@@ -1955,8 +1961,8 @@ std::vector<LoopConstraint::Ptr> LoopDetector::detectIntraSubmapLoop(
         if (teaser_res.rmse > max_rmse_) {
             teaser_rejected_rmse++;
             ALOG_INFO(MOD,
-                "[INTRA_LOOP][TEASER] REJECT_RMSE: submap_id=%d query_idx=%d cand_idx=%d "
-                "rmse=%.4f > max_rmse=%.3f (SKIP)",
+                "[INTRA_LOOP][TEASER] REJECT_RMSE: submap_id={} query_idx={} cand_idx={} "
+                "rmse={:.4f} > max_rmse={:.3f} (SKIP)",
                 submap->id, query_keyframe_idx, i, teaser_res.rmse, max_rmse_);
             continue;
         }
@@ -1971,8 +1977,8 @@ std::vector<LoopConstraint::Ptr> LoopDetector::detectIntraSubmapLoop(
         if (max_trans_diff > 0.0 || max_rot_diff_deg > 0.0) {
             const KeyFrame::Ptr& cand_kf = submap->keyframes[i];
             if (cand_kf) {
-                const Pose3d T_w_cand = cand_kf->T_w_b;
-                const Pose3d T_w_query = query_kf->T_w_b;
+                const Pose3d T_w_cand = cand_kf->T_odom_b;
+                const Pose3d T_w_query = query_kf->T_odom_b;
                 const Pose3d T_tgt_src_odom = T_w_cand.inverse() * T_w_query;
                 trans_diff_m = (teaser_res.T_tgt_src.translation() - T_tgt_src_odom.translation()).norm();
                 const Eigen::Matrix3d R_teaser = teaser_res.T_tgt_src.linear();
@@ -1999,30 +2005,30 @@ std::vector<LoopConstraint::Ptr> LoopDetector::detectIntraSubmapLoop(
                     else if (!trans_anomaly && rot_anomaly) root_cause = "rotation_only_mismatch (check feature ambiguity)";
 
                     ALOG_WARN(MOD,
-                        "[INTRA_LOOP][REJECT] pose_anomaly: submap_id=%d kf_i=%d kf_j=%d kf_id_cand=%d kf_id_query=%d ts_cand=%.3f ts_query=%.3f cause=%s",
-                        submap->id, i, query_keyframe_idx, cand_kf->id, query_kf->id, cand_kf->timestamp, query_kf->timestamp, root_cause.c_str());
+                        "[INTRA_LOOP][REJECT] pose_anomaly: submap_id={} kf_i={} kf_j={} kf_id_cand={} kf_id_query={} ts_cand={:.3f} ts_query={:.3f} cause={} | trans_diff={:.2f}m rot_diff={:.2f}deg",
+                        submap->id, i, query_keyframe_idx, cand_kf->id, query_kf->id, cand_kf->timestamp, query_kf->timestamp, root_cause, trans_diff_m, rot_diff_deg);
                     
                     // [GHOSTING_DIAG] 如果几何匹配很好但被位姿一致性检查拒绝，记录为潜在的“被错杀的真实回环”或“隐蔽的误匹配”
-                    if (teaser_res.inlier_ratio > 0.15 && teaser_res.rmse < 0.3) {
+                    if (teaser_res.inlier_ratio > 0.10 && teaser_res.rmse < 0.4) {
                         RCLCPP_ERROR(node()->get_logger(),
                             "[INTRA_LOOP][POSE_CONFLICT] STRONG geometric match REJECTED by pose consistency: "
-                            "submap_id=%d kf_%d->%d inlier=%.3f rmse=%.3f trans_diff=%.2fm rot_diff=%.2fdeg. "
-                            "If ghosting persists, consider if this loop was actually correct!",
-                            submap->id, i, query_keyframe_idx, teaser_res.inlier_ratio, teaser_res.rmse, trans_diff_m, rot_diff_deg);
+                            "submap_id=%d kf_%d->%d inlier=%.3f rmse=%.3f trans_diff=%.2fm (max=%.1f) rot_diff=%.2fdeg (max=%.1f). "
+                            "If ghosting persists, consider if this loop was actually correct! (Maybe large drift?)",
+                            submap->id, i, query_keyframe_idx, teaser_res.inlier_ratio, teaser_res.rmse, trans_diff_m, max_trans_diff, rot_diff_deg, max_rot_diff_deg);
                     }
 
                     ALOG_WARN(MOD,
-                        "[INTRA_LOOP][REJECT] pose_anomaly ODOM_rel:  trans_xyz=[%.4f,%.4f,%.4f] trans_norm=%.4fm rot_deg=%.2f",
+                        "[INTRA_LOOP][REJECT] pose_anomaly ODOM_rel:  trans_xyz=[{:.4f},{:.4f},{:.4f}] trans_norm={:.4f}m rot_deg={:.2f}",
                         t_odom.x(), t_odom.y(), t_odom.z(), t_odom.norm(), odom_rot_deg);
                     ALOG_WARN(MOD,
-                        "[INTRA_LOOP][REJECT] pose_anomaly TEASER_rel: trans_xyz=[%.4f,%.4f,%.4f] trans_norm=%.4fm rot_deg=%.2f inlier=%.4f rmse=%.4f",
+                        "[INTRA_LOOP][REJECT] pose_anomaly TEASER_rel: trans_xyz=[{:.4f},{:.4f},{:.4f}] trans_norm={:.4f}m rot_deg={:.2f} inlier={:.4f} rmse={:.4f}",
                         t_teaser.x(), t_teaser.y(), t_teaser.z(), t_teaser.norm(), teaser_rot_deg,
                         teaser_res.inlier_ratio, teaser_res.rmse);
                     ALOG_WARN(MOD,
-                        "[INTRA_LOOP][REJECT] pose_anomaly DIFF: trans_diff_xyz=[%.4f,%.4f,%.4f] trans_diff_norm=%.4fm rot_diff_deg=%.2f | thresholds trans=%.1fm rot=%.1fdeg (高精建图不应出现大变化，可能为计算/逻辑错误)",
+                        "[INTRA_LOOP][REJECT] pose_anomaly DIFF: trans_diff_xyz=[{:.4f},{:.4f},{:.4f}] trans_diff_norm={:.4f}m rot_diff_deg={:.2f} | thresholds trans={:.1f}m rot={:.1f}deg (高精建图不应出现大变化，可能为计算/逻辑错误)",
                         t_diff.x(), t_diff.y(), t_diff.z(), trans_diff_m, rot_diff_deg, max_trans_diff, max_rot_diff_deg);
                     ALOG_WARN(MOD,
-                        "[INTRA_LOOP][REJECT] pose_anomaly WORLD: cand_pos=[%.3f,%.3f,%.3f] query_pos=[%.3f,%.3f,%.3f] dist_world=%.3fm",
+                        "[INTRA_LOOP][REJECT] pose_anomaly WORLD: cand_pos=[{:.3f},{:.3f},{:.3f}] query_pos=[{:.3f},{:.3f},{:.3f}] dist_world={:.3f}m",
                         T_w_cand.translation().x(), T_w_cand.translation().y(), T_w_cand.translation().z(),
                         T_w_query.translation().x(), T_w_query.translation().y(), T_w_query.translation().z(),
                         (T_w_query.translation() - T_w_cand.translation()).norm());
@@ -2044,12 +2050,12 @@ std::vector<LoopConstraint::Ptr> LoopDetector::detectIntraSubmapLoop(
         const Eigen::Vector3d rpy = Eigen::Matrix3d(rot).eulerAngles(2, 1, 0).reverse();
         // 根据 inlier ratio 构造信息矩阵（TeaserMatcher::Result 没有 information 字段）
         // 修复: 使用更合理的信息矩阵计算，区分旋转和平移自由度
-        double info_scale = teaser_res.inlier_ratio * 100.0;
+        double info_scale = 100.0 * teaser_res.inlier_ratio / (teaser_res.rmse + 0.01);
         // 限制最大信息尺度，避免数值过大导致优化不稳定
-        info_scale = std::min(info_scale, 1e6);
+        info_scale = std::min(info_scale, 2e4);
         Mat66d information = Mat66d::Identity();
-        information.block<3,3>(0,0) *= info_scale * 0.1;  // 平移自由度权重较小
-        information.block<3,3>(3,3) *= info_scale;        // 旋转自由度权重较大
+        information.block<3,3>(0,0) *= info_scale * 0.5;  // 适度增加平移权重 (0.1 -> 0.5)
+        information.block<3,3>(3,3) *= info_scale;        // 旋转权重保持比例
 
         // [GHOSTING_DIAG] 记录信息矩阵强度，防止过强导致系统“硬扭”
         RCLCPP_INFO(node()->get_logger(), 
@@ -2058,10 +2064,10 @@ std::vector<LoopConstraint::Ptr> LoopDetector::detectIntraSubmapLoop(
 
         ALOG_INFO(MOD,
             "[INTRA_LOOP][DETECTED] ★★★ INTRA_SUBMAP_LOOP ★★★ "
-            "submap_id=%d kf_i=%d kf_j=%d "
-            "overlap=%.4f inlier=%.4f rmse=%.4f "
-            "delta_t=[%.3f,%.3f,%.3f] delta_rpy=[%.2f,%.2f,%.2f] "
-            "info_norm=%.2e",
+            "submap_id={} kf_i={} kf_j={} "
+            "overlap={:.4f} inlier={:.4f} rmse={:.4f} "
+            "delta_t=[{:.3f},{:.3f},{:.3f}] delta_rpy=[{:.2f},{:.2f},{:.2f}] "
+            "info_norm={:.2e}",
             submap->id, i, query_keyframe_idx,
             similarity, teaser_res.inlier_ratio, teaser_res.rmse,
             t.x(), t.y(), t.z(),
@@ -2104,7 +2110,7 @@ std::vector<LoopConstraint::Ptr> LoopDetector::detectIntraSubmapLoop(
             try {
                 cb(lc);
             } catch (const std::exception& e) {
-                ALOG_ERROR(MOD, "[INTRA_LOOP][CALLBACK] exception: %s", e.what());
+                ALOG_ERROR(MOD, "[INTRA_LOOP][CALLBACK] exception: {}", e.what());
             }
         }
 

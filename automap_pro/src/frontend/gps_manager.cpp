@@ -206,30 +206,31 @@ void GPSManager::addGPSMeasurement(
         quality = hdop_to_quality(hdop);
 
         // 🔧 V3 修复：GPS 杆臂补偿
-        // 原理：pos_body = pos_antenna - R_body_world * lever_arm
+        // 原理：pos_body = pos_antenna - R_enu_body * lever_arm
         // 注意：此处我们需要 body 在 ENU 系下的姿态。
-        // 1. 如果已对齐，使用当前对齐矩阵 R_map_enu * R_body_local
-        // 2. 如果未对齐，暂不补偿或仅补偿 Z（此处选择仅在已对齐后补偿以保证精确，或使用最近邻姿态）
+        // 1. 如果已对齐，使用当前对齐矩阵 R_enu_odom * R_odom_body
+        // 2. 如果未对齐，暂不补偿或仅补偿 Z（此处选择使用最近邻姿态作为参考）
         if (lever_arm_imu_.norm() > 1e-6) {
             auto odom_opt = findNearestOdomPose(timestamp);
             if (odom_opt) {
-                Eigen::Matrix3d R_body_enu;
+                Eigen::Matrix3d R_enu_body;
                 if (state_ == GPSAlignState::ALIGNED || state_ == GPSAlignState::DEGRADED) {
-                    // R_body_enu = R_map_enu * R_body_map
-                    R_body_enu = align_result_.R_gps_lidar.transpose() * odom_opt->second.linear();
+                    // R_enu_body = R_enu_odom * R_odom_body
+                    // align_result_.R_gps_lidar 就是 R_enu_odom
+                    R_enu_body = align_result_.R_gps_lidar * odom_opt->second.linear();
                 } else {
-                    // 未对齐时，假设 local 系与 ENU 系水平对齐（仅用于初始对齐前的粗略补偿）
-                    R_body_enu = odom_opt->second.linear();
+                    // 未对齐时，假设 odom 系与 ENU 系水平对齐（仅用于初始对齐前的粗略补偿）
+                    R_enu_body = odom_opt->second.linear();
                 }
-                pos_enu -= R_body_enu * lever_arm_imu_;
+                pos_enu -= R_enu_body * lever_arm_imu_;
                 
                 static std::atomic<uint32_t> lever_arm_log_count{0};
                 if (lever_arm_log_count.fetch_add(1) % 100 == 0) {
-                    Eigen::Vector3d antenna_pos = pos_enu + R_body_enu * lever_arm_imu_;
-                    ALOG_INFO(MOD, "[GPS_LEVER_ARM] Applied compensation: antenna=({:.3f},{:.3f},{:.3f}) -> body=({:.3f},{:.3f},{:.3f}) lever_arm_body=({:.3f},{:.3f},{:.3f}) state={}",
+                    Eigen::Vector3d antenna_pos = pos_enu + R_enu_body * lever_arm_imu_;
+                    ALOG_INFO(MOD, "[V3][POSE_DIAG] GPS lever arm comp: antenna=({:.2f},{:.2f},{:.2f}) -> imu=({:.2f},{:.2f},{:.2f}) R_enu_body_yaw={:.1f}deg state={}",
                               antenna_pos.x(), antenna_pos.y(), antenna_pos.z(),
                               pos_enu.x(), pos_enu.y(), pos_enu.z(),
-                              lever_arm_imu_.x(), lever_arm_imu_.y(), lever_arm_imu_.z(),
+                              std::atan2(R_enu_body(1,0), R_enu_body(0,0)) * 180.0 / M_PI,
                               static_cast<int>(state_.load()));
                 }
             }
@@ -387,14 +388,14 @@ void GPSManager::addGPSMeasurement(
     }
 }
 
-void GPSManager::addKeyFramePose(double timestamp, const Pose3d& T_w_b) {
+void GPSManager::addKeyFramePose(double timestamp, const Pose3d& T_odom_b) {
     std::lock_guard<std::recursive_mutex> lk(mutex_);
-    kf_window_.push_back({timestamp, T_w_b});
+    kf_window_.push_back({timestamp, T_odom_b});
     const size_t max_kf_window = ConfigManager::instance().gpsMaxWindowSize();
     while (kf_window_.size() > max_kf_window) kf_window_.pop_front();
     
     // 【修复】同时缓存所有里程计位姿用于精準插值
-    all_odom_poses_.push_back({timestamp, T_w_b});
+    all_odom_poses_.push_back({timestamp, T_odom_b});
     if (all_odom_poses_.size() > 5000) all_odom_poses_.pop_front();
 }
 

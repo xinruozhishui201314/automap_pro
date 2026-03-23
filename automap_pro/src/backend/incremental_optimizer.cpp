@@ -283,6 +283,20 @@ void IncrementalOptimizer::addSubMapNode(int sm_id, const Pose3d& init_pose, boo
             SM(sm_id), toPose3(init_pose), noise));
         has_prior_ = true;
         factor_count_++;
+        CONSTRAINT_LOG("step=prior_submap sm_id=%d result=ok factor_count=%d", sm_id, factor_count_);
+    }
+
+    // 🔧 修复孤立节点：确保子图节点 SM(sm_id) 总是链接到它的首个关键帧 KF(sm_id * MAX_KF_PER_SUBMAP)
+    // 即使不是首个 Prior，也要有 BetweenFactor 链接到已有的关键帧节点，避免 IndeterminantLinearSystemException
+    int anchor_kf_id = sm_id * MAX_KF_PER_SUBMAP;
+    if (keyframe_node_exists_.count(anchor_kf_id)) {
+        auto anchor_noise = gtsam::noiseModel::Diagonal::Variances(prior_var6_);
+        pending_graph_.add(gtsam::BetweenFactor<gtsam::Pose3>(
+            SM(sm_id), KF(anchor_kf_id), gtsam::Pose3::Identity(), anchor_noise));
+        factor_count_++;
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[IncrementalOptimizer][BACKEND][LINK] addSubMapNode: Linked SM(%d) to existing anchor KF(%d)",
+            sm_id, anchor_kf_id);
     }
 
     // 子图节点加入后尝试刷入此前因缺节点被 defer 的子图里程计因子，避免孤立 s 节点
@@ -1143,8 +1157,23 @@ void IncrementalOptimizer::addKeyFrameNode(int kf_id, const Pose3d& init_pose, b
     // 🔧 修复: 第一个 keyframe 必须添加 Prior 因子，避免孤立节点引发 IndeterminantLinearSystemException
     // - fixed: 外部显式指定（如回环修正后的重锚定）
     // - !has_prior_: 整个 session 的第一帧（之后所有帧通过 Between 链连接）
-    // 注意：移除 is_first_kf_of_submap 锚定，避免每个子图开头都发生跳变。
+    // 🔧 [核心修复] 建立 's' 节点 (Submap) 与 'x' 节点 (KeyFrame) 的连接：
+    // 通过 BetweenFactor 将子图锚点与子图节点关联，解决 iSAM2 因子图不连通导致的漂移与重影问题。
+    // 🔧 增强：只要是该子图的首帧，就尝试建立连接（无论 sm 节点还是 kf 节点谁先到达）
+    int sm_id = kf_id / MAX_KF_PER_SUBMAP;
+    if (is_first_kf_of_submap && node_exists_.count(sm_id)) {
+        gtsam::noiseModel::Diagonal::shared_ptr anchor_noise = 
+            gtsam::noiseModel::Diagonal::Variances(prior_var6_);
+        pending_graph_.add(gtsam::BetweenFactor<gtsam::Pose3>(
+            SM(sm_id), KF(kf_id), gtsam::Pose3::Identity(), anchor_noise));
+        factor_count_++;
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[IncrementalOptimizer][BACKEND][LINK] addKeyFrameNode: Linked existing SM(%d) to anchor KF(%d)",
+            sm_id, kf_id);
+    }
+
     bool need_prior = fixed || !has_prior_;
+    
     if (need_prior) {
         if (prior_var6_.size() != 6) {
             CONSTRAINT_LOG("step=prior_kf kf_id=%d result=skip reason=prior_var6_size=%zd", kf_id, prior_var6_.size());
@@ -2562,6 +2591,15 @@ void IncrementalOptimizer::rebuildAfterGPSAlign(const std::vector<SubmapData>& s
             auto noise = gtsam::noiseModel::Diagonal::Variances(prior_var6_);
             pending_graph_.add(gtsam::PriorFactor<gtsam::Pose3>(KF(d.id), toPose3(d.pose), noise));
             has_prior_ = true;
+            factor_count_++;
+        }
+
+        // 🔧 [核心修复] 在重建过程中同样建立 's' 与 'x' 节点的连接，确保 GPS 对齐后的全局一致性。
+        int sm_id = d.id / MAX_KF_PER_SUBMAP;
+        if (d.is_first_kf_of_submap && node_exists_.count(sm_id)) {
+            auto anchor_noise = gtsam::noiseModel::Diagonal::Variances(prior_var6_);
+            pending_graph_.add(gtsam::BetweenFactor<gtsam::Pose3>(
+                SM(sm_id), KF(d.id), gtsam::Pose3::Identity(), anchor_noise));
             factor_count_++;
         }
     }

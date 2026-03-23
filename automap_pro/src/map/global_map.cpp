@@ -61,14 +61,14 @@ GlobalMap::Config GlobalMap::getConfig() const {
 // 增量更新（同步）
 // ─────────────────────────────────────────────────────────────────────────────
 
-void GlobalMap::addCloud(const CloudXYZIPtr& cloud, const Pose3d& T_w_b) {
+void GlobalMap::addCloud(const CloudXYZIPtr& cloud, const Pose3d& T_map_b) {
     if (!cloud || cloud->empty()) return;
     
     std::lock_guard<std::mutex> lk(mutex_);
     
-    // 变换到世界坐标系
+    // 变换到地图坐标系
     CloudXYZIPtr transformed(new CloudXYZI);
-    transformCloud(cloud, T_w_b, *transformed);  // output by ref
+    transformCloud(cloud, T_map_b, *transformed);  // output by ref
     
     // 按距离过滤
     CloudXYZIPtr filtered(new CloudXYZI);
@@ -89,8 +89,8 @@ void GlobalMap::addCloud(const CloudXYZIPtr& cloud, const Pose3d& T_w_b) {
     // 首次或前几次添加时打 INFO，便于确认点云系与变换正确（grep GLOBAL_MAP_DIAG）
     static int add_cloud_call_count = 0;
     if (++add_cloud_call_count <= 3) {
-        const Eigen::Vector3d t = T_w_b.translation();
-        ALOG_INFO(MOD, "[GLOBAL_MAP_DIAG] addCloud #%d: pts=%zu T_w_b=[%.2f,%.2f,%.2f] total=%zu (cloud in body frame)",
+        const Eigen::Vector3d t = T_map_b.translation();
+        ALOG_INFO(MOD, "[GLOBAL_MAP_DIAG] addCloud #%d: pts=%zu T_map_b=[%.2f,%.2f,%.2f] total=%zu (cloud in body frame)",
                   add_cloud_call_count, filtered->size(), t.x(), t.y(), t.z(), global_cloud_->size());
     }
     
@@ -114,12 +114,12 @@ void GlobalMap::addCloud(const CloudXYZIPtr& cloud, const Pose3d& T_w_b) {
 // 增量更新（异步，后台线程）
 // ─────────────────────────────────────────────────────────────────────────────
 
-void GlobalMap::addCloudAsync(const CloudXYZIPtr& cloud, const Pose3d& T_w_b) {
+void GlobalMap::addCloudAsync(const CloudXYZIPtr& cloud, const Pose3d& T_map_b) {
     if (!cloud || cloud->empty()) return;
     
     UpdateTask task;
     task.cloud = cloud;
-    task.pose = T_w_b;
+    task.pose = T_map_b;
     
     {
         std::lock_guard<std::mutex> lk(mutex_);
@@ -176,7 +176,7 @@ void GlobalMap::processUpdateTask(const UpdateTask& task) {
     
     std::lock_guard<std::mutex> lk(mutex_);
     
-    // 变换到世界坐标系
+    // 变换到地图坐标系
     CloudXYZIPtr transformed(new CloudXYZI);
     transformCloud(task.cloud, task.pose, *transformed);  // output by ref
     

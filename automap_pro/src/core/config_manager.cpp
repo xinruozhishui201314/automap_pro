@@ -499,15 +499,19 @@ Eigen::Vector3d readVector3d(const YAML::Node& cfg, const std::string& key, doub
         YAML::Node node = cfg;
         std::istringstream ss(key);
         std::string token;
+        bool found = true;
         while (std::getline(ss, token, '.')) {
-            if (!node.IsMap() || !node[token]) return Eigen::Vector3d(dx, dy, dz);
+            if (!node.IsMap() || !node[token].IsDefined() || node[token].IsNull()) {
+                found = false;
+                break;
+            }
             node = node[token];
         }
-        if (!node.IsSequence() || node.size() < 3) return Eigen::Vector3d(dx, dy, dz);
-        return Eigen::Vector3d(node[0].as<double>(), node[1].as<double>(), node[2].as<double>());
-    } catch (...) {
-        return Eigen::Vector3d(dx, dy, dz);
-    }
+        if (found && node.IsSequence() && node.size() >= 3) {
+            return Eigen::Vector3d(node[0].as<double>(), node[1].as<double>(), node[2].as<double>());
+        }
+    } catch (...) {}
+    return Eigen::Vector3d(dx, dy, dz);
 }
 }  // namespace
 

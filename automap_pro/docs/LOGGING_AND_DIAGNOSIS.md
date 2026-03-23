@@ -369,3 +369,59 @@ grep '\[ISAM2_DIAG\]' full.log | tail -5
 - **last_step** 为崩溃前最后一次设置的步骤标识（如 `first_update_lm_optimize`、`first_update_isam2_init`、`first_update_phase3_add_factors`、`incremental_isam2_update`）。
 - 即使日志缓冲未刷新，该行也会在终止前写入，便于与 `[CRASH_CONTEXT]` 对照定位。
 - 建议同时：`ulimit -c unlimited` 后复现，用 `gdb -c core.<pid> $(which automap_system_node)` 执行 `bt full` 获取完整栈。
+
+### 10.6 GPS 对齐位姿跳变诊断（V3 VizModule）
+
+当 **GPS 对齐前后 RViz 中实时点云与轨迹出现跳变** 时，用下列标签定位根因（详见 [ROOT_CAUSE_GPS_ALIGNMENT_POSE_JUMP.md](../../docs/ROOT_CAUSE_GPS_ALIGNMENT_POSE_JUMP.md)）。
+
+| 标签 / 关键字 | 含义 |
+|---------------|------|
+| `[V3][VizModule][GPS_ALIGN] GPS aligned rmse=...` | GPS 对齐成功，修正量已缓存，等待 trajectory 更新后再应用 |
+| `[V3][VizModule][GPS_ALIGN] Applied GPS correction (synced with trajectory)` | 在收到 OptimizationResultEvent 且轨迹已实质更新后，安全应用修正（含 R_z、t 便于核对） |
+| `[V3][VizModule][GPS_ALIGN] PENDING_STUCK` | GPS 对齐后连续 ≥3 次 OptimizationResult 仍无法应用（trajectory_updated 检查未通过）→ 可能是首子图 Prior(identity) 场景或轨迹数据异常 |
+| `[GHOSTING_DIAG] optimized_path published ... T_applied=odom_to_map` | 轨迹发布时已应用 T_odom_to_map 变换，与点云同坐标系；T_applied=identity 表示未对齐 |
+
+**推荐 grep：**
+
+```bash
+# GPS 对齐与修正应用完整时间线
+grep 'GPS_ALIGN' full.log
+
+# 若出现跳变，确认 Applied 是否在 GPS aligned 之后
+grep -E '\[V3\]\[VizModule\]\[GPS_ALIGN\]|GPS alignment SUCCESS' full.log
+```
+
+**正常时序**：`GPS alignment SUCCESS` → `[GPS_ALIGN] GPS aligned` → （若干 OptimizationResult）→ `[GPS_ALIGN] Applied GPS correction`。
+
+### 10.7 V3 全链路诊断日志（[V3][DIAG]）
+
+V3 管线每个计算环节均输出 `[V3][DIAG]` 日志，便于通过 `grep "V3.*DIAG" full.log` 精确定位问题所在步骤。
+
+| 标签 / 关键字 | 含义 |
+|---------------|------|
+| `step=SyncedFrame_cloud` | 同步帧点云发布：cloud_pts、cloud_frame、T_applied |
+| `step=OptResult_enter` | 收到优化结果：version、sm/kf 数量、pending 状态 |
+| `step=OptResult_trajectory_check` | 轨迹是否已实质更新（决定能否应用 GPS 修正）：reason |
+| `step=publishEverything` | 发布全部可视化：sm/kf 数量、T_applied |
+| `step=updateGPSAlignment_enter` | GPS 对齐结果进入 Mapping 模块：rmse |
+| `step=updateGPSAlignment freezeSubmap` | 对齐后是否冻结当前子图 |
+| `step=onPoseOptimized` | Mapping 收到位姿优化：version、sm/kf 更新数 |
+| `step=onSubmapFrozen` | 子图冻结：sm_id |
+| `step=processFrame_keyframe` | 创建关键帧：ts |
+| `step=GPSAlignedEvent_publish` | GPS 模块发布 GPSAlignedEvent：success、rmse |
+| `step=MapRegistry_updatePoses` | 地图注册表写回位姿：version、sm/kf 更新数 |
+| `step=Optimizer_poseCallback_enter` | 优化器位姿回调入口：sm/kf 数 |
+| `step=Optimizer_poseCallback_done` | 优化器位姿回调完成：version |
+| `step=processTask type=` | 优化器处理任务：LOOP_FACTOR/SUBMAP_NODE/KEYFRAME_CREATE/GPS_BATCH_KF 等 |
+| `step=processGPSBatchKF` | GPS 对齐后批量添加历史 KF GPS 因子：factors 数或 done count |
+| `[GHOSTING_DIAG] keyframe_poses published` | 关键帧位姿数组发布：kf_count、first/last_pos、T_applied |
+
+**推荐 grep：**
+
+```bash
+# 全链路 V3 步骤时间线
+grep -E '\[V3\]\[DIAG\]|\[GHOSTING_DIAG\]' full.log
+
+# 仅步骤名（快速定位卡住环节）
+grep '\[V3\]\[DIAG\]' full.log | sed 's/.*step=/step=/' | cut -d' ' -f1
+```

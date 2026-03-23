@@ -242,6 +242,9 @@ submap:
   max_temporal_s:    60.0
   match_resolution:   0.4
   merge_resolution:   0.2
+  # 子图重建点云的阈值：当位姿跳变超过此值时触发 rebuild (trans_m, rot_deg)
+  rebuild_threshold_trans_m: 2.0
+  rebuild_threshold_rot_deg: 5.0
 
 # ── 3.2 GPS 延迟对齐 ───────────────────────────────────────────────────────
 gps:
@@ -329,6 +332,12 @@ backend:
   process_every_n_frames: 5
   # 每处理多少帧发布一次全局图（增大可减轻 publishGlobalMap 峰值耗时，见 docs/FULL_LOG_PERFORMANCE_ANALYSIS.md）
   publish_global_map_every_n_processed: 100
+  # 关键帧之间里程计噪声 (trans_m, rot_rad)
+  keyframe_odom_trans_noise: 0.005
+  keyframe_odom_rot_noise: 0.01
+  # 子图之间里程计噪声 (trans_m, rot_rad)
+  submap_odom_trans_noise: 0.01
+  submap_odom_rot_noise: 0.05
   # Keyframe 级 pending GPS 队列上限，超限 FIFO 丢弃最旧。见 docs/BACKEND_POTENTIAL_ISSUES.md 1.2.1
   max_pending_gps_keyframe_factors: 1000
   # 子图冻结时合并 forceUpdate：true=先 flush 所有 pending GPS 再统一一次 forceUpdate（减少 ISAM2 调用），false=保持原 3 次

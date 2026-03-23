@@ -83,6 +83,7 @@ void TeaserMatcher::applyConfig() {
     max_rmse_          = cfg.teaserMaxRMSE();
     max_points_        = cfg.teaserMaxPoints();
     min_safe_inliers_  = cfg.teaserMinSafeInliers();
+    fpfh_corr_max_dist_ = cfg.teaserFpfhCorrMaxDistanceM();
 }
 
 CloudXYZIPtr TeaserMatcher::preprocess(const CloudXYZIPtr& cloud) const {
@@ -270,8 +271,8 @@ TeaserMatcher::Result TeaserMatcher::match(
                   result.num_correspondences);
         ALOG_INFO(MOD, "[tid={}] step=fpfh_match_done correspondences={}", tid, result.num_correspondences);
 
-        // 【FPFH_DIAG】统计对应点距离分布，诊断误匹配
-        const double fpfh_corr_max_dist = ConfigManager::instance().teaserFpfhCorrMaxDistanceM();
+        // 【FPFH_DIAG】统计对应点距离分布，诊断误匹配（阈值仅来自 applyConfig 缓存，避免 match 线程访问 ConfigManager）
+        const double fpfh_corr_max_dist = fpfh_corr_max_dist_;
         if (!corrs.empty()) {
             std::vector<double> distances;
             distances.reserve(corrs.size());
@@ -437,9 +438,12 @@ TeaserMatcher::Result TeaserMatcher::match(
                       teaser_trans_m, teaser_rot_deg, rpy.x(), rpy.y(), rpy.z());
             
             // ⚠️ [GHOSTING_DIAG] 特别关注 Pitch 和 Roll
-            // 正常路面建图 Pitch/Roll 不应超过 30 度（除非是无人机或极端坡度）
-            if (std::abs(rpy.x()) > 30.0 || std::abs(rpy.y()) > 30.0) {
-                ALOG_WARN(MOD, "[TEASER_DIAG][UNUSUAL_ORIENTATION] Large Pitch/Roll detected: P={:.1f} R={:.1f}. This is likely a flipped mismatch causing ghosting!", rpy.y(), rpy.x());
+            // 正常路面建图 Pitch/Roll 不应超过 20 度（除非是无人机或极端坡度）
+            // 拦截翻转匹配（180度翻转），防止重影
+            if (std::abs(rpy.x()) > 20.0 || std::abs(rpy.y()) > 20.0) {
+                ALOG_ERROR(MOD, "[TEASER_DIAG][UNUSUAL_ORIENTATION] FATAL: Large Pitch/Roll detected: P={:.1f} R={:.1f}. REJECTING FLIPPED MATCH to prevent ghosting!", rpy.y(), rpy.x());
+                result.success = false;
+                return result;
             }
         }
 

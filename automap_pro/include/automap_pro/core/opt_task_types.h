@@ -20,6 +20,8 @@ struct OptTaskItem {
         GPS_ALIGN_COMPLETE, RESET,
         KEYFRAME_CREATE,
         FORCE_UPDATE,
+        /** V3: GPS 对齐后批量为历史关键帧添加 GPS 因子（等价于 V2 addBatchGPSFactors） */
+        GPS_BATCH_KF,
         // 子图内回环批量
         INTRA_LOOP_BATCH,
         // 活跃子图关键帧GPS绑定
@@ -27,6 +29,8 @@ struct OptTaskItem {
     } type;
     int from_id = 0;
     int to_id = 0;
+    /** SUBMAP_NODE：首个子图锚点等场景传入 IncrementalOptimizer::addSubMapNode(..., fixed) */
+    bool fixed = false;
     Pose3d rel_pose;
     Mat66d info_matrix;
     Eigen::Vector3d gps_pos;

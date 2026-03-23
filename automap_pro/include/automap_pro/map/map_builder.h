@@ -148,7 +148,7 @@ private:
     void cleanupMaps();
     
     // 辅助函数
-    void transformCloudToWorld(const CloudXYZIPtr& cloud, const Pose3d& T_w_b,
+    void transformCloudToMap(const CloudXYZIPtr& cloud, const Pose3d& T_map_b,
                               CloudXYZI& output) const;
     void mergeCloud(const CloudXYZIPtr& src, CloudXYZIPtr& dst);
     void saveIntermediateMap(const std::string& suffix) const;

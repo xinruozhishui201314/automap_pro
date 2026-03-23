@@ -20,22 +20,26 @@ constexpr float kMinVoxelLeafSize = 0.2f;
 /** True if (max-min)/leaf on any axis would exceed safe limit (PCL VoxelGrid int overflow). */
 bool voxelGridWouldOverflow(float min_x, float max_x, float min_y, float max_y, float min_z, float max_z, float leaf_size);
 
-/** Voxel downsample point cloud. leaf_size 会 clamp 至至少 kMinVoxelLeafSize；输入内部会 sanitize；溢出风险时放大 leaf 或返回副本。 */
-CloudXYZIPtr voxelDownsample(const CloudXYZIPtr& cloud, float leaf_size);
+/** Voxel downsample point cloud. leaf_size 会 clamp 至至少 kMinVoxelLeafSize；输入内部会 sanitize；溢出风险时放大 leaf 或返回副本。
+ *  @param parallel 是否使用 OpenMP 并行（默认为 true，建议在大点云时开启） */
+CloudXYZIPtr voxelDownsample(const CloudXYZIPtr& cloud, float leaf_size, bool parallel = true);
 
 /** 带超时保护的体素下采样。
  *  @param cloud 输入点云
  *  @param leaf_size 体素大小
  *  @param timeout_ms 超时时间（毫秒），默认 5000ms (5秒)
  *  @param timed_out 如果非空，超时时会被设置为 true
+ *  @param parallel 是否使用并行（默认为 true）
  *  @return 降采样后的点云；超时或异常时返回原始点云的副本
  */
 CloudXYZIPtr voxelDownsampleWithTimeout(const CloudXYZIPtr& cloud, float leaf_size, 
-                                         int timeout_ms = 5000, bool* timed_out = nullptr);
+                                         int timeout_ms = 5000, bool* timed_out = nullptr,
+                                         bool parallel = true);
 
 /** 分块体素滤波：按空间网格分块，每块单独滤波再合并，避免大范围点云单次滤波导致 PCL 溢出/崩溃。
- *  chunk_size_m 为每块边长（米），建议 40～80；若 <=0 则按 leaf 自动计算安全块大小。 */
-CloudXYZIPtr voxelDownsampleChunked(const CloudXYZIPtr& cloud, float leaf_size, float chunk_size_m = 50.0f);
+ *  chunk_size_m 为每块边长（米），建议 40～80；若 <=0 则按 leaf 自动计算安全块大小。
+ *  @param parallel 是否对分块执行 OpenMP 并行（默认为 true） */
+CloudXYZIPtr voxelDownsampleChunked(const CloudXYZIPtr& cloud, float leaf_size, float chunk_size_m = 50.0f, bool parallel = true);
 
 /** 带超时的分块体素：大点云时在异步任务中执行 voxelDownsampleChunked（内部 OpenMP 并行），超时返回 sanitized 副本。
  *  用于 merge 等路径，兼顾并行加速与超时保护。chunk_size_m<=0 表示自动。 */
@@ -73,6 +77,11 @@ Vec6d poseToVec6d(const Pose3d& T);
 
 /** 6D vector to Pose3d. */
 Pose3d vec6dToPose(const Vec6d& v);
+
+// --- GPS 转换 ---
+/** 将 WGS84 (lat, lon, alt) 转换为 ENU 坐标系 */
+Eigen::Vector3d wgs84ToEnu(double lat, double lon, double alt, 
+                           double origin_lat, double origin_lon, double origin_alt);
 
 }  // namespace utils
 

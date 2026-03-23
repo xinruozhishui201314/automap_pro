@@ -21,6 +21,33 @@ using json = nlohmann::json;
 
 namespace automap_pro {
 
+namespace {
+
+/**
+ * 与 exportSubmaps、SubMapManager::buildGlobalMap 主路径一致：用各关键帧 body 点云经 T_map_b_optimized 变换后拼接全局图。
+ * 禁止直接拼接 merged_cloud（冻结/里程计系），否则后端回环/GPS/HBA 优化后点云与轨迹不一致，表现为重影与视觉“发糊”。
+ */
+CloudXYZIPtr buildGlobalCloudFromSubmapsOptimized(const std::vector<SubMap::Ptr>& submaps) {
+    CloudXYZIPtr global(new CloudXYZI);
+    for (const auto& sm : submaps) {
+        if (!sm) continue;
+        if (!sm->keyframes.empty()) {
+            for (const auto& kf : sm->keyframes) {
+                if (!kf || !kf->cloud_body || kf->cloud_body->empty()) continue;
+                CloudXYZI tmp;
+                Eigen::Affine3f T_f = kf->T_map_b_optimized.cast<float>();
+                pcl::transformPointCloud(*kf->cloud_body, tmp, T_f);
+                *global += tmp;
+            }
+        } else if (sm->merged_cloud && !sm->merged_cloud->empty()) {
+            *global += *sm->merged_cloud;
+        }
+    }
+    return global;
+}
+
+}  // namespace
+
 MapExporter::MapExporter()
     : MapExporter(Config()) {
 }
@@ -152,14 +179,14 @@ bool MapExporter::exportSubmaps(const std::vector<SubMap::Ptr>& submaps,
         std::string full_path = config_.output_dir + "/" + filename;
         
         // 注意：不要直接导出 sm->merged_cloud。
-        // merged_cloud 是冻结时按当时的 T_w_b 变换得到的“世界系点云”，后端优化（GPS/回环/HBA）后会与轨迹不一致。
-        // 这里按 KeyFrame 的 body 点云 + T_w_b_optimized 重投影后再导出，保证导出的子图与最终位姿一致。
+        // merged_cloud 是冻结时按当时的 T_odom_b 变换得到的“局部系点云”，后端优化（GPS/回环/HBA）后会与轨迹不一致。
+        // 这里按 KeyFrame 的 body 点云 + T_map_b_optimized 重投影后再导出，保证导出的子图与最终位姿一致。
         CloudXYZIPtr world(new CloudXYZI);
         if (!sm->keyframes.empty()) {
             for (const auto& kf : sm->keyframes) {
                 if (!kf || !kf->cloud_body || kf->cloud_body->empty()) continue;
                 CloudXYZI tmp;
-                Eigen::Affine3f T_f = kf->T_w_b_optimized.cast<float>();
+                Eigen::Affine3f T_f = kf->T_map_b_optimized.cast<float>();
                 pcl::transformPointCloud(*kf->cloud_body, tmp, T_f);
                 *world += tmp;
             }
@@ -213,9 +240,9 @@ bool MapExporter::exportTrajectory(const std::vector<KeyFrame::Ptr>& keyframes,
     // 写入数据（与 buildGlobalMap/saveMapToFiles 一致：优先优化位姿，未优化则用原始位姿）
     for (const auto& kf : keyframes) {
         if (!kf) continue;
-        Pose3d T = kf->T_w_b_optimized;
-        if (T.matrix().isApprox(Eigen::Matrix4d::Identity(), 1e-6) && !kf->T_w_b.matrix().isApprox(Eigen::Matrix4d::Identity(), 1e-6))
-            T = kf->T_w_b;
+        Pose3d T = kf->T_map_b_optimized;
+        if (T.matrix().isApprox(Eigen::Matrix4d::Identity(), 1e-6) && !kf->T_odom_b.matrix().isApprox(Eigen::Matrix4d::Identity(), 1e-6))
+            T = kf->T_odom_b;
         Eigen::Vector3d t = T.translation();
         Eigen::Quaterniond q(T.rotation());
         
@@ -261,9 +288,9 @@ bool MapExporter::exportTrajectoryKML(const std::vector<KeyFrame::Ptr>& keyframe
 
     for (const auto& kf : keyframes) {
         if (!kf) continue;
-        Pose3d T = kf->T_w_b_optimized;
-        if (T.matrix().isApprox(Eigen::Matrix4d::Identity(), 1e-6) && !kf->T_w_b.matrix().isApprox(Eigen::Matrix4d::Identity(), 1e-6))
-            T = kf->T_w_b;
+        Pose3d T = kf->T_map_b_optimized;
+        if (T.matrix().isApprox(Eigen::Matrix4d::Identity(), 1e-6) && !kf->T_odom_b.matrix().isApprox(Eigen::Matrix4d::Identity(), 1e-6))
+            T = kf->T_odom_b;
         Eigen::Vector3d t_enu = T.translation();
         Eigen::Vector3d wgs84;
 
@@ -312,9 +339,9 @@ bool MapExporter::exportTrajectoryCSV(const std::vector<KeyFrame::Ptr>& keyframe
     // 写入数据（与轨迹 txt 一致：优先优化位姿）
     for (const auto& kf : keyframes) {
         if (!kf) continue;
-        Pose3d T = kf->T_w_b_optimized;
-        if (T.matrix().isApprox(Eigen::Matrix4d::Identity(), 1e-6) && !kf->T_w_b.matrix().isApprox(Eigen::Matrix4d::Identity(), 1e-6))
-            T = kf->T_w_b;
+        Pose3d T = kf->T_map_b_optimized;
+        if (T.matrix().isApprox(Eigen::Matrix4d::Identity(), 1e-6) && !kf->T_odom_b.matrix().isApprox(Eigen::Matrix4d::Identity(), 1e-6))
+            T = kf->T_odom_b;
         Eigen::Vector3d t = T.translation();
         Eigen::Quaterniond q(T.rotation());
         
@@ -423,16 +450,10 @@ bool MapExporter::exportAll(const std::vector<SubMap::Ptr>& submaps,
     
     bool all_success = true;
     
-    // 1. 导出全局地图
+    // 1. 导出全局地图（与 exportSubmaps 一致：kf->cloud_body + T_map_b_optimized，勿直接拼 merged_cloud）
     if (!submaps.empty()) {
-        // 合并所有子图点云
-        CloudXYZIPtr global_cloud(new CloudXYZI);
-        for (const auto& sm : submaps) {
-            if (sm && sm->merged_cloud && !sm->merged_cloud->empty()) {
-                *global_cloud += *sm->merged_cloud;
-            }
-        }
-        
+        CloudXYZIPtr global_cloud = buildGlobalCloudFromSubmapsOptimized(submaps);
+
         if (!global_cloud->empty()) {
             std::string map_path = export_dir + "/global_map.pcd";
             CloudXYZIPtr ds_cloud = downsampleCloud(global_cloud, config_.base_resolution);
@@ -776,9 +797,9 @@ MapExporter::ExportMetadata MapExporter::buildMetadata(const std::vector<SubMap:
     
     for (const auto& kf : keyframes) {
         if (!kf) continue;
-        Pose3d T = kf->T_w_b_optimized;
-        if (T.matrix().isApprox(Eigen::Matrix4d::Identity(), 1e-6) && !kf->T_w_b.matrix().isApprox(Eigen::Matrix4d::Identity(), 1e-6))
-            T = kf->T_w_b;
+        Pose3d T = kf->T_map_b_optimized;
+        if (T.matrix().isApprox(Eigen::Matrix4d::Identity(), 1e-6) && !kf->T_odom_b.matrix().isApprox(Eigen::Matrix4d::Identity(), 1e-6))
+            T = kf->T_odom_b;
         Eigen::Vector3d t = T.translation();
         min_pt = min_pt.cwiseMin(t);
         max_pt = max_pt.cwiseMax(t);

@@ -267,23 +267,44 @@ private:
      * @brief 更新噪声估计
      */
     void updateNoiseEstimate(const Eigen::Vector3d& acc, const Eigen::Vector3d& gyr) {
-        // 使用滑动窗口计算标准差
         if (!enable_auto_noise_adjust_) return;
         
-        // 这里简化处理，实际应该使用滑动窗口
-        // TODO: 实现完整的滑动窗口噪声估计
+        // 使用滑动窗口计算标准差
+        acc_noise_buffer_.push_back(acc);
+        gyr_noise_buffer_.push_back(gyr);
+        
+        if (acc_noise_buffer_.size() > noise_window_size_) {
+            acc_noise_buffer_.pop_front();
+            gyr_noise_buffer_.pop_front();
+        }
         
         auto now = this->now();
-        if ((now - last_noise_update_time_).seconds() >= noise_update_interval_) {
+        if ((now - last_noise_update_time_).seconds() >= noise_update_interval_ &&
+            acc_noise_buffer_.size() >= min_static_samples_) {
             
-            // 简单估计：使用当前测量与偏置的差值
-            Eigen::Vector3d acc_noise_vec = (acc - bias_acc_).cwiseAbs();
-            Eigen::Vector3d gyr_noise_vec = (gyr - bias_gyr_).cwiseAbs();
+            // 计算方差
+            Eigen::Vector3d acc_sum = Eigen::Vector3d::Zero();
+            Eigen::Vector3d acc_sq_sum = Eigen::Vector3d::Zero();
+            for (const auto& a : acc_noise_buffer_) {
+                acc_sum += a;
+                acc_sq_sum += a.cwiseProduct(a);
+            }
             
-            // 使用指数移动平均
-            double alpha = 0.1;
-            noise_acc_ = alpha * acc_noise_vec + (1.0 - alpha) * noise_acc_;
-            noise_gyr_ = alpha * gyr_noise_vec + (1.0 - alpha) * noise_gyr_;
+            size_t n = acc_noise_buffer_.size();
+            Eigen::Vector3d acc_mean = acc_sum / n;
+            Eigen::Vector3d acc_var = (acc_sq_sum / n - acc_mean.cwiseProduct(acc_mean)).cwiseMax(0.0);
+            noise_acc_ = acc_var.cwiseSqrt();
+            
+            Eigen::Vector3d gyr_sum = Eigen::Vector3d::Zero();
+            Eigen::Vector3d gyr_sq_sum = Eigen::Vector3d::Zero();
+            for (const auto& g : gyr_noise_buffer_) {
+                gyr_sum += g;
+                gyr_sq_sum += g.cwiseProduct(g);
+            }
+            
+            Eigen::Vector3d gyr_mean = gyr_sum / n;
+            Eigen::Vector3d gyr_var = (gyr_sq_sum / n - gyr_mean.cwiseProduct(gyr_mean)).cwiseMax(0.0);
+            noise_gyr_ = gyr_var.cwiseSqrt();
             
             last_noise_update_time_ = now;
             
@@ -373,6 +394,8 @@ private:
     // 数据缓冲区
     std::deque<Eigen::Vector3d> acc_buffer_;
     std::deque<Eigen::Vector3d> gyr_buffer_;
+    std::deque<Eigen::Vector3d> acc_noise_buffer_;
+    std::deque<Eigen::Vector3d> gyr_noise_buffer_;
     
     // 时间戳
     Eigen::Vector3d last_acc_{Eigen::Vector3d::Zero()};

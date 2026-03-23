@@ -44,7 +44,7 @@ bool HBABridge::exportToHBAFormat(
 
     for (size_t i = 0; i < keyframes.size(); ++i) {
         const auto& kf = keyframes[i];
-        const auto& T = kf->T_w_b;
+        const auto& T = kf->T_odom_b;
         const Eigen::Vector3d t = T.translation();
         Eigen::Quaterniond q(T.rotation());
         pose_file << std::fixed << std::setprecision(6)
@@ -87,7 +87,7 @@ bool HBABridge::loadHBAResultAndApply(
     if (poses.size() != keyframes.size()) return false;
 
     for (size_t i = 0; i < keyframes.size(); ++i)
-        keyframes[i]->T_w_b_optimized = poses[i];
+        keyframes[i]->T_map_b_optimized = poses[i];
     return true;
 }
 

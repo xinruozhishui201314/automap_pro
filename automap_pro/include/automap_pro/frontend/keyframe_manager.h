@@ -34,7 +34,7 @@ public:
 
     /** 创建关键帧（并更新最后位姿） */
     KeyFrame::Ptr createKeyFrame(
-        const Pose3d& T_w_b,
+        const Pose3d& T_odom_b,
         const Mat66d& covariance,
         double timestamp,
         const CloudXYZIPtr& cloud_body,

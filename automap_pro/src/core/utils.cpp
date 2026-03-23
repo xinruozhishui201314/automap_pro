@@ -2,6 +2,7 @@
 #include "automap_pro/core/config_manager.h"
 #include "automap_pro/core/logger.h"
 #include "automap_pro/core/metrics.h"
+#include <GeographicLib/LocalCartesian.hpp>
 #include <filesystem>
 #include <Eigen/Geometry>
 #include <system_error>
@@ -138,7 +139,7 @@ bool voxelGridWouldOverflow(float min_x, float max_x, float min_y, float max_y, 
             !std::isfinite(dx) || !std::isfinite(dy) || !std::isfinite(dz));
 }
 
-CloudXYZIPtr voxelDownsample(const CloudXYZIPtr& cloud, float leaf_size) {
+CloudXYZIPtr voxelDownsample(const CloudXYZIPtr& cloud, float leaf_size, bool parallel) {
     try {
         if (!cloud || cloud->empty()) {
             ALOG_WARN("Utils", "voxelDownsample: invalid input (cloud={:p}, size={})",
@@ -164,10 +165,11 @@ CloudXYZIPtr voxelDownsample(const CloudXYZIPtr& cloud, float leaf_size) {
         // 若单次体素网格会溢出，改用分块下采样（保持 leaf 不变，避免分辨率退化）
         if (voxelGridWouldOverflow(min_x, max_x, min_y, max_y, min_z, max_z, leaf)) {
             ALOG_INFO("Utils", "voxelDownsample: overflow risk with leaf={:.4f}, using chunked downsample (leaf unchanged)", leaf_size);
-            return voxelDownsampleChunked(input, leaf, 0.f);  // 0 = 自动块大小
+            return voxelDownsampleChunked(input, leaf, 0.f, parallel);  // 0 = 自动块大小
         }
-        // 使用无 PCL 的体素下采样；performance.parallel_voxel_downsample 为 true 时走 OpenMP 并行路径。
-        CloudXYZIPtr out = ConfigManager::instance().parallelVoxelDownsample()
+        // 使用无 PCL 的体素下采样；根据 parallel 参数决定是否走 OpenMP 并行路径。
+        // 🏛️ [架构优化] 移除对 ConfigManager 单例的运行时依赖，避免多线程/析构时的 SIGSEGV。
+        CloudXYZIPtr out = parallel
             ? voxelDownsampleGridNoPCLParallel(input, leaf)
             : voxelDownsampleGridNoPCL(input, leaf);
         if (out && out->empty()) {
@@ -188,7 +190,7 @@ CloudXYZIPtr voxelDownsample(const CloudXYZIPtr& cloud, float leaf_size) {
 // ============================================================================
 
 CloudXYZIPtr voxelDownsampleWithTimeout(const CloudXYZIPtr& cloud, float leaf_size,
-                                          int timeout_ms, bool* timed_out) {
+                                          int timeout_ms, bool* timed_out, bool parallel) {
     const unsigned tid = automap_pro::logThreadId();
     const auto t_start = std::chrono::steady_clock::now();
     
@@ -201,7 +203,7 @@ CloudXYZIPtr voxelDownsampleWithTimeout(const CloudXYZIPtr& cloud, float leaf_si
     // 对于小点云，直接处理（通常很快）
     if (cloud->size() < 50000) {
         try {
-            return voxelDownsample(cloud, leaf_size);
+            return voxelDownsample(cloud, leaf_size, parallel);
         } catch (const std::exception& e) {
             ALOG_ERROR("Utils", "[tid={}] voxelDownsampleWithTimeout: small cloud exception: {}", tid, e.what());
             return cloud;
@@ -216,9 +218,9 @@ CloudXYZIPtr voxelDownsampleWithTimeout(const CloudXYZIPtr& cloud, float leaf_si
                tid, cloud->size(), timeout_ms);
     
     // 按值捕获 cloud（shared_ptr 副本），避免超时返回后异步任务悬空引用
-    std::future<CloudXYZIPtr> future = std::async(std::launch::async, [cloud, leaf_size, tid]() -> CloudXYZIPtr {
+    std::future<CloudXYZIPtr> future = std::async(std::launch::async, [cloud, leaf_size, tid, parallel]() -> CloudXYZIPtr {
         try {
-            return voxelDownsample(cloud, leaf_size);
+            return voxelDownsample(cloud, leaf_size, parallel);
         } catch (const std::exception& e) {
             ALOG_ERROR("Utils", "[tid={}] voxelDownsampleWithTimeout async exception: {}", tid, e.what());
             return cloud;
@@ -264,17 +266,20 @@ CloudXYZIPtr voxelDownsampleChunkedWithTimeout(const CloudXYZIPtr& cloud, float 
     float leaf = std::max(leaf_size, kMinVoxelLeafSize);
     float chunk_m = (chunk_size_m > 0.f) ? chunk_size_m : 0.f;
 
+    // 🏛️ [架构优化] 在此处读取 ConfigManager 并显式向下传递，避免异步/OpenMP 线程内竞争
+    const bool parallel = ConfigManager::instance().parallelVoxelDownsample();
+
     if (cloud->size() < 50000u) {
         try {
-            return voxelDownsample(cloud, leaf);
+            return voxelDownsample(cloud, leaf, parallel);
         } catch (...) {
             return cloud;
         }
     }
 
-    std::future<CloudXYZIPtr> future = std::async(std::launch::async, [cloud, leaf, chunk_m, tid]() -> CloudXYZIPtr {
+    std::future<CloudXYZIPtr> future = std::async(std::launch::async, [cloud, leaf, chunk_m, tid, parallel]() -> CloudXYZIPtr {
         try {
-            return voxelDownsampleChunked(cloud, leaf, chunk_m);
+            return voxelDownsampleChunked(cloud, leaf, chunk_m, parallel);
         } catch (const std::exception& e) {
             ALOG_ERROR("Utils", "[tid={}] voxelDownsampleChunkedWithTimeout async exception: {}", tid, e.what());
             return cloud;
@@ -282,7 +287,7 @@ CloudXYZIPtr voxelDownsampleChunkedWithTimeout(const CloudXYZIPtr& cloud, float 
             return cloud;
         }
     });
-
+    
     std::future_status status = future.wait_for(std::chrono::milliseconds(timeout_ms));
     if (status == std::future_status::ready) {
         auto result = future.get();
@@ -314,15 +319,17 @@ CloudXYZIPtr voxelDownsampleSafe(const CloudXYZIPtr& cloud, float leaf_size, flo
         min_y = std::min(min_y, p.y); max_y = std::max(max_y, p.y);
         min_z = std::min(min_z, p.z); max_z = std::max(max_z, p.z);
     }
+    // 🏛️ [架构优化] 在顶层读取配置并向下传递
+    const bool parallel = ConfigManager::instance().parallelVoxelDownsample();
     bool overflow = voxelGridWouldOverflow(min_x, max_x, min_y, max_y, min_z, max_z, leaf);
     if (!overflow && input->size() <= kVoxelChunkedSizeThreshold) {
-        return voxelDownsample(cloud, leaf);
+        return voxelDownsample(cloud, leaf, parallel);
     }
     if (chunk_size_m <= 0.f) chunk_size_m = safeChunkSizeForLeaf(leaf);
-    return voxelDownsampleChunked(input, leaf, chunk_size_m);
+    return voxelDownsampleChunked(input, leaf, chunk_size_m, parallel);
 }
 
-CloudXYZIPtr voxelDownsampleChunked(const CloudXYZIPtr& cloud, float leaf_size, float chunk_size_m) {
+CloudXYZIPtr voxelDownsampleChunked(const CloudXYZIPtr& cloud, float leaf_size, float chunk_size_m, bool parallel) {
     const unsigned tid = automap_pro::logThreadId();
     if (!cloud || cloud->empty()) return cloud;
     float leaf = std::max(leaf_size, kMinVoxelLeafSize);
@@ -347,7 +354,7 @@ CloudXYZIPtr voxelDownsampleChunked(const CloudXYZIPtr& cloud, float leaf_size, 
         // 仅当点数少且空间范围不会溢出时 bypass：否则必须走分块→逐块降采样→合并，避免 overflow
         if (input->size() <= kVoxelChunkedSizeThreshold &&
             !voxelGridWouldOverflow(min_x, max_x, min_y, max_y, min_z, max_z, leaf)) {
-            return voxelDownsample(cloud, leaf);
+            return voxelDownsample(cloud, leaf, parallel);
         }
 
         float span_x = max_x - min_x;
@@ -380,34 +387,37 @@ CloudXYZIPtr voxelDownsampleChunked(const CloudXYZIPtr& cloud, float leaf_size, 
         const size_t num_pts = pts_ref.size();
         const float cs_f = cs;
 
+        // 🏛️ [P0 优化] 采用高效的一路分发 (One-pass distribution) 代替 O(Chunks * N) 的循环
+        // 之前每个 chunk 都会遍历全图，导致在大范围地图（chunk 数多）时计算量爆炸。
+        // 现在一次遍历即可将点分发到对应的 chunk 索引中。
+        std::vector<std::vector<size_t>> chunk_indices(static_cast<size_t>(total_chunks));
+        for (size_t i = 0; i < num_pts; ++i) {
+            const auto& p = pts_ref[i];
+            int ix = std::clamp(static_cast<int>((p.x - min_x) / cs_f), 0, nx - 1);
+            int iy = std::clamp(static_cast<int>((p.y - min_y) / cs_f), 0, ny - 1);
+            int iz = std::clamp(static_cast<int>((p.z - min_z) / cs_f), 0, nz - 1);
+            int idx = ix * (ny * nz) + iy * nz + iz;
+            chunk_indices[static_cast<size_t>(idx)].push_back(i);
+        }
+
 #ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic)
 #endif
         for (int idx = 0; idx < total_chunks; ++idx) {
-            const int iz = idx % nz;
-            const int iy = (idx / nz) % ny;
-            const int ix = idx / (nz * ny);
-            const float cx_min = min_x + ix * cs_f;
-            const float cx_max = (ix + 1 == nx) ? max_x : (min_x + (ix + 1) * cs_f);
-            const float cy_min = min_y + iy * cs_f;
-            const float cy_max = (iy + 1 == ny) ? max_y : (min_y + (iy + 1) * cs_f);
-            const float cz_min = min_z + iz * cs_f;
-            const float cz_max = (iz + 1 == nz) ? max_z : (min_z + (iz + 1) * cs_f);
-
-            auto chunk = std::make_shared<CloudXYZI>();
-            chunk->reserve(std::min(num_pts / (static_cast<size_t>(total_chunks) + 1), num_pts));
-            for (size_t i = 0; i < num_pts; ++i) {
-                const auto& p = pts_ref[i];
-                if (p.x >= cx_min && p.x <= cx_max && p.y >= cy_min && p.y <= cy_max && p.z >= cz_min && p.z <= cz_max)
-                    chunk->push_back(p);
-            }
-            if (chunk->empty()) {
+            if (chunk_indices[static_cast<size_t>(idx)].empty()) {
                 chunk_results[static_cast<size_t>(idx)] = nullptr;
                 continue;
             }
+
+            auto chunk = std::make_shared<CloudXYZI>();
+            chunk->points.reserve(chunk_indices[static_cast<size_t>(idx)].size());
+            for (size_t pt_idx : chunk_indices[static_cast<size_t>(idx)]) {
+                chunk->points.push_back(pts_ref[pt_idx]);
+            }
+
             CloudXYZIPtr ds;
             try {
-                ds = voxelDownsample(chunk, leaf);
+                ds = voxelDownsample(chunk, leaf, false); // 子块下采样不再二次并行，避免 OpenMP 嵌套竞争与 ConfigManager 访问
             } catch (const std::exception&) {
                 ds = chunk;
             } catch (...) {
@@ -436,7 +446,7 @@ CloudXYZIPtr voxelDownsampleChunked(const CloudXYZIPtr& cloud, float leaf_size, 
         CloudXYZIPtr result;
         if (!voxelGridWouldOverflow(m_min_x, m_max_x, m_min_y, m_max_y, m_min_z, m_max_z, leaf)) {
             ALOG_INFO("Utils", "[tid={}] [MAP] voxelDownsampleChunked step=final_voxel_enter merged={}", tid, merged->size());
-            result = voxelDownsample(merged, leaf);
+            result = voxelDownsample(merged, leaf, parallel);
         } else {
             ALOG_INFO("Utils", "[tid={}] [MAP] voxelDownsampleChunked step=skip_final_voxel (extent overflow risk) merged={}", tid, merged->size());
             result = merged;
@@ -445,10 +455,10 @@ CloudXYZIPtr voxelDownsampleChunked(const CloudXYZIPtr& cloud, float leaf_size, 
         return result;
     } catch (const std::exception& e) {
         // ALOG_ERROR("Utils", "voxelDownsampleChunked exception: {}", e.what());
-        return voxelDownsample(cloud, leaf);
+        return voxelDownsample(cloud, leaf, parallel);
     } catch (...) {
         // ALOG_ERROR("Utils", "voxelDownsampleChunked unknown exception");
-        return voxelDownsample(cloud, leaf);
+        return voxelDownsample(cloud, leaf, parallel);
     }
 }
 
@@ -548,6 +558,19 @@ Pose3d vec6dToPose(const Vec6d& v) {
         T = Pose3d::Identity();
     }
     return T;
+}
+
+Eigen::Vector3d wgs84ToEnu(double lat, double lon, double alt, 
+                           double origin_lat, double origin_lon, double origin_alt) {
+    try {
+        GeographicLib::LocalCartesian proj(origin_lat, origin_lon, origin_alt);
+        double x, y, z;
+        proj.Forward(lat, lon, alt, x, y, z);
+        return Eigen::Vector3d(x, y, z);
+    } catch (const std::exception& e) {
+        ALOG_ERROR("Utils", "wgs84ToEnu exception: {}", e.what());
+        return Eigen::Vector3d::Zero();
+    }
 }
 
 }  // namespace utils

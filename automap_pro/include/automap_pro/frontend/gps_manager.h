@@ -39,7 +39,7 @@ public:
         double hdop, int num_sats);
 
     /** 注入关键帧位姿（LiDAR轨迹），用于 SVD 匹配 */
-    void addKeyFramePose(double timestamp, const Pose3d& T_w_b);
+    void addKeyFramePose(double timestamp, const Pose3d& T_odom_b);
 
     // ── 状态查询 ──────────────────────────────────────────────────────────
 

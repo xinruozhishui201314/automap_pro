@@ -47,9 +47,12 @@ public:
 
     /**
      * 子图锚定位姿更新（由 iSAM2 优化后回调）
-     * 同时更新子图内所有关键帧的 T_w_b_optimized
+     * 同时更新子图内所有关键帧的 T_map_b_optimized
      */
     void updateSubmapPose(int submap_id, const Pose3d& new_pose);
+
+    /** 批量更新子图位姿（来自 iSAM2 优化结果），比逐个调用 updateSubmapPose 更高效，且支持版本号一致性 */
+    void batchUpdateSubmapPoses(const std::unordered_map<int, Pose3d>& updates, uint64_t version);
 
     /** 批量更新子图位姿（来自 HBA 结果） */
     void updateAllFromHBA(const HBAResult& result);
@@ -129,6 +132,13 @@ private:
     // 关键帧计数（全局）
     std::atomic<uint64_t>     kf_id_counter_{0};
 
+    // ── 全局点云构建缓存（P0 架构优化：解决高频冗余构建导致的性能卡顿） ──
+    mutable CloudXYZIPtr      cached_global_map_;
+    mutable uint64_t          last_build_kf_count_ = 0;
+    mutable uint64_t          last_build_map_version_ = 0;
+    mutable float             last_build_voxel_size_ = 0.0f;
+    uint64_t                  current_map_version_ = 0; // 跟踪 MapRegistry 传入的位姿版本
+
     // ✅ 修复：VoxelGrid 对象池缓存（按分辨率索引，mutable 以便 const 方法可延迟填充）
     mutable std::unordered_map<float, std::unique_ptr<pcl::VoxelGrid<pcl::PointXYZI>>> voxel_grid_cache_;
     mutable std::mutex vg_cache_mutex_;
@@ -191,13 +201,26 @@ private:
     mutable std::mutex frozen_cbs_mutex_;  // 保护 frozen_cbs_，回调前复制列表、锁外执行，避免重入死锁
 
     // 子图冻结后处理异步：voxel(merged_cloud)→downsampled_cloud 与 frozen_cbs_ 在专用线程执行，避免阻塞 addKeyFrame（有界队列+超时防死锁）
-    static constexpr size_t   kMaxFreezePostQueueSize = 32;
+    static constexpr size_t   kMaxFreezePostQueueSize = 128;
     std::queue<SubMap::Ptr>   freeze_post_queue_;
     std::mutex                freeze_post_mutex_;
     std::condition_variable   freeze_post_cv_;
     std::thread               freeze_post_thread_;
     std::atomic<bool>         freeze_post_running_{true};
     void freezePostProcessLoop();
+    
+    // 🏛️ V3: 点云合并异步化 (Merge Worker)
+    struct MergeTask {
+        SubMap::Ptr sm;
+        KeyFrame::Ptr kf;
+    };
+    static constexpr size_t   kMaxMergeQueueSize = 256;
+    std::queue<MergeTask>     merge_queue_;
+    std::mutex                merge_mutex_;
+    std::condition_variable   merge_cv_;
+    std::thread               merge_thread_;
+    std::atomic<bool>         merge_running_{true};
+    void mergeWorkerLoop();
 
     // ── 私有方法 ──────────────────────────────────────────────────────────
     /**

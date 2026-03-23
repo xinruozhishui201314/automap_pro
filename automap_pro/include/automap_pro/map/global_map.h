@@ -48,8 +48,8 @@ public:
     Config getConfig() const;
 
     // 增量更新
-    void addCloud(const CloudXYZIPtr& cloud, const Pose3d& T_w_b = Pose3d::Identity());
-    void addCloudAsync(const CloudXYZIPtr& cloud, const Pose3d& T_w_b = Pose3d::Identity());
+    void addCloud(const CloudXYZIPtr& cloud, const Pose3d& T_map_b = Pose3d::Identity());
+    void addCloudAsync(const CloudXYZIPtr& cloud, const Pose3d& T_map_b = Pose3d::Identity());
     
     // 等待后台更新完成
     void waitForUpdate();

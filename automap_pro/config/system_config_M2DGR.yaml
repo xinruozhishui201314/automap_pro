@@ -334,19 +334,16 @@ loop_closure:
     cbar2:            1.0
     voxel_size:       0.5       # 树多场景略大，减轻树叶/细枝噪声
     max_points:       15000
-    min_inlier_ratio: 0.04     # 树多场景放宽（配合 fpfh_corr_max_distance_m 过滤后易达标）
-    min_safe_inliers: 3
-    max_rmse_m:       0.75     # 略放宽以通过更多子图间回环（原 0.60 易拒；误回环仍靠 inlier_ratio 抑制）
+    min_inlier_ratio: 0.10      # 提高比例，防止噪声拟合
+    min_safe_inliers: 20
+    max_rmse_m:       0.60      # 收紧阈值，仅允许高精匹配
     min_relative_translation_m: 0.02
     icp_refine:       true
-    # 关键：只保留距离<5m 的 FPFH 对应点送 TEASER，树多场景过滤大量误匹配；结构化场景可改为 10
-    fpfh_corr_max_distance_m: 5.0
-  # 回环位姿一致性：TEASER 相对位姿 与 里程计相对位姿 的差异超过阈值则拒绝（认为异常）。子图内/子图间共用。
-  # 设计前提：回环应是「微调」——即 odom 已较准，TEASER 只做小修正。此时 5m/25° 合理。
-  # 若需「同向+反向+两次位移较大」都能检测回环：反向或大位移时 odom 相对位姿会很大/反向，与 TEASER「同一点」结果差很大，易被拒。
-  # 建议：仅微调场景用 5/25；要兼容反向+大位移则设为 0 关闭检查，或大幅放宽(如 20, 90)，仅靠 TEASER inlier_ratio/rmse 把关。
-  pose_consistency_max_trans_diff_m: 30.0   # 平移差(m)，放宽到 30m 以通过大漂移场景下的真实回环
-  pose_consistency_max_rot_diff_deg: 45.0 # 旋转差(度)，设置为 45 度以拒绝 180 度翻转等错误匹配（重影主因）
+    # 扩大搜索半径以支持横向偏移场景（原5m太短导致错失真匹配）
+    fpfh_corr_max_distance_m: 25.0
+  # 回环一致性检查：支持大漂移但拦截离谱偏移
+  pose_consistency_max_trans_diff_m: 10.0   
+  pose_consistency_max_rot_diff_deg: 20.0 # 拦截180度翻转等物理错误匹配（重影主因）
   # ── ScanContext / OverlapTransformer 回环粗匹配 ─────────────────────────
   # enabled=true：使用 ScanContext 做子图/关键帧描述子与候选检索（不调用 OT 模型）
   # enabled=false：使用 OverlapTransformer 模型（overlapTransformer.pt）做描述子与余弦相似度检索；需 LibTorch 与 .pt 模型

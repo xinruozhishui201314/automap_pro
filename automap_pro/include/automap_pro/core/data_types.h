@@ -142,9 +142,10 @@ struct KeyFrame {
     int      index_in_submap = -1; // ✅ V2 修复：存储在子图中的索引，用于 iSAM2 节点编码
     double   timestamp  = 0.0;
 
-    // 位姿（世界系下 body 位姿）
-    Pose3d T_w_b            = Pose3d::Identity();
-    Pose3d T_w_b_optimized  = Pose3d::Identity(); // 优化后位姿
+    // 位姿
+    Pose3d T_odom_b         = Pose3d::Identity(); // 原始里程计位姿 (odom 系)
+    Pose3d T_map_b_optimized  = Pose3d::Identity(); // 优化后位姿 (map 系)
+    Pose3d T_submap_kf      = Pose3d::Identity(); // 相对于子图锚点的位姿 (submap 系)
     Mat66d covariance       = Mat66d::Identity() * 1e-4;
 
     // 点云（body系下）
@@ -220,9 +221,9 @@ struct SubMap {
     // 关键帧下采样点云（用于子图内配准）
     std::vector<CloudXYZIPtr> keyframe_clouds_ds;
 
-    // 锚定位姿（第一帧的世界系位姿）
-    Pose3d pose_w_anchor           = Pose3d::Identity();
-    Pose3d pose_w_anchor_optimized = Pose3d::Identity();
+    // 锚定位姿
+    Pose3d pose_odom_anchor        = Pose3d::Identity(); // 锚点在里程计系下的位姿
+    Pose3d pose_map_anchor_optimized = Pose3d::Identity(); // 锚点在地图系下的位姿 (优化后)
 
     // 点云
     CloudXYZIPtr merged_cloud;       // 合并点云（世界系）
@@ -260,6 +261,23 @@ struct SessionInfo {
     bool        has_descriptor_db = false;
     Pose3d      gps_origin_pose = Pose3d::Identity();  // GPS对齐后的原点位姿
     using Ptr = std::shared_ptr<SessionInfo>;
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 位姿快照 (Pose Snapshot) - 用于生产级线程安全与版本控制
+// ─────────────────────────────────────────────────────────────────────────────
+struct PoseSnapshot {
+    uint64_t version = 0;
+    std::unordered_map<int, Pose3d> submap_poses;
+    std::unordered_map<uint64_t, Pose3d> keyframe_poses;
+    
+    // GPS 对齐状态
+    bool gps_aligned = false;
+    Eigen::Matrix3d R_enu_to_map = Eigen::Matrix3d::Identity();
+    Eigen::Vector3d t_enu_to_map = Eigen::Vector3d::Zero();
+    double gps_rmse = 0.0;
+
+    using Ptr = std::shared_ptr<const PoseSnapshot>;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────

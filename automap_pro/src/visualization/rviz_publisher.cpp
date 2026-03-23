@@ -230,7 +230,8 @@ void RvizPublisher::publishOdometryPath(const nav_msgs::msg::Path& path) {
     odom_path_pub_->publish(path);
 }
 
-void RvizPublisher::publishOptimizedPath(const std::vector<SubMap::Ptr>& submaps) {
+void RvizPublisher::publishOptimizedPath(const std::vector<SubMap::Ptr>& submaps,
+                                         const PoseSnapshot::Ptr& snapshot) {
     if (!node() || !opt_path_pub_) return;
     nav_msgs::msg::Path path;
     path.header.stamp    = node()->now();
@@ -241,7 +242,18 @@ void RvizPublisher::publishOptimizedPath(const std::vector<SubMap::Ptr>& submaps
         if (!sm) continue;
         for (const auto& kf : sm->keyframes) {
             if (!kf) continue;
-            sorted_kfs.push_back({kf->timestamp, kf->T_w_b_optimized});
+            
+            Pose3d pose_opt = kf->T_map_b_optimized;
+            if (snapshot) {
+                auto it = snapshot->keyframe_poses.find(kf->id);
+                if (it != snapshot->keyframe_poses.end()) {
+                    pose_opt = it->second;
+                }
+            }
+            
+            // 与 buildGlobalMap 一致：使用 kf->T_map_b_optimized（及快照），不在此再乘 R_enu_to_map（否则 Path 在 ENU/map 而 global_map 仍在 SLAM 世界系，RViz 中轨迹与点云错位）
+            Pose3d pose_map = pose_opt;
+            sorted_kfs.push_back({kf->timestamp, pose_map});
         }
     }
     std::sort(sorted_kfs.begin(), sorted_kfs.end(),
@@ -253,8 +265,8 @@ void RvizPublisher::publishOptimizedPath(const std::vector<SubMap::Ptr>& submaps
         const auto& first_t = sorted_kfs.front().second.translation();
         const auto& last_t = sorted_kfs.back().second.translation();
         RCLCPP_INFO(node()->get_logger(),
-            "[GHOSTING_DIAG] optimized_path published kf_count=%zu first_pos=[%.2f,%.2f,%.2f] last_pos=[%.2f,%.2f,%.2f] (与 map 同源则 last_pos 应与 pose_snapshot_taken 一致)",
-            sorted_kfs.size(), first_t.x(), first_t.y(), first_t.z(), last_t.x(), last_t.y(), last_t.z());
+            "[GHOSTING_DIAG] optimized_path published version=%lu kf_count=%zu first_pos=[%.2f,%.2f,%.2f] last_pos=[%.2f,%.2f,%.2f] frame=slam_world_same_as_global_map",
+            snapshot ? snapshot->version : 0, sorted_kfs.size(), first_t.x(), first_t.y(), first_t.z(), last_t.x(), last_t.y(), last_t.z());
     }
 
     for (const auto& [ts, pose] : sorted_kfs) {
@@ -271,19 +283,41 @@ void RvizPublisher::publishOptimizedPath(const std::vector<SubMap::Ptr>& submaps
     opt_path_pub_->publish(path);
 }
 
-void RvizPublisher::publishKeyframePoses(const std::vector<KeyFrame::Ptr>& keyframes) {
+void RvizPublisher::publishKeyframePoses(const std::vector<KeyFrame::Ptr>& keyframes,
+                                         const PoseSnapshot::Ptr& snapshot) {
     if (!node() || !kf_pose_array_pub_) return;
     geometry_msgs::msg::PoseArray msg;
     msg.header.stamp = node()->now();
     msg.header.frame_id = frame_id_;
+
+    Eigen::Vector3d first_t = Eigen::Vector3d::Zero(), last_t = Eigen::Vector3d::Zero();
+    size_t valid_count = 0;
     for (const auto& kf : keyframes) {
         if (!kf) continue;
+        
+        Pose3d pose_opt = kf->T_map_b_optimized;
+        if (snapshot) {
+            auto it = snapshot->keyframe_poses.find(kf->id);
+            if (it != snapshot->keyframe_poses.end()) {
+                pose_opt = it->second;
+            }
+        }
+
+        Pose3d pose_map = pose_opt;
+        const auto& p = pose_map.translation();
+        if (valid_count == 0) first_t = p;
+        last_t = p;
+        valid_count++;
         geometry_msgs::msg::Pose pose;
-        const auto& p = kf->T_w_b_optimized.translation();
-        Eigen::Quaterniond q(kf->T_w_b_optimized.rotation());
+        Eigen::Quaterniond q(pose_map.rotation());
         pose.position.x = p.x(); pose.position.y = p.y(); pose.position.z = p.z();
         pose.orientation.x = q.x(); pose.orientation.y = q.y(); pose.orientation.z = q.z(); pose.orientation.w = q.w();
         msg.poses.push_back(pose);
+    }
+    if (valid_count > 0) {
+        RCLCPP_DEBUG(node()->get_logger(),
+            "[GHOSTING_DIAG] keyframe_poses published version=%lu kf_count=%zu first_pos=[%.2f,%.2f,%.2f] last_pos=[%.2f,%.2f,%.2f] frame=slam_world_same_as_global_map",
+            snapshot ? snapshot->version : 0, valid_count, first_t.x(), first_t.y(), first_t.z(), last_t.x(), last_t.y(), last_t.z());
     }
     kf_pose_array_pub_->publish(msg);
 }
@@ -319,9 +353,9 @@ void RvizPublisher::publishGPSTrajectory(const std::vector<SubMap::Ptr>& submaps
         }
         raw_path.poses.push_back(ps);
         ps.header = aligned_path.header;
-        ps.pose.position.x = sm->pose_w_anchor_optimized.translation().x();
-        ps.pose.position.y = sm->pose_w_anchor_optimized.translation().y();
-        ps.pose.position.z = sm->pose_w_anchor_optimized.translation().z();
+        ps.pose.position.x = sm->pose_map_anchor_optimized.translation().x();
+        ps.pose.position.y = sm->pose_map_anchor_optimized.translation().y();
+        ps.pose.position.z = sm->pose_map_anchor_optimized.translation().z();
         aligned_path.poses.push_back(ps);
     }
     gps_raw_path_pub_->publish(raw_path);
@@ -452,7 +486,7 @@ void RvizPublisher::publishLoopMarkers(
     std::map<int, Eigen::Vector3d> sm_pos;
     for (const auto& sm : submaps) {
         if (!sm) continue;
-        sm_pos[sm->id] = sm->pose_w_anchor_optimized.translation();
+        sm_pos[sm->id] = sm->pose_map_anchor_optimized.translation();
     }
 
     visualization_msgs::msg::MarkerArray markers;
@@ -510,7 +544,7 @@ void RvizPublisher::publishLoopCandidateClouds(const SubMap::Ptr& query,
             *merged += *query->downsampled_cloud;
         if (candidate->downsampled_cloud && !candidate->downsampled_cloud->empty()) {
             CloudXYZI cand_world;
-            pcl::transformPointCloud(*candidate->downsampled_cloud, cand_world, candidate->pose_w_anchor_optimized.matrix());
+            pcl::transformPointCloud(*candidate->downsampled_cloud, cand_world, candidate->pose_map_anchor_optimized.matrix());
             *merged += cand_world;
         }
         if (merged->empty()) return;
@@ -529,7 +563,7 @@ void RvizPublisher::publishLoopDetectionStatus(const SubMap::Ptr& query,
     if (!node() || !loop_marker_pub_ || scores.empty()) return;
     visualization_msgs::msg::MarkerArray markers;
     // 以查询子图中心为基准，沿 X 轴偏移显示各候选得分（便于在场景中定位）
-    Eigen::Vector3d base = query ? query->pose_w_anchor_optimized.translation() : Eigen::Vector3d(0, 0, 0);
+    Eigen::Vector3d base = query ? query->pose_map_anchor_optimized.translation() : Eigen::Vector3d(0, 0, 0);
     int id = 0;
     float max_s = 0.f;
     for (const auto& p : scores) max_s = std::max(max_s, p.second);
@@ -565,7 +599,7 @@ void RvizPublisher::publishSubmapBoundaries(const std::vector<SubMap::Ptr>& subm
         if (!sm) continue;
         std_msgs::msg::ColorRGBA yellow;
         yellow.r = 1.0f; yellow.g = 1.0f; yellow.b = 0.0f; yellow.a = 1.0f;
-        auto text = makeTextMarker("submap_labels", id++, sm->pose_w_anchor_optimized.translation(),
+        auto text = makeTextMarker("submap_labels", id++, sm->pose_map_anchor_optimized.translation(),
             "SM" + std::to_string(sm->id), 1.5, &yellow);
         markers.markers.push_back(text);
     }
@@ -611,8 +645,8 @@ void RvizPublisher::publishSubmapGraph(const std::vector<SubMap::Ptr>& submaps) 
     int id = 0;
     std_msgs::msg::ColorRGBA gray = makeColor(0.5f, 0.5f, 0.5f, 0.6f);
     for (size_t i = 0; i + 1 < sorted.size(); ++i) {
-        Eigen::Vector3d a = sorted[i]->pose_w_anchor_optimized.translation();
-        Eigen::Vector3d b = sorted[i+1]->pose_w_anchor_optimized.translation();
+        Eigen::Vector3d a = sorted[i]->pose_map_anchor_optimized.translation();
+        Eigen::Vector3d b = sorted[i+1]->pose_map_anchor_optimized.translation();
         markers.markers.push_back(makeLineMarker("submap_graph", id++, a, b, gray, 0.03));
     }
     submap_graph_pub_->publish(markers);
@@ -639,7 +673,7 @@ void RvizPublisher::publishGPSMarkers(const std::vector<SubMap::Ptr>& submaps) {
     for (const auto& sm : submaps) {
         if (!sm || !sm->has_valid_gps) continue;
         // 使用优化后位姿，与轨迹一致（子图中心即 GPS 约束节点）
-        Eigen::Vector3d pos = sm->pose_w_anchor_optimized.translation();
+        Eigen::Vector3d pos = sm->pose_map_anchor_optimized.translation();
         auto sphere = makeSphereMarker("gps", id++, pos, kGpsMarkerSphereRadius, makeColor(0.0f, 0.6f, 1.0f, 0.9f));
         markers.markers.push_back(sphere);
     }
@@ -660,7 +694,7 @@ void RvizPublisher::publishGPSMarkersWithConstraintLines(
     for (const auto& sm : submaps) {
         if (!sm || !sm->has_valid_gps) continue;
         if (gps_idx >= gps_positions_map.size()) break;
-        Eigen::Vector3d pos = sm->pose_w_anchor_optimized.translation();
+        Eigen::Vector3d pos = sm->pose_map_anchor_optimized.translation();
         markers.markers.push_back(
             makeSphereMarker("gps", sphere_id++, pos, kGpsMarkerSphereRadius, makeColor(0.0f, 0.6f, 1.0f, 0.9f)));
         markers.markers.push_back(
@@ -685,7 +719,7 @@ void RvizPublisher::publishGPSAlignment(const GPSAlignResult& result,
     for (const auto& sm : submaps) {
         if (!sm || !sm->has_valid_gps) continue;
         markers.markers.push_back(makeSphereMarker("gps_aligned", static_cast<int>(markers.markers.size()),
-            sm->pose_w_anchor_optimized.translation(), kGpsAlignedSphereRadius, c));
+            sm->pose_map_anchor_optimized.translation(), kGpsAlignedSphereRadius, c));
     }
     gps_marker_pub_->publish(markers);
 }
@@ -704,7 +738,7 @@ void RvizPublisher::publishGPSQualityMarkers(const std::vector<SubMap::Ptr>& sub
             else if (kf->gps.hdop > 1.0) q = 0.8f;
             std_msgs::msg::ColorRGBA c = makeColorMap(q);
             c.a = 0.8f;
-            Eigen::Vector3d p = kf->T_w_b_optimized.translation();
+            Eigen::Vector3d p = kf->T_map_b_optimized.translation();
             markers.markers.push_back(makeSphereMarker("gps_quality", id++, p, 0.5, c));
         }
     }
@@ -739,7 +773,7 @@ void RvizPublisher::publishCovarianceEllipses(const std::vector<SubMap::Ptr>& su
         auto* kf = sm->keyframes.front().get();
         if (!kf) continue;
         Eigen::Matrix3d cov_xy = kf->covariance.block<3,3>(0,0);
-        auto ell = makeCovarianceEllipse("cov", id++, kf->T_w_b_optimized, cov_xy, 2.0);
+        auto ell = makeCovarianceEllipse("cov", id++, kf->T_map_b_optimized, cov_xy, 2.0);
         markers.markers.push_back(ell);
     }
     covariance_pub_->publish(markers);
@@ -887,7 +921,7 @@ void RvizPublisher::publishActiveRegion(const SubMap::Ptr& active_submap) {
     if (!node() || !active_region_pub_) return;
     visualization_msgs::msg::MarkerArray markers;
     if (active_submap && active_submap->merged_cloud && !active_submap->merged_cloud->empty()) {
-        Eigen::Vector3d c = active_submap->pose_w_anchor_optimized.translation();
+        Eigen::Vector3d c = active_submap->pose_map_anchor_optimized.translation();
         auto sphere = makeSphereMarker("active", 0, c, active_submap->spatial_extent_m > 0 ? active_submap->spatial_extent_m : 10.0,
             makeColor(0.2f, 0.8f, 0.2f, 0.25f));
         markers.markers.push_back(sphere);

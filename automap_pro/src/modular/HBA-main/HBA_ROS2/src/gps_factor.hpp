@@ -226,7 +226,7 @@ void GPS_Factor::UpdateXYZ(double lat, double lon, double alt)
     // 存储更新后的坐标
     local_E.push_back(local_E_raw);
     local_N.push_back(local_N_raw);
-    local_U.push_back(-local_U_raw);
+    local_U.push_back(local_U_raw);
 }
 
 void GPS_Factor::Reverse(
@@ -281,23 +281,10 @@ std::vector<GPS_Factor::gps_imu_pose3d> GPS_Factor::read_gps_raw_info(std::strin
     gps_pose_tran.resize(enu_pose.size());
     std::cout << "Start transform enu coordinations to IMU axis!" << std::endl;
 
-    std::vector<GPS_Factor::gps_imu_pose3d> gps_pose_trans_xyz;
-    gps_pose_trans_xyz.reserve(enu_pose.size());
     for(int i = 0; i < enu_pose.size(); i++)
     {
-        gps_pose_trans_xyz[i].t = Gnss_R_wrt_Lidar * enu_pose[i].t + Gnss_T_wrt_Lidar;
-    }
-    for(int i = 0 ; i < enu_pose.size(); i++)
-    {
-        gps_pose_tran[i].t[0] = gps_pose_trans_xyz[i].t[2];
-        gps_pose_tran[i].t[1] = gps_pose_trans_xyz[i].t[1];
-        gps_pose_tran[i].t[2] = gps_pose_trans_xyz[i].t[0];
-    }
-    /*
-    for (int i = 0; i < enu_pose.size(); i++)
-    {
         gps_pose_tran[i].t = Gnss_R_wrt_Lidar * enu_pose[i].t + Gnss_T_wrt_Lidar;
-    }*/
+    }
     return gps_pose_tran;
 }
 
@@ -320,7 +307,7 @@ void GPS_Factor::path_match(std::vector<mypcl::pose> lio_pose, std::vector<doubl
                 // std::cout << "no." << i + 1 << "lidar_time = " << fixed << setprecision(6) << lidar_time[i]  << endl;
                 // std::cout << "no." << j + 1 << "gps_time = " << fixed << setprecision(6)<< gps_time_raw[j]  << endl;
                 index_gps2lidar.push_back(i);
-                enu_pose.push_back(Eigen::Vector3d(local_E[i], local_N[i], local_U[i]));
+                enu_pose.push_back(gps_imu_pose3d(Eigen::Vector3d(local_E[j], local_N[j], local_U[j])));
                 gps_time.push_back(gps_time_raw[j]);
                 k++;
                 /*
@@ -387,7 +374,7 @@ void GPS_Factor::path_match(std::vector<mypcl::pose> lio_pose, std::vector<doubl
     {
         enu_centroid += p.t;
     }
-    for (const auto &p : lio_pose)
+    for (const auto &p : gps_pose_in_liopath)
     {
         lio_centroid += p.t;
     }
