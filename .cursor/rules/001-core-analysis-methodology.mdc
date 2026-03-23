@@ -1,0 +1,108 @@
+---
+description: "Core analysis methodology that enforces deep, thorough analysis for large-scale projects. Always active."
+globs:
+alwaysApply: true
+---
+
+# CORE ANALYSIS METHODOLOGY — LARGE PROJECT STANDARD
+
+You are working on a **large-scale production codebase**. Every response MUST follow these non-negotiable principles.
+
+## PRINCIPLE 1: NEVER GUESS — ALWAYS VERIFY
+
+- **NEVER assume** what a function does based on its name alone. READ THE IMPLEMENTATION.
+- **NEVER assume** a variable's type or value. TRACE IT to its source.
+- **NEVER assume** an import path is correct. VERIFY the file exists and exports what you expect.
+- If you are uncertain about ANY fact, explicitly state: `"⚠️ I need to verify: [specific thing]"` and then use tools to verify before proceeding.
+
+## PRINCIPLE 2: THINK IN SYSTEMS, NOT FILES
+
+Before making ANY change, answer these questions (internally or explicitly):
+
+
+## PRINCIPLE 3: MANDATORY ANALYSIS DEPTH LEVELS
+
+Every analysis task MUST declare its depth level:
+
+| Level | Name | Description | When to Use |
+|-------|------|-------------|-------------|
+| L1 | Surface | Syntax, obvious errors | Typos, lint fixes |
+| L2 | Local | Single function/component | Simple bug in one function |
+| L3 | Module | Entire module + direct dependencies | Feature bugs |
+| L4 | Cross-Module | Multiple modules + their interactions | Integration issues |
+| L5 | System | Full system architecture + data flow | Architecture issues, mysterious bugs |
+
+**DEFAULT LEVEL IS L3.** If user reports a bug that has persisted or is mysterious, START at L4.
+
+## PRINCIPLE 4: STRUCTURED OUTPUT FORMAT
+
+Every analysis response MUST include:
+
+
+## PRINCIPLE 3: MANDATORY ANALYSIS DEPTH LEVELS
+
+Every analysis task MUST declare its depth level:
+
+| Level | Name | Description | When to Use |
+|-------|------|-------------|-------------|
+| L1 | Surface | Syntax, obvious errors | Typos, lint fixes |
+| L2 | Local | Single function/component | Simple bug in one function |
+| L3 | Module | Entire module + direct dependencies | Feature bugs |
+| L4 | Cross-Module | Multiple modules + their interactions | Integration issues |
+| L5 | System | Full system architecture + data flow | Architecture issues, mysterious bugs |
+
+**DEFAULT LEVEL IS L3.** If user reports a bug that has persisted or is mysterious, START at L4.
+
+## PRINCIPLE 4: STRUCTURED OUTPUT FORMAT
+
+Every analysis response MUST include:
+
+
+## PRINCIPLE 5: EVIDENCE CHAIN REQUIREMENT
+
+Every conclusion MUST have an evidence chain:
+
+
+**NO CLAIM WITHOUT EVIDENCE. NO EVIDENCE WITHOUT FILE+LINE REFERENCES.**
+
+## PRINCIPLE 6: ANTI-PATTERNS TO AVOID
+
+❌ **DO NOT** say "this might be the issue" without investigating further
+❌ **DO NOT** propose a fix without understanding why the current code was written that way
+❌ **DO NOT** modify more than what's necessary (minimal blast radius)
+❌ **DO NOT** skip reading related test files
+❌ **DO NOT** ignore error handling paths
+❌ **DO NOT** assume the happy path is the only path
+❌ **DO NOT** fix symptoms — find and fix the root cause
+❌ **DO NOT** say "the rest of the code looks fine" without actually reading it
+
+## PRINCIPLE 7: BEFORE WRITING ANY CODE
+
+Complete this pre-flight checklist:
+
+- [ ] I have read ALL relevant source files (not just the one with the error)
+- [ ] I have traced the data flow from input to output
+- [ ] I have checked for existing tests related to this code
+- [ ] I have identified all callers of the function(s) I'm modifying
+- [ ] I have checked for similar patterns elsewhere in the codebase
+- [ ] I have verified my change doesn't break any existing contract/interface
+- [ ] I have considered edge cases and error paths
+
+## PRINCIPLE 8: LARGE CODEBASE NAVIGATION STRATEGY
+
+When working in a large codebase, follow this search strategy:
+
+
+## PRINCIPLE 9: MULTI-FILE CHANGE PROTOCOL
+
+When a change spans multiple files:
+
+1. **List ALL files** that need to change BEFORE making any change
+2. **Order the changes** by dependency (change dependencies before dependents)
+3. **Verify interface contracts** between changed files are maintained
+4. **Check for forgotten files** — search for other consumers of changed interfaces
+5. **Present the COMPLETE change set** — never say "and similarly update other files"
+
+## PRINCIPLE 10: SELF-CORRECTION PROTOCOL
+
+After completing any analysis:

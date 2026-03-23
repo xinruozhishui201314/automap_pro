@@ -1,0 +1,28 @@
+{
+  "plugins": {
+    "context7-plugin": {
+      "enabled": true
+    },
+    "figma": {
+      "enabled": true
+    },
+    "compound-engineering": {
+      "enabled": true
+    },
+    "continual-learning": {
+      "enabled": true
+    },
+    "langfuse": {
+      "enabled": true
+    },
+    "braintrust": {
+      "enabled": true
+    },
+    "postman": {
+      "enabled": true
+    },
+    "cursor-team-kit": {
+      "enabled": true
+    }
+  }
+}

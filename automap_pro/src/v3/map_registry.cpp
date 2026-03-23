@@ -1,4 +1,5 @@
 #include "automap_pro/v3/map_registry.h"
+#include "automap_pro/core/metrics.h"
 #include <rclcpp/rclcpp.hpp>
 #include <filesystem>
 #include <limits>
@@ -9,6 +10,25 @@ namespace automap_pro::v3 {
 
 void MapRegistry::addKeyFrame(KeyFrame::Ptr kf) {
     if (!kf) return;
+    if (kf->pose_frame == PoseFrame::UNKNOWN) {
+        RCLCPP_ERROR(rclcpp::get_logger("automap_pro"),
+            "[V3][CONTRACT] Reject addKeyFrame: kf_id=%lu pose_frame=UNKNOWN",
+            static_cast<unsigned long>(kf->id));
+        METRICS_INCREMENT(metrics::UNKNOWN_FRAME_RESULT_TOTAL);
+        return;
+    }
+    if (!kf->T_odom_b.matrix().allFinite() || !kf->T_map_b_optimized.matrix().allFinite()) {
+        RCLCPP_ERROR(rclcpp::get_logger("automap_pro"),
+            "[V3][CONTRACT] Reject addKeyFrame: kf_id=%lu non-finite pose detected",
+            static_cast<unsigned long>(kf->id));
+        METRICS_INCREMENT(metrics::FRAME_MISMATCH_TOTAL);
+        return;
+    }
+    RCLCPP_DEBUG(rclcpp::get_logger("automap_pro"),
+        "[V3][CONTRACT] addKeyFrame kf_id=%lu frame=%d odom_norm=%.3f map_norm=%.3f has_gps=%d",
+        static_cast<unsigned long>(kf->id), static_cast<int>(kf->pose_frame),
+        kf->T_odom_b.translation().norm(), kf->T_map_b_optimized.translation().norm(),
+        kf->has_valid_gps ? 1 : 0);
     {
         std::lock_guard<std::mutex> lock(kf_mutex_);
         keyframes_[kf->id] = kf;
@@ -56,6 +76,24 @@ std::vector<KeyFrame::Ptr> MapRegistry::getAllKeyFrames() const {
 
 void MapRegistry::addSubMap(SubMap::Ptr sm) {
     if (!sm) return;
+    if (sm->pose_frame == PoseFrame::UNKNOWN) {
+        RCLCPP_ERROR(rclcpp::get_logger("automap_pro"),
+            "[V3][CONTRACT] Reject addSubMap: sm_id=%d pose_frame=UNKNOWN", sm->id);
+        METRICS_INCREMENT(metrics::UNKNOWN_FRAME_RESULT_TOTAL);
+        return;
+    }
+    if (!sm->pose_odom_anchor.matrix().allFinite() || !sm->pose_map_anchor_optimized.matrix().allFinite()) {
+        RCLCPP_ERROR(rclcpp::get_logger("automap_pro"),
+            "[V3][CONTRACT] Reject addSubMap: sm_id=%d non-finite anchor pose detected", sm->id);
+        METRICS_INCREMENT(metrics::FRAME_MISMATCH_TOTAL);
+        return;
+    }
+    RCLCPP_DEBUG(rclcpp::get_logger("automap_pro"),
+        "[V3][CONTRACT] addSubMap sm_id=%d frame=%d odom_norm=%.3f map_norm=%.3f state=%d",
+        sm->id, static_cast<int>(sm->pose_frame),
+        sm->pose_odom_anchor.translation().norm(),
+        sm->pose_map_anchor_optimized.translation().norm(),
+        static_cast<int>(sm->state));
     {
         std::lock_guard<std::mutex> lock(sm_mutex_);
         submaps_[sm->id] = sm;
@@ -87,7 +125,44 @@ std::vector<SubMap::Ptr> MapRegistry::getAllSubMaps() const {
 }
 
 uint64_t MapRegistry::updatePoses(const std::unordered_map<int, Pose3d>& sm_updates,
-                                 const std::unordered_map<uint64_t, Pose3d>& kf_updates) {
+                                 const std::unordered_map<uint64_t, Pose3d>& kf_updates,
+                                 PoseFrame pose_frame,
+                                 const std::string& source_module,
+                                 uint32_t transform_applied_flags,
+                                 uint64_t batch_hash) {
+    if (pose_frame == PoseFrame::UNKNOWN) {
+        RCLCPP_ERROR(rclcpp::get_logger("automap_pro"),
+            "[V3][CONTRACT] Reject updatePoses: success-path pose_frame=UNKNOWN is forbidden");
+        METRICS_INCREMENT(metrics::UNKNOWN_FRAME_RESULT_TOTAL);
+        return current_version_.load();
+    }
+    if (pose_frame != PoseFrame::MAP) {
+        if (gps_aligned_.load()) {
+            RCLCPP_ERROR(rclcpp::get_logger("automap_pro"),
+                "[V3][CONTRACT] Reject updatePoses: non-MAP frame is forbidden after GPS alignment");
+            METRICS_INCREMENT(metrics::FRAME_MISMATCH_TOTAL);
+            return current_version_.load();
+        }
+        RCLCPP_WARN(rclcpp::get_logger("automap_pro"),
+            "[V3][CONTRACT] Accepting non-MAP frame in pre-alignment stage as MAP-equivalent");
+    }
+    for (const auto& [id, pose] : sm_updates) {
+        if (!pose.matrix().allFinite()) {
+            RCLCPP_ERROR(rclcpp::get_logger("automap_pro"),
+                "[V3][CONTRACT] Reject updatePoses: submap pose %d has non-finite value", id);
+            METRICS_INCREMENT(metrics::FRAME_MISMATCH_TOTAL);
+            return current_version_.load();
+        }
+    }
+    for (const auto& [id, pose] : kf_updates) {
+        if (!pose.matrix().allFinite()) {
+            RCLCPP_ERROR(rclcpp::get_logger("automap_pro"),
+                "[V3][CONTRACT] Reject updatePoses: keyframe pose %lu has non-finite value", id);
+            METRICS_INCREMENT(metrics::FRAME_MISMATCH_TOTAL);
+            return current_version_.load();
+        }
+    }
+
     std::vector<int> affected_kf_ids;
     std::vector<int> affected_sm_ids;
 
@@ -105,6 +180,7 @@ uint64_t MapRegistry::updatePoses(const std::unordered_map<int, Pose3d>& sm_upda
             auto it = submaps_.find(id);
             if (it != submaps_.end()) {
                 it->second->pose_map_anchor_optimized = pose;
+                it->second->pose_frame = PoseFrame::MAP; // State Invariant Contract
                 affected_sm_ids.push_back(id);
             }
         }
@@ -113,6 +189,7 @@ uint64_t MapRegistry::updatePoses(const std::unordered_map<int, Pose3d>& sm_upda
             auto it = keyframes_.find(static_cast<int>(id));
             if (it != keyframes_.end()) {
                 it->second->T_map_b_optimized = pose;
+                it->second->pose_frame = PoseFrame::MAP; // State Invariant Contract
                 affected_kf_ids.push_back(static_cast<int>(id));
             }
         }
@@ -154,8 +231,13 @@ uint64_t MapRegistry::updatePoses(const std::unordered_map<int, Pose3d>& sm_upda
     // 发布位姿图优化结果事件（用于同步各模块内部缓存，如 VisualizationModule）
     OptimizationResultEvent result_ev;
     result_ev.version = version;
+    result_ev.event_id = version;
     result_ev.submap_poses = sm_updates;
     result_ev.keyframe_poses = kf_updates;
+    result_ev.pose_frame = PoseFrame::MAP;
+    result_ev.source_module = source_module;
+    result_ev.transform_applied_flags = transform_applied_flags;
+    result_ev.batch_hash = batch_hash;
     event_bus_->publish(result_ev);
 
     // 发布地图变更事件

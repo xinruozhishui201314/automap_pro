@@ -21,6 +21,20 @@
 
 ---
 
+## 0.1 2026-03-23 已落地项（增量）
+
+本次已按“最小改动、契约优先”落地以下能力：
+
+- **接口契约 SSoT**：新增 `protocol_contract.h`，统一管理 API 版本、topics、services。
+- **启动期 Fail-Fast**：`ConfigManager::load` 增加 `system.api_version` 校验，不兼容时直接阻断启动。
+- **位姿坐标系契约**：`SyncedFrameEvent` / `OptimizationResultEvent` / `KeyFrame` / `SubMap` 补充 `PoseFrame` 语义。
+- **网关校核**：`MappingModule` / `VisualizationModule` 在接收位姿时按 `PoseFrame` 做坐标系核校与转换，避免双重变换与语义漂移。
+- **防错增强**：优化结果入库前增加有限值和合理性检查，异常数据直接拒绝。
+
+详见：`docs/COORDINATE_AND_PROTOCOL_CONTRACTS_20260323.md`
+
+---
+
 ## 1. CI/CD 与自动化
 
 ### 1.1 现状

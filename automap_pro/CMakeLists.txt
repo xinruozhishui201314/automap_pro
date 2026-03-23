@@ -513,6 +513,7 @@ ament_target_dependencies(automap_visualization ${AUTOMAP_AMENT_DEPS})
 # Composable Node 组件库（供 Component Container 加载）
 # ──────────────────────────────────────────────────────────
 add_library(automap_system_component SHARED
+  src/system/automap_system_component_plugin.cpp
   src/system/modules/system_init.cpp
   src/system/modules/data_callbacks.cpp
   src/system/modules/service_handlers.cpp

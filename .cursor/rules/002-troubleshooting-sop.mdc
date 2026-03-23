@@ -1,0 +1,37 @@
+---
+description: "Standard Operating Procedure for troubleshooting bugs and issues in large projects. Activate when user reports a bug, error, or unexpected behavior."
+globs:
+alwaysApply: false
+---
+
+# 🔧 TROUBLESHOOTING SOP — LARGE PROJECT BUG ANALYSIS
+
+When a user reports a bug, error, or unexpected behavior, follow this EXACT procedure. DO NOT SKIP STEPS.
+
+## PHASE 1: INTAKE & CLARIFICATION (Do NOT skip)
+
+## PHASE 2: RECONNAISSANCE (Map the battlefield)
+
+## PHASE 3: HYPOTHESIS GENERATION
+
+## PHASE 4: INVESTIGATION (The deep dive)
+
+## PHASE 5: SOLUTION DESIGN
+
+## PHASE 6: IMPLEMENTATION
+
+## PHASE 7: REPORT
+
+## TROUBLESHOOTING PROMPT TEMPLATES
+
+When you need to dig deeper, use these internal prompts:
+
+### Template: Trace Error Origin
+
+### Template: Dependency Impact Check
+
+### Template: State Corruption Hunt
+
+### Template: State Corruption Hunt
+
+### Template: Integration Point Failure

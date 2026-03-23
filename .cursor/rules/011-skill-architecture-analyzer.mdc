@@ -1,0 +1,26 @@
+---
+description: "Skill: Analyze and document the architecture of a large codebase or specific subsystem."
+globs:
+alwaysApply: false
+---
+
+# SKILL: ARCHITECTURE ANALYZER
+
+## Purpose
+Quickly build a mental model of a large codebase's architecture by systematically examining its structure, patterns, and conventions.
+
+## Procedure
+
+### STEP 1: PROJECT STRUCTURE SCAN
+
+### STEP 2: MODULE BOUNDARY IDENTIFICATION
+
+### STEP 3: PATTERN IDENTIFICATION
+
+### STEP 3: PATTERN IDENTIFICATION
+
+### STEP 4: DATA FLOW MAPPING
+
+### STEP 5: RISK AREA IDENTIFICATION
+
+### OUTPUT FORMAT

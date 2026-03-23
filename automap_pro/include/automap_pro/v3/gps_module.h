@@ -33,10 +33,15 @@ public:
             event.R_enu_to_map = r.R_enu_to_map;
             event.t_enu_to_map = r.t_enu_to_map;
             event.rmse = r.rmse_m;
-            RCLCPP_DEBUG(node_->get_logger(),
-                "[V3][DIAG] step=GPSAlignedEvent_publish success=%d rmse=%.3fm (grep V3 DIAG)",
-                r.success ? 1 : 0, r.rmse_m);
-            event_bus_->publish(event);
+            
+            if (event.isValid()) {
+                RCLCPP_DEBUG(node_->get_logger(),
+                    "[V3][DIAG] step=GPSAlignedEvent_publish success=%d rmse=%.3fm (grep V3 DIAG)",
+                    r.success ? 1 : 0, r.rmse_m);
+                event_bus_->publish(event);
+            } else {
+                RCLCPP_WARN(node_->get_logger(), "[V3][GPS] REJECTING invalid GPSAlignedEvent: NaN detected!");
+            }
         });
 
         // 注册对 RawGPSEvent 的订阅
@@ -69,6 +74,7 @@ protected:
         RCLCPP_INFO(node_->get_logger(), "[V3][GPSModule] Started worker thread");
         
         while (running_) {
+            updateHeartbeat();
             RawGPSEvent event;
             {
                 std::unique_lock<std::mutex> lock(queue_mutex_);

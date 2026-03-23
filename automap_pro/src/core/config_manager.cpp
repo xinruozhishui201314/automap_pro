@@ -93,6 +93,49 @@ void ConfigManager::load(const std::string& yaml_path) {
         
         ALOG_INFO("ConfigManager", "Successfully loaded config from: {}", yaml_path);
 
+        contract_strict_mode_ = get<bool>("contract.strict_mode", false);
+        contract_frame_policy_ = get<std::string>("contract.frame_policy", "compat");
+        if (contract_frame_policy_ != "compat" && contract_frame_policy_ != "strict_map_only") {
+            std::string err = "Invalid contract.frame_policy='" + contract_frame_policy_ +
+                "'. Allowed: compat | strict_map_only";
+            RCLCPP_FATAL(rclcpp::get_logger("automap_system"), "[PROTOCOL_FATAL] %s", err.c_str());
+            throw std::runtime_error(err);
+        }
+
+        // 🏛️ [架构契约] Fail-Fast 协议一致性校验
+        // 产品化要求：如果配置中显式声明了 API 版本，则必须与二进制文件内核版本兼容
+        if (cfg_["system"] && cfg_["system"]["api_version"]) {
+            std::string cfg_version = cfg_["system"]["api_version"].as<std::string>();
+            int major = 0, minor = 0;
+            if (sscanf(cfg_version.c_str(), "%d.%d", &major, &minor) >= 2) {
+                if (!protocol::isCompatible(major, minor)) {
+                    std::string err = "[PROTOCOL_FATAL] Config API version (" + cfg_version + 
+                                     ") is INCOMPATIBLE with System Kernal (v" + protocol::getVersionString() + 
+                                     "). Refusing to start to avoid interface mismatch!";
+                    RCLCPP_FATAL(rclcpp::get_logger("automap_system"), "%s", err.c_str());
+                    throw std::runtime_error(err);
+                }
+                RCLCPP_INFO(rclcpp::get_logger("automap_system"), 
+                    "[PROTOCOL] API Contract Verified: Config v%s <-> System v%s", 
+                    cfg_version.c_str(), protocol::getVersionString().c_str());
+            } else {
+                std::string err = "[PROTOCOL_FATAL] Invalid system.api_version format: '" + cfg_version + "'. Expected 'MAJOR.MINOR'.";
+                if (contract_strict_mode_) {
+                    RCLCPP_FATAL(rclcpp::get_logger("automap_system"), "%s", err.c_str());
+                    throw std::runtime_error(err);
+                }
+                RCLCPP_WARN(rclcpp::get_logger("automap_system"), "%s Running in COMPAT mode.", err.c_str());
+            }
+        } else {
+            if (contract_strict_mode_) {
+                std::string err = "[PROTOCOL_FATAL] strict_mode=true but missing required key: system.api_version";
+                RCLCPP_FATAL(rclcpp::get_logger("automap_system"), "%s", err.c_str());
+                throw std::runtime_error(err);
+            }
+            RCLCPP_WARN(rclcpp::get_logger("automap_system"),
+                "[PROTOCOL] Missing 'system.api_version' in config. Running in COMPAT mode.");
+        }
+
         // ========== 最先读取 sensor.gps 并缓存，避免后续 get()/路径解析导致 enabled 误为 false ==========
         {
             bool s_ok = cfg_["sensor"].IsMap();
@@ -354,6 +397,22 @@ void ConfigManager::load(const std::string& yaml_path) {
         } catch (const std::exception& e) {
             RCLCPP_WARN(rclcpp::get_logger("automap_system"),
                 "[ConfigManager][CONFIG_SYSTEM_CACHE] read failed: %s (getters will use get())", e.what());
+        }
+
+        // ========== 性能参数：一次性读入缓存，彻底解决多线程读取 YAML 导致的 SIGSEGV ==========
+        try {
+            perf_async_global_map_build_   = get<bool>("performance.async_global_map_build", true);
+            perf_async_isam2_update_       = get<bool>("performance.async_isam2_update", false);
+            perf_parallel_voxel_downsample_ = get<bool>("performance.parallel_voxel_downsample", true);
+            perf_parallel_teaser_match_     = get<bool>("performance.parallel_teaser_match", true);
+            perf_max_optimization_queue_size_ = get<int>("performance.max_optimization_queue_size", 64);
+            
+            RCLCPP_INFO(rclcpp::get_logger("automap_system"), 
+                "[ConfigManager][PERF_CACHE] async_build=%d async_isam=%d parallel_voxel=%d parallel_teaser=%d",
+                perf_async_global_map_build_, perf_async_isam2_update_, 
+                perf_parallel_voxel_downsample_, perf_parallel_teaser_match_);
+        } catch (...) {
+            RCLCPP_WARN(rclcpp::get_logger("automap_system"), "[ConfigManager][PERF_CACHE] preload failed, using defaults");
         }
 
         // ========== [ConfigManager][CONFIG_GET_DIAG] get() 与 raw/cache 对比，便于精准定位 key 解析问题 ==========

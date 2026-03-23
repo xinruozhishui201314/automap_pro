@@ -38,6 +38,7 @@ public:
         ALOG_INFO("Pipeline", "[PIPELINE][V3] module START name={} tid={} lwp={}",
                   name_, automap_pro::logThreadId(), automap_pro::logLwp());
         running_ = true;
+        updateHeartbeat();
         thread_ = std::thread(&ModuleBase::run, this);
     }
 
@@ -57,6 +58,25 @@ public:
 
     const std::string& getName() const { return name_; }
 
+    /**
+     * @brief 获取最后心跳时间 (L1 级健康检查)
+     */
+    double getLastHeartbeat() const { return last_heartbeat_s_.load(); }
+
+    /**
+     * @brief 更新心跳 (应在业务循环内调用)
+     */
+    void updateHeartbeat() {
+        auto now = std::chrono::steady_clock::now();
+        double ts = std::chrono::duration<double>(now.time_since_epoch()).count();
+        last_heartbeat_s_.store(ts);
+    }
+
+    /**
+     * @brief 检查模块是否空闲（队列为空）
+     */
+    virtual bool isIdle() const { return true; }
+
 protected:
     /**
      * @brief 核心业务循环逻辑
@@ -71,12 +91,21 @@ protected:
         event_bus_->subscribe<TEvent>(handler);
     }
 
+    /**
+     * @brief 异步注册事件订阅（不阻塞发布者，回调在独立线程执行）
+     */
+    template <typename TEvent>
+    void onEventAsync(std::function<void(const TEvent&)> handler) {
+        event_bus_->subscribeAsync<TEvent>(handler);
+    }
+
     // --- 状态控制 ---
     std::string name_;
     EventBus::Ptr event_bus_;
     MapRegistry::Ptr map_registry_;
     
     std::atomic<bool> running_{false};
+    std::atomic<double> last_heartbeat_s_{0.0};
     std::thread thread_;
     std::mutex mutex_;
     std::condition_variable cv_;

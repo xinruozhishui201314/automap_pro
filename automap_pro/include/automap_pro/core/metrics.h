@@ -328,6 +328,10 @@ inline constexpr const char* ODOMETRY_QUALITY = "odometry_quality";
 inline constexpr const char* TEASER_INLIER_RATIO = "teaser_inlier_ratio";
 // P2 修复：HBA↔iSAM2 同步诊断
 inline constexpr const char* HBA_ISAM2_SEPARATION_M = "hba_isam2_separation_m";
+inline constexpr const char* FRAME_MISMATCH_TOTAL = "frame_mismatch_total";
+inline constexpr const char* DUPLICATE_OPTIMIZATION_EVENT_TOTAL = "duplicate_optimization_event_total";
+inline constexpr const char* UNKNOWN_FRAME_RESULT_TOTAL = "unknown_frame_result_total";
+inline constexpr const char* STALE_VERSION_DROP_TOTAL = "stale_version_drop_total";
 
 } // namespace metrics
 
@@ -591,6 +595,10 @@ private:
         registerGauge(metrics::ODOMETRY_QUALITY, "Odometry quality");
         registerGauge(metrics::TEASER_INLIER_RATIO, "TEASER++ inlier ratio");
         registerGauge(metrics::HBA_ISAM2_SEPARATION_M, "HBA vs iSAM2 pose separation (m)");
+        registerCounter(metrics::FRAME_MISMATCH_TOTAL, "Frame mismatch contract violations");
+        registerCounter(metrics::DUPLICATE_OPTIMIZATION_EVENT_TOTAL, "Duplicate optimization events dropped");
+        registerCounter(metrics::UNKNOWN_FRAME_RESULT_TOTAL, "UNKNOWN frame optimization results dropped");
+        registerCounter(metrics::STALE_VERSION_DROP_TOTAL, "Stale optimization events dropped");
     }
 };
 

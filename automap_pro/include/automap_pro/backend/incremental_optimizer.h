@@ -325,6 +325,7 @@ private:
     int    node_count_   = 0;
     int    factor_count_ = 0;
     bool   has_prior_    = false;
+    PoseFrame current_pose_frame_ = PoseFrame::ODOM; // 🏛️ [架构加固] 跟踪当前因子图坐标系语义
 
     std::vector<PoseUpdateCallback> pose_update_cbs_;
 

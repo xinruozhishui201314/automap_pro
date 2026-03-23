@@ -765,6 +765,7 @@ void IncrementalOptimizer::addGPSFactor(
     // 🔧 DEBUG: 记录锁等待开始
     auto lock_start = std::chrono::steady_clock::now();
     std::unique_lock<std::shared_mutex> lk(rw_mutex_);
+    current_pose_frame_ = PoseFrame::MAP; // 🏛️ [架构加固] 注入 GPS 因子意味着因子图切换为 MAP 语义
     auto lock_wait_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - lock_start).count();
     if (lock_wait_ms > 100.0) {
         RCLCPP_WARN(rclcpp::get_logger("automap_system"),
@@ -930,6 +931,7 @@ void IncrementalOptimizer::addGPSFactorsBatch(const std::vector<GPSFactorItem>& 
     // 即使 GTSAM 本身有异常处理，也可能触发 SIGSEGV 信号
     try {
         std::unique_lock<std::shared_mutex> lk(rw_mutex_);
+        current_pose_frame_ = PoseFrame::MAP; // 🏛️ [架构加固] 注入 GPS 因子意味着因子图切换为 MAP 语义
         if (!prior_noise_) {
             RCLCPP_WARN(rclcpp::get_logger("automap_system"),
                 "[ISAM2_DIAG] addGPSFactorsBatch: prior_noise_ is null, skip");
@@ -1274,6 +1276,7 @@ void IncrementalOptimizer::addGPSFactorForKeyFrame(int kf_id, const Eigen::Vecto
     // 🔧 DEBUG: 记录锁等待开始
     auto lock_start = std::chrono::steady_clock::now();
     std::unique_lock<std::shared_mutex> lk(rw_mutex_);
+    current_pose_frame_ = PoseFrame::MAP; // 🏛️ [架构加固] 注入 GPS 因子意味着因子图切换为 MAP 语义
     auto lock_wait_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - lock_start).count();
     if (lock_wait_ms > 100.0) {
         RCLCPP_WARN(rclcpp::get_logger("automap_system"),
@@ -1414,6 +1417,7 @@ void IncrementalOptimizer::addGPSFactorsForKeyFramesBatch(const std::vector<GPSF
 
     try {
         std::unique_lock<std::shared_mutex> lk(rw_mutex_);
+        current_pose_frame_ = PoseFrame::MAP; // 🏛️ [架构加固] 注入 GPS 因子意味着因子图切换为 MAP 语义
         if (!prior_noise_) {
             RCLCPP_WARN(rclcpp::get_logger("automap_system"),
                 "[ISAM2_DIAG] addGPSFactorsForKeyFramesBatch: prior_noise_ is null, skip");
@@ -2377,6 +2381,7 @@ OptimizationResult IncrementalOptimizer::commitAndUpdate() {
     res.elapsed_ms    = elapsed;
     res.submap_poses  = sm_poses;
     res.keyframe_poses = kf_poses;
+    res.pose_frame = current_pose_frame_; // 🏛️ [架构加固] 显式标注坐标系语义
     
     // 若未提取到任何位姿（estimate 与 node_exists_ 不一致），视为失败并打清原因
     if (res.nodes_updated == 0 && (node_exists_.size() > 0 || keyframe_node_exists_.size() > 0)) {
@@ -2595,6 +2600,7 @@ void IncrementalOptimizer::rebuildAfterGPSAlign(const std::vector<SubmapData>& s
     node_count_ = 0;
     factor_count_ = 0;
     has_prior_ = false;
+    current_pose_frame_ = PoseFrame::MAP; // 🏛️ [架构加固] 重建后因子图语义切换为 MAP
 
     // 1. 恢复子图节点
     for (const auto& d : submap_data) {

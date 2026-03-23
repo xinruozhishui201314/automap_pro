@@ -2,6 +2,10 @@
 
 > 生成时间: 2026-03-04
 > 实现模块: PoseGraph, GlobalMap, MapBuilder, MapExporter, IcpRefiner增强
+>
+> 更新说明（2026-03-23）：
+> 本文档聚焦 2026-03-04 的模块实现交付，不包含后续 V3 坐标系契约与协议契约改造。
+> 最新契约化架构变更请查看：`docs/COORDINATE_AND_PROTOCOL_CONTRACTS_20260323.md`
 
 ---
 

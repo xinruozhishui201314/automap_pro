@@ -7,6 +7,8 @@
 #include <vector>
 #include <memory>
 #include <any>
+#include <future>
+#include <thread>
 
 namespace automap_pro::v3 {
 
@@ -33,6 +35,22 @@ public:
         auto& handlers = handlers_[typeid(TEvent)];
         handlers.push_back([handler](const std::any& any_event) {
             handler(std::any_cast<const TEvent&>(any_event));
+        });
+    }
+
+    /**
+     * @brief 异步订阅（回调在独立线程执行，不阻塞 publish）
+     */
+    template <typename TEvent>
+    void subscribeAsync(std::function<void(const TEvent&)> handler) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto& handlers = handlers_[typeid(TEvent)];
+        handlers.push_back([handler](const std::any& any_event) {
+            // 异步分发必须不阻塞 publish：避免临时 future 析构导致同步等待。
+            auto event_copy = std::any_cast<const TEvent&>(any_event);
+            std::thread([handler, event_copy]() {
+                handler(event_copy);
+            }).detach();
         });
     }
 

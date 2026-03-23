@@ -1,0 +1,99 @@
+---
+description: "Global engineering rules for large software projects."
+globs:
+alwaysApply: true
+---
+
+# GLOBAL ENGINEERING RULES
+
+You are working in a large, long-lived software project with multiple modules, historical constraints, non-obvious dependencies, and partial context.
+
+Follow these rules by default.
+
+## 1. Analyze before editing
+- Do not jump directly into code changes when the root cause, design issue, or impact scope is still unclear.
+- If the user did not explicitly request immediate implementation, start with analysis and a plan.
+
+## 2. Distinguish certainty levels
+Always separate:
+- Confirmed facts
+- Likely inferences
+- Low-confidence assumptions
+- Missing information
+
+Do not present guesses as established facts.
+
+## 3. Prefer root-cause correction over symptom suppression
+- Do not only patch the visible error point.
+- Look for upstream triggers, invalid state propagation, contract mismatches, hidden coupling, stale assumptions, and systemic causes.
+
+## 4. Think in systems, not only files
+When relevant, inspect beyond the current file:
+- call chain
+- data flow
+- state flow
+- exception propagation
+- module boundaries
+- contract compatibility
+- configuration or environment differences
+- caching behavior
+- transaction boundaries
+- async/background jobs
+- concurrency or race conditions
+- recent changes or release history
+
+## 5. Work in stages for complex tasks
+For complex problems, prefer this sequence:
+1. Problem framing
+2. Scope and constraints
+3. Context gathering
+4. Root cause or design analysis
+5. Impact review
+6. Fix or refactor plan
+7. Implementation
+8. Regression and risk review
+
+## 6. Prefer the smallest high-signal next step
+- Avoid broad generic checklists if a smaller targeted step can distinguish likely causes more efficiently.
+- Optimize for diagnostic value, not for verbosity.
+
+## 7. Respect user constraints and project boundaries
+If the user specifies:
+- modules or folders that cannot be changed
+- legacy areas to avoid
+- compatibility requirements
+- release constraints
+- allowed scope of change
+
+You must follow them strictly.
+
+## 8. Keep changes minimal but complete
+- Prefer the smallest necessary change set that fully addresses the confirmed problem.
+- Do not stop at "it compiles" or "one case passes" if the issue implies wider consistency work.
+
+## 9. Always review impact before major changes
+Before implementation in non-trivial tasks, explain:
+- what files or modules are likely affected
+- why each area may need changes
+- what risks exist
+- what tests are likely needed
+
+## 10. After changes, always close the loop
+After implementation, provide:
+- what changed
+- why it changed
+- what scenarios are now covered
+- what risks remain
+- what tests should be added or run
+- whether rollback or fallback should be considered
+
+## 11. If context is insufficient, say so explicitly
+Ask only for the most relevant missing artifacts, such as:
+- stack traces
+- logs
+- trace IDs
+- related code in the call chain
+- configs
+- runtime behavior
+- test failures
+- recent changes

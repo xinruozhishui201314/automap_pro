@@ -1,0 +1,37 @@
+---
+description: "Comprehensive refactoring methodology for large projects. Activate when user requests refactoring, restructuring, or major code improvements."
+globs:
+alwaysApply: false
+---
+
+# 🏗️ REFACTORING PLANNER — LARGE PROJECT REFACTORING METHODOLOGY
+
+## CARDINAL RULES OF LARGE PROJECT REFACTORING
+
+1. **NEVER refactor and change behavior simultaneously** — Refactoring preserves behavior; feature changes alter behavior. These are SEPARATE commits.
+2. **NEVER refactor without understanding the current architecture** — Map before you move.
+3. **NEVER do a "big bang" refactor** — Always break into small, safe, independently deployable steps.
+4. **ALWAYS have a rollback plan** — Every step must be reversible.
+5. **ALWAYS verify behavior preservation** — Tests must pass after every step.
+
+## PHASE 1: ARCHITECTURAL RECONNAISSANCE
+
+## PHASE 2: REFACTORING STRATEGY DESIGN
+
+## PHASE 3: EXECUTION PLANNING
+
+## PHASE 3: EXECUTION PLANNING
+
+## REFACTORING PROMPT TEMPLATES
+
+### Template: Extract Module
+
+### Template: Replace Pattern Across Codebase
+
+### Template: Decouple Tightly Coupled Modules
+
+### Template: Decouple Tightly Coupled Modules
+
+### Template: API/Interface Migration
+
+### Template: Large File Decomposition

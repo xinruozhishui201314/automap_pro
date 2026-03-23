@@ -1,0 +1,27 @@
+---
+description: "Skill: Analyze the full impact of a proposed code change across the codebase."
+globs:
+alwaysApply: false
+---
+
+# SKILL: CHANGE IMPACT ANALYZER
+
+## Purpose
+Before implementing any change, systematically analyze its impact across the entire codebase to prevent unintended side effects.
+
+## Procedure
+
+### INPUT
+- Proposed change description
+- Files to be modified
+- Nature of change (interface change, behavior change, data structure change, etc.)
+
+### STEP 1: DIRECT IMPACT ANALYSIS
+
+### STEP 2: RIPPLE EFFECT ANALYSIS
+
+### STEP 3: CROSS-CUTTING CONCERN ANALYSIS
+
+### STEP 4: TEST IMPACT ANALYSIS
+
+### STEP 5: IMPACT SUMMARY

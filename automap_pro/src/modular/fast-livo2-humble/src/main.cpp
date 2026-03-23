@@ -53,11 +53,18 @@ int main(int argc, char **argv)
   // 参数文件中的 overrides 仍会在 declare_parameter() 时被应用。
   options.automatically_declare_parameters_from_overrides(false);
 
-  rclcpp::Node::SharedPtr nh;
+  // 🏛️ [修复] 严重崩溃隐患：必须先创建 Node，再创建依赖 Node 的组件（如 image_transport）。
+  // 此前 nh 为空导致 it_ 内部状态非法，析构时触发 SIGSEGV。
+  auto nh = std::make_shared<rclcpp::Node>("laserMapping", options);
   image_transport::ImageTransport it_(nh);
+  
   LIVMapper mapper(nh, "laserMapping", options);
   mapper.initializeSubscribersAndPublishers(nh, it_);
   mapper.run(nh);
+  
+  // 🏛️ [安全策略] 显式重置以确保在 rclcpp::shutdown() 前清理所有资源，避免 static destruction 顺序导致的崩溃
+  nh.reset();
+  
   rclcpp::shutdown();
   return 0;
 }

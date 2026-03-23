@@ -1,0 +1,25 @@
+---
+description: "Skill: Trace dependencies across a large codebase. Use when you need to understand what depends on what."
+globs:
+alwaysApply: false
+---
+
+# SKILL: DEPENDENCY TRACER
+
+## Purpose
+Systematically trace all dependencies of a given code element (function, class, module, type) in both directions — what it depends on (downstream) and what depends on it (upstream).
+
+## Activation
+Use this skill when:
+- About to modify a function/class/interface
+- Need to understand blast radius of a change
+- Investigating why a change in file A broke file Z
+- Planning a refactoring that involves moving or renaming code
+
+## Procedure
+
+### DOWNSTREAM TRACE (What does this code depend on?)
+
+### UPSTREAM TRACE (What depends on this code?)
+
+### OUTPUT FORMAT

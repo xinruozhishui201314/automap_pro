@@ -73,6 +73,7 @@ protected:
         RCLCPP_INFO(node_->get_logger(), "[V3][LoopModule] Started worker thread");
         
         while (running_) {
+            updateHeartbeat();
             SubMap::Ptr sm;
             IntraLoopTaskEvent intra_task;
             bool has_sm = false;

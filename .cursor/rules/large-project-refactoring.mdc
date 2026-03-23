@@ -1,0 +1,174 @@
+---
+description: "Rules for analyzing and refactoring large project code safely and systematically."
+globs:
+alwaysApply: false
+---
+
+# LARGE PROJECT REFACTORING RULES
+
+Activate these rules when the user asks for:
+- refactoring
+- cleanup of complex code
+- decomposition of large modules or classes
+- responsibility separation
+- architectural improvement
+- deduplication across modules
+- boundary redesign
+- safer long-term structure
+
+Follow this process.
+
+---
+
+## PHASE 1: CLASSIFY THE PROBLEM
+
+### Objective
+Understand what kind of refactor this really is.
+
+### Required actions
+Classify the main issue when possible:
+- naming/readability issue
+- duplicate logic
+- responsibility leakage
+- poor module boundaries
+- mixed concerns
+- data model inconsistency
+- cross-layer coupling
+- architecture-level issue
+
+Also identify whether this task is:
+- a local cleanup
+- a focused refactor
+- a cross-module redesign
+- a rewrite disguised as refactoring
+
+### Output
+Provide:
+- Current design problem summary
+- Problem classification
+- Refactor scope level
+
+### Do not
+- Treat all structural problems as simple code cleanup.
+- Jump directly into rewriting.
+
+---
+
+## PHASE 2: MAP COUPLING AND CONSTRAINTS
+
+### Objective
+Understand what makes the current code hard to change.
+
+### Required actions
+Identify:
+- coupling points
+- hidden dependencies
+- shared contracts
+- compatibility-sensitive logic
+- historical assumptions
+- data shape constraints
+- operational/release constraints
+- areas that should not be changed immediately
+
+### Output
+Provide:
+- Coupling analysis
+- Constraints and assumptions
+- Risk-sensitive areas
+- Do-not-touch or defer-for-later areas
+
+### Do not
+- Assume all awkward code is accidental.
+- Remove legacy behavior without first identifying its purpose.
+
+---
+
+## PHASE 3: GENERATE REFACTOR OPTIONS
+
+### Objective
+Compare multiple refactor strategies instead of forcing one answer.
+
+### Required actions
+Provide at least 3 options when possible:
+1. Minimal-change option
+2. Balanced evolutionary option
+3. Ideal target-state option
+
+For each option, explain:
+- approach
+- benefits
+- risks
+- compatibility impact
+- migration complexity
+- implementation cost
+- whether incremental rollout is possible
+
+### Output
+Provide:
+- Option comparison
+- Trade-off analysis
+- Recommended option
+
+### Do not
+- Recommend a rewrite by default.
+- Present one option as obvious without comparison.
+
+---
+
+## PHASE 4: PLAN THE REFACTOR
+
+### Objective
+Turn the chosen option into a controlled engineering plan.
+
+### Required actions
+Provide:
+- target design
+- change boundary
+- phased rollout steps
+- migration order
+- compatibility preservation plan
+- fallback or rollback considerations if relevant
+- validation strategy
+
+### Output
+Provide:
+- Recommended plan
+- Phase-by-phase implementation sequence
+- Validation and test strategy
+- Remaining technical debt intentionally deferred
+
+### Do not
+- Suggest a large refactor without rollout sequencing.
+- Ignore migration cost and release safety.
+
+---
+
+## PHASE 5: IMPLEMENT WITH DISCIPLINE
+
+### Objective
+Apply the chosen refactor without uncontrolled scope growth.
+
+### Required actions
+If implementation is requested:
+- list planned files/modules first
+- explain why each is changing
+- keep edits aligned with the approved option
+- avoid broad unrelated cleanup
+- preserve behavior where compatibility matters
+
+After implementation:
+- summarize what improved
+- identify what coupling still remains
+- identify follow-up cleanup still recommended
+- recommend regression and compatibility tests
+
+### Output
+Provide:
+- Change summary
+- Structural improvements achieved
+- Remaining trade-offs
+- Suggested follow-up work
+
+### Do not
+- Expand into architecture redesign if only a focused refactor was approved.
+- Break contracts silently.

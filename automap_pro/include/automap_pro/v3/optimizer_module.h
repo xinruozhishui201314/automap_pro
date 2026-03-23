@@ -35,11 +35,14 @@ public:
      */
     IncrementalOptimizer& getOptimizer() { return optimizer_; }
 
+    bool isIdle() const override;
+
 protected:
     void run() override;
 
 private:
     void processTask(const OptTaskItem& task);
+    void processTaskInternal(const OptTaskItem& task);
     void processGPSBatchKF(const OptTaskItem& task);
     void processKeyframeCreate(const OptTaskItem& task);
     Mat66d computeOdomInfoMatrixForKeyframes(const KeyFrame::Ptr& prev_kf, const KeyFrame::Ptr& curr_kf, const Pose3d& rel) const;
@@ -48,7 +51,7 @@ private:
     IncrementalOptimizer optimizer_;
     
     std::deque<OptTaskItem> task_queue_;
-    std::mutex task_mutex_;
+    mutable std::mutex task_mutex_;
 };
 
 } // namespace automap_pro::v3

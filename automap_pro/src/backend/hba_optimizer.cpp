@@ -562,6 +562,10 @@ HBAResult HBAOptimizer::runHBA(const PendingTask& task) {
         result.final_mme       = api_result.final_mme;
         result.elapsed_ms      = api_result.elapsed_ms;
         result.optimized_poses = api_result.optimized_poses;
+        result.optimized_keyframe_ids.clear();
+        result.optimized_keyframe_ids.reserve(sorted_kfs.size());
+        for (const auto& kf : sorted_kfs) result.optimized_keyframe_ids.push_back(kf->id);
+        result.pose_frame      = gps_aligned_ ? PoseFrame::MAP : PoseFrame::ODOM;
     } else {
         BACKEND_STEP("step=HBA_runHBA_done backend=api success=0 elapsed_ms=%.1f error=%s",
             api_result.elapsed_ms, api_result.error_msg.c_str());
@@ -634,6 +638,28 @@ HBAResult HBAOptimizer::runGTSAMFallback(const PendingTask& task) {
             "[HBA_INPUT_ORDER] first kf_id=%lu sm_id=%d ts=%.3f last kf_id=%lu sm_id=%d ts=%.3f count=%zu (GTSAM_sorted，与 WRITEBACK_ORDER 应对齐)",
             f->id, f->submap_id, f->timestamp, b->id, b->submap_id, b->timestamp, sorted_kfs.size());
     }
+
+    // HBA 输出位姿坐标系语义探测（用于上层写回时避免 map/odom 混淆）
+    // 若输入里已有明显 map!=odom 偏移，则将输出视作 MAP；否则视作 ODOM。
+    bool input_has_map_offset = false;
+    double max_trans_diff = 0.0;
+    double max_rot_diff_deg = 0.0;
+    for (const auto& kf : sorted_kfs) {
+        if (!kf) continue;
+        const double trans_diff = (kf->T_map_b_optimized.translation() - kf->T_odom_b.translation()).norm();
+        const double rot_diff = Eigen::AngleAxisd(
+            kf->T_map_b_optimized.rotation().inverse() * kf->T_odom_b.rotation()).angle();
+        max_trans_diff = std::max(max_trans_diff, trans_diff);
+        max_rot_diff_deg = std::max(max_rot_diff_deg, rot_diff * 180.0 / M_PI);
+        if (trans_diff > 0.20 || rot_diff > (5.0 * M_PI / 180.0)) {
+            input_has_map_offset = true;
+            break;
+        }
+    }
+    result.pose_frame = input_has_map_offset ? PoseFrame::MAP : PoseFrame::ODOM;
+    RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+        "[V3][CONTRACT] HBA fallback frame inference: input_has_map_offset=%d max_trans_diff=%.3fm max_rot_diff=%.2fdeg => pose_frame=%d",
+        input_has_map_offset ? 1 : 0, max_trans_diff, max_rot_diff_deg, static_cast<int>(result.pose_frame));
 
     // 约束合理性：所有关键帧位姿有限且平移在合理范围内，否则不进入 GTSAM 避免崩溃
     auto poseForInitial = [](const KeyFrame::Ptr& kf) -> Pose3d {
@@ -1022,6 +1048,7 @@ HBAResult HBAOptimizer::runGTSAMFallback(const PendingTask& task) {
             if (optimized.exists(KF(i))) {
                 Pose3d new_pose = fromGtsamPose3(optimized.at<gtsam::Pose3>(KF(i)));
                 result.optimized_poses.push_back(new_pose);
+                result.optimized_keyframe_ids.push_back(sorted_kfs[i]->id);
             }
         }
         // [POSE_DIAG] 写回由 updateAllFromHBA 持锁统一执行；此处用 result.optimized_poses 打首/中/尾与 T_odom_b 的差值

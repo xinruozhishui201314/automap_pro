@@ -27,6 +27,7 @@ public:
 
     void start() override;
     void stop() override;
+    bool isIdle() const override;
 
 protected:
     void run() override;
@@ -44,6 +45,15 @@ private:
 
     // 🏛️ V3: 位姿跳变修正 logic
     void onPoseOptimized(const OptimizationResultEvent& ev);
+    
+    /**
+     * @brief 🏛️ [架构加固] 统一位姿应用网关
+     * 处理坐标系补偿 (ODOM -> MAP) 并分发到各个管理器
+     */
+    void applyOptimizedPoses(const std::unordered_map<int, Pose3d>& sm_poses, 
+                             const std::unordered_map<uint64_t, Pose3d>& kf_poses, 
+                             PoseFrame frame, uint64_t version);
+    bool shouldAcceptOptimizationEvent(const OptimizationResultEvent& ev);
 
     // 辅助函数
     Mat66d computeOdomInfoMatrix(const SubMap::Ptr& prev, const SubMap::Ptr& curr, const Pose3d& rel) const;
@@ -68,7 +78,7 @@ private:
     };
     std::deque<Command> command_queue_;
 
-    std::mutex queue_mutex_;  // 保护所有队列
+    mutable std::mutex queue_mutex_;  // 保护所有队列
     
     std::atomic<bool> gps_aligned_{false};
     Eigen::Matrix3d gps_transform_R_ = Eigen::Matrix3d::Identity();
@@ -80,10 +90,15 @@ private:
     
     // 🏛️ 生产级版本控制：本地已应用的最新的地图版本
     std::atomic<uint64_t> processed_map_version_{0};
+    double last_barrier_wait_start_time_ = -1.0; // 🏛️ [P1 稳定性] 屏障超时计时器
+    uint64_t last_applied_version_{0};
+    uint64_t last_applied_batch_hash_{0};
+    uint64_t last_applied_event_id_{0};
 
     // 统计
     std::atomic<int> frozen_submap_count_{0};
     std::atomic<int> processed_frame_count_{0}; // 🏛️ [P0 优化] 记录处理帧数以执行按帧频率的地图构建触发
+    std::atomic<int> optimized_apply_count_{0}; // 优化结果应用计数，用于节流优化驱动的全局地图构建
 
     /// 上一次已冻结子图（仅用于子图间 ODOM 因子）。禁止在冻结回调里调用 getFrozenSubmaps()（会与 merge 持锁竞态）。
     SubMap::Ptr prev_frozen_for_odom_;

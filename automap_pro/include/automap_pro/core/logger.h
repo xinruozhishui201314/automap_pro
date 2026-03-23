@@ -151,17 +151,35 @@ private:
         std::filesystem::path(__FILE__).filename().string(), __LINE__, __func__)
 
 #define ALOG_TRACE(mod, ...) \
-    SPDLOG_LOGGER_TRACE(spdlog::default_logger(), _AUTOMAP_LOC(mod) + fmt::format(__VA_ARGS__))
+    do { \
+        auto _log = spdlog::default_logger(); \
+        if (_log) SPDLOG_LOGGER_TRACE(_log, _AUTOMAP_LOC(mod) + fmt::format(__VA_ARGS__)); \
+    } while(0)
 #define ALOG_DEBUG(mod, ...) \
-    SPDLOG_LOGGER_DEBUG(spdlog::default_logger(), _AUTOMAP_LOC(mod) + fmt::format(__VA_ARGS__))
+    do { \
+        auto _log = spdlog::default_logger(); \
+        if (_log) SPDLOG_LOGGER_DEBUG(_log, _AUTOMAP_LOC(mod) + fmt::format(__VA_ARGS__)); \
+    } while(0)
 #define ALOG_INFO(mod, ...) \
-    SPDLOG_LOGGER_INFO(spdlog::default_logger(),  _AUTOMAP_LOC(mod) + fmt::format(__VA_ARGS__))
+    do { \
+        auto _log = spdlog::default_logger(); \
+        if (_log) SPDLOG_LOGGER_INFO(_log,  _AUTOMAP_LOC(mod) + fmt::format(__VA_ARGS__)); \
+    } while(0)
 #define ALOG_WARN(mod, ...) \
-    SPDLOG_LOGGER_WARN(spdlog::default_logger(),  _AUTOMAP_LOC(mod) + fmt::format(__VA_ARGS__))
+    do { \
+        auto _log = spdlog::default_logger(); \
+        if (_log) SPDLOG_LOGGER_WARN(_log,  _AUTOMAP_LOC(mod) + fmt::format(__VA_ARGS__)); \
+    } while(0)
 #define ALOG_ERROR(mod, ...) \
-    SPDLOG_LOGGER_ERROR(spdlog::default_logger(), _AUTOMAP_LOC(mod) + fmt::format(__VA_ARGS__))
+    do { \
+        auto _log = spdlog::default_logger(); \
+        if (_log) SPDLOG_LOGGER_ERROR(_log, _AUTOMAP_LOC(mod) + fmt::format(__VA_ARGS__)); \
+    } while(0)
 #define ALOG_CRITICAL(mod, ...) \
-    SPDLOG_LOGGER_CRITICAL(spdlog::default_logger(), _AUTOMAP_LOC(mod) + fmt::format(__VA_ARGS__))
+    do { \
+        auto _log = spdlog::default_logger(); \
+        if (_log) SPDLOG_LOGGER_CRITICAL(_log, _AUTOMAP_LOC(mod) + fmt::format(__VA_ARGS__)); \
+    } while(0)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 性能计时宏（RAII 作用域计时）

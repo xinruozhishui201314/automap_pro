@@ -1,0 +1,142 @@
+---
+description: "Rules for impact assessment, controlled implementation, and regression review in large projects."
+globs:
+alwaysApply: false
+---
+
+# IMPACT REVIEW + IMPLEMENTATION DISCIPLINE
+
+Use these rules before and during non-trivial code changes in large projects.
+
+---
+
+## PART 1: IMPACT REVIEW BEFORE EDITING
+
+### Objective
+Assess the likely blast radius before implementation.
+
+### Required actions
+Before making non-trivial changes, review possible impact across:
+- entry points
+- service/application logic
+- domain behavior
+- repository/data access
+- DTO / VO / entity / schema consistency
+- serialization / deserialization / mapping
+- caching behavior and cache keys
+- transactions and side effects
+- async/background jobs
+- config flags and environment-dependent behavior
+- external service contracts
+- observability/logging/metrics assumptions
+- tests, fixtures, mocks, and documentation
+
+### Output
+Provide:
+- Proposed change summary
+- Potentially impacted modules/layers/files
+- Contract and compatibility risks
+- Data/state risks
+- Operational risks
+- Recommended test scope
+- Remaining uncertainties
+
+### Do not
+- Limit impact review to the current file.
+- Skip impact review for shared logic, public interfaces, or cross-module flows.
+
+---
+
+## PART 2: CHANGE PLAN BEFORE IMPLEMENTATION
+
+### Objective
+Create a reviewable implementation plan before editing.
+
+### Required actions
+Before editing, provide:
+- problem summary
+- root-cause or design summary
+- change goal
+- in-scope and out-of-scope areas
+- planned files/modules
+- why each file/module needs changes
+- main risk points
+- why this change plan addresses root cause or design intent
+
+### Output
+Provide:
+- Change boundary
+- Planned changes
+- Rationale per file/module
+- Risk notes
+- Test strategy
+
+### Do not
+- Start broad edits without a visible implementation plan.
+- Expand scope silently.
+
+---
+
+## PART 3: IMPLEMENTATION DISCIPLINE
+
+### Objective
+Implement safely with minimal necessary scope.
+
+### Required actions
+During implementation:
+- keep scope minimal but complete
+- respect do-not-touch areas and user constraints
+- preserve compatibility unless explicitly told otherwise
+- avoid unrelated cleanup unless required for correctness
+- keep naming, contracts, and behavior consistent across touched layers
+
+### If you edit code
+After editing, summarize:
+- what changed
+- why it changed
+- how it addresses root cause or design goal
+- what scenarios are covered
+- what remains risky or uncertain
+
+### Do not
+- Optimize for "it compiles" over correctness.
+- Change public or shared behavior silently.
+- Leave touched flows internally inconsistent.
+
+---
+
+## PART 4: REGRESSION REVIEW AFTER IMPLEMENTATION
+
+### Objective
+Review what may have been missed and what should be tested.
+
+### Required actions
+Check:
+- main success path
+- failure path and exception handling
+- null / empty / boundary values
+- retry / timeout behavior
+- concurrency and race conditions
+- cache consistency and invalidation
+- transaction consistency
+- async side effects
+- contract compatibility
+- legacy behavior compatibility
+- test coverage gaps
+- rollback or fallback feasibility
+
+### Output
+Provide:
+- Covered scenarios
+- Potentially missed scenarios
+- Recommended tests:
+  - unit
+  - integration
+  - regression
+  - manual verification
+- Release risks
+- Rollback / fallback considerations
+
+### Do not
+- Assume existing tests are sufficient.
+- End with code only.

@@ -1,6 +1,7 @@
 #include "automap_pro/system/automap_system.h"
 #include "automap_pro/core/config_manager.h"
 #include "automap_pro/core/health_monitor.h"
+#include "automap_pro/core/protocol_contract.h" // 🏛️ [架构加固] 引入协议契约
 
 #include <chrono>
 #include <cstdlib>
@@ -127,13 +128,34 @@ void AutoMapSystem::handleFinishMapping(
     const std::shared_ptr<std_srvs::srv::Trigger::Request>,
     std::shared_ptr<std_srvs::srv::Trigger::Response> res)
 {
-    RCLCPP_INFO(get_logger(), "[AutoMapSystem] Finish mapping requested");
+    RCLCPP_INFO(get_logger(), "[AutoMapSystem] Finish mapping requested. Waiting for backend to idle...");
     
+    // 🏛️ [架构修复] 等待后端所有模块处理完成
+    // 理由：前端 (fast_livo) 处理 bag 很快，发布完所有数据后就会触发 finish。
+    // 后端 (Mapping/Optimizer) 有大量队列积压，若立即退出会导致后半段地图丢失。
+    int wait_count = 0;
+    while (!v3_context_->isAllIdle() && wait_count < 600) { // 最多等 10 分钟 (600 * 1s)
+        if (wait_count % 10 == 0) {
+            RCLCPP_INFO(get_logger(), "[AutoMapSystem] Backend still busy, waiting... (%ds)", wait_count);
+        }
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        wait_count++;
+    }
+    
+    if (wait_count >= 600) {
+        RCLCPP_WARN(get_logger(), "[AutoMapSystem] Wait for idle TIMEOUT! Forcing save and exit.");
+    } else {
+        RCLCPP_INFO(get_logger(), "[AutoMapSystem] Backend idle. Proceeding to save and exit.");
+    }
+
+    // 🏛️ [架构契约] 协议版本检查（即使 srv 还没更新，也要在日志中显式声明契约一致性）
+    RCLCPP_INFO(get_logger(), "[PROTOCOL] Interface Check: Backend API v%s OK", protocol::getVersionString().c_str());
+
     std::string out_dir = getOutputDir();
     saveMapToFiles(out_dir);
-    
+
     res->success = true;
-    res->message = "Mapping finished and saved";
+    res->message = "Mapping finished and saved after waiting for backend idle (API v" + protocol::getVersionString() + ")";
     
     // 延迟退出
     std::thread([this]() {

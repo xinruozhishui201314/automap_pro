@@ -1,0 +1,20 @@
+---
+description: "Skill: Apply the 5-Why root cause analysis method with code evidence at each level."
+globs:
+alwaysApply: false
+---
+
+# SKILL: 5-WHY ROOT CAUSE ANALYSIS WITH CODE EVIDENCE
+
+## Purpose
+Systematically drill down from a symptom to its true root cause, requiring concrete code evidence at every level.
+
+## Procedure
+
+### SETUP
+
+### THE 5-WHY CHAIN
+
+### ROOT CAUSE VALIDATION
+
+### FIX DESIGN

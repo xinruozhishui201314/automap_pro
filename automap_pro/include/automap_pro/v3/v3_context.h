@@ -5,6 +5,8 @@
 #include "automap_pro/v3/module_base.h"
 #include "automap_pro/core/logger.h"
 
+#include <rclcpp/rclcpp.hpp>
+
 #include <memory>
 #include <vector>
 #include <mutex>
@@ -13,7 +15,7 @@ namespace automap_pro::v3 {
 
 /**
  * @brief V3 架构上下文 (Architecture Context)
- * 
+ *
  * 职责：
  * 1. 管理整个系统的核心组件 (EventBus, MapRegistry)
  * 2. 挂载和生命周期管理所有模块
@@ -26,11 +28,24 @@ public:
         event_bus_ = std::make_shared<EventBus>();
     }
 
-    void init(rclcpp::Node::SharedPtr /*node*/) {
+    /**
+     * @param node ROS node for timers/logging; may be nullptr during parent ctor
+     *        (shared_from_this() unsafe there). Call attachNode() once a node exists.
+     */
+    void init(rclcpp::Node::SharedPtr node) {
+        node_ = node;
         map_registry_ = std::make_shared<MapRegistry>(event_bus_);
+        startHealthMonitorIfNodeReady();
+    }
+
+    /** Bind node and start periodic health checks (call when shared_from_this() is valid). */
+    void attachNode(rclcpp::Node::SharedPtr node) {
+        node_ = std::move(node);
+        startHealthMonitorIfNodeReady();
     }
 
     ~V3Context() {
+        if (health_timer_) health_timer_->cancel();
         stopAll();
     }
 
@@ -63,11 +78,70 @@ public:
         ALOG_INFO("Pipeline", "[PIPELINE][V3] V3Context::stopAll done");
     }
 
+    /**
+     * @brief 检查所有模块是否空闲
+     */
+    bool isAllIdle() const {
+        std::lock_guard<std::mutex> lock(module_mutex_);
+        for (const auto& mod : modules_) {
+            if (!mod->isIdle()) return false;
+        }
+        return true;
+    }
+
+    /**
+     * @brief 系统健康巡检 (Periodic Health Check)
+     */
+    void checkHealth() {
+        if (!node_) return;
+
+        SystemStatusEvent ev;
+        auto now = std::chrono::steady_clock::now();
+        ev.timestamp = std::chrono::duration<double>(now.time_since_epoch()).count();
+        ev.overall_ok = true;
+
+        {
+            std::lock_guard<std::mutex> lock(module_mutex_);
+            for (const auto& mod : modules_) {
+                ModuleStatus status;
+                status.name = mod->getName();
+                status.last_heartbeat = mod->getLastHeartbeat();
+                status.age_s = ev.timestamp - status.last_heartbeat;
+
+                // 🏛️ 健康阈值：如果模块超过 10s 没有心跳，标记为异常 (Zombie detect)
+                status.ok = (status.age_s < 10.0);
+                if (!status.ok) ev.overall_ok = false;
+                ev.modules.push_back(status);
+
+                if (!status.ok) {
+                    RCLCPP_ERROR_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000,
+                        "[CRITICAL_V3] Module '%s' seems to be HUNG! (age=%.1fs) (grep V3 ZOMBIE)",
+                        status.name.c_str(), status.age_s);
+                }
+            }
+        }
+
+        event_bus_->publish(ev);
+    }
+
 private:
+    void startHealthMonitorIfNodeReady() {
+        if (!node_) return;
+        if (health_timer_) {
+            health_timer_->cancel();
+            health_timer_.reset();
+        }
+        health_timer_ = node_->create_wall_timer(
+            std::chrono::seconds(2), [this]() { this->checkHealth(); });
+        RCLCPP_INFO(node_->get_logger(), "[PIPELINE][V3] Health monitor initialized (2s interval)");
+    }
+
     EventBus::Ptr event_bus_;
     MapRegistry::Ptr map_registry_;
-    
-    std::mutex module_mutex_;
+    rclcpp::Node::SharedPtr node_;
+    rclcpp::TimerBase::SharedPtr health_timer_;
+
+    mutable std::mutex module_mutex_;
     std::vector<ModuleBase::Ptr> modules_;
 };
 

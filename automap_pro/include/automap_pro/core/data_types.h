@@ -59,6 +59,15 @@ enum class GPSAlignState : int {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// 位姿坐标系标记（跨模块协议）
+// ─────────────────────────────────────────────────────────────────────────────
+enum class PoseFrame : int {
+    UNKNOWN = 0,
+    ODOM = 1,
+    MAP = 2,
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
 // IMU 数据（与 ImuProcessor/TimeSync 共用）
 // ─────────────────────────────────────────────────────────────────────────────
 struct ImuData {
@@ -146,6 +155,7 @@ struct KeyFrame {
     Pose3d T_odom_b         = Pose3d::Identity(); // 原始里程计位姿 (odom 系)
     Pose3d T_map_b_optimized  = Pose3d::Identity(); // 优化后位姿 (map 系)
     Pose3d T_submap_kf      = Pose3d::Identity(); // 相对于子图锚点的位姿 (submap 系)
+    PoseFrame pose_frame    = PoseFrame::ODOM;    // 🏛️ [架构契约] 显式标注 T_map_b_optimized 所在的坐标系
     Mat66d covariance       = Mat66d::Identity() * 1e-4;
 
     // 点云（body系下）
@@ -224,6 +234,7 @@ struct SubMap {
     // 锚定位姿
     Pose3d pose_odom_anchor        = Pose3d::Identity(); // 锚点在里程计系下的位姿
     Pose3d pose_map_anchor_optimized = Pose3d::Identity(); // 锚点在地图系下的位姿 (优化后)
+    PoseFrame pose_frame           = PoseFrame::ODOM;    // 🏛️ [架构契约] 显式标注 pose_map_anchor_optimized 所在的坐标系
 
     // 点云
     CloudXYZIPtr merged_cloud;       // 合并点云（世界系）
@@ -290,6 +301,27 @@ struct OptimizationResult {
     double  final_rmse = 0.0;
     std::unordered_map<int, Pose3d> submap_poses;
     std::unordered_map<uint64_t, Pose3d> keyframe_poses;
+    PoseFrame pose_frame = PoseFrame::UNKNOWN; // 🏛️ [架构加固] 显式标注位姿坐标系
+
+    bool isFinite() const {
+        for (const auto& [id, pose] : submap_poses) if (!pose.matrix().allFinite()) return false;
+        for (const auto& [id, pose] : keyframe_poses) if (!pose.matrix().allFinite()) return false;
+        return true;
+    }
+
+    /**
+     * @brief [产品化增强] 检查位姿是否在合理范围内
+     * 防止因优化器数值爆炸导致的地图损毁
+     */
+    bool isReasonable(double max_trans = 5000.0) const {
+        for (const auto& [id, pose] : submap_poses) {
+            if (pose.translation().norm() > max_trans) return false;
+        }
+        for (const auto& [id, pose] : keyframe_poses) {
+            if (pose.translation().norm() > max_trans) return false;
+        }
+        return true;
+    }
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -301,6 +333,20 @@ struct HBAResult {
     int     iterations_per_layer = 0;
     double  elapsed_ms = 0.0;
     std::vector<Pose3d> optimized_poses; // 与输入keyframe顺序一致
+    std::vector<uint64_t> optimized_keyframe_ids; // 与 optimized_poses 一一对应
+    PoseFrame pose_frame = PoseFrame::UNKNOWN; // optimized_poses 所在坐标系
+
+    bool isFinite() const {
+        for (const auto& pose : optimized_poses) if (!pose.matrix().allFinite()) return false;
+        return true;
+    }
+
+    bool isReasonable(double max_trans = 5000.0) const {
+        for (const auto& pose : optimized_poses) {
+            if (pose.translation().norm() > max_trans) return false;
+        }
+        return true;
+    }
 };
 
 // ─────────────────────────────────────────────────────────────────────────────

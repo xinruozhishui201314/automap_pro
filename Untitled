@@ -1,0 +1,1 @@
+使用 `root-cause-investigator` agent 和 `root-cause-analysis` skill分析GPS轨迹跳变和关键帧位姿跳变的根本原因，给出根本原因并最小化修复问题，证据链要闭环？是否还存在其他严重的问题？增强日志，只要出现问题就能看到问题的原因

@@ -64,6 +64,7 @@ void FrontEndModule::run() {
     RCLCPP_INFO(node_->get_logger(), "[V3][FrontEndModule] Started sync thread");
     
     while (running_) {
+        updateHeartbeat();
         FrameToProcess f;
         bool woke_by_data = frame_processor_.tryPopFrame(100, f);
         if (!running_) break;
@@ -102,9 +103,17 @@ void FrontEndModule::run() {
         event.kf_info = kfinfo_copy;
         event.has_gps = has_gps;
         event.gps = matched_gps;
+        event.pose_frame = PoseFrame::ODOM; // 🏛️ [架构契约] 显式标注前端产出为 ODOM 系
+        event.cloud_frame = ConfigManager::instance().frontendCloudFrame();
         event.ref_map_version = map_registry_->getVersion();
 
-        event_bus_->publish(event);
+        if (event.isValid()) {
+            event_bus_->publish(event);
+        } else {
+            RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000,
+                "[V3][CONTRACT] Dropping invalid SyncedFrameEvent (NaN/null/invalid cloud_frame=%s)",
+                event.cloud_frame.c_str());
+        }
     }
 }
 

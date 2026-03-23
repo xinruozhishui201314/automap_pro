@@ -11,8 +11,14 @@
 #include <memory>
 #include <vector>
 #include <atomic>
+#include <string>
 
 namespace automap_pro::v3 {
+
+enum class OptimizationTransformFlags : uint32_t {
+    NONE = 0u,
+    MAP_COMPENSATION_APPLIED = 1u << 0u
+};
 
 /**
  * @brief 核心地图注册中心 (Central Map Registry)
@@ -60,7 +66,11 @@ public:
      * @return 新的版本号
      */
     uint64_t updatePoses(const std::unordered_map<int, Pose3d>& sm_updates,
-                         const std::unordered_map<uint64_t, Pose3d>& kf_updates);
+                         const std::unordered_map<uint64_t, Pose3d>& kf_updates,
+                         PoseFrame pose_frame,
+                         const std::string& source_module,
+                         uint32_t transform_applied_flags = static_cast<uint32_t>(OptimizationTransformFlags::NONE),
+                         uint64_t batch_hash = 0);
 
     /**
      * @brief 获取当前版本号
@@ -189,6 +199,10 @@ struct GPSAlignedEvent {
     Eigen::Matrix3d R_enu_to_map;
     Eigen::Vector3d t_enu_to_map;
     double rmse;
+
+    bool isValid() const {
+        return R_enu_to_map.allFinite() && t_enu_to_map.allFinite() && std::isfinite(rmse);
+    }
 };
 
 struct GPSFactorEvent {
@@ -212,8 +226,22 @@ struct IntraLoopTaskEvent {
 
 struct OptimizationResultEvent {
     uint64_t version;
+    uint64_t event_id = 0;
     std::unordered_map<int, Pose3d> submap_poses;
     std::unordered_map<uint64_t, Pose3d> keyframe_poses;
+    std::string source_module = "unknown";
+    uint32_t transform_applied_flags = 0;
+    uint64_t batch_hash = 0;
+    PoseFrame pose_frame = PoseFrame::MAP; // 🏛️ [架构加固] 显式标注位姿坐标系
+
+    bool isValid() const {
+        if (event_id == 0 || version == 0) return false;
+        if (pose_frame == PoseFrame::UNKNOWN) return false;
+        if (source_module.empty()) return false;
+        for (const auto& [id, pose] : submap_poses) if (!pose.matrix().allFinite()) return false;
+        for (const auto& [id, pose] : keyframe_poses) if (!pose.matrix().allFinite()) return false;
+        return true;
+    }
 };
 
 // --- 传感器与前端事件 (Sensor & FrontEnd Events) ---
@@ -243,6 +271,8 @@ struct SyncedFrameEvent {
     CloudXYZIPtr cloud_ds; // Downsampled
     Pose3d T_odom_b;
     Mat66d covariance;
+    PoseFrame pose_frame = PoseFrame::ODOM; // 🏛️ [架构契约] 显式标注 T_odom_b 的坐标系语义
+    std::string cloud_frame = "body";       // 🏛️ [架构契约] 显式标注 cloud/cloud_ds 的坐标系语义：body/world
     LivoKeyFrameInfo kf_info;
     
     // GPS 观测 (可选)
@@ -252,6 +282,20 @@ struct SyncedFrameEvent {
     // 🏛️ 生产级确定性：本帧依赖的地图版本
     // MappingModule 必须等待 MapRegistry 达到此版本后才处理本帧，确保坐标系一致
     uint64_t ref_map_version = 0;
+
+    bool isValid() const {
+        if (!std::isfinite(timestamp)) return false;
+        if (!cloud || cloud->empty()) return false;
+        if (!T_odom_b.matrix().allFinite()) return false;
+        if (!covariance.allFinite()) return false;
+        if (pose_frame == PoseFrame::UNKNOWN) return false;
+        if (cloud_frame != "body" && cloud_frame != "world") return false;
+        if (has_gps) {
+            if (!gps.position_enu.allFinite()) return false;
+            if (!gps.covariance.allFinite()) return false;
+        }
+        return true;
+    }
 };
 
 // --- 图维护事件 (Graph Maintenance Events) ---
@@ -284,6 +328,21 @@ struct GlobalMapBuildRequestEvent {
 
 struct GlobalMapBuildResultEvent {
     CloudXYZIPtr global_map;
+};
+
+// --- 系统健康与状态事件 (System Health & Status Events) ---
+
+struct ModuleStatus {
+    std::string name;
+    bool ok;
+    double last_heartbeat;
+    double age_s;
+};
+
+struct SystemStatusEvent {
+    double timestamp;
+    std::vector<ModuleStatus> modules;
+    bool overall_ok;
 };
 
 } // namespace automap_pro::v3

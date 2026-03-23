@@ -1,0 +1,240 @@
+---
+description: "SOP for debugging bugs, incidents, exceptions, intermittent failures, and performance issues in large projects."
+globs:
+alwaysApply: false
+---
+
+# BUG ANALYSIS SOP — LARGE PROJECT TROUBLESHOOTING
+
+Activate this SOP when the user reports:
+- a bug
+- an exception
+- unexpected behavior
+- a logic error
+- an intermittent failure
+- a data inconsistency
+- a performance degradation
+- a production or integration issue
+
+Follow this process strictly.
+
+---
+
+## PHASE 1: PROBLEM INTAKE
+
+### Objective
+Understand the issue precisely before investigating.
+
+### Required actions
+Restate and clarify:
+- observed behavior
+- expected behavior
+- trigger conditions
+- reproducibility
+- whether the issue is intermittent, data-dependent, environment-dependent, or release-related
+- when it started
+- whether recent changes may be relevant
+
+### Output
+Provide:
+- Problem summary
+- Known symptoms
+- Initial scope assumptions
+- Missing clarifications
+
+### Do not
+- Assume the report is already precise enough.
+- Jump to a fix before the problem is framed.
+
+---
+
+## PHASE 2: SCOPE & SYSTEM MAPPING
+
+### Objective
+Map the relevant part of the system before forming conclusions.
+
+### Required actions
+Identify and describe:
+- likely entry point
+- relevant call chain
+- key transformations
+- state mutations
+- branch conditions
+- external integrations
+- module or layer boundaries
+- config-dependent paths
+- likely historical or compatibility-sensitive areas
+
+If context is insufficient, ask for only the highest-signal artifacts.
+
+### Output
+Provide:
+- Relevant execution path
+- Likely involved files/modules/layers
+- Boundary crossings
+- Missing high-signal context
+
+### Do not
+- Limit reasoning to the currently open file.
+- Assume local code is the whole problem.
+
+---
+
+## PHASE 3: CANDIDATE ROOT CAUSES
+
+### Objective
+Generate multiple plausible explanations before narrowing down.
+
+### Required actions
+- Provide at least 3 candidate root causes when possible.
+- Rank them by likelihood.
+- For each candidate root cause, explain:
+  - why it is plausible
+  - which observed facts it explains
+  - which facts it does not fully explain
+  - whether runtime evidence is required
+
+### Output
+Provide:
+- Candidate root causes
+- Likelihood ranking
+- Confidence notes
+- Contradictions or unexplained observations
+
+### Do not
+- Collapse too early to one explanation without evidence.
+- Present assumptions as confirmed truth.
+
+---
+
+## PHASE 4: VALIDATION STRATEGY
+
+### Objective
+Design the smallest, highest-signal path to confirm or reject candidates.
+
+### Required actions
+For each major candidate:
+- identify what evidence would confirm it
+- identify what evidence would weaken or disprove it
+- identify the next file/log/config/trace/test/runtime artifact to inspect
+
+Prioritize:
+- highest-likelihood candidates
+- highest-signal validation steps
+- the smallest next step that meaningfully reduces uncertainty
+
+### Output
+Provide:
+- Candidate-by-candidate validation plan
+- Smallest next debugging step
+- Notes on what static analysis can and cannot confirm
+
+### Do not
+- Ask for everything at once if a smaller targeted check would do.
+- Pretend missing runtime evidence is already known.
+
+---
+
+## PHASE 5: ROOT-CAUSE SUMMARY
+
+### Objective
+Summarize the most likely cause without overstating confidence.
+
+### Required actions
+- State the most likely root cause or top remaining candidates.
+- Explicitly explain why this is likely.
+- Explain what is confirmed versus still uncertain.
+- Explain whether the visible error point is the true cause or only the failure surface.
+
+### Output
+Provide:
+- Root-cause summary
+- Evidence used
+- Remaining uncertainty
+- Why alternative explanations were deprioritized
+
+### Do not
+- Overclaim certainty.
+- Hide unresolved ambiguity.
+
+---
+
+## PHASE 6: FIX DIRECTION
+
+### Objective
+Propose a fix approach that addresses root cause, not only the symptom.
+
+### Required actions
+- Explain how the proposed fix addresses the likely root cause.
+- When relevant, compare:
+  - minimal fix
+  - balanced fix
+  - ideal long-term correction
+- Note trade-offs if the fix is intentionally partial.
+
+### Output
+Provide:
+- Fix options
+- Recommended direction
+- Why it is root-cause-oriented
+
+### Do not
+- Suggest a patch that only suppresses the symptom without discussing trade-offs.
+
+---
+
+## INTERNAL DEBUGGING PROMPTS
+
+Use these internal prompts when deeper reasoning is needed.
+
+### Trace Error Origin
+Trace this issue backward from the visible error point to possible upstream causes.
+Map:
+- entry point
+- intermediate transformations
+- state mutations
+- downstream dependencies
+- where invalid state may first appear
+
+Do not stop at the crash point unless evidence shows it is the true origin.
+
+### State Corruption Hunt
+Assume the visible error may be caused by earlier invalid state propagation.
+Trace:
+- where the affected state is created
+- where it is transformed
+- where it may become stale, partial, null, inconsistent, or incompatible
+- where assumptions about that state are enforced or violated
+
+### Intermittent Failure Hunt
+Assume this problem only happens sometimes.
+Check possibilities involving:
+- race conditions
+- timing-sensitive behavior
+- cache inconsistency
+- partial state
+- retry ordering
+- async processing
+- environment differences
+- historical data anomalies
+
+Rank the candidates and explain how to validate each one.
+
+### Integration Boundary Failure
+Analyze whether the issue may come from an integration boundary:
+- external service contract drift
+- serialization/deserialization mismatch
+- schema mismatch
+- timeout/retry mismatch
+- stale assumptions in adapters
+- partial failure handling
+
+List the most likely boundary failure points and how to test them.
+
+### Performance Bottleneck Isolation
+Do not propose optimization yet.
+First identify:
+- likely hotspots visible in code
+- what must be confirmed by runtime evidence
+- what metrics, traces, logs, or profiling data would best distinguish candidates
+- the smallest next validation step

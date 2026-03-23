@@ -12,7 +12,6 @@
 #include "automap_pro/v3/mapping_module.h"
 
 #include <rclcpp/rclcpp.hpp>
-#include <rclcpp_components/register_node_macro.hpp>
 #include <nav_msgs/msg/path.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/msg/imu.hpp>
@@ -145,5 +144,3 @@ private:
 };
 
 } // namespace automap_pro
-
-RCLCPP_COMPONENTS_REGISTER_NODE(automap_pro::AutoMapSystem)

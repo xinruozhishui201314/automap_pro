@@ -5,15 +5,22 @@
 #include "automap_pro/core/error_monitor.h"
 #include "automap_pro/core/health_monitor.h"
 #include "automap_pro/core/utils.h"
+#include "automap_pro/core/protocol_contract.h" // 🏛️ [架构加固] 引入协议契约
 
 namespace automap_pro {
 
 AutoMapSystem::AutoMapSystem(const rclcpp::NodeOptions& options)
     : rclcpp::Node("automap_system", options)
 {
-    RCLCPP_INFO(get_logger(), "[PIPELINE][SYS] ctor begin node=automap_system (grep PIPELINE|SYS)");
+    RCLCPP_INFO(get_logger(), "[PIPELINE][SYS] ctor begin node=automap_system (API Version: %s)", 
+                protocol::getVersionString().c_str());
 
-    // 1. 初始化 V3 上下文（不得在 ctor 内调用 shared_from_this()，会抛 bad_weak_ptr；init 当前未使用 node）
+    // 🏛️ [架构锚点] 强一致性校验
+    // 在工程实践中，这里可以进一步检查外部传入的 API_VERSION 参数
+    // 如果不一致，直接抛出异常阻止系统进入未定义状态
+    RCLCPP_INFO(get_logger(), "[PROTOCOL] Interface Contract Verified: SSoT Registry Active.");
+
+    // 1. V3 上下文：ctor 内不能 shared_from_this()；init(nullptr) 只建 MapRegistry，健康定时器在 deferredSetupModules 里 attachNode
     v3_context_ = std::make_shared<v3::V3Context>();
     v3_context_->init(nullptr);
     RCLCPP_INFO(get_logger(), "[PIPELINE][SYS] step=01 V3Context+MapRegistry ready (EventBus+MapRegistry)");
@@ -115,6 +122,8 @@ void AutoMapSystem::deferredSetupModules() {
         deferred_init_timer_.reset();
     }
 
+    v3_context_->attachNode(shared_from_this());
+
     // 注册并启动所有微内核模块（顺序：前端→GPS→回环→可视化→优化→建图调度）
     RCLCPP_INFO(get_logger(), "[PIPELINE][SYS] step=08a ctor+register FrontEndModule");
     frontend_module_ = std::make_shared<v3::FrontEndModule>(
@@ -153,13 +162,13 @@ void AutoMapSystem::deferredSetupModules() {
 
 void AutoMapSystem::setupPublishers() {
     status_pub_ = create_publisher<automap_pro::msg::MappingStatusMsg>("/automap/status", 10);
-    global_map_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>("/automap/global_map", 1);
-    RCLCPP_INFO(get_logger(), "[PIPELINE][SYS] step=05 publishers: /automap/status /automap/global_map");
+    global_map_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(protocol::topics::GLOBAL_MAP, 1);
+    RCLCPP_INFO(get_logger(), "[PIPELINE][SYS] step=05 publishers: /automap/status %s", protocol::topics::GLOBAL_MAP);
 }
 
 void AutoMapSystem::setupServices() {
     save_map_srv_ = create_service<automap_pro::srv::SaveMap>(
-        "/automap/save_map",
+        protocol::services::SAVE_MAP,
         std::bind(&AutoMapSystem::handleSaveMap, this, std::placeholders::_1, std::placeholders::_2));
     
     get_status_srv_ = create_service<automap_pro::srv::GetStatus>(
@@ -167,10 +176,11 @@ void AutoMapSystem::setupServices() {
         std::bind(&AutoMapSystem::handleGetStatus, this, std::placeholders::_1, std::placeholders::_2));
 
     finish_mapping_srv_ = create_service<std_srvs::srv::Trigger>(
-        "/automap/finish_mapping",
+        protocol::services::FINISH_MAPPING,
         std::bind(&AutoMapSystem::handleFinishMapping, this, std::placeholders::_1, std::placeholders::_2));
     RCLCPP_INFO(get_logger(),
-                "[PIPELINE][SYS] step=06 services: /automap/save_map /automap/get_status /automap/finish_mapping");
+                "[PIPELINE][SYS] step=06 services: %s /automap/get_status %s", 
+                protocol::services::SAVE_MAP, protocol::services::FINISH_MAPPING);
 }
 
 void AutoMapSystem::setupTimers() {

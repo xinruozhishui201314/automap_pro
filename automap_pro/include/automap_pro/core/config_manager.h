@@ -8,6 +8,7 @@
 #include <yaml-cpp/yaml.h>
 #include <Eigen/Dense>
 #include <rclcpp/rclcpp.hpp>
+#include "automap_pro/core/protocol_contract.h" // 🏛️ [架构加固] 注入契约
 
 namespace automap_pro {
 
@@ -39,6 +40,8 @@ public:
     double      sensorIdleTimeoutSec() const { return std::max(1.0, sensor_idle_timeout_sec_); }
     /** 是否在传感器空闲超时后自动执行最终 HBA、导出地图并结束建图 */
     bool        autoFinishOnSensorIdle() const { return get<bool>("system.auto_finish_on_sensor_idle", true); }
+    bool        contractStrictMode() const { return contract_strict_mode_; }
+    std::string contractFramePolicy() const { return contract_frame_policy_; }
     /** 离线模式“播完再结束”；load() 时从 system 节缓存 */
     bool        offlineFinishAfterBag() const {
         if (system_queue_cached_) return system_offline_finish_after_bag_;
@@ -402,6 +405,11 @@ public:
         int v = get<int>("backend.publish_global_map_every_n_processed", 100);
         return std::max(50, std::min(1000, v));
     }
+    /** SubMap 合并线程数（原固定 4，现支持配置）。默认 8，建议 8~10。 */
+    int backendSubmapMergeThreads() const {
+        int v = get<int>("backend.submap_merge_threads", 8);
+        return std::max(1, std::min(32, v));
+    }
     /** 关键帧之间里程计因子的噪声参数 (trans_m, rot_rad) */
     double kfOdomTransNoise() const { return get<double>("backend.keyframe_odom_trans_noise", 0.005); }
     double kfOdomRotNoise()   const { return get<double>("backend.keyframe_odom_rot_noise",   0.01); }
@@ -424,14 +432,11 @@ public:
     }
 
     // ── 性能优化（performance.*）────────────────────────────────────────────
-    bool asyncGlobalMapBuild() const { return get<bool>("performance.async_global_map_build", true); }
-    bool asyncIsam2Update() const { return get<bool>("performance.async_isam2_update", false); }
-    bool parallelVoxelDownsample() const { return get<bool>("performance.parallel_voxel_downsample", true); }
-    bool parallelTeaserMatch() const { return get<bool>("performance.parallel_teaser_match", true); }
-    int maxOptimizationQueueSize() const {
-        int v = get<int>("performance.max_optimization_queue_size", 64);
-        return std::max(4, std::min(256, v));
-    }
+    bool asyncGlobalMapBuild() const { return perf_async_global_map_build_; }
+    bool asyncIsam2Update() const { return perf_async_isam2_update_; }
+    bool parallelVoxelDownsample() const { return perf_parallel_voxel_downsample_; }
+    bool parallelTeaserMatch() const { return perf_parallel_teaser_match_; }
+    int maxOptimizationQueueSize() const { return perf_max_optimization_queue_size_; }
 
     // ── iSAM2 ─────────────────────────────────────────────
     double isam2RelinThresh()   const { return get<double>("backend.isam2.relinearize_threshold", 0.01); }
@@ -448,7 +453,7 @@ public:
     bool   hbaEnabled()         const { return get<bool>("backend.hba.enabled", true); }
     int    hbaTotalLayers()     const { return get<int>("backend.hba.total_layer_num", 3); }
     int    hbaThreadNum()       const { return get<int>("backend.hba.thread_num", 8); }
-    int    hbaTriggerSubmaps()  const { return get<int>("backend.hba.trigger_every_n_submaps", 10); }
+    int    hbaTriggerSubmaps()  const { return std::max(1, get<int>("backend.hba.trigger_every_n_submaps", 10)); }
     bool   hbaOnLoop()          const { return get<bool>("backend.hba.trigger_on_loop", false); }
     bool   hbaOnFinish()        const { return get<bool>("backend.hba.trigger_on_finish", true); }
     std::string hbaDataPath()   const { return get<std::string>("backend.hba.data_path", "/tmp/hba_data"); }
@@ -482,6 +487,13 @@ public:
     std::vector<std::string> previousSessionDirs() const;
 
 private:
+    // 性能参数缓存（避免运行时访问 YAML::Node 导致多线程崩溃）
+    bool perf_async_global_map_build_{true};
+    bool perf_async_isam2_update_{false};
+    bool perf_parallel_voxel_downsample_{true};
+    bool perf_parallel_teaser_match_{true};
+    int  perf_max_optimization_queue_size_{64};
+
     YAML::Node cfg_;
     /** 加载过的配置文件路径；全工程唯一源，用于“只加载一次”守卫与 configFilePath() */
     std::string config_file_path_;
@@ -525,6 +537,8 @@ private:
     /** load() 时从 sensor.gps.enabled 读入并缓存，避免 gpsEnabled() 与 load() 内诊断不一致（见 LOG_ANALYSIS） */
     bool sensor_gps_enabled_cached_{false};
     bool sensor_gps_enabled_value_{false};
+    bool contract_strict_mode_{false};
+    std::string contract_frame_policy_{"compat"};
 
     /** 从 flat_params_cache_ 解析字符串为 T，get() 在 node 路径失败时回退使用 */
     template<typename T>
@@ -545,6 +559,15 @@ private:
 
     template<typename T>
     T get(const std::string& key, const T& default_val) const {
+        // ========== [架构安全] 优先从扁平化缓存读取，避免并发访问 YAML::Node 导致 SIGSEGV ==========
+        auto it = flat_params_cache_.find(key);
+        if (it != flat_params_cache_.end()) {
+            try {
+                return parseFlatValue<T>(it->second, default_val);
+            } catch (...) {}
+        }
+
+        // 仅在 load() 过程中或缓存未命中时尝试访问原始 YAML（此时应持锁或单线程）
         try {
             YAML::Node node = cfg_;
             std::istringstream ss(key);
@@ -563,12 +586,7 @@ private:
                 } catch (...) {}
             }
         } catch (...) {}
-        auto it = flat_params_cache_.find(key);
-        if (it != flat_params_cache_.end()) {
-            try {
-                return parseFlatValue<T>(it->second, default_val);
-            } catch (...) {}
-        }
+        
         return default_val;
     }
 

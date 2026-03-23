@@ -358,6 +358,7 @@ loop_closure:
 # ── 3.4 后端优化（ISAM2、HBA）────────────────────────────────────────────────
 # HBA 键与 params_from_system_config.get_hba_params / get_hba_cal_mme_params / get_hba_visualize_params 一致
 backend:
+  submap_merge_threads: 10   # 推荐 8~10
   # 调试阶段：true=每个计算环节打 BACKEND_TRACE 便于证据链闭环；发布阶段置 false 关闭
   verbose_trace: true
   # 每隔多少帧处理一帧（1=每帧都处理；5=默认跳过4帧处理1帧；10=减少处理频率减轻后端压力）

@@ -54,6 +54,9 @@ public:
     /** 批量更新子图位姿（来自 iSAM2 优化结果），比逐个调用 updateSubmapPose 更高效，且支持版本号一致性 */
     void batchUpdateSubmapPoses(const std::unordered_map<int, Pose3d>& updates, uint64_t version);
 
+    /** 🏛️ [架构加固] 批量更新关键帧绝对位姿（SSoT 语义网关应用） */
+    void batchUpdateKeyFramePoses(const std::unordered_map<uint64_t, Pose3d>& updates, uint64_t version);
+
     /** 批量更新子图位姿（来自 HBA 结果） */
     void updateAllFromHBA(const HBAResult& result);
 
@@ -100,6 +103,14 @@ public:
 
     /** 更新子图的 GPS 重力中心 */
     void updateGPSGravityCenter(const KeyFrame::Ptr& kf);
+
+    /** 检查子图管理器是否空闲（没有正在进行的合并或后处理任务） */
+    bool isIdle() const {
+        std::lock_guard<std::mutex> lk(merge_mutex_);
+        std::lock_guard<std::mutex> lk2(freeze_post_mutex_);
+        return merge_queue_.empty() && freeze_post_queue_.empty() && 
+               active_merge_tasks_.load() == 0;
+    }
 
     /** 发布错误事件到 ROS2 话题 */
     void publishErrorEvent(int submap_id, const automap_pro::ErrorDetail& error);
@@ -203,7 +214,7 @@ private:
     // 子图冻结后处理异步：voxel(merged_cloud)→downsampled_cloud 与 frozen_cbs_ 在专用线程执行，避免阻塞 addKeyFrame（有界队列+超时防死锁）
     static constexpr size_t   kMaxFreezePostQueueSize = 128;
     std::queue<SubMap::Ptr>   freeze_post_queue_;
-    std::mutex                freeze_post_mutex_;
+    mutable std::mutex        freeze_post_mutex_;  // isIdle() 等 const 方法需检查队列
     std::condition_variable   freeze_post_cv_;
     std::thread               freeze_post_thread_;
     std::atomic<bool>         freeze_post_running_{true};
@@ -215,11 +226,13 @@ private:
         KeyFrame::Ptr kf;
     };
     static constexpr size_t   kMaxMergeQueueSize = 256;
+    int                       merge_thread_count_ = 4;
     std::queue<MergeTask>     merge_queue_;
-    std::mutex                merge_mutex_;
+    mutable std::mutex        merge_mutex_;  // isIdle() 等 const 方法需检查队列
     std::condition_variable   merge_cv_;
-    std::thread               merge_thread_;
+    std::vector<std::thread>  merge_threads_; // 🏛️ [P0 性能优化] 支持多线程合并
     std::atomic<bool>         merge_running_{true};
+    std::atomic<int>          active_merge_tasks_{0}; // 🏛️ [修复] 跟踪正在处理的任务数，用于 isIdle 判断
     void mergeWorkerLoop();
 
     // ── 私有方法 ──────────────────────────────────────────────────────────

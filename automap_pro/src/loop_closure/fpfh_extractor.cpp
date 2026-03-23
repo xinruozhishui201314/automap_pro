@@ -16,17 +16,17 @@
 
 #define MOD "FPFHExtractor"
 
-// 崩溃精准分析：关键步骤带 ts_ms/lwp，同时写 cerr，便于与系统日志和 GDB info threads 对应
+// 崩溃精准分析：关键步骤带 ts_ms/lwp，使用 stderr 绕过 spdlog 以防 heap 损坏或 shutdown 导致的 logger 崩溃
 #define _FPFH_TS_MS() (std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count())
 #define FPFH_CRASH_LOG(step, msg) do { \
     auto _ts = _FPFH_TS_MS(); \
-    ALOG_INFO(MOD, "[CRASH_TRACE][tid={}][lwp={}][ts_ms={}] {} {}", automap_pro::logThreadId(), automap_pro::logLwp(), _ts, step, msg); \
-    std::cerr << "[FPFH_CRASH_TRACE] ts_ms=" << _ts << " lwp=" << automap_pro::logLwp() << " " << step << " " << msg << std::endl; \
+    fprintf(stderr, "[FPFH_CRASH_TRACE][lwp=%ld][ts_ms=%lu] %s %s\n", automap_pro::logLwp(), (unsigned long)_ts, step, msg); \
+    fflush(stderr); \
 } while(0)
 #define FPFH_CRASH_LOG_PTR(step, msg, ptr, size) do { \
     auto _ts = _FPFH_TS_MS(); \
-    ALOG_INFO(MOD, "[CRASH_TRACE][tid={}][lwp={}][ts_ms={}] {} {} ptr={} size={}", automap_pro::logThreadId(), automap_pro::logLwp(), _ts, step, msg, static_cast<const void*>(ptr), (size)); \
-    std::cerr << "[FPFH_CRASH_TRACE] ts_ms=" << _ts << " lwp=" << automap_pro::logLwp() << " " << step << " " << msg << " ptr=" << static_cast<const void*>(ptr) << " size=" << (size) << std::endl; \
+    fprintf(stderr, "[FPFH_CRASH_TRACE][lwp=%ld][ts_ms=%lu] %s %s ptr=%p size=%zu\n", automap_pro::logLwp(), (unsigned long)_ts, step, msg, static_cast<const void*>(ptr), (size_t)(size)); \
+    fflush(stderr); \
 } while(0)
 
 // 在关键步骤可选打印 backtrace（环境变量 AUTOMAP_FPFH_BACKTRACE=1 时启用）
@@ -229,104 +229,94 @@ FPFHCloudPtr FpfhExtractor::compute(
         ALOG_INFO(MOD, "[tid={}] [STEP=1.0] LOCK ACQUIRED", tid);
         if (enableBacktraceLog()) logBacktraceToStderr("after_lock_acquired");
 
-        // === 阶段1：法向量（heap 分配、永不 delete，避免 exit 时析构 free 崩溃，见 PCL #4877）===
-        ALOG_INFO(MOD, "[tid={}] [STEP=1.1] NORMAL ESTIMATION START", tid);
-        auto normals = std::make_shared<pcl::PointCloud<pcl::Normal>>();
+    // === 阶段1：法向量（heap 分配、永不 delete，避免 exit 时析构 free 崩溃，见 PCL #4877）===
+    // 🏛️ [安全增强] 增加 PCL 1.11 状态机防御，防止 setInputCloud 内部引用计数损坏
+    FPFH_CRASH_LOG("1.1", "ne_init_check");
+    static pcl::NormalEstimation<pcl::PointXYZI, pcl::Normal>* ne_ptr = nullptr;
+    if (!ne_ptr) {
+        ne_ptr = new pcl::NormalEstimation<pcl::PointXYZI, pcl::Normal>();
+        FPFH_CRASH_LOG("1.1", "ne_ptr_created");
+    }
+    pcl::NormalEstimation<pcl::PointXYZI, pcl::Normal>& ne = *ne_ptr;
 
-        static pcl::NormalEstimation<pcl::PointXYZI, pcl::Normal>* ne_ptr = nullptr;
-        if (!ne_ptr) ne_ptr = new pcl::NormalEstimation<pcl::PointXYZI, pcl::Normal>();
-        pcl::NormalEstimation<pcl::PointXYZI, pcl::Normal>& ne = *ne_ptr;
-        pcl::search::KdTree<pcl::PointXYZI>::Ptr tree_n;
-        try {
-            tree_n = std::make_shared<pcl::search::KdTree<pcl::PointXYZI>>();
-        } catch (const std::exception& e) {
-            ALOG_ERROR(MOD, "[tid={}] [STEP=1.1] kdtree exception msg={}", tid, e.what());
-            return std::make_shared<FPFHCloud>();
-        }
-        if (!tree_n) {
-            ALOG_ERROR(MOD, "[tid={}] [STEP=1.1] kdtree null", tid);
-            return std::make_shared<FPFHCloud>();
-        }
-        FPFH_CRASH_LOG("1.1", "kdtree_created");
+    auto normals = std::make_shared<pcl::PointCloud<pcl::Normal>>();
+    pcl::search::KdTree<pcl::PointXYZI>::Ptr tree_n;
+    try {
+        tree_n = std::make_shared<pcl::search::KdTree<pcl::PointXYZI>>();
+    } catch (const std::exception& e) {
+        ALOG_ERROR(MOD, "[tid={}] [STEP=1.1] kdtree exception msg={}", tid, e.what());
+        return std::make_shared<FPFHCloud>();
+    }
+    FPFH_CRASH_LOG("1.2", "kdtree_created");
 
-        if (!working_cloud || !working_cloud.get() || working_cloud->empty()) {
-            ALOG_ERROR(MOD, "[tid={}] [STEP=1.3] working_cloud invalid before setInputCloud", tid);
-            return std::make_shared<FPFHCloud>();
-        }
-        FPFH_CRASH_LOG_PTR("1.3a", "ne_setInputCloud_before", working_cloud.get(), working_cloud->size());
-        try {
-            ne.setInputCloud(working_cloud);
-        } catch (const std::exception& e) {
-            ALOG_ERROR(MOD, "[tid={}] [STEP=1.3a] ne.setInputCloud exception msg={}", tid, e.what());
-            return std::make_shared<FPFHCloud>();
-        }
-        FPFH_CRASH_LOG("1.3b", "ne_setInputCloud_done");
-        try {
-            ne.setSearchMethod(tree_n);
-            ne.setRadiusSearch(normal_radius);
-        } catch (const std::exception& e) {
-            ALOG_ERROR(MOD, "[tid={}] [STEP=1.3b] ne.setSearchMethod/setRadiusSearch exception msg={}", tid, e.what());
-            return std::make_shared<FPFHCloud>();
-        }
-        FPFH_CRASH_LOG("1.6", "ne_compute_start");
-        try {
-            ne.compute(*normals);
-        } catch (const std::exception& e) {
-            ALOG_ERROR(MOD, "[tid={}] [STEP=1.6] ne.compute exception msg={}", tid, e.what());
-            return std::make_shared<FPFHCloud>();
-        }
-        FPFH_CRASH_LOG_PTR("1.6", "ne_compute_success", normals.get(), normals ? normals->size() : 0u);
-        ALOG_INFO(MOD, "[tid={}] [STEP=1.9] NORMAL ESTIMATION COMPLETE normals_size={}", tid, normals ? normals->size() : 0u);
+    // 🏛️ [P0 修复] 严防 setInputCloud(nullptr/empty)：PCL 1.11 会在下次 replace 引用时解引用 null 指针
+    if (!working_cloud || working_cloud->empty()) {
+        ALOG_ERROR(MOD, "[tid={}] [STEP=1.3] CRITICAL: working_cloud is empty before ne.setInputCloud", tid);
+        return std::make_shared<FPFHCloud>();
+    }
 
-        // === 阶段2：FPFH（heap 分配、永不 delete，避免 exit 时析构 Eigen aligned_free 崩溃）===
-        ALOG_INFO(MOD, "[tid={}] [STEP=2.0] FPFH COMPUTATION START cloud_ptr={} normals_ptr={}",
-                  tid, static_cast<const void*>(working_cloud.get()), static_cast<const void*>(normals.get()));
+    FPFH_CRASH_LOG_PTR("1.3a", "ne_setInputCloud_before", working_cloud.get(), working_cloud->size());
+    try {
+        ne.setInputCloud(working_cloud);
+        ne.setSearchMethod(tree_n);
+        ne.setRadiusSearch(normal_radius);
+    } catch (const std::exception& e) {
+        ALOG_ERROR(MOD, "[tid={}] [STEP=1.3] ne.setInput/Search exception msg={}", tid, e.what());
+        return std::make_shared<FPFHCloud>();
+    }
+    FPFH_CRASH_LOG("1.5", "ne_params_set");
 
-        static pcl::FPFHEstimation<pcl::PointXYZI, pcl::Normal, pcl::FPFHSignature33>* fpfh_ptr = nullptr;
-        if (!fpfh_ptr) fpfh_ptr = new pcl::FPFHEstimation<pcl::PointXYZI, pcl::Normal, pcl::FPFHSignature33>();
-        pcl::FPFHEstimation<pcl::PointXYZI, pcl::Normal, pcl::FPFHSignature33>& fpfh = *fpfh_ptr;
-        pcl::search::KdTree<pcl::PointXYZI>::Ptr tree_f;
-        try {
-            tree_f = std::make_shared<pcl::search::KdTree<pcl::PointXYZI>>();
-        } catch (const std::exception& e) {
-            ALOG_ERROR(MOD, "[tid={}] [STEP=2.1] fpfh kdtree exception msg={}", tid, e.what());
-            return std::make_shared<FPFHCloud>();
-        }
-        if (!tree_f) {
-            ALOG_ERROR(MOD, "[tid={}] [STEP=2.1] fpfh kdtree null", tid);
-            return std::make_shared<FPFHCloud>();
-        }
+    FPFH_CRASH_LOG("1.6", "ne_compute_start");
+    try {
+        ne.compute(*normals);
+    } catch (const std::exception& e) {
+        ALOG_ERROR(MOD, "[tid={}] [STEP=1.6] ne.compute exception msg={}", tid, e.what());
+        return std::make_shared<FPFHCloud>();
+    }
+    FPFH_CRASH_LOG_PTR("1.7", "ne_compute_success", normals.get(), normals->size());
 
-        if (!working_cloud || !working_cloud.get() || working_cloud->empty()) {
-            ALOG_ERROR(MOD, "[tid={}] [STEP=2.3] working_cloud invalid before fpfh setInputCloud", tid);
-            return std::make_shared<FPFHCloud>();
-        }
-        if (!normals || !normals.get() || normals->size() != working_cloud->size()) {
-            ALOG_ERROR(MOD, "[tid={}] [STEP=2.3] normals invalid ptr={} n_size={} cloud_size={}", tid,
-                       static_cast<const void*>(normals.get()), normals ? normals->size() : 0u, working_cloud->size());
-            return std::make_shared<FPFHCloud>();
-        }
-        FPFH_CRASH_LOG_PTR("2.3a", "fpfh_setInputCloud_before", working_cloud.get(), working_cloud->size());
-        try {
-            fpfh.setInputCloud(working_cloud);
-            fpfh.setInputNormals(normals);
-            fpfh.setSearchMethod(tree_f);
-            fpfh.setRadiusSearch(fpfh_radius);
-        } catch (const std::exception& e) {
-            ALOG_ERROR(MOD, "[tid={}] [STEP=2.3] fpfh setInput exception msg={}", tid, e.what());
-            return std::make_shared<FPFHCloud>();
-        }
-        FPFH_CRASH_LOG("2.5", "fpfh_setInput_done");
-        if (enableBacktraceLog()) logBacktraceToStderr("before_fpfh_compute");
+    // === 阶段2：FPFH（heap 分配、永不 delete，避免 exit 时析构 Eigen aligned_free 崩溃）===
+    FPFH_CRASH_LOG("2.0", "fpfh_init_check");
+    static pcl::FPFHEstimation<pcl::PointXYZI, pcl::Normal, pcl::FPFHSignature33>* fpfh_ptr = nullptr;
+    if (!fpfh_ptr) {
+        fpfh_ptr = new pcl::FPFHEstimation<pcl::PointXYZI, pcl::Normal, pcl::FPFHSignature33>();
+        FPFH_CRASH_LOG("2.0", "fpfh_ptr_created");
+    }
+    pcl::FPFHEstimation<pcl::PointXYZI, pcl::Normal, pcl::FPFHSignature33>& fpfh = *fpfh_ptr;
 
-        FPFH_CRASH_LOG("2.7", "fpfh_compute_start");
-        try {
-            fpfh.compute(*feat);
-        } catch (const std::exception& e) {
-            ALOG_ERROR(MOD, "[tid={}] [STEP=2.7] fpfh.compute exception msg={}", tid, e.what());
-            return std::make_shared<FPFHCloud>();
-        }
-        FPFH_CRASH_LOG_PTR("2.7", "fpfh_compute_success", feat.get(), feat ? feat->size() : 0u);
+    pcl::search::KdTree<pcl::PointXYZI>::Ptr tree_f;
+    try {
+        tree_f = std::make_shared<pcl::search::KdTree<pcl::PointXYZI>>();
+    } catch (const std::exception& e) {
+        ALOG_ERROR(MOD, "[tid={}] [STEP=2.1] fpfh kdtree exception msg={}", tid, e.what());
+        return std::make_shared<FPFHCloud>();
+    }
+
+    if (!normals || normals->size() != working_cloud->size()) {
+        ALOG_ERROR(MOD, "[tid={}] [STEP=2.3] normals size mismatch normals={} cloud={}", tid, normals ? normals->size() : 0u, working_cloud->size());
+        return std::make_shared<FPFHCloud>();
+    }
+
+    FPFH_CRASH_LOG_PTR("2.3a", "fpfh_setInputCloud_before", working_cloud.get(), working_cloud->size());
+    try {
+        fpfh.setInputCloud(working_cloud);
+        fpfh.setInputNormals(normals);
+        fpfh.setSearchMethod(tree_f);
+        fpfh.setRadiusSearch(fpfh_radius);
+    } catch (const std::exception& e) {
+        ALOG_ERROR(MOD, "[tid={}] [STEP=2.3] fpfh setInput exception msg={}", tid, e.what());
+        return std::make_shared<FPFHCloud>();
+    }
+    FPFH_CRASH_LOG("2.5", "fpfh_params_set");
+
+    FPFH_CRASH_LOG("2.7", "fpfh_compute_start");
+    try {
+        fpfh.compute(*feat);
+    } catch (const std::exception& e) {
+        ALOG_ERROR(MOD, "[tid={}] [STEP=2.7] fpfh.compute exception msg={}", tid, e.what());
+        return std::make_shared<FPFHCloud>();
+    }
+    FPFH_CRASH_LOG_PTR("2.8", "fpfh_compute_success", feat.get(), feat->size());
 
         if (feat->size() == 0)
             ALOG_WARN(MOD, "[tid={}] [STEP=2.7] compute_empty_features", tid);

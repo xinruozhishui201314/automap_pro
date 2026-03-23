@@ -29,7 +29,8 @@ public:
         rviz_publisher_.setFrameId("map");
 
         // 订阅同步帧（用于显示当前点云）
-        onEvent<SyncedFrameEvent>([this](const SyncedFrameEvent& ev) {
+        // 🏛️ [P0 性能优化] 使用 onEventAsync 确保可视化点云变换不阻塞 FrontEndModule 发布线程
+        onEventAsync<SyncedFrameEvent>([this](const SyncedFrameEvent& ev) {
             // 与 global_map / optimized_path 一致：回环或 iSAM2 修正后 T_map_b_optimized ≠ T_odom_b，
             // 当前帧 /cloud_registered 仍在 LIO 世界系，需用「最新关键帧」上的 odom→优化 链式修正到 map。
             try {
@@ -42,32 +43,35 @@ public:
                     T_map_odom.translation() = snapshot->t_enu_to_map;
                 }
 
+                // 🏛️ [架构契约] 确定基础变换语义
+                Pose3d T_base_to_map = Pose3d::Identity();
+                if (ev.pose_frame == PoseFrame::ODOM) {
+                    T_base_to_map = T_map_odom;
+                }
+
                 KeyFrame::Ptr anchor_kf = map_registry_->getLatestKeyFrameByTimestamp();
-                Pose3d T_world_to_map = Pose3d::Identity();
+                Pose3d T_world_to_map = T_base_to_map; // 默认使用基础契约转换
                 if (anchor_kf) {
                     Pose3d T_k_opt = anchor_kf->T_map_b_optimized;
                     auto it = snapshot->keyframe_poses.find(anchor_kf->id);
                     if (it != snapshot->keyframe_poses.end()) {
                         T_k_opt = it->second;
                     }
+                    
+                    // 🏛️ [契约校核] 如果关键帧还是 ODOM 系但系统已对齐，执行自动补偿
+                    if (anchor_kf->pose_frame == PoseFrame::ODOM && snapshot->gps_aligned) {
+                        T_k_opt = T_map_odom * T_k_opt;
+                    }
+
                     // p_map ≈ T_k_opt * inv(T_k_odom) * p_lio_world（帧间相对仍用前端里程计）
                     T_world_to_map = T_k_opt * anchor_kf->T_odom_b.inverse();
                 }
 
                 if (ConfigManager::instance().frontendCloudFrame() == "world") {
-                    if (anchor_kf) {
-                        pcl::transformPointCloud(*ev.cloud, *cloud_map, T_world_to_map.matrix().cast<float>());
-                    } else {
-                        pcl::transformPointCloud(*ev.cloud, *cloud_map, T_map_odom.matrix().cast<float>());
-                    }
+                    pcl::transformPointCloud(*ev.cloud, *cloud_map, T_world_to_map.matrix().cast<float>());
                 } else {
-                    if (anchor_kf) {
-                        Pose3d T_map_body = T_world_to_map * ev.T_odom_b;
-                        pcl::transformPointCloud(*ev.cloud, *cloud_map, T_map_body.matrix().cast<float>());
-                    } else {
-                        Pose3d T_map_body = T_map_odom * ev.T_odom_b;
-                        pcl::transformPointCloud(*ev.cloud, *cloud_map, T_map_body.matrix().cast<float>());
-                    }
+                    Pose3d T_map_body = T_world_to_map * ev.T_odom_b;
+                    pcl::transformPointCloud(*ev.cloud, *cloud_map, T_map_body.matrix().cast<float>());
                 }
                 rviz_publisher_.publishCurrentCloud(cloud_map);
             } catch (const std::exception& e) {
@@ -77,18 +81,18 @@ public:
         });
 
         // 🏛️ 已移除同步回调中的复杂逻辑，全部改由 publishEverything 使用快照处理
-        onEvent<GPSAlignedEvent>([this](const GPSAlignedEvent& /*ev*/) {
+        onEventAsync<GPSAlignedEvent>([this](const GPSAlignedEvent& /*ev*/) {
             // 仅触发刷新，实际对齐逻辑已由 MapRegistry 快照化
             requestRefresh();
         });
 
         // 订阅地图变更事件
-        onEvent<MapUpdateEvent>([this](const MapUpdateEvent& /*ev*/) {
+        onEventAsync<MapUpdateEvent>([this](const MapUpdateEvent& /*ev*/) {
             requestRefresh();
         });
 
         // 订阅优化结果事件
-        onEvent<OptimizationResultEvent>([this](const OptimizationResultEvent& /*ev*/) {
+        onEventAsync<OptimizationResultEvent>([this](const OptimizationResultEvent& /*ev*/) {
             requestRefresh();
         });
         RCLCPP_INFO(node_->get_logger(),
@@ -100,6 +104,7 @@ protected:
         RCLCPP_INFO(node_->get_logger(), "[V3][VisualizationModule] Started worker thread");
         
         while (running_) {
+            updateHeartbeat();
             {
                 std::unique_lock<std::mutex> lock(mutex_);
                 cv_.wait_for(lock, std::chrono::seconds(1), [this] { 

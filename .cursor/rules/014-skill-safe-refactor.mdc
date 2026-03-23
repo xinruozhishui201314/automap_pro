@@ -1,0 +1,22 @@
+---
+description: "Skill: Execute refactoring operations safely with verification at each step."
+globs:
+alwaysApply: false
+---
+
+# SKILL: SAFE REFACTORING EXECUTION
+
+## Purpose
+Execute code refactoring in large projects with safety checks at every step to prevent introducing regressions.
+
+## REFACTORING OPERATIONS LIBRARY
+
+### Operation: RENAME (Symbol, File, Module)
+
+### Operation: EXTRACT FUNCTION
+
+### Operation: EXTRACT MODULE / SPLIT FILE
+
+### Operation: CHANGE FUNCTION SIGNATURE
+
+### Operation: REPLACE IMPLEMENTATION (Same Interface)

@@ -10,6 +10,7 @@
 #define MOD "SubMapMgr"
 
 #include <algorithm>
+#include <cassert>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -36,6 +37,7 @@ SubMapManager::SubMapManager() {
     max_temporal_ = cfg.submapMaxTemporal();
     match_res_    = cfg.submapMatchRes();
     merge_res_    = cfg.submapMergeRes();
+    merge_thread_count_ = cfg.backendSubmapMergeThreads();
     
     // ✅ P1 修复：配置检查
     bool retain_cloud = cfg.retainCloudBody();
@@ -64,8 +66,10 @@ void SubMapManager::stop() {
     if (merge_running_.load()) {
         merge_running_.store(false);
         merge_cv_.notify_all();
-        if (merge_thread_.joinable())
-            merge_thread_.join();
+        for (auto& t : merge_threads_) {
+            if (t.joinable()) t.join();
+        }
+        merge_threads_.clear();
     }
     if (freeze_post_running_.load()) {
         freeze_post_running_.store(false);
@@ -80,7 +84,13 @@ void SubMapManager::init(rclcpp::Node::SharedPtr node) {
     event_pub_ = node->create_publisher<automap_pro::msg::SubMapEventMsg>(
         "/automap/submap_event", 50);
     RCLCPP_INFO(node->get_logger(), "[SubMapMgr][TOPIC] publish: /automap/submap_event");
-    merge_thread_ = std::thread(&SubMapManager::mergeWorkerLoop, this);
+    
+    // 启动可配置的合并线程（默认 8，建议 8~10）
+    for (int i = 0; i < merge_thread_count_; ++i) {
+        merge_threads_.emplace_back(&SubMapManager::mergeWorkerLoop, this);
+    }
+    RCLCPP_INFO(node->get_logger(), "[SubMapMgr] merge worker threads=%d", merge_thread_count_);
+    
     freeze_post_thread_ = std::thread(&SubMapManager::freezePostProcessLoop, this);
 }
 
@@ -175,7 +185,9 @@ void SubMapManager::addKeyFrame(const KeyFrame::Ptr& kf) {
             // 🏛️ [修复] 初始锚点应继承关键帧的优化位姿（可能已由 MappingModule 应用 GPS 对齐），
             // 否则会导致每一块新子图在优化结果返回前都产生位姿“回退”到 Odom 系的重影。
             active_submap_->pose_map_anchor_optimized = kf->T_map_b_optimized;
+            active_submap_->pose_frame = PoseFrame::MAP;
             kf->is_anchor = true;
+            kf->pose_frame = PoseFrame::MAP;
             kf->T_submap_kf = Pose3d::Identity();
 
             RCLCPP_INFO(rclcpp::get_logger("automap_system"),
@@ -190,6 +202,7 @@ void SubMapManager::addKeyFrame(const KeyFrame::Ptr& kf) {
             // 新关键帧的优化位姿 = 当前子图锚点优化位姿 * 帧相对于锚点的位姿。
             // 这确保了在 iSAM2 异步更新期间，新加入的帧能立即继承子图已有的优化/对齐偏移。
             kf->T_map_b_optimized = active_submap_->pose_map_anchor_optimized * kf->T_submap_kf;
+            kf->pose_frame = PoseFrame::MAP;
 
             RCLCPP_DEBUG_THROTTLE(rclcpp::get_logger("automap_system"), *node()->get_clock(), 5000,
                 "[V3][POSE_DIAG] Submap #%d KF #%lu: T_submap_kf=[%.2f,%.2f,%.2f] T_map_b_opt=[%.2f,%.2f,%.2f]",
@@ -468,6 +481,7 @@ void SubMapManager::mergeWorkerLoop() {
             if (merge_queue_.empty()) continue;
             task = std::move(merge_queue_.front());
             merge_queue_.pop();
+            active_merge_tasks_++; // 🏛️ [修复] 增加活动任务数
         }
 
         if (task.sm && task.kf) {
@@ -479,6 +493,7 @@ void SubMapManager::mergeWorkerLoop() {
                     "[SubMapMgr][ASYNC_MERGE] Exception: %s", e.what());
             }
         }
+        active_merge_tasks_--; // 🏛️ [修复] 减少活动任务数
     }
 }
 
@@ -557,8 +572,6 @@ constexpr size_t kDownsampleThreshold = 200000;
 }
 
 void SubMapManager::mergeCloudToSubmap(SubMap::Ptr& sm, const KeyFrame::Ptr& kf) const {
-    using Clock = std::chrono::steady_clock;
-    constexpr int kMergeVoxelTimeoutMs = 15000;  // 子图合并体素超时，超时必记 [SubMapMgr][TIMEOUT]
     if (!kf->cloud_body || kf->cloud_body->empty()) {
         RCLCPP_DEBUG(rclcpp::get_logger("automap_system"),
             "[GLOBAL_MAP_DIAG] mergeCloudToSubmap: kf_id=%lu has null/empty cloud_body, skip merge", 
@@ -566,132 +579,92 @@ void SubMapManager::mergeCloudToSubmap(SubMap::Ptr& sm, const KeyFrame::Ptr& kf)
         return;
     }
 
-    // 与 updateSubmapPose / batchUpdateSubmapPoses 一致：整段合并必须串行访问 merged_cloud。
-    // 此前仅在 transform/append 段持锁，pre-merge voxel 无锁，与后端原地 transform merged_cloud 并发 → 数据竞争、堆损坏、malloc abort。
-    std::lock_guard<std::mutex> lk(mutex_);
+    // 🏛️ [P0 性能优化] 架构重构：耗时操作移出锁外，支持多线程并行
+    // 1. 快照关键帧数据
+    CloudXYZIPtr raw_cloud = kf->cloud_body;
+    Pose3d T_map_b_snapshot = kf->T_map_b_optimized;
 
-    // 合并前先检查是否需要降采样（带超时；每步打 STEP+file+line 精确定位到行）
-    if (sm->merged_cloud && sm->merged_cloud->size() > kDownsampleThreshold) {
-        size_t old_pts = sm->merged_cloud->size();
-        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-            "[SubMapMgr][STEP] step=merge_pre_voxel_enter sm_id=%d kf_id=%lu pts=%zu file=%s line=%d",
-            sm->id, kf->id, old_pts, __FILE__, __LINE__);
-        auto t_pre = Clock::now();
-        bool timed_out = false;
-        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-            "[SubMapMgr][STEP] step=merge_pre_voxel_call_enter (下一行即 voxelDownsampleChunkedWithTimeout) file=%s line=%d", __FILE__, __LINE__);
-        const float kMergeChunkSizeM = 50.0f;
-        CloudXYZIPtr temp = utils::voxelDownsampleChunkedWithTimeout(
-            sm->merged_cloud, static_cast<float>(merge_res_), kMergeChunkSizeM, kMergeVoxelTimeoutMs, &timed_out);
-        double ms_pre = 1e-3 * std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - t_pre).count();
-        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-            "[SubMapMgr][STEP] step=merge_pre_voxel_exit sm_id=%d duration_ms=%.1f timed_out=%d file=%s line=%d",
-            sm->id, ms_pre, timed_out ? 1 : 0, __FILE__, __LINE__);
-        if (timed_out) {
-            RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
-                "[SubMapMgr][TIMEOUT] pre-merge voxelDownsample timed out sm_id=%d pts=%zu limit_ms=%d (建图时请重点关注)",
-                sm->id, old_pts, kMergeVoxelTimeoutMs);
-        }
-        if (temp && !temp->empty()) {
-            size_t new_pts = temp->size();
-            sm->merged_cloud.swap(temp);
-            ALOG_DEBUG(MOD, "SM#{} pre-merge downsample: {} -> {} pts",
-                       sm->id, old_pts, new_pts);
-            RCLCPP_DEBUG(rclcpp::get_logger("automap_system"),
-                "[GLOBAL_MAP_DIAG] SM#%d pre-merge downsample: %zu → %zu pts", sm->id, old_pts, new_pts);
-        }
-    }
-
-    // 将 body 系点云变换到世界系
-    RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-        "[SubMapMgr][STEP] step=merge_transform_enter kf_id=%lu body_pts=%zu file=%s line=%d",
-        kf->id, kf->cloud_body->size(), __FILE__, __LINE__);
+    // 2. 耗时预处理 (Outside Lock)
+    CloudXYZIPtr filtered_kf_cloud = raw_cloud;
     
-    // 🔧 [修复] SOR 滤波：在合并前去除关键帧中的离群点，显著提升点云清晰度
-    // 默认使用 MeanK=50, StdMul=1.0，抑制运动产生的拖影与噪声
-    CloudXYZIPtr filtered_kf_cloud(new CloudXYZI());
-    try {
-        pcl::StatisticalOutlierRemoval<pcl::PointXYZI> sor;
-        sor.setInputCloud(kf->cloud_body);
-        sor.setMeanK(50);
-        sor.setStddevMulThresh(1.0);
-        sor.filter(*filtered_kf_cloud);
-        
-        // 🔧 [修复] 提升全局图清晰度：将过滤后的点云写回关键帧 cloud_body
-        // 否则 buildGlobalMap 与 saveMapToFiles 仍会使用包含离群点的原始点云
-        if (!filtered_kf_cloud->empty()) {
-            kf->cloud_body = filtered_kf_cloud;
+    // 2.1 SOR 滤波
+    if (ConfigManager::instance().mapStatisticalFilter()) {
+        CloudXYZIPtr temp(new CloudXYZI());
+        try {
+            pcl::StatisticalOutlierRemoval<pcl::PointXYZI> sor;
+            sor.setInputCloud(raw_cloud);
+            sor.setMeanK(ConfigManager::instance().mapStatFilterMeanK());
+            sor.setStddevMulThresh(ConfigManager::instance().mapStatFilterStdMul());
+            sor.filter(*temp);
+            if (!temp->empty()) {
+                filtered_kf_cloud = temp;
+            }
+        } catch (const std::exception& e) {
+            RCLCPP_WARN(rclcpp::get_logger("automap_system"),
+                "[SubMapMgr][CLARITY] SOR filter failed for kf_id=%lu: %s", kf->id, e.what());
         }
-
-        RCLCPP_DEBUG(rclcpp::get_logger("automap_system"),
-            "[SubMapMgr][CLARITY] SOR filter kf_id=%lu: pts_remained=%zu",
-            kf->id, filtered_kf_cloud->size());
-    } catch (const std::exception& e) {
-        RCLCPP_WARN(rclcpp::get_logger("automap_system"),
-            "[SubMapMgr][CLARITY] SOR filter failed for kf_id=%lu: %s, using raw cloud",
-            kf->id, e.what());
-        filtered_kf_cloud = kf->cloud_body;
     }
 
-    auto t_tf = Clock::now();
-    CloudXYZIPtr world_cloud = getCloudFromPool();
-    Eigen::Affine3f T_wf;
+    // 2.2 关键帧级别降采样 (核心优化：避免后续对整个子图进行全量降采样)
+    CloudXYZIPtr ds_kf_cloud(new CloudXYZI());
+    {
+        pcl::VoxelGrid<pcl::PointXYZI> vg;
+        vg.setInputCloud(filtered_kf_cloud);
+        const float res = static_cast<float>(merge_res_);
+        vg.setLeafSize(res, res, res);
+        vg.filter(*ds_kf_cloud);
+    }
+    if (ds_kf_cloud->empty()) ds_kf_cloud = filtered_kf_cloud;
 
-    // 与 buildGlobalMap 主路径一致：body→world 使用 T_map_b_optimized（创建时初值=T_odom_b），
-    // 避免后端优化后仍用 T_odom_b 合并导致 merged_cloud 与 optimized_path/global_map 错位。
-    T_wf.matrix() = kf->T_map_b_optimized.cast<float>().matrix();
-    RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-        "[SubMapMgr][STEP] step=merge_transform_pcl_enter (下一行即 pcl::transformPointCloud) file=%s line=%d", __FILE__, __LINE__);
+    // 2.3 变换到世界坐标系
+    CloudXYZIPtr world_cloud(new CloudXYZI());
+    Eigen::Affine3f T_wf;
+    T_wf.matrix() = T_map_b_snapshot.cast<float>().matrix();
     try {
-        pcl::transformPointCloud(*filtered_kf_cloud, *world_cloud, T_wf);
+        pcl::transformPointCloud(*ds_kf_cloud, *world_cloud, T_wf);
     } catch (const std::exception& e) {
         RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
             "[GLOBAL_MAP_DIAG] mergeCloudToSubmap: kf_id=%lu transform failed: %s", kf->id, e.what());
         return;
     }
-    double ms_tf = 1e-3 * std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - t_tf).count();
-    RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-        "[SubMapMgr][STEP] step=merge_transform_exit kf_id=%lu duration_ms=%.1f world_pts=%zu file=%s line=%d",
-        kf->id, ms_tf, world_cloud->size(), __FILE__, __LINE__);
 
-    if (world_cloud->empty()) {
-        RCLCPP_DEBUG(rclcpp::get_logger("automap_system"),
-            "[GLOBAL_MAP_DIAG] mergeCloudToSubmap: kf_id=%lu transform resulted in empty cloud", kf->id);
-        return;
+    // 3. 极速合并 (Inside Lock)
+    {
+        std::lock_guard<std::mutex> lk(mutex_);
+        
+        // 更新关键帧本体点云（写回 SOR 过滤后的结果，不包含降采样）
+        if (filtered_kf_cloud != raw_cloud) {
+            kf->cloud_body = filtered_kf_cloud;
+        }
+
+        if (!sm->merged_cloud || sm->merged_cloud->empty()) {
+            sm->merged_cloud = std::make_shared<CloudXYZI>(*world_cloud);
+        } else {
+            // 直接追加，因为每一帧都已经预降采样过了，merged_cloud 增长可控
+            sm->merged_cloud->points.insert(sm->merged_cloud->points.end(),
+                                            world_cloud->points.begin(), world_cloud->points.end());
+        }
+        
+        // 偶尔检查是否需要对整个子图做一次全量降采样（例如点云极其稠密时）
+        if (sm->merged_cloud->size() > kDownsampleThreshold * 4) {
+             CloudXYZIPtr temp(new CloudXYZI());
+             pcl::VoxelGrid<pcl::PointXYZI> vg;
+             vg.setInputCloud(sm->merged_cloud);
+             const float res = static_cast<float>(merge_res_);
+             vg.setLeafSize(res, res, res);
+             vg.filter(*temp);
+             sm->merged_cloud.swap(temp);
+        }
     }
 
-    size_t world_cloud_size = world_cloud->size();
-
-    // 合并点云（append）
-    RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-        "[SubMapMgr][STEP] step=merge_append_enter kf_id=%lu sm_id=%d merged_before=%zu world_pts=%zu file=%s line=%d",
-        kf->id, sm->id, sm->merged_cloud ? sm->merged_cloud->size() : 0u, world_cloud_size, __FILE__, __LINE__);
-    auto t_append = Clock::now();
-    if (!sm->merged_cloud || sm->merged_cloud->empty()) {
-        sm->merged_cloud = std::make_shared<CloudXYZI>(*world_cloud);
-    } else {
-        size_t old_size = sm->merged_cloud->size();
-        sm->merged_cloud->reserve(old_size + world_cloud->size());
-        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-            "[SubMapMgr][STEP] step=merge_append_loop_enter count=%zu file=%s line=%d", world_cloud->size(), __FILE__, __LINE__);
-        sm->merged_cloud->points.insert(sm->merged_cloud->points.end(),
-                                        world_cloud->points.begin(), world_cloud->points.end());
-        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-            "[SubMapMgr][STEP] step=merge_append_loop_exit file=%s line=%d", __FILE__, __LINE__);
-    }
-    double ms_append = 1e-3 * std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - t_append).count();
-    RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-        "[SubMapMgr][STEP] step=merge_append_exit kf_id=%lu duration_ms=%.1f merged_total=%zu file=%s line=%d",
-        kf->id, ms_append, sm->merged_cloud->size(), __FILE__, __LINE__);
-
-    // [POSE_DIAG] 合并到子图时使用的位姿（与上方变换一致：T_map_b_optimized）
-    const Eigen::Vector3d t = kf->T_map_b_optimized.translation();
-    double yaw_deg = std::atan2(kf->T_map_b_optimized.rotation()(1, 0), kf->T_map_b_optimized.rotation()(0, 0)) * 180.0 / M_PI;
     RCLCPP_DEBUG(rclcpp::get_logger("automap_system"),
-        "[GLOBAL_MAP_DIAG] ✓ merge sm_id=%d kf_id=%lu: body_pts=%zu → world_pts=%zu, T_map_b_opt=[%.2f,%.2f,%.2f], merged_total=%zu",
-        sm->id, kf->id, kf->cloud_body->size(), world_cloud_size, t.x(), t.y(), t.z(), sm->merged_cloud->size());
-    // [GHOSTING_TRACE] 合并已用 T_map_b_optimized；此处记录与纯里程计差异（应接近 0 若与后端一致）
+        "[SubMapMgr][P0_OPT] merge sm_id=%d kf_id=%lu: raw=%zu -> filtered=%zu -> ds=%zu, merged_total=%zu",
+        sm->id, kf->id, raw_cloud->size(), filtered_kf_cloud->size(), world_cloud->size(), 
+        sm->merged_cloud ? sm->merged_cloud->size() : 0);
+
+    // [GHOSTING_TRACE] 合并已用快照位姿 T_map_b_snapshot；与 odom 差异诊断
     if (ConfigManager::instance().backendVerboseTrace()) {
+        const Eigen::Vector3d t = T_map_b_snapshot.translation();
         const Eigen::Vector3d t_odom = kf->T_odom_b.translation();
         const Eigen::Vector3d t_opt = kf->T_map_b_optimized.translation();
         double trans_diff = (t_odom - t_opt).norm();
@@ -702,60 +675,6 @@ void SubMapManager::mergeCloudToSubmap(SubMap::Ptr& sm, const KeyFrame::Ptr& kf)
         RCLCPP_INFO(rclcpp::get_logger("automap_system"),
             "[GHOSTING_TRACE] mergeCloudToSubmap sm_id=%d kf_id=%lu pose_source=T_map_b_optimized merge_t=[%.2f,%.2f,%.2f] T_odom_b=[%.2f,%.2f,%.2f] odom_vs_opt_trans=%.3fm odom_vs_opt_yaw=%.2fdeg",
             sm->id, kf->id, t.x(), t.y(), t.z(), t_odom.x(), t_odom.y(), t_odom.z(), trans_diff, yaw_diff);
-    }
-    // 首帧合并到该子图时打 INFO（每子图一条）
-    const bool is_first_merge = (sm->merged_cloud->size() == world_cloud_size);
-    if (is_first_merge) {
-        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-            "[SubMapMgr][POSE_DIAG] mergeCloudToSubmap sm_id=%d 首帧 kf_id=%lu T_map_b_optimized=[%.4f,%.4f,%.4f] yaw=%.2fdeg (与 buildGlobalMap 主路径一致)",
-            sm->id, kf->id, t.x(), t.y(), t.z(), yaw_deg);
-    }
-
-    // 合并后超过阈值则降采样（带超时；打 STEP+file+line 精确定位到行）
-    if (sm->merged_cloud && sm->merged_cloud->size() > kDownsampleThreshold) {
-        size_t before_downsample = sm->merged_cloud->size();
-        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-            "[SubMapMgr][STEP] step=merge_post_voxel_enter sm_id=%d kf_id=%lu pts=%zu file=%s line=%d",
-            sm->id, kf->id, before_downsample, __FILE__, __LINE__);
-        auto t_post = Clock::now();
-        bool timed_out = false;
-        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-            "[SubMapMgr][STEP] step=merge_post_voxel_call_enter (下一行即 voxelDownsampleChunkedWithTimeout) file=%s line=%d", __FILE__, __LINE__);
-        const float kMergeChunkSizeM = 50.0f;
-        CloudXYZIPtr temp = utils::voxelDownsampleChunkedWithTimeout(
-            sm->merged_cloud, static_cast<float>(merge_res_), kMergeChunkSizeM, kMergeVoxelTimeoutMs, &timed_out);
-        double ms_post = 1e-3 * std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - t_post).count();
-        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-            "[SubMapMgr][STEP] step=merge_post_voxel_exit sm_id=%d kf_id=%lu duration_ms=%.1f timed_out=%d file=%s line=%d",
-            sm->id, kf->id, ms_post, timed_out ? 1 : 0, __FILE__, __LINE__);
-        if (timed_out) {
-            RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
-                "[SubMapMgr][TIMEOUT] post-merge voxelDownsample timed out sm_id=%d kf_id=%lu pts=%zu limit_ms=%d (建图时请重点关注)",
-                sm->id, kf->id, before_downsample, kMergeVoxelTimeoutMs);
-        }
-        if (temp && !temp->empty()) {
-            size_t after_downsample = temp->size();
-            // ✅ 修复：检查降采样后点数，防止降采样失败或点数仍然过大
-            if (after_downsample > 10000000) {  // 超过1000万点则强制清空
-                RCLCPP_WARN(rclcpp::get_logger("automap_system"),
-                    "[GLOBAL_MAP_DIAG] SM#%d post-merge downsample result too large (%zu pts), clearing to avoid memory issue",
-                    sm->id, after_downsample);
-                sm->merged_cloud->clear();
-                sm->merged_cloud->points.shrink_to_fit();
-            } else {
-                sm->merged_cloud.swap(temp);
-                RCLCPP_DEBUG(rclcpp::get_logger("automap_system"),
-                    "[GLOBAL_MAP_DIAG] SM#%d post-merge downsample: %zu → %zu pts (threshold=%.0f)",
-                    sm->id, before_downsample, after_downsample, static_cast<float>(kDownsampleThreshold));
-            }
-        } else {
-            // ✅ 修复：降采样失败则清空，避免累积过多点
-            RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
-                "[GLOBAL_MAP_DIAG] SM#%d post-merge downsample failed (returned empty), clearing merged cloud",
-                sm->id);
-            sm->merged_cloud->clear();
-            sm->merged_cloud->points.shrink_to_fit();
-        }
     }
 }
 
@@ -796,11 +715,13 @@ void SubMapManager::updateSubmapPose(int submap_id, const Pose3d& new_pose) {
         Pose3d delta = new_pose * old_anchor.inverse();
 
         sm->pose_map_anchor_optimized = new_pose;
+        sm->pose_frame = PoseFrame::MAP;
         sm->state = SubMapState::OPTIMIZED;
 
         // 更新关键帧位姿
         for (auto& kf : sm->keyframes) {
             kf->T_map_b_optimized = sm->pose_map_anchor_optimized * kf->T_submap_kf;
+            kf->pose_frame = PoseFrame::MAP;
         }
 
         // 🔧 [修复] 保持 merged_cloud 与轨迹同步：同步变换该子图的合并点云，避免重影
@@ -839,6 +760,7 @@ void SubMapManager::batchUpdateSubmapPoses(const std::unordered_map<int, Pose3d>
                 Pose3d delta = new_pose * old_anchor.inverse();
 
                 sm->pose_map_anchor_optimized = new_pose;
+                sm->pose_frame = PoseFrame::MAP;
                 sm->state = SubMapState::OPTIMIZED;
 
                 double trans_diff = (new_pose.translation() - old_anchor.translation()).norm();
@@ -850,6 +772,8 @@ void SubMapManager::batchUpdateSubmapPoses(const std::unordered_map<int, Pose3d>
                 // 更新关键帧位姿
                 for (auto& kf : sm->keyframes) {
                     kf->T_map_b_optimized = sm->pose_map_anchor_optimized * kf->T_submap_kf;
+                    kf->pose_frame = PoseFrame::MAP;
+                    assert(kf->pose_frame == PoseFrame::MAP && "State Invariant: optimized keyframe must be MAP frame");
                 }
 
                 // 🔧 [修复] 保持 merged_cloud 与轨迹同步：同步变换该子图的合并点云，避免重影
@@ -880,6 +804,52 @@ void SubMapManager::batchUpdateSubmapPoses(const std::unordered_map<int, Pose3d>
         lk.unlock();
         rebuildMergedCloudFromOptimizedPoses();
     }
+}
+
+void SubMapManager::batchUpdateKeyFramePoses(const std::unordered_map<uint64_t, Pose3d>& updates, uint64_t version) {
+    if (updates.empty()) return;
+    std::lock_guard<std::mutex> lk(mutex_);
+    current_map_version_ = version;
+    size_t updated = 0;
+    for (auto& sm : submaps_) {
+        if (!sm) continue;
+        for (auto& kf : sm->keyframes) {
+            if (!kf) continue;
+            auto it = updates.find(kf->id);
+            if (it != updates.end()) {
+                // 🏛️ [数值安全加固] 
+                if (!it->second.matrix().allFinite()) continue;
+                
+                kf->T_map_b_optimized = it->second;
+                kf->pose_frame = PoseFrame::MAP;
+                // 🏛️ [架构加固] 保证子图内相对位姿的一致性，防止后续增量更新导致重影
+                // 🔒 安全检查：确保锚点位姿可逆，避免 NaN 扩散
+                if (sm->pose_map_anchor_optimized.matrix().allFinite()) {
+                    kf->T_submap_kf = sm->pose_map_anchor_optimized.inverse() * kf->T_map_b_optimized;
+                }
+                updated++;
+            }
+        }
+    }
+    // 也检查活跃子图
+    if (active_submap_) {
+        for (auto& kf : active_submap_->keyframes) {
+            if (!kf) continue;
+            auto it = updates.find(kf->id);
+            if (it != updates.end()) {
+                if (!it->second.matrix().allFinite()) continue;
+                kf->T_map_b_optimized = it->second;
+                kf->pose_frame = PoseFrame::MAP;
+                if (active_submap_->pose_map_anchor_optimized.matrix().allFinite()) {
+                    kf->T_submap_kf = active_submap_->pose_map_anchor_optimized.inverse() * kf->T_map_b_optimized;
+                }
+                updated++;
+            }
+        }
+    }
+    RCLCPP_DEBUG(rclcpp::get_logger("automap_system"), 
+                 "[SubMapMgr][Gateway] batchUpdateKeyFramePoses: updated %zu/%zu kfs to version %lu", 
+                 updated, updates.size(), version);
 }
 
 std::vector<KeyFrame::Ptr> SubMapManager::collectKeyframesInHBAOrder() const {
@@ -952,6 +922,7 @@ void SubMapManager::updateAllFromHBA(const HBAResult& result) {
     for (size_t i = 0; i < n_poses; ++i) {
         // [HBA_GHOSTING_FIX] 直接覆盖为 HBA 优化后的绝对位姿
         kfs_in_hba_order[i]->T_map_b_optimized = result.optimized_poses[i];
+        kfs_in_hba_order[i]->pose_frame = PoseFrame::MAP;
     }
 
     // [PCD_GHOSTING_VERIFY] ... (此处省略校验代码) ...
@@ -968,6 +939,7 @@ void SubMapManager::updateAllFromHBA(const HBAResult& result) {
         // ... (此处省略日志代码) ...
 
         sm->pose_map_anchor_optimized = anchor->T_map_b_optimized;
+        sm->pose_frame = PoseFrame::MAP;
         sm->pose_odom_anchor = anchor->T_odom_b;
 
         // 🏛️ [架构重构] HBA 可能会改变子图内部结构，因此需要更新 T_submap_kf
@@ -975,6 +947,7 @@ void SubMapManager::updateAllFromHBA(const HBAResult& result) {
         for (auto& kf : sm->keyframes) {
             if (kf) {
                 kf->T_submap_kf = sm->pose_map_anchor_optimized.inverse() * kf->T_map_b_optimized;
+                kf->pose_frame = PoseFrame::MAP;
             }
         }
 
@@ -1542,6 +1515,54 @@ bool SubMapManager::archiveSubmap(const SubMap::Ptr& submap, const std::string& 
         if (submap->has_valid_gps) {
             meta["gps_center"] = {submap->gps_center.x(), submap->gps_center.y(), submap->gps_center.z()};
         }
+
+        // ========== [增量建图] 保存子图内所有关键帧信息 ==========
+        std::vector<uint64_t> kf_ids;
+        std::string kf_dir = subdir + "/keyframes";
+        fs::create_directories(kf_dir);
+        
+        for (const auto& kf : submap->keyframes) {
+            if (!kf) continue;
+            kf_ids.push_back(kf->id);
+            
+            json kf_meta;
+            kf_meta["id"] = kf->id;
+            kf_meta["ts"] = kf->timestamp;
+            kf_meta["submap_id"] = kf->submap_id;
+            
+            // 位姿
+            auto save_pose = [](const Pose3d& T) {
+                Eigen::Quaterniond q(T.rotation());
+                return json{
+                    {"px", T.translation().x()}, {"py", T.translation().y()}, {"pz", T.translation().z()},
+                    {"qx", q.x()}, {"qy", q.y()}, {"qz", q.z()}, {"qw", q.w()}
+                };
+            };
+            kf_meta["T_odom_b"] = save_pose(kf->T_odom_b);
+            kf_meta["T_map_b_optimized"] = save_pose(kf->T_map_b_optimized);
+            kf_meta["T_submap_kf"] = save_pose(kf->T_submap_kf);
+            
+            // GPS (如果有)
+            if (kf->has_valid_gps) {
+                kf_meta["gps"] = {
+                    {"lat", kf->gps.latitude}, {"lon", kf->gps.longitude}, {"alt", kf->gps.altitude},
+                    {"hdop", kf->gps.hdop}
+                };
+            }
+
+            // 保存关键帧元数据
+            std::string kf_base = kf_dir + "/kf_" + std::to_string(kf->id);
+            std::ofstream kf_ofs(kf_base + ".json");
+            kf_ofs << kf_meta.dump(2);
+            
+            // 保存关键帧原始点云 (cloud_body)
+            if (kf->cloud_body && !kf->cloud_body->empty()) {
+                pcl::io::savePCDFileBinary(kf_base + ".pcd", *kf->cloud_body);
+            }
+        }
+        meta["keyframe_ids"] = kf_ids;
+        // ========================================================
+
         if (submap->has_descriptor && submap->overlap_descriptor.size() > 0) {
             meta["descriptor"] = std::vector<float>(submap->overlap_descriptor.data(),
                 submap->overlap_descriptor.data() + submap->overlap_descriptor.size());
@@ -1587,6 +1608,7 @@ bool SubMapManager::loadArchivedSubmap(const std::string& dir, int submap_id, Su
             sm->pose_map_anchor_optimized.linear() = q.toRotationMatrix();
             sm->pose_map_anchor_optimized.translation() << ap.value("px", 0.0), ap.value("py", 0.0), ap.value("pz", 0.0);
             sm->pose_odom_anchor = sm->pose_map_anchor_optimized;
+            sm->pose_frame = PoseFrame::MAP;
         }
         if (meta.contains("gps_center") && meta["gps_center"].is_array() && meta["gps_center"].size() >= 3) {
             sm->gps_center << meta["gps_center"][0], meta["gps_center"][1], meta["gps_center"][2];

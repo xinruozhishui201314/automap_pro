@@ -37,10 +37,16 @@ inline std::string hostTimeString() {
 }
 }
 LIVMapper::LIVMapper(rclcpp::Node::SharedPtr &node, std::string node_name, const rclcpp::NodeOptions & options)
-    : node(std::make_shared<rclcpp::Node>(node_name, options)),
-      extT(0, 0, 0),
+    : extT(0, 0, 0),
       extR(M3D::Identity())
 {
+  // 🏛️ [修复] 严重架构缺陷：若外部传入 node 为空，则内部创建并回填；若不为空则复用。
+  // 此前内部创建后不回填，导致 main.cpp 中的 nh 始终为 nullptr，触发 image_transport 等组件崩溃。
+  if (!node) {
+    node = std::make_shared<rclcpp::Node>(node_name, options);
+  }
+  this->node = node;
+
   extrinT.assign(3, 0.0);
   extrinR.assign(9, 0.0);
   cameraextrinT.assign(3, 0.0);
