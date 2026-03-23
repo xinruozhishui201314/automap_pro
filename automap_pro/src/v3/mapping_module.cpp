@@ -9,6 +9,7 @@
 #include <vector>
 #include <filesystem>
 #include <chrono>
+#include <future>
 #include <pcl/common/transforms.h>
 #include <pcl/io/pcd_io.h>
 
@@ -181,6 +182,7 @@ MappingModule::MappingModule(EventBus::Ptr event_bus, MapRegistry::Ptr map_regis
         Command cmd;
         cmd.type = Command::Type::SAVE_MAP;
         cmd.output_dir = ev.output_dir;
+        cmd.save_completion = ev.completion;
         command_queue_.push_back(cmd);
         cv_.notify_one();
     });
@@ -311,7 +313,19 @@ void MappingModule::run() {
             if (cmd.type == Command::Type::SAVE_MAP) {
                 SaveMapRequestEvent ev;
                 ev.output_dir = cmd.output_dir;
-                handleSaveMap(ev);
+                try {
+                    handleSaveMap(ev);
+                } catch (const std::exception& e) {
+                    RCLCPP_ERROR(node_->get_logger(),
+                        "[V3][MappingModule] SaveMap command failed: %s", e.what());
+                }
+                if (cmd.save_completion) {
+                    try {
+                        cmd.save_completion->set_value();
+                    } catch (const std::future_error&) {
+                        // already satisfied
+                    }
+                }
             } else if (cmd.type == Command::Type::BUILD_GLOBAL_MAP) {
                 GlobalMapBuildRequestEvent ev;
                 ev.voxel_size = cmd.voxel_size;
@@ -664,10 +678,10 @@ void MappingModule::applyOptimizedPoses(const std::unordered_map<int, Pose3d>& s
 
     // 2. 批量分发到位姿后端 (SubMapManager / MapRegistry)
     if (!sm_to_apply.empty()) {
-        sm_manager_.batchUpdateSubmapPoses(sm_to_apply, version);
+        sm_manager_.batchUpdateSubmapPoses(sm_to_apply, version, frame);
     }
     if (!kf_to_apply.empty()) {
-        sm_manager_.batchUpdateKeyFramePoses(kf_to_apply, version);
+        sm_manager_.batchUpdateKeyFramePoses(kf_to_apply, version, frame);
     }
 
     // 3. 屏障同步：更新本地处理版本，解除 frame_queue_ 阻塞
@@ -780,6 +794,10 @@ void MappingModule::handleSaveMap(const SaveMapRequestEvent& ev) {
             pcl::io::savePCDFileBinary(global_path, *global_map);
             RCLCPP_INFO(node_->get_logger(), "[V3][MappingModule] Global map saved to %s (%zu pts)", 
                         global_path.c_str(), global_map->size());
+        } else {
+            RCLCPP_WARN(node_->get_logger(),
+                "[V3][MappingModule] Final global map empty or null; skip global_map_final.pcd (output_dir=%s)",
+                ev.output_dir.c_str());
         }
     } catch (const std::exception& e) {
         RCLCPP_ERROR(node_->get_logger(), "[V3][MappingModule] Failed to save final global map: %s", e.what());

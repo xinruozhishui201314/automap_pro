@@ -1,6 +1,7 @@
 #pragma once
 
 #include "automap_pro/core/data_types.h"
+
 #include "automap_pro/core/opt_task_types.h"
 #include "automap_pro/v3/event_bus.h"
 #include "automap_pro/frontend/keyframe_manager.h"
@@ -9,6 +10,7 @@
 #include <unordered_map>
 #include <mutex>
 #include <memory>
+#include <future>
 #include <vector>
 #include <atomic>
 #include <string>
@@ -319,6 +321,8 @@ struct LoadSessionRequestEvent {
 
 struct SaveMapRequestEvent {
     std::string output_dir;
+    /** If non-null, set_value() after archive + final global PCD attempt (success or failure). */
+    std::shared_ptr<std::promise<void>> completion;
 };
 
 struct GlobalMapBuildRequestEvent {

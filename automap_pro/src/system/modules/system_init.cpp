@@ -77,9 +77,8 @@ AutoMapSystem::~AutoMapSystem() {
     RCLCPP_INFO(get_logger(), "[PIPELINE][SYS][SHUTDOWN] step=saveMapToFiles PRIORITY_SAVE out_dir=%s", out_dir.c_str());
     saveMapToFiles(out_dir);
 
-    // 🏛️ [安全策略] 给保存预留一点时间，让 MappingModule::run 循环能处理保存任务
-    // 注意：MappingModule::handleSaveMap 会在 worker thread 执行，这里主线程稍等即可。
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    // saveMapToFiles 已通过 SaveMapRequestEvent.completion 等待 MappingModule 完成归档与 global_map_final
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
     if (v3_context_) {
         RCLCPP_INFO(get_logger(), "[PIPELINE][SYS][SHUTDOWN] step=stop V3Context::stopAll (all V3 modules)");

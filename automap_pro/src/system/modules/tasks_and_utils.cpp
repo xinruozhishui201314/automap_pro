@@ -3,7 +3,10 @@
 #include "automap_pro/core/logger.h"
 #include "automap_pro/core/utils.h"
 #include <pcl_conversions/pcl_conversions.h>
+#include <cstdlib>
+#include <chrono>
 #include <filesystem>
+#include <future>
 #include <iomanip>
 
 namespace automap_pro {
@@ -57,17 +60,32 @@ void AutoMapSystem::publishGlobalMap() {
 
 void AutoMapSystem::saveMapToFiles(const std::string& output_dir) {
     if (!v3_context_ || !v3_context_->mapRegistry()) return;
-    
+
+    auto completion = std::make_shared<std::promise<void>>();
+    std::future<void> done = completion->get_future();
+
     v3::SaveMapRequestEvent ev;
     ev.output_dir = output_dir;
+    ev.completion = completion;
     v3_context_->eventBus()->publish(ev);
 
-    // 其他统计记录
+    constexpr int k_save_wait_hours = 4;
+    const auto wt = done.wait_for(std::chrono::hours(k_save_wait_hours));
+    if (wt == std::future_status::timeout) {
+        RCLCPP_ERROR(get_logger(),
+            "[AutoMapSystem] SaveMap timed out after %d h; trajectory CSV may precede incomplete map export",
+            k_save_wait_hours);
+    }
+
     writeTrajectoryOdomAfterMapping(output_dir);
     writeMappingAccuracyGpsVsHba(output_dir);
 }
 
 std::string AutoMapSystem::getOutputDir() const {
+    const char* session = std::getenv("AUTOMAP_SESSION_OUTPUT_DIR");
+    if (session && session[0] != '\0') {
+        return std::string(session);
+    }
     if (!output_dir_override_.empty()) return output_dir_override_;
     return ConfigManager::instance().outputDir();
 }

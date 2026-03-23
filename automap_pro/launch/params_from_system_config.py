@@ -342,9 +342,14 @@ def _get_fast_livo2_params_impl(config):
         else:
             params[section] = val
 
-    # 前端 PCD 保存目录与 system.output_dir 统一，始终覆盖为 system.output_dir，保证与后端 automap_output 同目录
+    # 前端 PCD 保存目录与 system.output_dir 统一。
+    # 若 launch 已设置 AUTOMAP_SESSION_OUTPUT_DIR（与 automap_system getOutputDir 一致），优先使用。
     system = config.get("system") if isinstance(config.get("system"), dict) else {}
-    out_dir = (system.get("output_dir") or "").strip() or "/data/automap_output"
+    session_env = (os.environ.get("AUTOMAP_SESSION_OUTPUT_DIR") or "").strip()
+    if session_env:
+        out_dir = os.path.abspath(session_env)
+    else:
+        out_dir = (system.get("output_dir") or "").strip() or "/data/automap_output"
     if "pcd_save" not in params:
         params["pcd_save"] = {}
     if isinstance(params["pcd_save"], dict):

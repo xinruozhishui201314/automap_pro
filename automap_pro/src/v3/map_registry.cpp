@@ -143,7 +143,8 @@ uint64_t MapRegistry::updatePoses(const std::unordered_map<int, Pose3d>& sm_upda
             METRICS_INCREMENT(metrics::FRAME_MISMATCH_TOTAL);
             return current_version_.load();
         }
-        RCLCPP_WARN(rclcpp::get_logger("automap_pro"),
+        // Expected until GPS alignment: optimizer reports ODOM semantics; registry stores as MAP-equivalent.
+        RCLCPP_DEBUG(rclcpp::get_logger("automap_pro"),
             "[V3][CONTRACT] Accepting non-MAP frame in pre-alignment stage as MAP-equivalent");
     }
     for (const auto& [id, pose] : sm_updates) {
@@ -180,7 +181,7 @@ uint64_t MapRegistry::updatePoses(const std::unordered_map<int, Pose3d>& sm_upda
             auto it = submaps_.find(id);
             if (it != submaps_.end()) {
                 it->second->pose_map_anchor_optimized = pose;
-                it->second->pose_frame = PoseFrame::MAP; // State Invariant Contract
+                it->second->pose_frame = pose_frame; // 🏛️ [架构加固] 尊重优化器报告的坐标系语义
                 affected_sm_ids.push_back(id);
             }
         }
@@ -189,7 +190,7 @@ uint64_t MapRegistry::updatePoses(const std::unordered_map<int, Pose3d>& sm_upda
             auto it = keyframes_.find(static_cast<int>(id));
             if (it != keyframes_.end()) {
                 it->second->T_map_b_optimized = pose;
-                it->second->pose_frame = PoseFrame::MAP; // State Invariant Contract
+                it->second->pose_frame = pose_frame; // 🏛️ [架构加固] 尊重优化器报告的坐标系语义
                 affected_kf_ids.push_back(static_cast<int>(id));
             }
         }
@@ -234,7 +235,7 @@ uint64_t MapRegistry::updatePoses(const std::unordered_map<int, Pose3d>& sm_upda
     result_ev.event_id = version;
     result_ev.submap_poses = sm_updates;
     result_ev.keyframe_poses = kf_updates;
-    result_ev.pose_frame = PoseFrame::MAP;
+    result_ev.pose_frame = pose_frame; // 🏛️ [架构加固] 透传优化结果的坐标系语义
     result_ev.source_module = source_module;
     result_ev.transform_applied_flags = transform_applied_flags;
     result_ev.batch_hash = batch_hash;

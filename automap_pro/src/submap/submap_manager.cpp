@@ -185,9 +185,8 @@ void SubMapManager::addKeyFrame(const KeyFrame::Ptr& kf) {
             // 🏛️ [修复] 初始锚点应继承关键帧的优化位姿（可能已由 MappingModule 应用 GPS 对齐），
             // 否则会导致每一块新子图在优化结果返回前都产生位姿“回退”到 Odom 系的重影。
             active_submap_->pose_map_anchor_optimized = kf->T_map_b_optimized;
-            active_submap_->pose_frame = PoseFrame::MAP;
+            active_submap_->pose_frame = kf->pose_frame; // 🏛️ [架构加固] 尊重关键帧自带的坐标系语义
             kf->is_anchor = true;
-            kf->pose_frame = PoseFrame::MAP;
             kf->T_submap_kf = Pose3d::Identity();
 
             RCLCPP_INFO(rclcpp::get_logger("automap_system"),
@@ -202,7 +201,7 @@ void SubMapManager::addKeyFrame(const KeyFrame::Ptr& kf) {
             // 新关键帧的优化位姿 = 当前子图锚点优化位姿 * 帧相对于锚点的位姿。
             // 这确保了在 iSAM2 异步更新期间，新加入的帧能立即继承子图已有的优化/对齐偏移。
             kf->T_map_b_optimized = active_submap_->pose_map_anchor_optimized * kf->T_submap_kf;
-            kf->pose_frame = PoseFrame::MAP;
+            kf->pose_frame = active_submap_->pose_frame; // 🏛️ [架构加固] 继承子图锚点的坐标系语义
 
             RCLCPP_DEBUG_THROTTLE(rclcpp::get_logger("automap_system"), *node()->get_clock(), 5000,
                 "[V3][POSE_DIAG] Submap #%d KF #%lu: T_submap_kf=[%.2f,%.2f,%.2f] T_map_b_opt=[%.2f,%.2f,%.2f]",
@@ -678,7 +677,7 @@ void SubMapManager::mergeCloudToSubmap(SubMap::Ptr& sm, const KeyFrame::Ptr& kf)
     }
 }
 
-void SubMapManager::updateSubmapPose(int submap_id, const Pose3d& new_pose) {
+void SubMapManager::updateSubmapPose(int submap_id, const Pose3d& new_pose, PoseFrame pose_frame) {
     // 结构化日志：开始Span
     SLOG_START_SPAN(MOD, "update_submap_pose");
     
@@ -692,7 +691,7 @@ void SubMapManager::updateSubmapPose(int submap_id, const Pose3d& new_pose) {
     RCLCPP_INFO(rclcpp::get_logger("automap_system"),
         "[SubMapMgr][SUBMAP_POSE_UPDATE_DEBUG] =======================================================");
     RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-        "[SubMapMgr][SUBMAP_POSE_UPDATE_DEBUG] 开始更新子图%d的位姿...", submap_id);
+        "[SubMapMgr][SUBMAP_POSE_UPDATE_DEBUG] 开始更新子图%d的位姿... frame=%d", submap_id, static_cast<int>(pose_frame));
     RCLCPP_INFO(rclcpp::get_logger("automap_system"),
         "[SubMapMgr][SUBMAP_POSE_UPDATE_DEBUG] 新锚点位姿: pos=(%.2f, %.2f, %.2f), RPY=(%.1f, %.1f, %.1f)",
         new_pose.translation().x(), new_pose.translation().y(), new_pose.translation().z(),
@@ -715,13 +714,13 @@ void SubMapManager::updateSubmapPose(int submap_id, const Pose3d& new_pose) {
         Pose3d delta = new_pose * old_anchor.inverse();
 
         sm->pose_map_anchor_optimized = new_pose;
-        sm->pose_frame = PoseFrame::MAP;
+        sm->pose_frame = pose_frame; // 🏛️ [架构加固] 使用参数传入的 frame
         sm->state = SubMapState::OPTIMIZED;
 
         // 更新关键帧位姿
         for (auto& kf : sm->keyframes) {
             kf->T_map_b_optimized = sm->pose_map_anchor_optimized * kf->T_submap_kf;
-            kf->pose_frame = PoseFrame::MAP;
+            kf->pose_frame = pose_frame; // 🏛️ [架构加固] 继承子图锚点的坐标系语义
         }
 
         // 🔧 [修复] 保持 merged_cloud 与轨迹同步：同步变换该子图的合并点云，避免重影
@@ -744,7 +743,7 @@ void SubMapManager::updateSubmapPose(int submap_id, const Pose3d& new_pose) {
     SLOG_END_SPAN();
 }
 
-void SubMapManager::batchUpdateSubmapPoses(const std::unordered_map<int, Pose3d>& updates, uint64_t version) {
+void SubMapManager::batchUpdateSubmapPoses(const std::unordered_map<int, Pose3d>& updates, uint64_t version, PoseFrame pose_frame) {
     if (updates.empty()) return;
 
     std::unique_lock<std::mutex> lk(mutex_);
@@ -760,7 +759,7 @@ void SubMapManager::batchUpdateSubmapPoses(const std::unordered_map<int, Pose3d>
                 Pose3d delta = new_pose * old_anchor.inverse();
 
                 sm->pose_map_anchor_optimized = new_pose;
-                sm->pose_frame = PoseFrame::MAP;
+                sm->pose_frame = pose_frame; // 🏛️ [架构加固] 尊重传入的坐标系语义
                 sm->state = SubMapState::OPTIMIZED;
 
                 double trans_diff = (new_pose.translation() - old_anchor.translation()).norm();
@@ -772,8 +771,7 @@ void SubMapManager::batchUpdateSubmapPoses(const std::unordered_map<int, Pose3d>
                 // 更新关键帧位姿
                 for (auto& kf : sm->keyframes) {
                     kf->T_map_b_optimized = sm->pose_map_anchor_optimized * kf->T_submap_kf;
-                    kf->pose_frame = PoseFrame::MAP;
-                    assert(kf->pose_frame == PoseFrame::MAP && "State Invariant: optimized keyframe must be MAP frame");
+                    kf->pose_frame = pose_frame; // 🏛️ [架构加固] 继承子图锚点的坐标系语义
                 }
 
                 // 🔧 [修复] 保持 merged_cloud 与轨迹同步：同步变换该子图的合并点云，避免重影
@@ -806,7 +804,7 @@ void SubMapManager::batchUpdateSubmapPoses(const std::unordered_map<int, Pose3d>
     }
 }
 
-void SubMapManager::batchUpdateKeyFramePoses(const std::unordered_map<uint64_t, Pose3d>& updates, uint64_t version) {
+void SubMapManager::batchUpdateKeyFramePoses(const std::unordered_map<uint64_t, Pose3d>& updates, uint64_t version, PoseFrame pose_frame) {
     if (updates.empty()) return;
     std::lock_guard<std::mutex> lk(mutex_);
     current_map_version_ = version;
@@ -821,7 +819,7 @@ void SubMapManager::batchUpdateKeyFramePoses(const std::unordered_map<uint64_t, 
                 if (!it->second.matrix().allFinite()) continue;
                 
                 kf->T_map_b_optimized = it->second;
-                kf->pose_frame = PoseFrame::MAP;
+                kf->pose_frame = pose_frame; // 🏛️ [架构加固] 尊重传入的坐标系语义
                 // 🏛️ [架构加固] 保证子图内相对位姿的一致性，防止后续增量更新导致重影
                 // 🔒 安全检查：确保锚点位姿可逆，避免 NaN 扩散
                 if (sm->pose_map_anchor_optimized.matrix().allFinite()) {
@@ -839,7 +837,7 @@ void SubMapManager::batchUpdateKeyFramePoses(const std::unordered_map<uint64_t, 
             if (it != updates.end()) {
                 if (!it->second.matrix().allFinite()) continue;
                 kf->T_map_b_optimized = it->second;
-                kf->pose_frame = PoseFrame::MAP;
+                kf->pose_frame = pose_frame; // 🏛️ [架构加固] 尊重传入的坐标系语义
                 if (active_submap_->pose_map_anchor_optimized.matrix().allFinite()) {
                     kf->T_submap_kf = active_submap_->pose_map_anchor_optimized.inverse() * kf->T_map_b_optimized;
                 }
@@ -922,7 +920,7 @@ void SubMapManager::updateAllFromHBA(const HBAResult& result) {
     for (size_t i = 0; i < n_poses; ++i) {
         // [HBA_GHOSTING_FIX] 直接覆盖为 HBA 优化后的绝对位姿
         kfs_in_hba_order[i]->T_map_b_optimized = result.optimized_poses[i];
-        kfs_in_hba_order[i]->pose_frame = PoseFrame::MAP;
+        kfs_in_hba_order[i]->pose_frame = result.pose_frame; // 🏛️ [架构加固] 尊重 HBA 报告的坐标系语义
     }
 
     // [PCD_GHOSTING_VERIFY] ... (此处省略校验代码) ...
@@ -939,7 +937,7 @@ void SubMapManager::updateAllFromHBA(const HBAResult& result) {
         // ... (此处省略日志代码) ...
 
         sm->pose_map_anchor_optimized = anchor->T_map_b_optimized;
-        sm->pose_frame = PoseFrame::MAP;
+        sm->pose_frame = result.pose_frame; // 🏛️ [架构加固] 尊重 HBA 报告的坐标系语义
         sm->pose_odom_anchor = anchor->T_odom_b;
 
         // 🏛️ [架构重构] HBA 可能会改变子图内部结构，因此需要更新 T_submap_kf
@@ -947,7 +945,7 @@ void SubMapManager::updateAllFromHBA(const HBAResult& result) {
         for (auto& kf : sm->keyframes) {
             if (kf) {
                 kf->T_submap_kf = sm->pose_map_anchor_optimized.inverse() * kf->T_map_b_optimized;
-                kf->pose_frame = PoseFrame::MAP;
+                kf->pose_frame = result.pose_frame; // 🏛️ [架构加固] 继承子图锚点的坐标系语义
             }
         }
 

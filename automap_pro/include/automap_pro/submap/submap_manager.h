@@ -49,13 +49,13 @@ public:
      * 子图锚定位姿更新（由 iSAM2 优化后回调）
      * 同时更新子图内所有关键帧的 T_map_b_optimized
      */
-    void updateSubmapPose(int submap_id, const Pose3d& new_pose);
+    void updateSubmapPose(int submap_id, const Pose3d& new_pose, PoseFrame pose_frame);
 
     /** 批量更新子图位姿（来自 iSAM2 优化结果），比逐个调用 updateSubmapPose 更高效，且支持版本号一致性 */
-    void batchUpdateSubmapPoses(const std::unordered_map<int, Pose3d>& updates, uint64_t version);
+    void batchUpdateSubmapPoses(const std::unordered_map<int, Pose3d>& updates, uint64_t version, PoseFrame pose_frame);
 
     /** 🏛️ [架构加固] 批量更新关键帧绝对位姿（SSoT 语义网关应用） */
-    void batchUpdateKeyFramePoses(const std::unordered_map<uint64_t, Pose3d>& updates, uint64_t version);
+    void batchUpdateKeyFramePoses(const std::unordered_map<uint64_t, Pose3d>& updates, uint64_t version, PoseFrame pose_frame);
 
     /** 批量更新子图位姿（来自 HBA 结果） */
     void updateAllFromHBA(const HBAResult& result);

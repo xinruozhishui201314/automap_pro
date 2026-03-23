@@ -22,6 +22,7 @@ import os
 import sys
 import yaml
 import tempfile
+from datetime import datetime
 
 # 与 offline/online launch 一致：从 sensor + fast_livo 合并生成 params，话题唯一来自 sensor
 _launch_dir = os.path.dirname(os.path.abspath(__file__))
@@ -63,6 +64,18 @@ def _setup_fast_livo(context, *args, **kwargs):
         raise RuntimeError(
             f"[automap_composable] 'fast_livo:' (or frontend.fast_livo2) missing in {config_file}. "
             "Required for extrin_calib, preprocess, etc.")
+
+    # 单次 run 会话目录：与子进程共享，使 automap_system 与 fast_livo 写入同一 run_* 路径
+    system = cfg.get('system') if isinstance(cfg.get('system'), dict) else {}
+    base_out = (system.get('output_dir') or '').strip() or '/data/automap_output'
+    base_out = os.path.abspath(base_out.rstrip('/'))
+    if '/run_' not in base_out:
+        session_out = base_out + '/run_' + datetime.now().strftime('%Y%m%d_%H%M%S')
+    else:
+        session_out = base_out
+    os.makedirs(session_out, exist_ok=True)
+    os.environ['AUTOMAP_SESSION_OUTPUT_DIR'] = session_out
+    print(f'[automap_composable] AUTOMAP_SESSION_OUTPUT_DIR={session_out}')
 
     # 话题唯一来自 sensor: 节，与 offline/online launch 一致
     fl_params = get_fast_livo2_params(cfg)

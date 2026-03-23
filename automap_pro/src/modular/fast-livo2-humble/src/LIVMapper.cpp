@@ -232,19 +232,23 @@ void LIVMapper::readParameters(rclcpp::Node::SharedPtr &node)
   this->node->get_parameter("pcd_save.output_dir", pcd_output_dir_);
   if (!pcd_output_dir_.empty() && pcd_output_dir_.back() == '/') pcd_output_dir_.pop_back();
 
-  // 🔧 自动创建带时间戳的输出子目录，与后端 AutoMapSystem 逻辑一致
+  // 🔧 会话子目录：若 launch/params 已给出 .../run_*（与 AUTOMAP_SESSION_OUTPUT_DIR 一致），不再嵌套第二层 run_
   static std::string s_timestamped_dir = "";
   if (s_timestamped_dir.empty() && !pcd_output_dir_.empty()) {
-      auto now = std::chrono::system_clock::now();
-      auto t = std::chrono::system_clock::to_time_t(now);
-      std::tm buf;
-      std::tm* ptm = ::localtime_r(&t, &buf);
-      char timestamp[64];
-      if (ptm) {
-          std::strftime(timestamp, sizeof(timestamp), "%Y%m%d_%H%M%S", ptm);
-          s_timestamped_dir = pcd_output_dir_ + "/run_" + std::string(timestamp);
+      if (pcd_output_dir_.find("/run_") != std::string::npos) {
+          s_timestamped_dir = pcd_output_dir_;
       } else {
-          s_timestamped_dir = pcd_output_dir_ + "/run_default";
+          auto now = std::chrono::system_clock::now();
+          auto t = std::chrono::system_clock::to_time_t(now);
+          std::tm buf;
+          std::tm* ptm = ::localtime_r(&t, &buf);
+          char timestamp[64];
+          if (ptm) {
+              std::strftime(timestamp, sizeof(timestamp), "%Y%m%d_%H%M%S", ptm);
+              s_timestamped_dir = pcd_output_dir_ + "/run_" + std::string(timestamp);
+          } else {
+              s_timestamped_dir = pcd_output_dir_ + "/run_default";
+          }
       }
   }
   if (!s_timestamped_dir.empty()) {

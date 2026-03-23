@@ -6,6 +6,7 @@ import os
 import sys
 import subprocess
 import traceback
+from datetime import datetime
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, EmitEvent, ExecuteProcess, OpaqueFunction, RegisterEventHandler
@@ -31,6 +32,7 @@ def _log_launch_exception(step_name, e):
 
 def _launch_nodes_offline(context, *args, **kwargs):
     config_path_raw = (LaunchConfiguration("config").perform(context) or "").strip()
+    session_out = ""
     try:
         pkg_share = get_package_share_directory("automap_pro")
     except Exception as e:
@@ -50,6 +52,37 @@ def _launch_nodes_offline(context, *args, **kwargs):
     if config_path:
         sys.stderr.write("{} [CONFIG] 全工程唯一配置文件: {}\n".format(_LP, os.path.abspath(config_path) if config_path and os.path.isfile(config_path) else config_path))
         sys.stderr.flush()
+    # 统一离线会话输出目录：让 fast_livo 与 automap_system 写入同一 run_* 目录，
+    # 并覆盖 map.frame_config_path，避免 map_frame.cfg 落在基础目录。
+    if config_path and os.path.isfile(config_path):
+        try:
+            import yaml as _yaml
+            with open(config_path, "r", encoding="utf-8") as _f:
+                _cfg = _yaml.safe_load(_f) or {}
+            _system = _cfg.get("system") if isinstance(_cfg.get("system"), dict) else {}
+            _base_out = (_system.get("output_dir") or "").strip() or "/data/automap_output"
+            _base_out = os.path.abspath(_base_out.rstrip("/"))
+            if "/run_" in _base_out:
+                session_out = _base_out
+            else:
+                session_out = _base_out + "/run_" + datetime.now().strftime("%Y%m%d_%H%M%S")
+            os.makedirs(session_out, exist_ok=True)
+            os.environ["AUTOMAP_SESSION_OUTPUT_DIR"] = session_out
+
+            _cfg.setdefault("system", {})
+            _cfg["system"]["output_dir"] = session_out
+            _cfg.setdefault("map", {})
+            _cfg["map"]["frame_config_path"] = os.path.join(session_out, "map_frame.cfg")
+
+            _patched_config = "/tmp/automap_offline_system_config_{}.yaml".format(os.getpid())
+            with open(_patched_config, "w", encoding="utf-8") as _f:
+                _yaml.safe_dump(_cfg, _f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+            config_path = _patched_config
+            sys.stderr.write("{} [OUTPUT] AUTOMAP_SESSION_OUTPUT_DIR={}\n".format(_LP, session_out))
+            sys.stderr.write("{} [CONFIG] offline patched config: {}\n".format(_LP, config_path))
+            sys.stderr.flush()
+        except Exception as e:
+            _log_launch_exception("构建离线 run_* 会话输出目录/补丁配置", e)
     # RViz 配置：前端 / 后端分两个窗口
     rviz_frontend_config = os.path.join(pkg_share, "rviz", "automap_frontend.rviz")
     rviz_backend_config = os.path.join(pkg_share, "rviz", "automap_backend.rviz")
@@ -198,14 +231,16 @@ def _launch_nodes_offline(context, *args, **kwargs):
     run_automap_under_gdb = LaunchConfiguration("run_automap_under_gdb", default="false").perform(context).lower() == "true"
     # 可选：预加载 libgtsam 以尝试规避 lago 静态初始化 double free（见 docs/FIX_GTSAM_LAGO_STATIC_INIT_DOUBLE_FREE.md）
     gtsam_preload_path = LaunchConfiguration("gtsam_preload_path", default="").perform(context).strip()
-    automap_env = None
+    automap_env = {}
     if gtsam_preload_path and os.path.isfile(gtsam_preload_path):
-        automap_env = {"LD_PRELOAD": gtsam_preload_path}
+        automap_env["LD_PRELOAD"] = gtsam_preload_path
         sys.stderr.write("{} [GTSAM] LD_PRELOAD={} (avoid lago static-init double free)\n".format(_LP, gtsam_preload_path))
         sys.stderr.flush()
     elif gtsam_preload_path:
         sys.stderr.write("{} [WARN] gtsam_preload_path 指定但文件不存在: {}，忽略\n".format(_LP, gtsam_preload_path))
         sys.stderr.flush()
+    if session_out:
+        automap_env["AUTOMAP_SESSION_OUTPUT_DIR"] = session_out
     # launch_ros Node 的 prefix 多元素 list 会被错误拼接；用包装脚本可靠调用 gdb
     gdb_wrapper = os.path.join(launch_dir, "run_under_gdb.sh")
     automap_prefix = [gdb_wrapper] if (run_automap_under_gdb and os.path.isfile(gdb_wrapper)) else []
@@ -217,13 +252,16 @@ def _launch_nodes_offline(context, *args, **kwargs):
         sys.stderr.flush()
     automap_system_node = None
     try:
+        node_params = [{"config_file": config_path_str}, {"use_sim_time": True}]
+        if session_out:
+            node_params.append({"output_dir": session_out})
         node_kw = dict(
             package="automap_pro", executable="automap_system_node", name="automap_system",
             output="screen",
-            parameters=[{"config_file": config_path_str}, {"use_sim_time": True}],
+            parameters=node_params,
             prefix=automap_prefix,
         )
-        if automap_env is not None:
+        if automap_env:
             node_kw["additional_env"] = automap_env
         automap_system_node = Node(**node_kw)
         nodes.append(automap_system_node)

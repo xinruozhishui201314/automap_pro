@@ -5,6 +5,8 @@
 #include "automap_pro/submap/submap_manager.h"
 #include "automap_pro/backend/hba_optimizer.h"
 #include <deque>
+#include <future>
+#include <memory>
 #include <mutex>
 
 namespace automap_pro::v3 {
@@ -75,6 +77,7 @@ private:
         std::string output_dir;
         float voxel_size;
         bool async;
+        std::shared_ptr<std::promise<void>> save_completion;
     };
     std::deque<Command> command_queue_;
 
