@@ -277,7 +277,9 @@ bool FrontEndModule::gpsCacheGet(double ts, GPSMeasurement& out_m) {
             best->m,
             best->m.is_valid,
             cfg.gpsMinAcceptedQualityLevel(),
-            false);
+            false,
+            min_dt,
+            max_dt);
         if (!decision.accepted) {
             g_gps_cache_get_reject_invalid_total.fetch_add(1, std::memory_order_relaxed);
             RCLCPP_DEBUG(node_->get_logger(),

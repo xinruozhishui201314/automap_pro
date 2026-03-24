@@ -24,6 +24,7 @@ public:
         int     num_correspondences = 0;
         bool    used_teaser   = false;
         GeomPath geom_path    = GeomPath::UNKNOWN;
+        bool    fpfh_garbage_rejected = false;
     };
 
     explicit TeaserMatcher();

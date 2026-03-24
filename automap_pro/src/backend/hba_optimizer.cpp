@@ -841,8 +841,10 @@ HBAResult HBAOptimizer::runGTSAMFallback(const PendingTask& task) {
         if (task.enable_gps && gps_aligned_) {
             for (size_t i = 0; i < sorted_kfs.size(); ++i) {
                 const auto& kf = sorted_kfs[i];
+                const double gps_dt = std::abs(kf->timestamp - kf->gps.timestamp);
                 const auto decision = evaluateKeyframeGpsConstraint(
-                    kf->gps, kf->has_valid_gps, gps_min_accepted_quality_level_, true);
+                    kf->gps, kf->has_valid_gps, gps_min_accepted_quality_level_, true,
+                    gps_dt, gps_keyframe_match_window_s_);
                 if (!decision.accepted) {
                     if (decision.reason == GPSConstraintRejectReason::NO_GPS_ON_KEYFRAME) gps_reject_no_valid++;
                     if (decision.reason == GPSConstraintRejectReason::QUALITY_BELOW_POLICY) gps_reject_quality++;

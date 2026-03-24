@@ -298,6 +298,7 @@ TeaserMatcher::Result TeaserMatcher::match(
                 ALOG_ERROR(MOD, "[FPFH_DIAG][CRITICAL] High p90 distance ({:.2f}m) detected! REJECTING garbage input to prevent TEASER++ heap corruption.", p90);
                 ALOG_INFO(MOD, "[TRACE] step=loop_match result=fail reason=fpfh_garbage_input tid={} p90={:.2f}", tid, p90);
                 result.success = false;
+                result.fpfh_garbage_rejected = true;
                 return result;
             }
 

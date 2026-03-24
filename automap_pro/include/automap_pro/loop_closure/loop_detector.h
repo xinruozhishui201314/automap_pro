@@ -229,6 +229,10 @@ private:
     bool allow_sc_fallback_ = true;
     bool allow_descriptor_fallback_ = true;
     bool allow_svd_geom_fallback_ = true;
+    int svd_temp_enable_after_fpfh_critical_ = 3;
+    int svd_temp_enable_budget_max_ = 24;
+    int svd_temp_enable_budget_left_ = 0;
+    int consecutive_fpfh_critical_rejects_ = 0;
     bool log_effective_flow_ = true;
     std::string loop_flow_mode_ = "safe_degraded";
     int parallel_teaser_max_inflight_ = 4;
@@ -279,6 +283,7 @@ private:
     void computeDescriptorAsync(const SubMap::Ptr& submap);
     void onDescriptorReady(const SubMap::Ptr& submap);
     void processMatchTask(const MatchTask& task);
+    bool shouldAllowSvdFallbackNow(const TeaserMatcher::Result& res, int query_id, int target_id, const char* stage_tag);
     void updateLoopHealthKpi(int query_id, int candidates, int accepted);
     std::string makeSubmapKey(uint64_t session_id, int submap_id) const;
     double submapRepresentativeTime(const SubMap::Ptr& submap) const;

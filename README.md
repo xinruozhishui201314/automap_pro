@@ -82,6 +82,31 @@ bash run_automap.sh --help
 
 V3 系统采用微内核式模块注册与事件驱动，主数据流如下：
 
+```mermaid
+flowchart TD
+    A[LiDAR / IMU / GPS] --> B[FrontEndModule]
+    B --> C[SyncedFrameEvent]
+    C --> D[DynamicFilterModule]
+    D --> E[FilteredFrameEventRequiredDs]
+    E --> F[MappingModule]
+    F --> G[OptimizerModule]
+    G --> H[HBA / iSAM2]
+    H --> I[OptimizationResultEvent]
+    I --> J[MapRegistry]
+    J --> K[VisualizationModule]
+    J --> L[Map / Trajectory Output]
+
+    C --> M[SemanticModule]
+    M --> N[SemanticProcessor<br/>SLOAM + ONNX]
+    N --> O[SemanticLandmarkEvent]
+    O --> F
+
+    F --> P[LoopModule]
+    P --> G
+```
+
+对应文本版主链路：
+
 ```text
 传感器数据 (LiDAR/IMU/GPS)
         ↓
@@ -98,12 +123,12 @@ MapRegistry (统一状态写入与版本推进)
 输出地图/轨迹/可视化
 ```
 
-语义分支（可选）：
+语义分支（必选）：
 
 ```text
 SyncedFrameEvent
    ↓
-SemanticModule / SemanticProcessor (SLOAM/ONNX 或 Stub)
+SemanticModule / SemanticProcessor (SLOAM + ONNX，禁止 Stub)
    ↓
 SemanticLandmarkEvent
    ↓
@@ -112,12 +137,90 @@ MappingModule -> CYLINDER_LANDMARK_FACTOR -> Optimizer
 
 ---
 
+## 🏛️ 系统架构（详细）
+
+### 1) 模块启动与依赖顺序
+
+系统按以下顺序完成模块注册与启动（先生产数据、后消费数据）：
+
+1. `FrontEndModule`
+2. `SemanticModule`
+3. `DynamicFilterModule`
+4. `GPSModule`
+5. `LoopModule`
+6. `VisualizationModule`
+7. `OptimizerModule`
+8. `MappingModule`
+
+该顺序用于保证：
+
+- 前端同步帧优先进入事件流
+- 语义与动态滤波可在建图前准备好输入
+- 优化器与建图调度在完整输入链路就绪后再工作
+
+### 2) 部署拓扑（默认 Docker 模式）
+
+```mermaid
+flowchart LR
+    subgraph Host[Host Ubuntu]
+        H1[run_automap.sh]
+        H2[data/]
+        H3[logs/]
+    end
+
+    subgraph C[Docker container automap-env:humble]
+        C1[ROS2 Launch]
+        C2[FrontEnd + AutoMapSystem]
+        C3[Semantic Runtime<br/>ONNX + sloam_segmentation]
+        C4[RViz2 optional]
+    end
+
+    H1 --> C1
+    H2 <--> C2
+    C2 --> C3
+    C2 --> C4
+    C1 --> C2
+    C2 --> H3
+```
+
+```text
+Host (Ubuntu)
+ ├─ run_automap.sh
+ ├─ data/                      (输入 bag + 输出地图)
+ ├─ logs/                      (build.log / full.log)
+ └─ Docker container (automap-env:humble)
+     ├─ ROS2 launch (offline/online)
+     ├─ FrontEnd + AutoMapSystem (V3 modules)
+     ├─ Optional Semantic Runtime (ONNX + sloam_segmentation)
+     └─ RViz2 (可选)
+```
+
+### 3) 关键事件契约（Event Contracts）
+
+- `SyncedFrameEvent`：前端时序对齐后的核心输入事件
+- `FilteredFrameEventRequiredDs`：动态滤波后的建图输入事件
+- `SemanticLandmarkEvent`：语义模块输出的地标事件
+- `OptimizationResultEvent`：优化器输出的位姿更新事件
+
+约定：
+
+- 事件必须带时间戳并保持单向数据流（sensor -> frontend -> backend -> output）
+- 跨模块共享状态优先通过 `MapRegistry` 快照/写入接口，不直接绕过状态中心
+
+### 4) 并发与队列模型（运维视角）
+
+- 模块内部采用 worker + queue 的异步处理模式，避免在 ROS 回调中做重计算
+- 队列必须有边界与超时策略，防止离线高倍速回放导致内存/延迟失控
+- 日志定位优先看 `logs/full.log` 的模块 INIT/RUN 标记，确认链路是否卡在某一阶段
+
+---
+
 ## 🧭 模块边界与职责（当前实现约定）
 
 - `MapRegistry`：关键帧、子图、版本号、对齐 epoch 的统一状态中心（Single Source of Truth）
 - `MappingModule`：关键帧与子图生成、优化任务组织、语义地标入图
 - `OptimizerModule`：消费图优化任务并更新位姿结果
-- `SemanticModule`：异步语义处理与语义事件发布（可退化到 Stub）
+- `SemanticModule`：异步语义处理与语义事件发布（必须真实生效，禁止 Stub）
 - `LoopModule`：回环候选与几何验证链路（含 OverlapTransformer/TEASER++）
 - `VisualizationModule`：RViz 数据发布与观测输出
 
@@ -125,18 +228,66 @@ MappingModule -> CYLINDER_LANDMARK_FACTOR -> Optimizer
 
 ---
 
-## 🧠 语义管线（新增）
+## 🧠 语义管线（必选项清单）
 
-### 编译期开关与退化行为
+> 当前工程策略：**语义模块必须真实处理数据并发挥作用，禁止以 Stub 模式运行。**
 
-- 当检测到 ONNX Runtime 与 `sloam_segmentation` 时，组件编译定义 `AUTOMAP_USE_SLOAM_SEMANTIC=1`
-- 仅有 ONNX Runtime 但缺失 `sloam_segmentation`，或未检测到 ONNX Runtime 时，自动进入 Stub 模式
-- Stub 模式下流程可跑通，但不产出完整语义能力
+### A. 构建前必选依赖（缺一不可）
 
-### 运行时关注点
+- `thrid_party/sloam_rec/sloam/include/segmentation/inference.h` 必须存在（vendor 目录）
+- ONNX Runtime 必须可被 CMake 发现（`ONNXRUNTIME_HOME` 或 `install_deps/onnxruntime`）
+- `sloam_segmentation` 动态库必须可被 CMake 找到
 
-- 语义处理为异步链路，需关注队列长度、延迟和回压
-- 语义匹配依赖时间戳关联，长时运行建议监控时间同步质量
+### B. 构建期强约束（必须满足）
+
+- CMake 默认启用 `AUTOMAP_REQUIRE_SEMANTIC=ON`
+- 若 ONNX Runtime 或 `sloam_segmentation` 缺失，配置阶段直接 `FATAL_ERROR`
+- 只有依赖齐全时，才会定义 `AUTOMAP_USE_SLOAM_SEMANTIC=1`
+
+### C. 构建验收清单（必须逐条确认）
+
+执行：
+
+```bash
+bash run_automap.sh --build-only --clean
+```
+
+在构建日志中必须看到：
+
+- `ONNX Runtime + sloam_segmentation found: SLOAM semantic ENABLED`
+- `AUTOMAP_USE_SLOAM_SEMANTIC=1`（可在编译命令或 CMake 输出中确认）
+
+若看到以下任一信息即为失败（不得继续运行）：
+
+- `Semantic pipeline is REQUIRED but ONNX Runtime was not found`
+- `Semantic pipeline is REQUIRED but sloam_segmentation library is missing`
+
+### D. 运行验收清单（必须逐条确认）
+
+离线运行后检查 `logs/full.log`，必须满足：
+
+- 出现 `\[SEMANTIC\]\[Processor\]\[INIT\] step=ok`
+- 出现 `\[SEMANTIC\]\[Module\]\[INIT\] step=ok enabled=1`
+- 出现 `\[SEMANTIC\]\[Module\]\[RUN\] step=done ... landmarks=...`
+
+若出现以下任一信息即为失败（视为发布阻断）：
+
+- `stub mode`
+- `SemanticProcessor requires AUTOMAP_USE_SLOAM_SEMANTIC=1`
+- `SemanticModule init failed: runtime semantic capability is unavailable`
+
+### E. 日常排查命令（建议固定执行）
+
+```bash
+# 1) 快速确认语义初始化
+rg "\[SEMANTIC\]\[Processor\]\[INIT\]|\[SEMANTIC\]\[Module\]\[INIT\]" logs/full.log
+
+# 2) 确认语义持续产出（landmark 数）
+rg "\[SEMANTIC\]\[Module\]\[RUN\] step=done" logs/full.log
+
+# 3) 发现即失败：任何 stub/降级痕迹
+rg "stub mode|runtime semantic capability is unavailable|AUTOMAP_USE_SLOAM_SEMANTIC=1" logs/full.log logs/build.log
+```
 
 ---
 

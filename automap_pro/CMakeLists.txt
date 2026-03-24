@@ -97,6 +97,7 @@ endif()
 
 # sloam_rec（SemanticProcessor）：仅使用本包内 thrid_party/sloam_rec（勿依赖仓库外 ../thrid_party）
 set(SLOAM_REC_SLOAM_INCLUDE "${CMAKE_CURRENT_SOURCE_DIR}/thrid_party/sloam_rec/sloam/include")
+option(AUTOMAP_REQUIRE_SEMANTIC "Require non-stub semantic pipeline" ON)
 if(EXISTS "${SLOAM_REC_SLOAM_INCLUDE}/segmentation/inference.h")
   message(STATUS "[automap_pro] sloam_rec sloam include: ${SLOAM_REC_SLOAM_INCLUDE}")
 else()
@@ -141,11 +142,23 @@ if(ONNX_INCLUDE_DIR AND ONNX_LIBRARY)
     message(STATUS "[automap_pro] ONNX Runtime + sloam_segmentation found: SLOAM semantic ENABLED")
   else()
     set(USE_SLOAM_SEMANTIC 0)
-    message(WARNING "[automap_pro] ONNX Runtime found but sloam_segmentation library missing: semantic processor will run in stub mode")
+    if(AUTOMAP_REQUIRE_SEMANTIC)
+      message(FATAL_ERROR
+        "[automap_pro] Semantic pipeline is REQUIRED but sloam_segmentation library is missing.\n"
+        "Checked install_deps and system paths. Please build/install sloam_segmentation first.")
+    else()
+      message(WARNING "[automap_pro] ONNX Runtime found but sloam_segmentation library missing: semantic processor will run in stub mode")
+    endif()
   endif()
 else()
   set(USE_SLOAM_SEMANTIC 0)
-  message(STATUS "[automap_pro] ONNX Runtime not found: SLOAM semantic DISABLED (stub mode)")
+  if(AUTOMAP_REQUIRE_SEMANTIC)
+    message(FATAL_ERROR
+      "[automap_pro] Semantic pipeline is REQUIRED but ONNX Runtime was not found.\n"
+      "Set ONNXRUNTIME_HOME or install onnxruntime in install_deps.")
+  else()
+    message(STATUS "[automap_pro] ONNX Runtime not found: SLOAM semantic DISABLED (stub mode)")
+  endif()
 endif()
 
 # Boost（lockfree SPSC 队列，用于 ingress/frame 热路径无锁）

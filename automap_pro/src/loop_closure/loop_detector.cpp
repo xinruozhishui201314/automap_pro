@@ -64,6 +64,10 @@ LoopDetector::LoopDetector() {
     log_effective_flow_ = cfg.loopLogEffectiveFlow();
     loop_flow_mode_ = cfg.loopFlowMode();
     parallel_teaser_max_inflight_ = cfg.parallelTeaserMaxInflight();
+    svd_temp_enable_after_fpfh_critical_ = 3;
+    svd_temp_enable_budget_max_ = 24;
+    svd_temp_enable_budget_left_ = 0;
+    consecutive_fpfh_critical_rejects_ = 0;
 
     // 缓存 pose_consistency 参数，避免 processMatchTask 中访问 ConfigManager 单例导致 shutdown 时 SIGSEGV（析构/卸载顺序不确定）
     pose_consistency_max_trans_m_ = cfg.loopPoseConsistencyMaxTransDiffM();
@@ -93,6 +97,43 @@ double LoopDetector::submapRepresentativeTime(const SubMap::Ptr& submap) const {
         if (kf1) return kf1->timestamp;
     }
     return 0.0;
+}
+
+bool LoopDetector::shouldAllowSvdFallbackNow(
+    const TeaserMatcher::Result& res, int query_id, int target_id, const char* stage_tag) {
+    if (allow_svd_geom_fallback_) {
+        return true;
+    }
+    if (loop_flow_mode_ != "safe_degraded") {
+        return false;
+    }
+
+    if (res.used_teaser) {
+        consecutive_fpfh_critical_rejects_ = 0;
+        svd_temp_enable_budget_left_ = 0;
+        return false;
+    }
+
+    if (res.fpfh_garbage_rejected) {
+        consecutive_fpfh_critical_rejects_++;
+        if (consecutive_fpfh_critical_rejects_ >= svd_temp_enable_after_fpfh_critical_ &&
+            svd_temp_enable_budget_left_ <= 0) {
+            svd_temp_enable_budget_left_ = svd_temp_enable_budget_max_;
+            ALOG_WARN(MOD,
+                "[LOOP_FLOW] stage={} query_id={} target_id={} activate_temp_svd_fallback=1 "
+                "reason=consecutive_fpfh_critical count={} budget={}",
+                stage_tag, query_id, target_id, consecutive_fpfh_critical_rejects_,
+                svd_temp_enable_budget_left_);
+        }
+    } else {
+        consecutive_fpfh_critical_rejects_ = 0;
+    }
+
+    if (svd_temp_enable_budget_left_ > 0) {
+        svd_temp_enable_budget_left_--;
+        return true;
+    }
+    return false;
 }
 
 void LoopDetector::init(rclcpp::Node::SharedPtr node) {
@@ -139,6 +180,10 @@ void LoopDetector::init(rclcpp::Node::SharedPtr node) {
     loop_max_match_queue_size_ = cfg.loopMaxMatchQueueSize();
     teaser_min_safe_inliers_ = cfg.teaserMinSafeInliers();
     parallel_teaser_match_ = cfg.parallelTeaserMatch();
+    svd_temp_enable_after_fpfh_critical_ = 3;
+    svd_temp_enable_budget_max_ = 24;
+    svd_temp_enable_budget_left_ = 0;
+    consecutive_fpfh_critical_rejects_ = 0;
 
     teaser_matcher_.applyConfig();
     RCLCPP_INFO(node->get_logger(),
@@ -1098,7 +1143,9 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
                 loop_teaser_geom_total_.fetch_add(1, std::memory_order_relaxed);
             } else {
                 loop_svd_geom_total_.fetch_add(1, std::memory_order_relaxed);
-                if (!allow_svd_geom_fallback_) {
+                const bool allow_svd_now =
+                    shouldAllowSvdFallbackNow(res, task.query ? task.query->id : -1, kfc.submap_id, "inter_kf");
+                if (!allow_svd_now) {
                     loop_fallback_reject_total_.fetch_add(1, std::memory_order_relaxed);
                     ALOG_WARN(MOD, "[INTER_KF][REJECT] sm_i={} sm_j={} geom_path=SVD_FALLBACK reason=svd_fallback_disabled",
                               kfc.submap_id, task.query->id);
@@ -1457,7 +1504,9 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
                     loop_teaser_geom_total_.fetch_add(1, std::memory_order_relaxed);
                 } else {
                     loop_svd_geom_total_.fetch_add(1, std::memory_order_relaxed);
-                    if (!allow_svd_geom_fallback_) {
+                    const bool allow_svd_now =
+                        shouldAllowSvdFallbackNow(teaser_res, query ? query->id : -1, works[i].cand.submap_id, "parallel");
+                    if (!allow_svd_now) {
                         loop_fallback_reject_total_.fetch_add(1, std::memory_order_relaxed);
                         ALOG_WARN(MOD, "[LOOP_FLOW] query_id={} target_id={} geom_path=SVD_FALLBACK reject=1 reason=svd_fallback_disabled (parallel)",
                                   query->id, works[i].cand.submap_id);
@@ -1630,7 +1679,9 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
             loop_teaser_geom_total_.fetch_add(1, std::memory_order_relaxed);
         } else {
             loop_svd_geom_total_.fetch_add(1, std::memory_order_relaxed);
-            if (!allow_svd_geom_fallback_) {
+            const bool allow_svd_now =
+                shouldAllowSvdFallbackNow(teaser_res, query ? query->id : -1, target ? target->id : -1, "serial");
+            if (!allow_svd_now) {
                 loop_fallback_reject_total_.fetch_add(1, std::memory_order_relaxed);
                 ALOG_WARN(MOD, "[LOOP_FLOW] query_id={} target_id={} geom_path=SVD_FALLBACK reject=1 reason=svd_fallback_disabled",
                           query->id, target->id);
