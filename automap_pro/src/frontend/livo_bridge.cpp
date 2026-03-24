@@ -349,7 +349,8 @@ void LivoBridge::onGPS(const sensor_msgs::msg::NavSatFix::SharedPtr msg) {
 
     double sigma_h = std::isfinite(msg->position_covariance[0]) ? std::sqrt(std::max(0.0, static_cast<double>(msg->position_covariance[0]))) : 1.0;
     double hdop    = std::max(0.5, sigma_h / 0.3);
-    int sats = 0;
+    // NavSatFix 不携带卫星数；用 -1 表示 unknown，避免上游将其当成“卫星数不足”。
+    int sats = -1;
 
     if (c == 0) {
         RCLCPP_INFO(node_->get_logger(),

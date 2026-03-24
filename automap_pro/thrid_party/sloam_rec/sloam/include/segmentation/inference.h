@@ -18,9 +18,13 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <memory>
+#include <mutex>
 #include <numeric>
 #include <string>
 #include <vector>
+#include <cstddef>
+#include <cstdint>
 
 using Point = pcl::PointXYZI;
 using Cloud = pcl::PointCloud<Point>;
@@ -55,7 +59,9 @@ struct Timer{
 class Segmentation {
  public:
     explicit Segmentation(const std::string modelFilePath,
-        const float fov_up, const float fov_down, const int img_w, const int img_h, const int img_d, bool do_destagger);
+        const float fov_up, const float fov_down, const int img_w, const int img_h,
+        const int input_channels, const int num_classes, const int tree_class_id,
+        const std::vector<float>& input_mean, const std::vector<float>& input_std, bool do_destagger);
 
     Segmentation(const Segmentation &) = delete;
     Segmentation operator=(const Segmentation &) = delete;
@@ -75,14 +81,23 @@ class Segmentation {
     // void _preProcessRange(cv::Mat& rImg, float maxDist);
     void _makeTensor(std::vector<std::vector<float>>& projected_data, std::vector<float>& tensor, std::vector<size_t>& invalid_idxs);
     void _startONNXSession(const std::string sessionName, const std::string modelFilePath, bool useCUDA, size_t numThreads);
+    void _finalizeInputNormStats();
     void _mask(const float* output, const std::vector<size_t>& invalid_idxs, cv::Mat& maskImg);
     void _destaggerCloud(const Cloud::Ptr cloud, Cloud::Ptr& outCloud);
+    void _recordStageTiming(double projection_ms, double tensor_ms, double run_ms, double mask_ms, size_t cloud_points);
+    void _recordBufferStats(uint64_t run_id) const;
 
-    boost::shared_ptr<Ort::Session> _session = nullptr;
-    boost::shared_ptr<Ort::MemoryInfo> _memoryInfo = nullptr;
-    boost::shared_ptr<Ort::Env> _env = nullptr;
+    // --- Order of declaration is critical for correct destruction sequence ---
+    // Ort::Env MUST be destroyed AFTER Ort::Session.
+    // In C++, members are destroyed in the REVERSE order of their declaration.
+    // Thus, declare _env FIRST, _memoryInfo SECOND, and _session LAST.
+    std::unique_ptr<Ort::Env> _env = nullptr;
+    std::unique_ptr<Ort::MemoryInfo> _memoryInfo = nullptr;
+    std::unique_ptr<Ort::Session> _session = nullptr;
 
     Ort::AllocatorWithDefaultOptions _allocator;
+    std::vector<std::string> _inputNamesStr;
+    std::vector<std::string> _outputNamesStr;
     std::vector<const char*> _inputNames;
     std::vector<const char*> _outputNames;
     std::vector<int64_t> _inputDims;
@@ -91,6 +106,8 @@ class Segmentation {
     size_t _outputTensorSize;
     Timer _timer;
     bool _verbose = false;
+
+    std::recursive_mutex _run_mutex; // Protect against concurrent calls to run() and member buffers.
 
     std::vector<float> proj_xs; // stope a copy in original order
     std::vector<float> proj_ys;
@@ -101,7 +118,29 @@ class Segmentation {
     int _img_w;
     int _img_h;
     int _img_d;
+    int _num_classes;
+    int _tree_class_id;
+    std::vector<float> _user_input_mean;
+    std::vector<float> _user_input_std;
+    std::vector<float> _norm_mean;
+    std::vector<float> _norm_std;
     bool _do_destagger;
+
+    std::vector<double> _hist_projection_ms;
+    std::vector<double> _hist_tensor_ms;
+    std::vector<double> _hist_run_ms;
+    std::vector<double> _hist_mask_ms;
+    size_t _timing_window_size = 120;
+    size_t _timing_print_interval = 30;
+    size_t _timing_sample_count = 0;
+    uint64_t _run_seq = 0;
+    size_t _last_projection_invalid_points = 0;
+    size_t _last_projection_oob_writes = 0;
+    size_t _last_projection_points = 0;
+    // Reused per-frame buffers to reduce allocator jitter in inference hot path.
+    std::vector<float> _input_tensor_buffer;
+    std::vector<size_t> _invalid_idx_buffer;
+    size_t _buffer_stats_interval = 100;
 };
 
 template <typename T>
@@ -235,9 +274,15 @@ std::vector<size_t> sort_indexes(const std::vector<T> &v) {
     std::vector<size_t> idx(v.size());
     std::iota(idx.begin(), idx.end(), 0);
 
-    // sort indexes based on comparing values in v. >: decrease <: increase
-    std::sort(idx.begin(), idx.end(),
-         [&v](size_t i1, size_t i2) {return v[i1] > v[i2];});
+    // Sort by descending finite value; non-finite values go to the tail.
+    std::sort(idx.begin(), idx.end(), [&v](size_t i1, size_t i2) {
+         const bool f1 = std::isfinite(static_cast<double>(v[i1]));
+         const bool f2 = std::isfinite(static_cast<double>(v[i2]));
+         if (f1 != f2) return f1;
+         if (!f1 && !f2) return i1 < i2;
+         if (v[i1] == v[i2]) return i1 < i2;
+         return v[i1] > v[i2];
+    });
 
     return idx;
 }

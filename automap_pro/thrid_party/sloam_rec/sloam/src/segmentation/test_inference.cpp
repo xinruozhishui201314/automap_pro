@@ -76,7 +76,9 @@ int main(int argc, char* argv[])
     std::string realModelFilepath{"/opt/bags/inf/models/real_erfnet.onnx"};
     std::string realCloudPath{"/opt/bags/inf/pcds/800m.pcd"};
     // // std::string realCloudPath{"/opt/bags/inf/pcds/s3_p1_f2_800.pcd"};
-    auto realSegmenter = Segmentation(realModelFilepath, 22.5, -22.5, 2048, 64, 1, true);
+    std::vector<float> no_mean;
+    std::vector<float> no_std;
+    auto realSegmenter = Segmentation(realModelFilepath, 22.5, -22.5, 2048, 64, 1, 2, 1, no_mean, no_std, true);
 
     // // // // READ PCD FROM FILE
     pcl::PointCloud<pcl::PointXYZI>::Ptr realCloud (new pcl::PointCloud<pcl::PointXYZI>);

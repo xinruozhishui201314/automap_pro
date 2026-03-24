@@ -2,6 +2,8 @@
 #include "automap_pro/core/logger.h"
 #include "automap_pro/core/config_manager.h"
 #include <stdexcept>
+#include <cmath>
+#include <chrono>
 
 // sloam_rec：include 根目录为包内 thrid_party/sloam_rec/sloam/include（由 CMake 注入）
 #ifdef AUTOMAP_USE_SLOAM_SEMANTIC
@@ -47,8 +49,9 @@ SemanticProcessor::SemanticProcessor(const Config& config) : config_(config) {
     try {
         // Initialize SLOAM components
         segmentator_ = std::make_shared<seg::Segmentation>(
-            config.model_path, config.fov_up, config.fov_down, 
-            config.img_w, config.img_h, 1, config.do_destagger);
+            config.model_path, config.fov_up, config.fov_down,
+            config.img_w, config.img_h, config.input_channels, config.num_classes, config.tree_class_id,
+            config.input_mean, config.input_std, config.do_destagger);
 
         instance_detector_ = std::make_unique<Instance>();
         Instance::Params params;
@@ -60,8 +63,9 @@ SemanticProcessor::SemanticProcessor(const Config& config) : config_(config) {
         instance_detector_->set_params(params);
         
         RCLCPP_INFO(rclcpp::get_logger("automap_system"), 
-            "[SEMANTIC][Processor][INIT] step=ok model_path=%s fov=[%.1f,%.1f] img=%dx%d",
-            config.model_path.c_str(), config.fov_up, config.fov_down, config.img_w, config.img_h);
+            "[SEMANTIC][Processor][INIT] step=ok model_path=%s fov=[%.1f,%.1f] img=%dx%d input_channels=%d num_classes=%d tree_class_id=%d",
+            config.model_path.c_str(), config.fov_up, config.fov_down, config.img_w, config.img_h,
+            config.input_channels, config.num_classes, config.tree_class_id);
     } catch (const std::exception& e) {
         RCLCPP_ERROR(rclcpp::get_logger("automap_system"), 
             "[SEMANTIC][Processor][INIT] step=FAILED model_path=%s error=%s → abort startup",
@@ -82,6 +86,11 @@ std::vector<CylinderLandmark::Ptr> SemanticProcessor::process(const CloudXYZICon
     (void)cloud;
     return landmarks;
 #else
+    if (runtime_disabled_.load(std::memory_order_relaxed)) {
+        RCLCPP_WARN(rclcpp::get_logger("automap_system"),
+            "[SEMANTIC][Processor][process] step=skip reason=runtime_disabled_after_repeated_exceptions");
+        return landmarks;
+    }
     if (!segmentator_) {
         RCLCPP_WARN(rclcpp::get_logger("automap_system"),
             "[SEMANTIC][Processor][process] step=skip reason=segmentator_null (feature disabled)");
@@ -96,28 +105,62 @@ std::vector<CylinderLandmark::Ptr> SemanticProcessor::process(const CloudXYZICon
     std::lock_guard<std::recursive_mutex> lock(resource_mutex_);
 
     try {
+        const auto t0 = std::chrono::steady_clock::now();
+        RCLCPP_DEBUG(rclcpp::get_logger("automap_system"),
+            "[SEMANTIC][Processor][process] step=input_snapshot cloud_size=%zu cloud_wh=%ux%u expected_mask_wh=%dx%d",
+            cloud->size(), cloud->width, cloud->height, config_.img_w, config_.img_h);
+
         // 🏛️ [坐标系对齐] sloam_rec 内部使用 yaw = -atan2(y, x)
         // 标准 ROS 使用 atan2(y, x)。为了对齐，我们将 y 轴取反后再送入投影。
         CloudXYZIPtr flipped_cloud(new CloudXYZI());
         flipped_cloud->header = cloud->header;
-        flipped_cloud->width = cloud->width;
-        flipped_cloud->height = cloud->height;
         flipped_cloud->points.reserve(cloud->size());
+        size_t dropped_invalid_points = 0;
         for (const auto& p : cloud->points) {
+            if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z) || !std::isfinite(p.intensity)) {
+                ++dropped_invalid_points;
+                continue;
+            }
+            const float r2 = p.x * p.x + p.y * p.y + p.z * p.z;
+            if (!(r2 > 1e-12f)) {
+                ++dropped_invalid_points;
+                continue;
+            }
             auto p_f = p;
             p_f.y = -p.y;
             flipped_cloud->push_back(p_f);
         }
+        flipped_cloud->width = static_cast<uint32_t>(flipped_cloud->points.size());
+        flipped_cloud->height = 1;
+        if (dropped_invalid_points > 0) {
+            RCLCPP_WARN(rclcpp::get_logger("automap_system"),
+                "[SEMANTIC][Processor][process] step=input_filter dropped_invalid=%zu kept=%zu",
+                dropped_invalid_points, flipped_cloud->size());
+        }
+        if (flipped_cloud->empty()) {
+            RCLCPP_WARN(rclcpp::get_logger("automap_system"),
+                "[SEMANTIC][Processor][process] step=skip reason=all_points_invalid_after_filter raw_size=%zu",
+                cloud->size());
+            return landmarks;
+        }
+        const auto t1 = std::chrono::steady_clock::now();
 
-        // 1. Semantic Segmentation
-        cv::Mat mask = cv::Mat::zeros(flipped_cloud->height, flipped_cloud->width, CV_8U);
+        // 1. Semantic Segmentation — mask 必须为模型输出分辨率 (_img_h x _img_w)，
+        // 不可用 cloud->width/height（无序点云常为 N×1）；否则 _mask 会 memcpy H*W 字节导致堆溢出。
+        cv::Mat mask = cv::Mat::zeros(config_.img_h, config_.img_w, CV_8U);
         segmentator_->run(flipped_cloud, mask);
+        const auto t2 = std::chrono::steady_clock::now();
 
         // 2. Mask Tree Points
         CloudXYZIPtr tree_cloud(new CloudXYZI());
-        segmentator_->maskCloud(flipped_cloud, mask, tree_cloud, 255, true);
+        // 当前 V3 输入为非组织化点云，不能走 dense+destagger 路径（会要求 H*W 点布局）。
+        // 这里按稀疏输出返回树点，后续实例聚类仅依赖点集合本身。
+        segmentator_->maskCloud(flipped_cloud, mask, tree_cloud, 255, false);
+        const auto t3 = std::chrono::steady_clock::now();
+        ++processed_frames_;
 
         if (tree_cloud->empty()) {
+            ++empty_tree_frames_;
             RCLCPP_DEBUG(rclcpp::get_logger("automap_system"),
                 "[SEMANTIC][Processor][process] step=mask_tree pts=%zu tree_pts=0 → no tree points",
                 cloud->size());
@@ -127,10 +170,14 @@ std::vector<CylinderLandmark::Ptr> SemanticProcessor::process(const CloudXYZICon
         // 3. Instance Segmentation (Clustering)
         std::vector<std::vector<TreeVertex>> tree_clusters;
         instance_detector_->computeGraph(flipped_cloud, tree_cloud, tree_clusters);
+        const auto t4 = std::chrono::steady_clock::now();
 
         RCLCPP_DEBUG(rclcpp::get_logger("automap_system"),
             "[SEMANTIC][Processor][process] step=instance tree_pts=%zu clusters=%zu",
             tree_cloud->size(), tree_clusters.size());
+        if (tree_clusters.empty()) {
+            ++empty_cluster_frames_;
+        }
 
         // 4. Cylinder Fitting for each cluster
         for (const auto& cluster : tree_clusters) {
@@ -151,8 +198,10 @@ std::vector<CylinderLandmark::Ptr> SemanticProcessor::process(const CloudXYZICon
                 landmarks.push_back(landmark);
             }
         }
+        const auto t5 = std::chrono::steady_clock::now();
 
         if (landmarks.empty()) {
+            ++empty_fit_frames_;
             RCLCPP_DEBUG(rclcpp::get_logger("automap_system"),
                 "[SEMANTIC][Processor][process] step=done clusters=%zu fitted=0 (all rejected)",
                 tree_clusters.size());
@@ -161,10 +210,45 @@ std::vector<CylinderLandmark::Ptr> SemanticProcessor::process(const CloudXYZICon
                 "[SEMANTIC][Processor][process] step=done clusters=%zu fitted=%zu",
                 tree_clusters.size(), landmarks.size());
         }
+        const auto processed = processed_frames_.load();
+        const auto now = std::chrono::steady_clock::now();
+        const auto secs_since_stats = std::chrono::duration_cast<std::chrono::seconds>(now - last_stats_log_tp_).count();
+        if (secs_since_stats >= 10) {
+            last_stats_log_tp_ = now;
+            const auto empty_tree = empty_tree_frames_.load();
+            const auto empty_cluster = empty_cluster_frames_.load();
+            const auto empty_fit = empty_fit_frames_.load();
+            const double empty_tree_ratio = processed > 0 ? (100.0 * static_cast<double>(empty_tree) / static_cast<double>(processed)) : 0.0;
+            const double empty_cluster_ratio = processed > 0 ? (100.0 * static_cast<double>(empty_cluster) / static_cast<double>(processed)) : 0.0;
+            const double empty_fit_ratio = processed > 0 ? (100.0 * static_cast<double>(empty_fit) / static_cast<double>(processed)) : 0.0;
+            const auto input_filter_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            const auto seg_ms = std::chrono::duration<double, std::milli>(t2 - t1).count();
+            const auto mask_ms = std::chrono::duration<double, std::milli>(t3 - t2).count();
+            const auto cluster_ms = std::chrono::duration<double, std::milli>(t4 - t3).count();
+            const auto fit_ms = std::chrono::duration<double, std::milli>(t5 - t4).count();
+            RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                "[SEMANTIC][Processor][STATS] processed=%lu empty_tree=%lu(%.1f%%) empty_cluster=%lu(%.1f%%) empty_fit=%lu(%.1f%%) "
+                "latest(tree_pts=%zu clusters=%zu fitted=%zu) stage_ms(filter=%.1f seg=%.1f mask=%.1f cluster=%.1f fit=%.1f)",
+                static_cast<unsigned long>(processed),
+                static_cast<unsigned long>(empty_tree), empty_tree_ratio,
+                static_cast<unsigned long>(empty_cluster), empty_cluster_ratio,
+                static_cast<unsigned long>(empty_fit), empty_fit_ratio,
+                tree_cloud->size(), tree_clusters.size(), landmarks.size(),
+                input_filter_ms, seg_ms, mask_ms, cluster_ms, fit_ms);
+        }
+        consecutive_failures_.store(0, std::memory_order_relaxed);
     } catch (const std::exception& e) {
+        const size_t failures = consecutive_failures_.fetch_add(1, std::memory_order_relaxed) + 1;
         RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
-            "[SEMANTIC][Processor][process] step=EXCEPTION error=%s cloud_size=%zu",
-            e.what(), cloud ? cloud->size() : 0);
+            "[SEMANTIC][Processor][process] step=EXCEPTION error=%s cloud_size=%zu cloud_wh=%ux%u cfg(mask_wh=%dx%d input_ch=%d classes=%d tree_class=%d) consecutive_failures=%zu",
+            e.what(), cloud ? cloud->size() : 0, cloud ? cloud->width : 0, cloud ? cloud->height : 0,
+            config_.img_w, config_.img_h, config_.input_channels, config_.num_classes, config_.tree_class_id, failures);
+        if (failures >= kMaxConsecutiveFailures) {
+            runtime_disabled_.store(true, std::memory_order_relaxed);
+            RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+                "[SEMANTIC][Processor][process] step=DISABLED reason=too_many_exceptions threshold=%zu",
+                kMaxConsecutiveFailures);
+        }
     }
 
     return landmarks;
@@ -173,7 +257,7 @@ std::vector<CylinderLandmark::Ptr> SemanticProcessor::process(const CloudXYZICon
 
 bool SemanticProcessor::hasRuntimeCapability() const {
 #ifdef AUTOMAP_USE_SLOAM_SEMANTIC
-    return segmentator_ != nullptr;
+    return segmentator_ != nullptr && !runtime_disabled_.load(std::memory_order_relaxed);
 #else
     return false;
 #endif

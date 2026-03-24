@@ -142,6 +142,13 @@ struct CylinderLandmark {
     // 原始点云索引或简易点集（可选，用于可视化或进一步优化）
     CloudXYZIPtr points; 
 
+    bool isValid() const {
+        return std::isfinite(root.x()) && std::isfinite(root.y()) && std::isfinite(root.z()) &&
+               std::isfinite(ray.x()) && std::isfinite(ray.y()) && std::isfinite(ray.z()) &&
+               std::isfinite(radius) && radius > 0.0 &&
+               std::isfinite(confidence) && confidence >= 0.0;
+    }
+
     using Ptr = std::shared_ptr<CylinderLandmark>;
 };
 
@@ -361,6 +368,7 @@ struct HBAResult {
     std::vector<Pose3d> optimized_poses; // 与输入keyframe顺序一致
     std::vector<uint64_t> optimized_keyframe_ids; // 与 optimized_poses 一一对应
     PoseFrame pose_frame = PoseFrame::UNKNOWN; // optimized_poses 所在坐标系
+    uint64_t alignment_epoch_snapshot = 0; // 任务入队时的对齐世代快照
 
     bool isFinite() const {
         for (const auto& pose : optimized_poses) if (!pose.matrix().allFinite()) return false;

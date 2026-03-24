@@ -96,6 +96,31 @@ frontend:
   kf_info_topic: "/fast_livo/keyframe_info"
   cloud_frame:   "world"   # body | world；fast_livo 默认 world
 
+# ── 2.2c 语义模块（SLOAM 语义分割 + 树干地标）───────────────────────────────
+semantic:
+  enabled: true
+  # 离线 launch 会将 ${CMAKE_CURRENT_SOURCE_DIR} 解析为仓库绝对路径并写入 /tmp 补丁配置。
+  # 若该路径不存在，离线 launch 会自动尝试仓库 models 下其它 segmentator onnx 候选。
+  model_path: "${CMAKE_CURRENT_SOURCE_DIR}/models/squeezesegV2_segmentator.onnx"
+  # 模型自描述驱动:
+  # 0 = 自动从 ONNX 输入/输出维度读取（推荐，换模型无需改代码）
+  input_channels: 0
+  num_classes: 0
+  # -1 = 自动回退（num_classes>2 时默认 2，否则 1）
+  tree_class_id: -1
+  # 可选：与 ONNX 输入通道数一致时的 per-channel 归一化 (x-mean)/std；不填则用默认 range=12.97/12.35 其余 mean=0 std=1
+  # SqueezeSeg 风格 5 通道示例（需与训练一致）:
+  # input_mean: [12.12, 10.88, 0.23, -1.04, 0.21]
+  # input_std: [12.32, 11.47, 6.91, 0.86, 0.16]
+  fov_up: 22.5
+  fov_down: -22.5
+  img_w: 2048
+  img_h: 64
+  do_destagger: true
+  # 仅对关键帧做语义，显著降低推理负载；关键帧判定基于 frame_ts 与 kf_info.timestamp 时间对齐
+  keyframes_only: true
+  keyframe_time_tolerance_s: 0.03
+
 # ── 2.2b 动态点过滤（FrontEnd->DynamicFilter->Mapping）──────────────────────
 dynamic_filter:
   enabled: true

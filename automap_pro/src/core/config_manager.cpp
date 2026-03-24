@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <vector>
 #include <filesystem>
+#include <unordered_set>
 
 namespace automap_pro {
 
@@ -195,6 +196,28 @@ void ConfigManager::load(const std::string& yaml_path) {
         try {
             std::vector<std::pair<std::string, std::string>> flat;
             flattenYamlParams(cfg_, "", flat);
+            std::unordered_set<std::string> seen_keys;
+            std::unordered_set<std::string> duplicate_keys;
+            for (const auto& kv : flat) {
+                if (!seen_keys.insert(kv.first).second) {
+                    duplicate_keys.insert(kv.first);
+                }
+            }
+            if (!duplicate_keys.empty()) {
+                std::string dup_joined;
+                bool first = true;
+                for (const auto& k : duplicate_keys) {
+                    if (!first) dup_joined += ", ";
+                    dup_joined += k;
+                    first = false;
+                }
+                RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+                    "[ConfigManager][CONFIG_DUPLICATE_KEYS] duplicate flattened keys detected: %s",
+                    dup_joined.c_str());
+                if (contract_strict_mode_) {
+                    throw std::runtime_error("duplicate YAML keys detected in strict mode: " + dup_joined);
+                }
+            }
             flat_params_cache_.clear();
             for (const auto& p : flat) flat_params_cache_[p.first] = p.second;
             RCLCPP_INFO(rclcpp::get_logger("automap_system"), "[ConfigManager][CONFIG_FILE_PARAMS] ====== all params from file (key=value) total=%zu ======", flat.size());
@@ -797,6 +820,33 @@ std::vector<std::string> ConfigManager::previousSessionDirs() const {
         ErrorMonitor::instance().recordException(e, errors::CONFIG_KEY_NOT_FOUND);
     }
     return dirs;
+}
+
+namespace {
+std::vector<float> readSemanticFloatSequence(const YAML::Node& cfg, const char* key) {
+    std::vector<float> out;
+    try {
+        YAML::Node sem = cfg["semantic"];
+        if (!sem || !sem.IsMap()) return out;
+        YAML::Node n = sem[key];
+        if (!n || !n.IsSequence()) return out;
+        out.reserve(n.size());
+        for (const auto& item : n) {
+            if (item.IsScalar()) {
+                out.push_back(static_cast<float>(item.as<double>()));
+            }
+        }
+    } catch (...) {}
+    return out;
+}
+}  // namespace
+
+std::vector<float> ConfigManager::semanticInputMean() const {
+    return readSemanticFloatSequence(cfg_, "input_mean");
+}
+
+std::vector<float> ConfigManager::semanticInputStd() const {
+    return readSemanticFloatSequence(cfg_, "input_std");
 }
 
 } // namespace automap_pro

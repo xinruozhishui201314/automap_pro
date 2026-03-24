@@ -1,4 +1,5 @@
 #include "automap_pro/v3/map_registry.h"
+#include "automap_pro/core/config_manager.h"
 #include "automap_pro/core/metrics.h"
 #include <rclcpp/rclcpp.hpp>
 #include <filesystem>
@@ -50,15 +51,20 @@ KeyFrame::Ptr MapRegistry::getKeyFrame(int id) const {
     return (it != keyframes_.end()) ? it->second : nullptr;
 }
 
-KeyFrame::Ptr MapRegistry::getKeyFrameByTimestamp(double timestamp) const {
+KeyFrame::Ptr MapRegistry::getKeyFrameByTimestamp(double timestamp, double tolerance_s) const {
     std::lock_guard<std::mutex> lock(kf_mutex_);
+    KeyFrame::Ptr best = nullptr;
+    double best_dt = std::numeric_limits<double>::infinity();
     for (const auto& [id, kf] : keyframes_) {
         (void)id;
-        if (kf && std::abs(kf->timestamp - timestamp) < 1e-4) {
-            return kf;
+        if (!kf) continue;
+        const double dt = std::abs(kf->timestamp - timestamp);
+        if (dt <= tolerance_s && dt < best_dt) {
+            best = kf;
+            best_dt = dt;
         }
     }
-    return nullptr;
+    return best;
 }
 
 KeyFrame::Ptr MapRegistry::getLatestKeyFrameByTimestamp() const {
@@ -174,6 +180,26 @@ uint64_t MapRegistry::updatePoses(const std::unordered_map<int, Pose3d>& sm_upda
             RCLCPP_ERROR(rclcpp::get_logger("automap_pro"),
                 "[V3][CONTRACT] Reject updatePoses: keyframe pose %lu has non-finite value", id);
             METRICS_INCREMENT(metrics::FRAME_MISMATCH_TOTAL);
+            return current_version_.load();
+        }
+    }
+
+    // 🏛️ [产品化加固] Reasonableness Check (数值安全网)
+    // 防止优化器因离群值导致的数值爆炸损毁地图
+    const double max_trans = ConfigManager::instance().mappingMaxReasonableTranslationM();
+    for (const auto& [id, pose] : sm_updates) {
+        if (pose.translation().norm() > max_trans) {
+            RCLCPP_ERROR(rclcpp::get_logger("automap_pro"),
+                "[V3][CRASH_GUARD] Reject updatePoses: submap %d translation too large (%.1fm > %.1fm) from %s",
+                id, pose.translation().norm(), max_trans, source_module.c_str());
+            return current_version_.load();
+        }
+    }
+    for (const auto& [id, pose] : kf_updates) {
+        if (pose.translation().norm() > max_trans) {
+            RCLCPP_ERROR(rclcpp::get_logger("automap_pro"),
+                "[V3][CRASH_GUARD] Reject updatePoses: keyframe %lu translation too large (%.1fm > %.1fm) from %s",
+                id, pose.translation().norm(), max_trans, source_module.c_str());
             return current_version_.load();
         }
     }

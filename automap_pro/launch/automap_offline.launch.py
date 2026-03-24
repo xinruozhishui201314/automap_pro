@@ -88,6 +88,54 @@ def _launch_nodes_offline(context, *args, **kwargs):
                             sys.stderr.flush()
             except Exception as _e_res:
                 _log_launch_exception("resolve loop_closure.overlap_transformer.model_path (offline)", _e_res)
+            # 语义模型路径离线解析：避免 /tmp 补丁 YAML 导致 ${CMAKE_CURRENT_SOURCE_DIR} 失效。
+            # 同时在配置未写 semantic.model_path 时自动尝试常见路径，确保语义模块可被真正启用。
+            try:
+                _pkg_root = os.path.dirname(os.path.dirname(_orig_config_abs))
+                _sm = _cfg.get("semantic")
+                if isinstance(_sm, dict) and bool(_sm.get("enabled", True)):
+                    _raw_sem_mp = (_sm.get("model_path") or "").strip()
+                    _sem_mp = _raw_sem_mp
+                    _cmake = "${CMAKE_CURRENT_SOURCE_DIR}"
+                    if _sem_mp:
+                        if _cmake in _sem_mp:
+                            _sem_mp = _sem_mp.replace(_cmake, _pkg_root)
+                        elif not os.path.isabs(_sem_mp):
+                            _sem_mp = os.path.abspath(
+                                os.path.join(os.path.dirname(_orig_config_abs), _sem_mp)
+                            )
+                        _sem_mp = os.path.normpath(_sem_mp)
+                    if not _sem_mp or (not os.path.isfile(_sem_mp)):
+                        _candidates = [
+                            os.path.join(_pkg_root, "models", "squeezesegV2_segmentator.onnx"),
+                            os.path.join(_pkg_root, "models", "squeezesegV2-crf_segmentator.onnx"),
+                            os.path.join(_pkg_root, "models", "squeezeseg_segmentator.onnx"),
+                            os.path.join(_pkg_root, "models", "squeezeseg-crf_segmentator.onnx"),
+                            os.path.join(_pkg_root, "models", "darknet53-1024_segmentator.onnx"),
+                            "/opt/sloam_ws/src/models/darknet53-1024_segmentator.onnx",
+                        ]
+                        _found = ""
+                        for _c in _candidates:
+                            if os.path.isfile(_c):
+                                _found = _c
+                                break
+                        if _found:
+                            _sem_mp = _found
+                    if _sem_mp and os.path.isfile(_sem_mp):
+                        _sm["model_path"] = _sem_mp
+                        _cfg["semantic"] = _sm
+                        sys.stderr.write(
+                            "{} [SEMANTIC] offline resolved model_path={}\n".format(_LP, _sem_mp)
+                        )
+                        sys.stderr.flush()
+                    else:
+                        raise RuntimeError(
+                            "semantic.enabled=true but semantic.model_path is empty or file not found. "
+                            "Set semantic.model_path in config or provide one of the default model files."
+                        )
+            except Exception as _e_sem:
+                _log_launch_exception("resolve semantic.model_path (offline)", _e_sem)
+                raise
             _system = _cfg.get("system") if isinstance(_cfg.get("system"), dict) else {}
             _base_out = (_system.get("output_dir") or "").strip() or "/data/automap_output"
             _base_out = os.path.abspath(_base_out.rstrip("/"))

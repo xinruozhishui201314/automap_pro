@@ -1,6 +1,7 @@
 #include "automap_pro/backend/hba_optimizer.h"
 #include "automap_pro/backend/gps_constraint_policy.h"
 #include "automap_pro/backend/gtsam_guard.h"
+#include "automap_pro/backend/isam2_factor_types.h"
 #include "automap_pro/core/config_manager.h"
 #include "automap_pro/core/logger.h"
 #include "automap_pro/core/metrics.h"
@@ -102,6 +103,7 @@ static Pose3d fromGtsamPose3(const gtsam::Pose3& p) {
     return T;
 }
 static gtsam::Symbol KF(size_t i) { return gtsam::Symbol('x', static_cast<gtsam::Key>(i)); }
+static gtsam::Symbol SM(int id) { return gtsam::Symbol('s', id); }
 } // namespace
 #endif
 
@@ -114,19 +116,45 @@ void HBAOptimizer::init() {
     hba_enabled_ = cfg.hbaEnabled();
     hba_gtsam_fallback_enabled_ = cfg.hbaGtsamFallbackEnabled();
     gps_min_accepted_quality_level_ = cfg.gpsMinAcceptedQualityLevel();
+    gps_keyframe_match_window_s_ = cfg.gpsKeyframeMatchWindowS();
     hba_total_layers_ = cfg.hbaTotalLayers();
     hba_thread_num_ = cfg.hbaThreadNum();
     hba_trigger_submaps_ = cfg.hbaTriggerSubmaps();
     hba_on_loop_ = cfg.hbaOnLoop();
+    RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+        "[DIAG][HBA][CONFIG] enabled=%d gtsam_fallback=%d trigger_submaps=%d on_loop=%d total_layers=%d "
+        "thread_num=%d gps_min_quality=%d gps_match_window_s=%.2f",
+        hba_enabled_ ? 1 : 0,
+        hba_gtsam_fallback_enabled_ ? 1 : 0,
+        hba_trigger_submaps_,
+        hba_on_loop_ ? 1 : 0,
+        hba_total_layers_,
+        hba_thread_num_,
+        gps_min_accepted_quality_level_,
+        gps_keyframe_match_window_s_);
 
+    Eigen::Vector3d cfg_lever_arm = Eigen::Vector3d::Zero();
+    bool cfg_loaded = false;
+    std::string cfg_path;
+    try {
+        cfg_loaded = cfg.isLoaded();
+        cfg_path = cfg.configFilePath();
+        if (cfg_loaded) cfg_lever_arm = cfg.gpsLeverArmImu();
+    } catch (...) {
+    }
     resolveGpsLeverArmForHba(lever_arm_);
     if (lever_arm_.norm() > 1e-12) {
         RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-            "[HBA] GPS lever arm (gps.lever_arm_imu or sensor_config/gps_imu_extrinsic.yaml next to config): [%.4f, %.4f, %.4f] m",
-            lever_arm_.x(), lever_arm_.y(), lever_arm_.z());
+            "[HBA] GPS lever arm resolved=[%.4f, %.4f, %.4f] m (cfg_loaded=%d cfg_path=%s cfg_gps_lever_arm=[%.4f, %.4f, %.4f])",
+            lever_arm_.x(), lever_arm_.y(), lever_arm_.z(),
+            cfg_loaded ? 1 : 0, cfg_path.c_str(),
+            cfg_lever_arm.x(), cfg_lever_arm.y(), cfg_lever_arm.z());
     } else {
         RCLCPP_WARN(rclcpp::get_logger("automap_system"),
-            "[HBA] GPS lever arm is zero (set gps.lever_arm_imu in main YAML or T_gps_imu.translation in config_dir/sensor_config/gps_imu_extrinsic.yaml)");
+            "[HBA] GPS lever arm is zero (cfg_loaded=%d cfg_path=%s cfg_gps_lever_arm=[%.4f, %.4f, %.4f]). "
+            "Set gps.lever_arm_imu in main YAML or T_gps_imu.translation in config_dir/sensor_config/gps_imu_extrinsic.yaml",
+            cfg_loaded ? 1 : 0, cfg_path.c_str(),
+            cfg_lever_arm.x(), cfg_lever_arm.y(), cfg_lever_arm.z());
     }
 }
 
@@ -217,7 +245,8 @@ void HBAOptimizer::triggerAsync(
     const std::vector<SubMap::Ptr>& all_submaps,
     const std::vector<LoopConstraint::Ptr>& loops,
     bool wait,
-    const char* trigger_source)
+    const char* trigger_source,
+    uint64_t alignment_epoch_snapshot)
 {
     auto kfs = collectKeyFramesFromSubmaps(all_submaps);
     if (kfs.empty()) return;
@@ -248,6 +277,14 @@ void HBAOptimizer::triggerAsync(
     for (const auto& lc : loops) {
         if (!lc) continue;
         loops_total++;
+        
+        // 🏛️ [架构增强] 过滤 PENDING 状态的回环，防止未经验证的约束进入 HBA
+        if (lc->status == LoopStatus::REJECTED) {
+            RCLCPP_DEBUG(rclcpp::get_logger("automap_system"),
+                "[HBA][LOOP_FILTER] skip rejected loop sm%d <-> sm%d", lc->submap_i, lc->submap_j);
+            continue;
+        }
+
         // 创建副本，避免修改原始回环数据（虽然是 shared_ptr，但为了安全建议新建）
         auto resolved_lc = std::make_shared<LoopConstraint>(*lc);
         bool resolved = false;
@@ -306,11 +343,60 @@ void HBAOptimizer::triggerAsync(
     size_t kf_count = kfs.size();
     size_t sm_count = all_submaps.size();
     size_t loop_count = resolved_loops.size();
+
+    // 🏛️ [架构增强] 收集并构建所有子图内的语义因子，准备进行 HBA 语义优化
+    std::vector<CylinderFactorItemKF> all_semantic_factors;
+    std::unordered_map<int, Pose3d> sm_anchor_poses;
+    for (const auto& sm : all_submaps) {
+        if (!sm) continue;
+        sm_anchor_poses[sm->id] = sm->pose_map_anchor_optimized;
+        
+        for (const auto& kf : sm->keyframes) {
+            if (!kf) continue;
+            for (const auto& l_kf : kf->landmarks) {
+                if (!l_kf) continue;
+
+                CylinderFactorItemKF factor;
+                factor.kf_id = kf->id;
+                factor.sm_id = static_cast<uint64_t>(sm->id);
+                factor.point_body = l_kf->root;
+                factor.weight = l_kf->confidence;
+
+                bool factor_ready = false;
+                if (l_kf->associated_idx >= 0 && l_kf->associated_idx < static_cast<int>(sm->landmarks.size())) {
+                    const auto& l_sm = sm->landmarks[l_kf->associated_idx];
+                    if (l_sm) {
+                        factor.root_submap = l_sm->root;
+                        factor.ray_submap = l_sm->ray;
+                        factor.radius = l_sm->radius;
+                        factor_ready = true;
+                    }
+                }
+
+                if (!factor_ready) {
+                    // Fallback: 关联信息缺失时，使用 KF 局部语义观测通过 T_submap_kf 投影到子图系，避免语义信息被整体丢弃。
+                    factor.root_submap = kf->T_submap_kf * l_kf->root;
+                    factor.ray_submap = (kf->T_submap_kf.rotation() * l_kf->ray).normalized();
+                    factor.radius = l_kf->radius;
+                    factor_ready = std::isfinite(factor.radius) && factor.radius > 0.0;
+                }
+
+                if (factor_ready && factor.root_submap.allFinite() && factor.ray_submap.allFinite()) {
+                    all_semantic_factors.push_back(factor);
+                }
+            }
+        }
+    }
+
+    size_t semantic_count = all_semantic_factors.size();
     {
         std::lock_guard<std::mutex> lk(queue_mutex_);
         PendingTask task;
         task.keyframes  = std::move(kfs);
         task.loops      = std::move(resolved_loops);
+        task.semantic_factors = std::move(all_semantic_factors);
+        task.submap_anchor_poses = std::move(sm_anchor_poses);
+        task.alignment_epoch_snapshot = alignment_epoch_snapshot;
         task.enable_gps = gps_aligned_;
         pending_queue_.push(std::move(task));
         queue_cv_.notify_one();
@@ -320,8 +406,8 @@ void HBAOptimizer::triggerAsync(
     { std::lock_guard<std::mutex> lk(queue_mutex_); queue_depth = pending_queue_.size(); }
     const char* src = trigger_source ? trigger_source : "unknown";
     RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-        "[HBA][STATE] enqueue source=%s submaps=%zu keyframes=%zu loops=%zu gps=%d trigger_count=%d queue_depth=%zu (重影诊断: 同一轮建图内 trigger_count>1 表示被多次触发)",
-        src, sm_count, kf_count, loop_count, gps_aligned_ ? 1 : 0, trigger_count_, queue_depth);
+        "[HBA][STATE] enqueue source=%s submaps=%zu keyframes=%zu loops=%zu semantic_factors=%zu gps=%d trigger_count=%d queue_depth=%zu (重影诊断: 同一轮建图内 trigger_count>1 表示被多次触发)",
+        src, sm_count, kf_count, loop_count, semantic_count, gps_aligned_ ? 1 : 0, trigger_count_, queue_depth);
     ALOG_INFO(MOD, "HBA triggerAsync: source={} submaps={} keyframes={} loops={} gps={} trigger_count={} queue_depth={}",
               src, sm_count, kf_count, loop_count, gps_aligned_ ? 1 : 0, trigger_count_, queue_depth);
 
@@ -373,7 +459,7 @@ void HBAOptimizer::onGPSAligned(
 
     // GPS 对齐后立即触发一次全局优化（backend.hba.enabled=false 时跳过，仅 ISAM2+GPS）
     if (hba_enabled_)
-        triggerAsync(all_submaps, loops, false, "onGPSAligned");
+        triggerAsync(all_submaps, loops, false, "onGPSAligned", 0);
 }
 
 void HBAOptimizer::setGPSAlignedState(const GPSAlignResult& align_result) {
@@ -442,6 +528,7 @@ HBAResult HBAOptimizer::runHBA(const PendingTask& task) {
     BACKEND_STEP("step=HBA_runHBA_enter keyframes=%zu gps=%d", task.keyframes.size(), task.enable_gps ? 1 : 0);
     HBAResult result;
     result.success = false;
+    result.alignment_epoch_snapshot = task.alignment_epoch_snapshot;
 
     // ========== 数据验证 ==========
     if (task.keyframes.empty()) {
@@ -522,6 +609,27 @@ HBAResult HBAOptimizer::runHBA(const PendingTask& task) {
     // lever_arm_ 在 init() 中通过 resolveGpsLeverArmForHba 已缓存，worker 路径不再访问 ConfigManager
 
 #ifdef USE_HBA_API
+    // 语义契约强门控：一旦存在语义因子，禁止走 HBA API（当前 API 不支持语义因子）。
+    // 为避免“看起来开了语义、运行时却丢语义”，强制切换到 GTSAM fallback。
+    if (!task.semantic_factors.empty()) {
+#ifdef USE_GTSAM_FALLBACK
+        RCLCPP_WARN(rclcpp::get_logger("automap_system"),
+            "[HBA][CONTRACT][SEMANTIC_GATE] semantic_factors=%zu detected: force backend switch API -> GTSAM_fallback",
+            task.semantic_factors.size());
+        ALOG_WARN(MOD, "HBA semantic gate: forcing GTSAM fallback for {} semantic factors",
+                  task.semantic_factors.size());
+        return runGTSAMFallback(task);
+#else
+        RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+            "[HBA][CONTRACT][SEMANTIC_GATE] semantic_factors=%zu detected but GTSAM fallback is unavailable. "
+            "Rejecting HBA run to prevent semantic loss.",
+            task.semantic_factors.size());
+        ALOG_ERROR(MOD, "HBA semantic gate: fallback unavailable, rejecting run to avoid semantic loss");
+        result.success = false;
+        return result;
+#endif
+    }
+
     hba_api::Config hba_cfg;
     hba_cfg.total_layer_num = hba_total_layers_;
     hba_cfg.thread_num      = hba_thread_num_;
@@ -574,6 +682,15 @@ HBAResult HBAOptimizer::runHBA(const PendingTask& task) {
 
     // 执行 HBA 优化（进度输出到终端，与 [HBA][STATE] 一致）
     std::string params = "keyframes=" + std::to_string(task.keyframes.size()) + " gps=" + (task.enable_gps ? "1" : "0");
+    
+    // 🏛️ [架构报警] HBA API 目前不支持语义地标约束
+    if (!task.semantic_factors.empty()) {
+        RCLCPP_WARN(rclcpp::get_logger("automap_system"),
+            "[HBA][BACKEND][SEMANTIC_GAP] HBA API path does NOT support semantic landmarks yet (%zu factors ignored). "
+            "Consider enabling backend.hba.enable_gtsam_fallback for full semantic integration.",
+            task.semantic_factors.size());
+    }
+
     GtsamCallScope scope(GtsamCaller::HBA, "PGO", params, true);
     auto api_result = optimizer.optimize([](int cur, int total, float pct) {
         RCLCPP_INFO(rclcpp::get_logger("automap_system"),
@@ -744,6 +861,14 @@ HBAResult HBAOptimizer::runGTSAMFallback(const PendingTask& task) {
         between_var6 << between_rotate_var, between_rotate_var, between_rotate_var, 
                         between_trans_var, between_trans_var, between_trans_var;
 
+        // 🏛️ [架构增强] 添加子图锚点节点并固定（作为语义地标的参考坐标系）
+        gtsam::SharedNoiseModel sm_prior_noise = gtsam::noiseModel::Isotropic::Sigma(6, 1e-6); 
+        for (const auto& [sm_id, sm_pose] : task.submap_anchor_poses) {
+            initial.insert(SM(sm_id), toGtsamPose3(sm_pose));
+            graph.add(gtsam::PriorFactor<gtsam::Pose3>(SM(sm_id), toGtsamPose3(sm_pose), sm_prior_noise));
+            factor_type_log.push_back("SM_Prior(s" + std::to_string(sm_id) + ")");
+        }
+
         for (size_t i = 0; i < sorted_kfs.size(); ++i) {
             Pose3d pose_i = poseForInitial(sorted_kfs[i]);
             initial.insert(KF(i), toGtsamPose3(pose_i));
@@ -896,6 +1021,15 @@ HBAResult HBAOptimizer::runGTSAMFallback(const PendingTask& task) {
             RCLCPP_INFO(rclcpp::get_logger("automap_system"),
                 "[HBA][GTSAM][GPS_FILTER] candidates=%zu added=%zu reject_no_valid=%zu reject_quality=%zu reject_non_finite_pos=%zu reject_non_finite_cov=%zu",
                 gps_candidates_total, gps_factors_added, gps_reject_no_valid, gps_reject_quality, gps_reject_non_finite_pos, gps_reject_non_finite_cov);
+            if (gps_candidates_total > 0 && gps_factors_added == 0) {
+                RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+                    "[DIAG][HBA][E_GPS_FACTORS_ZERO] all GPS candidates rejected: candidates=%zu "
+                    "reject_no_valid=%zu reject_quality=%zu reject_non_finite_pos=%zu reject_non_finite_cov=%zu "
+                    "gps_aligned=%d min_quality=%d match_window_s=%.2f",
+                    gps_candidates_total, gps_reject_no_valid, gps_reject_quality,
+                    gps_reject_non_finite_pos, gps_reject_non_finite_cov,
+                    gps_aligned_ ? 1 : 0, gps_min_accepted_quality_level_, gps_keyframe_match_window_s_);
+            }
             RCLCPP_INFO(rclcpp::get_logger("automap_system"),
                 "[CONSTRAINT_KPI][HBA] loop_added=%zu gps_added=%zu gps_reject_quality=%zu gps_min_accepted_quality_level=%d total_loop_added=%lu total_gps_added=%lu",
                 loop_factors_added, gps_factors_added, gps_reject_quality,
@@ -908,12 +1042,43 @@ HBAResult HBAOptimizer::runGTSAMFallback(const PendingTask& task) {
                 task.enable_gps ? 1 : 0, gps_aligned_ ? 1 : 0, gps_candidates_total);
         }
 
+        // 🏛️ [架构增强] 添加语义地标约束 (CylinderFactor)
+        size_t landmark_factors_added = 0;
+        for (const auto& factor : task.semantic_factors) {
+            auto it_kf = kf_id_to_idx.find(factor.kf_id);
+            if (it_kf == kf_id_to_idx.end()) continue;
+
+            if (task.submap_anchor_poses.find(static_cast<int>(factor.sm_id)) == task.submap_anchor_poses.end()) continue;
+
+            // 1D Isotropic Noise Model (与 IncrementalOptimizer 保持一致)
+            double sigma = 0.1 / std::max(1e-3, factor.weight);
+            auto noise = gtsam::noiseModel::Isotropic::Sigma(1, sigma);
+
+            gtsam::Point3 point_body(factor.point_body.x(), factor.point_body.y(), factor.point_body.z());
+            gtsam::Point3 root_submap(factor.root_submap.x(), factor.root_submap.y(), factor.root_submap.z());
+            gtsam::Unit3 ray_submap(factor.ray_submap.x(), factor.ray_submap.y(), factor.ray_submap.z());
+
+            graph.add(boost::make_shared<CylinderFactor>(
+                KF(it_kf->second), SM(static_cast<int>(factor.sm_id)),
+                point_body, root_submap, ray_submap, factor.radius, noise));
+            
+            factor_type_log.push_back("Landmark(k" + std::to_string(it_kf->second) + "-s" + std::to_string(factor.sm_id) + ")");
+            landmark_factors_added++;
+        }
+
+        if (landmark_factors_added > 0) {
+            RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                "[HBA][GTSAM][BACKEND] Semantic landmark factors added to HBA graph count=%zu", 
+                landmark_factors_added);
+        }
+
         size_t n_factors = graph.size();
         size_t n_values = initial.size();
         RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-            "[HBA][GTSAM] graph built: factors=%zu values=%zu loop_factors=%zu gps_factors=%zu (building LM optimizer...)",
-            n_factors, n_values, loop_factors_added, gps_factors_added);
-        ALOG_INFO(MOD, "HBA GTSAM: factors={} values={} loops={} gps={}", n_factors, n_values, loop_factors_added, gps_factors_added);
+            "[HBA][GTSAM] graph built: factors=%zu values=%zu loop_factors=%zu gps_factors=%zu landmark_factors=%zu (building LM optimizer...)",
+            n_factors, n_values, loop_factors_added, gps_factors_added, landmark_factors_added);
+        ALOG_INFO(MOD, "HBA GTSAM: factors={} values={} loops={} gps={} landmarks={}", 
+                  n_factors, n_values, loop_factors_added, gps_factors_added, landmark_factors_added);
 
         // 诊断：逐因子打印类型，便于崩溃时定位是哪一个 factor 在 error() 路径触发 double free
         for (size_t idx = 0; idx < graph.size(); ++idx) {

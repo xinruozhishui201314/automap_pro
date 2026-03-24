@@ -51,8 +51,15 @@ SegNode::SegNode(const ros::NodeHandle &nh) : nh_(nh)
   int lidar_w = nh_.param("seg_lidar_w", 2048);
   int lidar_h = nh_.param("seg_lidar_h", 64);
   bool do_destagger = nh_.param("do_destagger", true);
+  int input_channels = nh_.param("seg_input_channels", 0);
+  int num_classes = nh_.param("seg_num_classes", 0);
+  int tree_class_id = nh_.param("seg_tree_class_id", -1);
 
-  auto temp_seg = boost::make_shared<seg::Segmentation>(modelFilepath, fov, -fov, lidar_w, lidar_h, 1, do_destagger);
+  std::vector<float> empty_mean;
+  std::vector<float> empty_std;
+  auto temp_seg = boost::make_shared<seg::Segmentation>(
+      modelFilepath, fov, -fov, lidar_w, lidar_h, input_channels, num_classes, tree_class_id,
+      empty_mean, empty_std, do_destagger);
   segmentator_ = std::move(temp_seg);
   prevStamp = ros::Time::now();
 

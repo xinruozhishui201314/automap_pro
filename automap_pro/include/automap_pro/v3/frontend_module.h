@@ -80,6 +80,8 @@ private:
 
     rclcpp::Node::SharedPtr node_;
     std::atomic<bool> shutdown_requested_{false};
+    std::atomic<bool> throttle_active_{false};
+    std::atomic<double> throttle_until_{0.0};
     
     // 同步用数据（从 AutoMapSystem 移来）
     mutable std::mutex data_mutex_;

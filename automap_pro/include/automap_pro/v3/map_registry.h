@@ -47,8 +47,8 @@ public:
     
     void addKeyFrame(KeyFrame::Ptr kf);
     KeyFrame::Ptr getKeyFrame(int id) const;
-    /** 根据时间戳精确查找关键帧；无时返回 nullptr */
-    KeyFrame::Ptr getKeyFrameByTimestamp(double timestamp) const;
+    /** 根据时间戳近邻查找关键帧；在容差内返回最接近项，无时返回 nullptr */
+    KeyFrame::Ptr getKeyFrameByTimestamp(double timestamp, double tolerance_s = 1e-4) const;
     /** 时间戳最大的关键帧（用于与当前帧点云对齐到最新优化位姿链）；无时返回 nullptr */
     KeyFrame::Ptr getLatestKeyFrameByTimestamp() const;
     std::vector<KeyFrame::Ptr> getAllKeyFrames() const;
@@ -211,12 +211,16 @@ struct RawGPSEvent {
 struct GPSAlignedEvent {
     /** 与 GPSAlignResult::success 一致；MapRegistry 对齐态仅由 MappingModule 根据本字段写入 */
     bool success = false;
+    /** GPS 对齐事件序号（单调递增），用于去重与乱序保护。 */
+    uint64_t event_seq = 0;
+    /** 发布时观测到的当前 alignment_epoch（提示值，非目标写入值）。 */
     uint64_t alignment_epoch = 0;
     Eigen::Matrix3d R_enu_to_map;
     Eigen::Vector3d t_enu_to_map;
     double rmse = 0.0;
 
     bool isValid() const {
+        if (event_seq == 0) return false;
         if (!R_enu_to_map.allFinite() || !t_enu_to_map.allFinite()) return false;
         if (success) return std::isfinite(rmse);
         return true;
@@ -329,6 +333,8 @@ struct SyncedFrameEvent {
  */
 struct SemanticLandmarkEvent {
     double timestamp = 0.0;
+    double keyframe_timestamp_hint = 0.0; // 关键帧模式下由前端 KFInfo 时间透传，优先用于绑定 KeyFrame
+    uint64_t keyframe_id_hint = 0;        // 关键帧 ID 提示（优先于时间戳匹配）
     std::vector<CylinderLandmark::Ptr> landmarks;
 
     bool isValid() const {
@@ -453,6 +459,25 @@ struct GlobalMapBuildResultEvent {
 
 // --- 系统健康与状态事件 (System Health & Status Events) ---
 
+/**
+ * @brief 系统静默请求 (Quiescence Request)
+ * 🏛️ [架构契约] 强制所有模块排空队列，进入只读/待机模式。
+ */
+struct SystemQuiesceRequestEvent {
+    bool enable = true;
+    std::string reason = "manual";
+};
+
+/**
+ * @brief 背压警告事件 (Backpressure Warning)
+ * 🏛️ [架构契约] 当消费者队列过载时，向上游发出减速信号。
+ */
+struct BackpressureWarningEvent {
+    std::string module_name;
+    float queue_usage_ratio; // 0.0 ~ 1.0
+    bool critical = false;
+};
+
 struct ModuleStatus {
     std::string name;
     bool ok;
@@ -464,6 +489,17 @@ struct SystemStatusEvent {
     double timestamp;
     std::vector<ModuleStatus> modules;
     bool overall_ok;
+};
+
+/**
+ * @brief 前端位姿调整事件 (Frontend Pose Adjustment)
+ * 🏛️ [架构契约] 当后端发生回环或 GPS 对齐导致地图坐标系跳变时，通知前端同步调整。
+ */
+struct FrontendPoseAdjustEvent {
+    uint64_t from_version;
+    uint64_t to_version;
+    Pose3d T_map_new_map_old; // 坐标系跳变增量
+    PoseFrame target_frame;
 };
 
 } // namespace automap_pro::v3

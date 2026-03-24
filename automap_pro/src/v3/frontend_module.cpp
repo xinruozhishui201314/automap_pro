@@ -19,7 +19,9 @@ std::atomic<uint64_t> g_gps_cache_get_ok_total{0};
 
 
 GPSQuality qualityFromHdopAndSats(double hdop, int sats, double medium_max_hdop) {
-    if (sats < 4 || !std::isfinite(hdop)) return GPSQuality::INVALID;
+    // NavSatFix 常不提供卫星颗数；sats<=0 视为未知，不直接否决，改由 HDOP 门控。
+    // 仅在明确给出且小于 4 时判定为无效。
+    if ((sats > 0 && sats < 4) || !std::isfinite(hdop)) return GPSQuality::INVALID;
     if (hdop <= 1.0) return GPSQuality::EXCELLENT;
     if (hdop <= 2.0) return GPSQuality::HIGH;
     if (hdop <= medium_max_hdop) return GPSQuality::MEDIUM;
@@ -75,10 +77,44 @@ FrontEndModule::FrontEndModule(EventBus::Ptr event_bus, MapRegistry::Ptr map_reg
     const size_t max_ingress_q = cfg.ingressQueueMaxSize();
     const size_t max_frame_q = cfg.frameQueueMaxSize();
     frame_processor_.init(max_ingress_q, max_frame_q);
+    RCLCPP_INFO(node_->get_logger(),
+        "[DIAG][GPS_CACHE][CONFIG] gps_enabled=%d gps_topic=%s quality_threshold_hdop=%.2f min_quality=%d "
+        "keyframe_match_window_s=%.2f gps_cache_size=%zu",
+        gps_enabled ? 1 : 0, gps_topic.c_str(),
+        cfg.gpsQualityThreshold(), cfg.gpsMinAcceptedQualityLevel(),
+        cfg.gpsKeyframeMatchWindowS(), kMaxGPSCacheSize);
 
     RCLCPP_INFO(node_->get_logger(),
                 "[PIPELINE][FE] ctor OK LivoBridge+FrameProcessor ingress_max=%zu frame_max=%zu gps=%s topic=%s",
                 max_ingress_q, max_frame_q, gps_enabled ? "on" : "off", gps_topic.c_str());
+
+    // 🏛️ [架构契约] Cascading Backpressure (级联背压响应)
+    onEvent<BackpressureWarningEvent>([this](const BackpressureWarningEvent& ev) {
+        if (ev.queue_usage_ratio > 0.9f || ev.critical) {
+            throttle_active_.store(true);
+            const double now = node_->now().seconds();
+            throttle_until_.store(now + 2.0); // 惩罚性限流 2s
+            RCLCPP_WARN(node_->get_logger(),
+                "[V3][BACKPRESSURE] FE reacting to %s overload: Enabling CRITICAL throttle.", ev.module_name.c_str());
+        } else if (ev.queue_usage_ratio > 0.7f) {
+            throttle_active_.store(true);
+            const double now = node_->now().seconds();
+            throttle_until_.store(now + 0.5); // 轻微限流 0.5s
+            RCLCPP_INFO(node_->get_logger(),
+                "[V3][BACKPRESSURE] FE reacting to %s pressure: Enabling soft throttle.", ev.module_name.c_str());
+        }
+    });
+
+    // 🏛️ [架构契约] Frontend Pose Adjustment (位姿跳变对齐)
+    onEvent<FrontendPoseAdjustEvent>([this](const FrontendPoseAdjustEvent& ev) {
+        std::lock_guard<std::mutex> lk(data_mutex_);
+        // 修正当前追踪器位姿，使其随地图跳变，避免重影
+        last_odom_pose_ = ev.T_map_new_map_old * last_odom_pose_;
+        
+        RCLCPP_INFO(node_->get_logger(),
+            "[V3][GHOST_GUARD] FE adjusted current pose by backend feedback: v%lu->v%lu",
+            ev.from_version, ev.to_version);
+    });
 }
 
 void FrontEndModule::start() {
@@ -109,6 +145,18 @@ void FrontEndModule::run() {
     
     while (running_) {
         updateHeartbeat();
+
+        // 🏛️ [架构契约] 背压限流应用
+        if (throttle_active_.load()) {
+            const double now = node_->now().seconds();
+            if (now < throttle_until_.load()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                continue;
+            } else {
+                throttle_active_.store(false);
+            }
+        }
+
         FrameToProcess f;
         bool woke_by_data = frame_processor_.tryPopFrame(100, f);
         if (!running_) break;
@@ -130,10 +178,20 @@ void FrontEndModule::run() {
         }
 
         LivoKeyFrameInfo kfinfo_copy;
-        if (!kfinfoCacheGet(f.ts, kfinfo_copy)) {
+        bool kfinfo_from_cache = kfinfoCacheGet(f.ts, kfinfo_copy);
+        if (!kfinfo_from_cache) {
             std::lock_guard<std::mutex> lk(data_mutex_);
             kfinfo_copy = last_livo_info_;
+            RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 2000,
+                "[SEMANTIC][FrontEnd][KFINFO] source=fallback_last_livo frame_ts=%.3f fallback_kf_ts=%.3f",
+                f.ts, kfinfo_copy.timestamp);
         }
+        const bool kf_ts_valid = std::isfinite(kfinfo_copy.timestamp) && (kfinfo_copy.timestamp > 0.0);
+        const double kf_dt = kf_ts_valid ? std::abs(f.ts - kfinfo_copy.timestamp) : -1.0;
+        RCLCPP_INFO_THROTTLE(node_->get_logger(), *node_->get_clock(), 2000,
+            "[SEMANTIC][FrontEnd][KFINFO] source=%s frame_ts=%.3f kf_ts=%.3f dt=%.3f valid=%d",
+            kfinfo_from_cache ? "cache_leq_ts" : "fallback_last_livo",
+            f.ts, kfinfo_copy.timestamp, kf_dt, kf_ts_valid ? 1 : 0);
 
         GPSMeasurement matched_gps;
         bool has_gps = gpsCacheGet(f.ts, matched_gps);
@@ -253,6 +311,8 @@ bool FrontEndModule::gpsCacheGet(double ts, GPSMeasurement& out_m) {
         g_gps_cache_get_empty_total.fetch_add(1, std::memory_order_relaxed);
         RCLCPP_DEBUG(node_->get_logger(),
             "[GPS_CACHE][VERIFY] miss reason=empty_cache ts_req=%.6f", ts);
+        RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000,
+            "[DIAG][GPS_CACHE][E_EMPTY] cache empty while querying ts=%.6f (no GPS can bind to keyframe)", ts);
         return false;
     }
     
@@ -288,6 +348,12 @@ bool FrontEndModule::gpsCacheGet(double ts, GPSMeasurement& out_m) {
                 ts, min_dt, static_cast<int>(best->m.quality), cfg.gpsMinAcceptedQualityLevel(),
                 best->m.is_valid ? 1 : 0, best->m.position_enu.allFinite() ? 1 : 0,
                 best->m.hdop, static_cast<int>(decision.reason));
+            RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000,
+                "[DIAG][GPS_CACHE][E_BIND_REJECT] ts_req=%.6f dt=%.4f quality=%d min_quality=%d "
+                "is_valid=%d pos_enu_finite=%d hdop=%.2f reject_reason=%d",
+                ts, min_dt, static_cast<int>(best->m.quality), cfg.gpsMinAcceptedQualityLevel(),
+                best->m.is_valid ? 1 : 0, best->m.position_enu.allFinite() ? 1 : 0,
+                best->m.hdop, static_cast<int>(decision.reason));
             return false;
         }
         out_m = best->m;
@@ -297,6 +363,9 @@ bool FrontEndModule::gpsCacheGet(double ts, GPSMeasurement& out_m) {
     g_gps_cache_get_no_neighbor_total.fetch_add(1, std::memory_order_relaxed);
     RCLCPP_DEBUG(node_->get_logger(),
         "[GPS_CACHE][VERIFY] miss reason=no_neighbor_in_window ts_req=%.6f min_dt=%.4f max_dt=%.2f",
+        ts, best ? min_dt : -1.0, max_dt);
+    RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000,
+        "[DIAG][GPS_CACHE][E_NO_NEIGHBOR] ts_req=%.6f min_dt=%.4f max_dt=%.2f",
         ts, best ? min_dt : -1.0, max_dt);
     return false;
 }

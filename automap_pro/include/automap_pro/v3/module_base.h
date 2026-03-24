@@ -3,6 +3,7 @@
 #include "automap_pro/v3/event_bus.h"
 #include "automap_pro/v3/map_registry.h"
 #include "automap_pro/core/logger.h"
+#include "automap_pro/core/resource_monitor.h"
 
 #include <atomic>
 #include <thread>
@@ -64,6 +65,28 @@ public:
     double getLastHeartbeat() const { return last_heartbeat_s_.load(); }
 
     /**
+     * @brief 进入/退出静默模式 (🏛️ [架构契约] 屏障同步)
+     */
+    virtual void quiesce(bool enable) {
+        quiescing_.store(enable);
+        ALOG_INFO("Pipeline", "[PIPELINE][V3] module QUIESCE name={} enable={}", name_, enable);
+        cv_.notify_all();
+    }
+
+    bool isQuiescing() const { return quiescing_.load(); }
+
+    /**
+     * @brief 检查模块健康状态 (L2 级健康检查)
+     */
+    virtual bool checkHealth() {
+        if (automap_pro::core::ResourceMonitor::isMemoryCritical(0.95f)) {
+            ALOG_ERROR("Pipeline", "[HEALTH][V3] module={} CRITICAL memory usage! System is under extreme pressure.", name_);
+            return false;
+        }
+        return true;
+    }
+
+    /**
      * @brief 更新心跳 (应在业务循环内调用)
      */
     void updateHeartbeat() {
@@ -105,6 +128,7 @@ protected:
     MapRegistry::Ptr map_registry_;
     
     std::atomic<bool> running_{false};
+    std::atomic<bool> quiescing_{false};
     std::atomic<double> last_heartbeat_s_{0.0};
     std::thread thread_;
     std::mutex mutex_;

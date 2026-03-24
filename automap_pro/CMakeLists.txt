@@ -110,6 +110,7 @@ endif()
 set(_onnx_include "")
 set(_onnx_lib "")
 set(_sloam_segmentation_lib "")
+set(_sloam_segmentation_target "")
 set(_install_deps_onnx "")
 if(DEFINED ENV{ONNXRUNTIME_HOME})
   set(_install_deps_onnx "$ENV{ONNXRUNTIME_HOME}")
@@ -129,25 +130,75 @@ find_library(ONNX_LIBRARY onnxruntime
 if(ONNX_INCLUDE_DIR AND ONNX_LIBRARY)
   set(_onnx_include "${ONNX_INCLUDE_DIR}")
   set(_onnx_lib "${ONNX_LIBRARY}")
+  set(_sloam_seg_hints "")
+  if(DEFINED ENV{SLOAM_HOME})
+    list(APPEND _sloam_seg_hints "$ENV{SLOAM_HOME}/lib")
+  endif()
+  if(DEFINED ENV{SLOAM_SEGMENTATION_LIB_DIR})
+    list(APPEND _sloam_seg_hints "$ENV{SLOAM_SEGMENTATION_LIB_DIR}")
+  endif()
+  if(CMAKE_SOURCE_DIR)
+    get_filename_component(_ws_root "${CMAKE_SOURCE_DIR}/../.." ABSOLUTE)
+    list(APPEND _sloam_seg_hints
+      "${_ws_root}/install_deps/sloam/lib"
+      "${_ws_root}/install/sloam/lib"
+      "${_ws_root}/install/lib")
+  endif()
+  list(APPEND _sloam_seg_hints
+    "${CMAKE_SOURCE_DIR}/../../install_deps/sloam/lib"
+    "${CMAKE_SOURCE_DIR}/../install_deps/sloam/lib"
+    /usr/local/lib
+    /usr/lib/x86_64-linux-gnu)
+  list(REMOVE_DUPLICATES _sloam_seg_hints)
   find_library(SLOAM_SEGMENTATION_LIBRARY sloam_segmentation
-    HINTS
-      "${CMAKE_SOURCE_DIR}/../../install_deps/sloam/lib"
-      "${CMAKE_SOURCE_DIR}/../install_deps/sloam/lib"
-      /usr/local/lib
-      /usr/lib/x86_64-linux-gnu
+    HINTS ${_sloam_seg_hints}
   )
   if(SLOAM_SEGMENTATION_LIBRARY)
     set(_sloam_segmentation_lib "${SLOAM_SEGMENTATION_LIBRARY}")
+    set(_sloam_segmentation_target "${_sloam_segmentation_lib}")
     set(USE_SLOAM_SEMANTIC 1)
     message(STATUS "[automap_pro] ONNX Runtime + sloam_segmentation found: SLOAM semantic ENABLED")
   else()
-    set(USE_SLOAM_SEMANTIC 0)
-    if(AUTOMAP_REQUIRE_SEMANTIC)
-      message(FATAL_ERROR
-        "[automap_pro] Semantic pipeline is REQUIRED but sloam_segmentation library is missing.\n"
-        "Checked install_deps and system paths. Please build/install sloam_segmentation first.")
+    # 强制语义模式下的最小兜底：若预编译库缺失，则编译仓库内 sloam_rec segmentation 源码
+    set(_sloam_seg_src_inference "${CMAKE_CURRENT_SOURCE_DIR}/thrid_party/sloam_rec/sloam/src/segmentation/inference.cpp")
+    set(_sloam_seg_src_trellis "${CMAKE_CURRENT_SOURCE_DIR}/thrid_party/sloam_rec/sloam/src/segmentation/trellis.cpp")
+    if(EXISTS "${_sloam_seg_src_inference}" AND EXISTS "${_sloam_seg_src_trellis}")
+      add_library(automap_sloam_segmentation STATIC
+        "${_sloam_seg_src_inference}"
+        "${_sloam_seg_src_trellis}")
+      target_include_directories(automap_sloam_segmentation PUBLIC
+        "${SLOAM_REC_SLOAM_INCLUDE}"
+        "${SLOAM_REC_SLOAM_INCLUDE}/segmentation"
+        "${SLOAM_REC_SLOAM_INCLUDE}/helpers"
+        "${_onnx_include}")
+      # sloam_rec headers include ROS2 message/cv_bridge headers directly.
+      ament_target_dependencies(automap_sloam_segmentation
+        geometry_msgs
+        sensor_msgs
+        cv_bridge)
+      target_link_libraries(automap_sloam_segmentation
+        ${PCL_LIBRARIES}
+        ${OpenCV_LIBS}
+        Eigen3::Eigen
+        "${_onnx_lib}")
+      set(_sloam_segmentation_target automap_sloam_segmentation)
+      set(USE_SLOAM_SEMANTIC 1)
+      message(WARNING
+        "[automap_pro] Prebuilt sloam_segmentation not found. "
+        "Using in-tree source fallback target: automap_sloam_segmentation")
     else()
-      message(WARNING "[automap_pro] ONNX Runtime found but sloam_segmentation library missing: semantic processor will run in stub mode")
+      set(USE_SLOAM_SEMANTIC 0)
+      if(AUTOMAP_REQUIRE_SEMANTIC)
+        message(FATAL_ERROR
+          "[automap_pro] Semantic pipeline is REQUIRED but sloam_segmentation library is missing.\n"
+          "Searched paths: ${_sloam_seg_hints}\n"
+          "Also checked in-tree fallback sources:\n"
+          "  ${_sloam_seg_src_inference}\n"
+          "  ${_sloam_seg_src_trellis}\n"
+          "Please build/install sloam_segmentation first, or set SLOAM_HOME / SLOAM_SEGMENTATION_LIB_DIR.")
+      else()
+        message(WARNING "[automap_pro] ONNX Runtime found but sloam_segmentation library missing: semantic processor will run in stub mode")
+      endif()
     endif()
   endif()
 else()
@@ -621,7 +672,7 @@ target_link_libraries(automap_system_component
 )
 if(USE_SLOAM_SEMANTIC)
   target_link_libraries(automap_system_component "${_onnx_lib}")
-  target_link_libraries(automap_system_component "${_sloam_segmentation_lib}")
+  target_link_libraries(automap_system_component ${_sloam_segmentation_target})
 endif()
 ament_target_dependencies(automap_system_component ${AUTOMAP_AMENT_DEPS} ament_index_cpp)
 rclcpp_components_register_node(automap_system_component

@@ -145,6 +145,8 @@ private:
     std::atomic<int> pub_status_count_{0};
     std::atomic<int> pub_map_count_{0};
     int status_publish_count_ = 0;
+    std::atomic<bool> finish_mapping_in_progress_{false};
+    std::atomic<bool> finish_mapping_requested_{false};
 };
 
 } // namespace automap_pro

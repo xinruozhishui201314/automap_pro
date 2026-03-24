@@ -5,6 +5,7 @@
 #include <sstream>
 #include <type_traits>
 #include <string>
+#include <vector>
 #include <yaml-cpp/yaml.h>
 #include <Eigen/Dense>
 #include <rclcpp/rclcpp.hpp>
@@ -480,6 +481,23 @@ public:
         int v = get<int>("backend.process_every_n_frames", 5);
         return std::max(1, std::min(100, v));
     }
+    /** Mapping worker frame queue cap. */
+    size_t mappingFrameQueueMaxSize() const {
+        int v = get<int>("mapping.frame_queue_max_size", 1024);
+        return static_cast<size_t>(std::max(64, std::min(100000, v)));
+    }
+    /** Motion continuity crash guard: reasonable max velocity (m/s). */
+    double mappingMaxReasonableVelocityMps() const {
+        return get<double>("mapping.max_reasonable_velocity_mps", 50.0);
+    }
+    /** Motion continuity crash guard: reasonable max jump distance (m). */
+    double mappingMaxReasonableJumpM() const {
+        return get<double>("mapping.max_reasonable_jump_m", 10.0);
+    }
+    /** Pose reasonableness guard used by MapRegistry update gateway. */
+    double mappingMaxReasonableTranslationM() const {
+        return get<double>("mapping.max_reasonable_translation_m", 5000.0);
+    }
     /** 单帧处理耗时超过此值(秒)时打 WARN 便于诊断卡点；≤0 表示不告警。默认 15.0 */
     double backendSingleFrameWarnDurationSec() const {
         return get<double>("backend.single_frame_warn_duration_sec", 15.0);
@@ -574,7 +592,27 @@ public:
     float       semanticFovDown()    const { return get<float>("semantic.fov_down", -22.5f); }
     int         semanticImgW()       const { return get<int>("semantic.img_w", 2048); }
     int         semanticImgH()       const { return get<int>("semantic.img_h", 64); }
+    int         semanticInputChannels() const {
+        int v = get<int>("semantic.input_channels", 0);  // 0 = auto by model
+        return std::max(0, std::min(32, v));
+    }
+    int         semanticNumClasses() const {
+        int v = get<int>("semantic.num_classes", 0);  // 0 = auto by model
+        return std::max(0, std::min(512, v));
+    }
+    int         semanticTreeClassId() const {
+        int v = get<int>("semantic.tree_class_id", -1);  // -1 = auto fallback
+        return std::max(-1, std::min(511, v));
+    }
+    /** 与模型 input_channels 等长；空表示每层用内置默认（range 通道 12.97/12.35，其余 mean=0 std=1） */
+    std::vector<float> semanticInputMean() const;
+    std::vector<float> semanticInputStd() const;
     bool        semanticDoDestagger()const { return get<bool>("semantic.do_destagger", true); }
+    bool        semanticKeyframesOnly() const { return get<bool>("semantic.keyframes_only", false); }
+    double      semanticKeyframeTimeToleranceS() const {
+        double v = get<double>("semantic.keyframe_time_tolerance_s", 0.03);
+        return std::max(1e-4, std::min(1.0, v));
+    }
     size_t      semanticMappingQueueMaxSize() const {
         int v = get<int>("semantic.mapping_queue_max_size", 4096);
         return static_cast<size_t>(std::max(128, std::min(200000, v)));

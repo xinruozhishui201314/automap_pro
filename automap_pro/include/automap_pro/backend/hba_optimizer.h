@@ -1,6 +1,7 @@
 #pragma once
 
 #include "automap_pro/core/data_types.h"
+#include "automap_pro/backend/isam2_factor_types.h"
 #include <thread>
 #include <mutex>
 #include <condition_variable>
@@ -57,7 +58,8 @@ public:
     void triggerAsync(const std::vector<SubMap::Ptr>& all_submaps,
                       const std::vector<LoopConstraint::Ptr>& loops = {},
                       bool wait = false,
-                      const char* trigger_source = nullptr);
+                      const char* trigger_source = nullptr,
+                      uint64_t alignment_epoch_snapshot = 0);
 
     /** 等待队列清空且当前无 HBA 运行，最多等待 timeout_ms 毫秒（用于关闭时限时等待） */
     void waitUntilIdleFor(std::chrono::milliseconds timeout_ms);
@@ -87,6 +89,11 @@ private:
     struct PendingTask {
         std::vector<KeyFrame::Ptr> keyframes;
         std::vector<LoopConstraint::Ptr> loops;
+        // 🏛️ [架构增强] 语义因子列表，支持 HBA 语义优化
+        std::vector<CylinderFactorItemKF> semantic_factors;
+        // 🏛️ [架构增强] 子图锚点快照，用于约束语义地标
+        std::unordered_map<int, Pose3d> submap_anchor_poses;
+        uint64_t alignment_epoch_snapshot = 0;
         bool enable_gps = false;
     };
 
@@ -112,6 +119,7 @@ private:
     bool hba_enabled_{true};
     bool hba_gtsam_fallback_enabled_{false};
     int gps_min_accepted_quality_level_{3};
+    double gps_keyframe_match_window_s_{0.5};
     int hba_total_layers_{3};
     int hba_thread_num_{8};
     int hba_trigger_submaps_{10};

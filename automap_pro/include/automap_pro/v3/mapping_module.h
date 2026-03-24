@@ -98,6 +98,7 @@ private:
     // 🏛️ 生产级版本控制：本地已应用的最新的地图版本
     std::atomic<uint64_t> processed_map_version_{0};
     std::atomic<uint64_t> processed_alignment_epoch_{0};
+    std::atomic<uint64_t> last_gps_event_seq_{0};
     double last_barrier_wait_start_time_ = -1.0; // 🏛️ [P1 稳定性] 屏障超时计时器
     uint64_t last_applied_version_{0};
     uint64_t last_applied_batch_hash_{0};
@@ -117,6 +118,7 @@ private:
     std::mutex loop_constraints_mutex_;
 
     // 🏛️ [P1 稳定性修复] 异步语义地标待处理队列（解决 KeyFrame 尚未分配 submap_id 的竞态）
+    size_t max_frame_queue_size_ = 1024;
     size_t max_semantic_queue_size_ = 4096;
     size_t max_pending_semantic_events_ = 4096;
     double semantic_timestamp_match_tolerance_s_ = 1e-4;

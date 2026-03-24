@@ -61,6 +61,7 @@ MappingModule::MappingModule(EventBus::Ptr event_bus, MapRegistry::Ptr map_regis
     : ModuleBase("MappingModule", event_bus, map_registry), node_(node) {
     
     const auto& cfg = ConfigManager::instance();
+    max_frame_queue_size_ = cfg.mappingFrameQueueMaxSize();
     max_semantic_queue_size_ = cfg.semanticMappingQueueMaxSize();
     max_pending_semantic_events_ = cfg.semanticPendingQueueMaxSize();
     semantic_timestamp_match_tolerance_s_ = cfg.semanticTimestampMatchToleranceS();
@@ -144,7 +145,16 @@ MappingModule::MappingModule(EventBus::Ptr event_bus, MapRegistry::Ptr map_regis
             transform_flags |= static_cast<uint32_t>(OptimizationTransformFlags::MAP_COMPENSATION_APPLIED);
         }
 
-        const uint64_t source_alignment_epoch = map_registry_->getAlignmentEpoch();
+        const uint64_t source_alignment_epoch = result.alignment_epoch_snapshot;
+        const uint64_t current_alignment_epoch = map_registry_->getAlignmentEpoch();
+        if (source_alignment_epoch == 0 || source_alignment_epoch != current_alignment_epoch) {
+            RCLCPP_WARN(node_->get_logger(),
+                "[V3][CONTRACT] Drop HBA result by alignment_epoch mismatch: result_epoch=%lu current_epoch=%lu",
+                static_cast<unsigned long>(source_alignment_epoch),
+                static_cast<unsigned long>(current_alignment_epoch));
+            METRICS_INCREMENT(metrics::STALE_VERSION_DROP_TOTAL);
+            return;
+        }
         const uint64_t batch_hash = computeBatchHash({}, kf_updates);
         const uint64_t version = map_registry_->updatePoses(
             {}, kf_updates, output_frame, "HBAOptimizer", source_alignment_epoch,
@@ -162,14 +172,40 @@ MappingModule::MappingModule(EventBus::Ptr event_bus, MapRegistry::Ptr map_regis
     // 订阅动态过滤后的帧
     onEvent<FilteredFrameEventRequiredDs>([this](const FilteredFrameEventRequiredDs& ev) {
         if (!running_.load()) return;
+        if (quiescing_.load()) {
+            RCLCPP_DEBUG_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000,
+                "[V3][Mapping] Drop frame: Module is QUIESCING");
+            return;
+        }
         if (!ev.isValid()) {
             RCLCPP_ERROR_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000,
                 "[V3][CONTRACT] Reject invalid FilteredFrameEventRequiredDs before queueing");
             METRICS_INCREMENT(metrics::FRAME_MISMATCH_TOTAL);
             return;
         }
-        std::lock_guard<std::mutex> lock(queue_mutex_);
-        frame_queue_.push_back(ev);
+        
+        {
+            std::lock_guard<std::mutex> lock(queue_mutex_);
+            if (frame_queue_.size() >= max_frame_queue_size_) {
+                frame_queue_.pop_front();
+                RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000,
+                    "[V3][BACKPRESSURE] frame_queue overflow, dropping oldest (cap=%zu). SENDING WARNING.",
+                    max_frame_queue_size_);
+                
+                BackpressureWarningEvent warn;
+                warn.module_name = name_;
+                warn.queue_usage_ratio = 1.0f;
+                warn.critical = true;
+                event_bus_->publish(warn);
+            } else if (frame_queue_.size() > max_frame_queue_size_ * 0.8) {
+                BackpressureWarningEvent warn;
+                warn.module_name = name_;
+                warn.queue_usage_ratio = static_cast<float>(frame_queue_.size()) / max_frame_queue_size_;
+                warn.critical = false;
+                event_bus_->publish(warn);
+            }
+            frame_queue_.push_back(ev);
+        }
         cv_.notify_one();
     });
 
@@ -232,7 +268,13 @@ MappingModule::MappingModule(EventBus::Ptr event_bus, MapRegistry::Ptr map_regis
             std::lock_guard<std::mutex> lk(loop_constraints_mutex_);
             loops = loop_constraints_;
         }
-        hba_optimizer_.triggerAsync(all_frozen, loops, ev.wait_for_result, "ManualRequest");
+        hba_optimizer_.triggerAsync(all_frozen, loops, ev.wait_for_result, "ManualRequest",
+                                    processed_alignment_epoch_.load());
+    });
+
+    // 订阅系统静默请求 (🏛️ [架构契约] 屏障同步)
+    onEvent<SystemQuiesceRequestEvent>([this](const SystemQuiesceRequestEvent& ev) {
+        this->quiesce(ev.enable);
     });
 
     // 🏛️ [架构演进] 订阅异步语义地标
@@ -409,6 +451,35 @@ void MappingModule::processFrame(const FilteredFrameEventRequiredDs& event) {
     if (!kf_manager_.shouldCreateKeyFrame(event.T_odom_b, event.timestamp)) {
         return;
     }
+
+    // 🏛️ [架构契约] Motion Continuity Invariant (运动连续性守卫)
+    // 防止前端退化导致的位姿巨大跳变进入后端
+    KeyFrame::Ptr prev_kf = kf_manager_.getLastKeyFrame();
+    if (prev_kf) {
+        double dist = (event.T_odom_b.translation() - prev_kf->T_odom_b.translation()).norm();
+        double dt = event.timestamp - prev_kf->timestamp;
+        if (dt > 0.0) {
+            double v = dist / dt;
+            const double max_v = ConfigManager::instance().mappingMaxReasonableVelocityMps();
+            if (v > max_v) {
+                RCLCPP_ERROR(node_->get_logger(),
+                    "[V3][CRASH_GUARD] Reject frame: unreasonable velocity detected! v=%.2f m/s > max=%.2f m/s (ts=%.3f)",
+                    v, max_v, event.timestamp);
+                METRICS_INCREMENT(metrics::FRAME_MISMATCH_TOTAL);
+                return;
+            }
+        }
+        // 瞬间跳变检测 (即使 dt 很大，单次 jump 也不应超过 10m)
+        const double max_jump = ConfigManager::instance().mappingMaxReasonableJumpM();
+        if (dist > max_jump && dt < 0.5) {
+             RCLCPP_ERROR(node_->get_logger(),
+                "[V3][CRASH_GUARD] Reject frame: unreasonable pose jump! dist=%.2f m > max=%.2f m (dt=%.3fs, ts=%.3f)",
+                dist, max_jump, dt, event.timestamp);
+            METRICS_INCREMENT(metrics::FRAME_MISMATCH_TOTAL);
+            return;
+        }
+    }
+
     RCLCPP_INFO(node_->get_logger(),
         "[V3][CONTRACT] processFrame ingress ts=%.3f pose_frame=%d cloud_frame=%s has_gps=%d ref_map_version=%lu ref_alignment_epoch=%lu",
         event.timestamp, static_cast<int>(event.pose_frame), event.cloud_frame.c_str(),
@@ -438,7 +509,6 @@ void MappingModule::processFrame(const FilteredFrameEventRequiredDs& event) {
         return;
     }
 
-    KeyFrame::Ptr prev_kf = kf_manager_.getLastKeyFrame();
     
     // ── V3: 处理坐标系不匹配 (Double Transformation Fix) ──
     // 如果 cloud_frame 为 "world"，则云已经在世界系下。
@@ -535,8 +605,22 @@ void MappingModule::processFrame(const FilteredFrameEventRequiredDs& event) {
     {
         std::lock_guard<std::mutex> lk(pending_semantic_mutex_);
         for (auto it = pending_semantic_landmarks_.begin(); it != pending_semantic_landmarks_.end(); ++it) {
-            const double dt = std::abs(it->timestamp - kf->timestamp);
-            if (dt <= semantic_timestamp_match_tolerance_s_) {
+            bool match = false;
+            if (it->keyframe_id_hint != 0 && it->keyframe_id_hint == kf->id) {
+                match = true;
+            } else {
+                if (std::isfinite(it->keyframe_timestamp_hint) && it->keyframe_timestamp_hint > 0.0) {
+                    const double dt_hint = std::abs(it->keyframe_timestamp_hint - kf->timestamp);
+                    if (dt_hint <= semantic_timestamp_match_tolerance_s_) {
+                        match = true;
+                    }
+                }
+                if (!match) {
+                    const double dt = std::abs(it->timestamp - kf->timestamp);
+                    match = (dt <= semantic_timestamp_match_tolerance_s_);
+                }
+            }
+            if (match) {
                 deferred_ev = *it;
                 has_deferred = true;
                 pending_semantic_landmarks_.erase(it);
@@ -629,14 +713,25 @@ void MappingModule::onSubmapFrozen(const SubMap::Ptr& submap) {
                       [](const SubMap::Ptr& a, const SubMap::Ptr& b) {
                           return a->id < b->id;
                       });
-            hba_optimizer_.triggerAsync(frozen_for_hba, loops, false, "onSubmapFrozen");
+            hba_optimizer_.triggerAsync(frozen_for_hba, loops, false, "onSubmapFrozen",
+                                        processed_alignment_epoch_.load());
         }
     }
 }
 
 void MappingModule::updateGPSAlignment(const GPSAlignedEvent& ev) {
+    const uint64_t last_seq = last_gps_event_seq_.load();
+    if (ev.event_seq <= last_seq) {
+        RCLCPP_WARN(node_->get_logger(),
+            "[V3][CONTRACT] Drop stale/duplicate GPSAlignedEvent by event_seq: event_seq=%lu last_seq=%lu",
+            static_cast<unsigned long>(ev.event_seq),
+            static_cast<unsigned long>(last_seq));
+        return;
+    }
+    last_gps_event_seq_.store(ev.event_seq);
+
     const uint64_t local_epoch_before = processed_alignment_epoch_.load();
-    if (ev.alignment_epoch <= local_epoch_before) {
+    if (ev.alignment_epoch != 0 && ev.alignment_epoch <= local_epoch_before) {
         RCLCPP_WARN(node_->get_logger(),
             "[V3][CONTRACT] Drop stale/duplicate GPSAlignedEvent: event_epoch=%lu local_epoch=%lu success=%d",
             static_cast<unsigned long>(ev.alignment_epoch),
@@ -770,6 +865,7 @@ bool MappingModule::applyOptimizedPoses(const std::unordered_map<int, Pose3d>& s
     // 1. 语义校准：如果系统已 GPS 对齐，但输入是 ODOM，则自动补偿 T_map_odom
     std::unordered_map<int, Pose3d> sm_to_apply = sm_poses;
     std::unordered_map<uint64_t, Pose3d> kf_to_apply = kf_poses;
+    PoseFrame effective_frame = frame;
 
     if (gps_aligned_.load() && frame != PoseFrame::MAP) {
         Pose3d T_map_odom = Pose3d::Identity();
@@ -804,6 +900,7 @@ bool MappingModule::applyOptimizedPoses(const std::unordered_map<int, Pose3d>& s
         for (auto& [id, pose] : kf_to_apply) {
             pose = T_map_odom * pose;
         }
+        effective_frame = PoseFrame::MAP;
         RCLCPP_WARN(node_->get_logger(),
             "[V3][POSE_DIAG] Applied T_map_odom compensation to %zu submaps and %zu keyframes",
             sm_to_apply.size(), kf_to_apply.size());
@@ -825,17 +922,53 @@ bool MappingModule::applyOptimizedPoses(const std::unordered_map<int, Pose3d>& s
 
     // 2. 批量分发到位姿后端 (SubMapManager / MapRegistry)
     if (!sm_to_apply.empty()) {
-        sm_manager_.batchUpdateSubmapPoses(sm_to_apply, version, frame);
+        sm_manager_.batchUpdateSubmapPoses(sm_to_apply, version, effective_frame);
     }
     if (!kf_to_apply.empty()) {
-        sm_manager_.batchUpdateKeyFramePoses(kf_to_apply, version, frame);
+        sm_manager_.batchUpdateKeyFramePoses(kf_to_apply, version, effective_frame);
     }
 
-    // 3. 屏障同步：更新本地处理版本，解除 frame_queue_ 阻塞
+    // 3. 屏障同步与子图隔离 (🏛️ [架构契约] 消除重影的核心逻辑)
+    // 每次应用优化结果后，必须强制冻结当前子图。
+    // 理由：子图内部所有点云必须在同一坐标系语义下。如果子图处理一半时坐标系跳变，
+    // 则该子图后续的点云将与前半部分产生重影。通过强制切分，将跳变完全限制在子图间。
+    auto active_sm = sm_manager_.getActiveSubmap();
+    if (active_sm && active_sm->state == SubMapState::ACTIVE) {
+        RCLCPP_INFO(node_->get_logger(),
+            "[V3][GHOST_GUARD] Freezing submap %d due to pose optimization (version %lu)",
+            active_sm->id, version);
+        sm_manager_.freezeSubmap(active_sm);
+    }
+
+    // 4. 计算位姿跳变增量并反馈前端 (Propagation)
+    // 选取最后一个关键帧作为参考点计算坐标系偏移
+    if (!kf_to_apply.empty()) {
+        uint64_t latest_kf_id = 0;
+        for (const auto& [id, _] : kf_to_apply) latest_kf_id = std::max(latest_kf_id, id);
+        
+        auto kf = map_registry_->getKeyFrame(static_cast<int>(latest_kf_id));
+        if (kf) {
+            Pose3d T_old = kf->T_map_b_optimized;
+            Pose3d T_new = kf_to_apply.at(latest_kf_id);
+            Pose3d delta = T_new * T_old.inverse();
+
+            FrontendPoseAdjustEvent adjust_ev;
+            adjust_ev.from_version = processed_map_version_.load();
+            adjust_ev.to_version = version;
+            adjust_ev.T_map_new_map_old = delta;
+            adjust_ev.target_frame = effective_frame;
+            event_bus_->publish(adjust_ev);
+            
+            RCLCPP_INFO(node_->get_logger(),
+                "[V3][GHOST_GUARD] Propagating pose jump to Frontend: delta_t=[%.2f,%.2f,%.2f]",
+                delta.translation().x(), delta.translation().y(), delta.translation().z());
+        }
+    }
+
     processed_map_version_.store(version);
     last_applied_version_ = version;
 
-    // 4. 可视化同步（节流：避免每次优化都触发一次全局构图造成后端抖动）
+    // 5. 可视化同步（节流：避免每次优化都触发一次全局构图造成后端抖动）
     const int optimize_interval = std::max(1, ConfigManager::instance().backendPublishGlobalMapEveryNProcessed());
     const int optimized_count = ++optimized_apply_count_;
     if (optimized_count % optimize_interval == 0) {
@@ -855,7 +988,7 @@ bool MappingModule::applyOptimizedPoses(const std::unordered_map<int, Pose3d>& s
         std::chrono::steady_clock::now() - t0).count();
     RCLCPP_INFO(node_->get_logger(),
         "[V3][PERF] applyOptimizedPoses done: version=%lu frame=%d sm=%zu kf=%zu elapsed=%ldms",
-        static_cast<unsigned long>(version), static_cast<int>(frame),
+        static_cast<unsigned long>(version), static_cast<int>(effective_frame),
         sm_to_apply.size(), kf_to_apply.size(), static_cast<long>(elapsed_ms));
     return true;
 }
@@ -1008,6 +1141,19 @@ void MappingModule::onSemanticLandmarks(const SemanticLandmarkEvent& ev) {
         std::lock_guard<std::mutex> lk(pending_semantic_mutex_);
         if (pending_semantic_landmarks_.size() >= max_pending_semantic_events_) {
             pending_semantic_landmarks_.pop_front();
+            
+            // 🏛️ [架构契约] 待处理队列满，发布警告
+            BackpressureWarningEvent warn;
+            warn.module_name = name_ + "_pending_semantic";
+            warn.queue_usage_ratio = 1.0f;
+            warn.critical = true;
+            event_bus_->publish(warn);
+        } else if (pending_semantic_landmarks_.size() > max_pending_semantic_events_ * 0.8) {
+            BackpressureWarningEvent warn;
+            warn.module_name = name_ + "_pending_semantic";
+            warn.queue_usage_ratio = static_cast<float>(pending_semantic_landmarks_.size()) / max_pending_semantic_events_;
+            warn.critical = false;
+            event_bus_->publish(warn);
         }
         pending_semantic_landmarks_.push_back(pending_ev);
         RCLCPP_DEBUG(node_->get_logger(),
@@ -1015,8 +1161,19 @@ void MappingModule::onSemanticLandmarks(const SemanticLandmarkEvent& ev) {
             reason, pending_ev.timestamp, static_cast<unsigned long>(kf_id), sm_id, pending_semantic_landmarks_.size());
     };
 
-    // 1. 查找对应的关键帧
-    auto kf = map_registry_->getKeyFrameByTimestamp(ev.timestamp);
+    // 1. 查找对应的关键帧（优先 keyframe_id_hint，其次 keyframe timestamp hint，再兜底语义事件时间戳）
+    KeyFrame::Ptr kf = nullptr;
+    if (ev.keyframe_id_hint != 0) {
+        kf = map_registry_->getKeyFrame(static_cast<int>(ev.keyframe_id_hint));
+    }
+    if (std::isfinite(ev.keyframe_timestamp_hint) && ev.keyframe_timestamp_hint > 0.0) {
+        if (!kf || std::abs(kf->timestamp - ev.keyframe_timestamp_hint) > semantic_timestamp_match_tolerance_s_) {
+            kf = map_registry_->getKeyFrameByTimestamp(ev.keyframe_timestamp_hint, semantic_timestamp_match_tolerance_s_);
+        }
+    }
+    if (!kf) {
+        kf = map_registry_->getKeyFrameByTimestamp(ev.timestamp, semantic_timestamp_match_tolerance_s_);
+    }
     if (!kf) {
         defer_semantic_event(ev, "kf_not_found", 0, -1);
         return;
@@ -1027,7 +1184,18 @@ void MappingModule::onSemanticLandmarks(const SemanticLandmarkEvent& ev) {
     }
 
     // 2. 更新关键帧的地标
-    kf->landmarks = ev.landmarks;
+    // 🏛️ [架构契约] 数据完整性校验
+    std::vector<CylinderLandmark::Ptr> valid_landmarks;
+    for (const auto& l : ev.landmarks) {
+        if (l && l->isValid()) {
+            valid_landmarks.push_back(l);
+        } else {
+            RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000,
+                "[SEMANTIC][CONTRACT] Drop invalid landmark: non-finite or zero radius");
+        }
+    }
+    if (valid_landmarks.empty()) return;
+    kf->landmarks = valid_landmarks;
 
     // 3. 关联到子图（由 SubMapManager 内部完成互斥，避免外层重复加锁导致自锁）
     auto sm = sm_manager_.getSubmap(static_cast<int>(kf->submap_id));
@@ -1036,6 +1204,7 @@ void MappingModule::onSemanticLandmarks(const SemanticLandmarkEvent& ev) {
             "[SEMANTIC][Mapping][onSemanticLandmarks] step=sm_not_found ts=%.3f kf_id=%lu sm_id=%d → skip",
             ev.timestamp, kf->id, kf->submap_id);
     } else {
+        // 🏛️ [架构增强] 检查地标是否重复关联，避免同一物理地标在同一 KF 下产生多重约束
         sm_manager_.associateLandmarks(sm, kf);
         
         // 4. 发布优化任务

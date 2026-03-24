@@ -201,6 +201,19 @@ void LoopDetector::init(rclcpp::Node::SharedPtr node) {
     RCLCPP_INFO(node->get_logger(),
         "[LoopDetector][CONFIG] geo_prefilter: max_distance_m=%.1f skip_above_score=%.2f (0=off; grep CONFIG 验证)",
         geo_prefilter_max_distance_m_, geo_prefilter_skip_above_score_);
+    RCLCPP_INFO(node->get_logger(),
+        "[DIAG][LOOP][CONFIG] flow_mode=%s ot_preferred=%d allow_sc_fallback=%d allow_descriptor_fallback=%d "
+        "allow_svd_geom_fallback=%d scancontext_enabled=%d overlap_threshold=%.2f top_k=%d min_temporal_gap_s=%.1f "
+        "parallel_teaser_match=%d parallel_teaser_max_inflight=%d min_submap_gap=%d geo_prefilter_max_distance_m=%.1f",
+        loop_flow_mode_.c_str(),
+        ot_preferred_flow_ ? 1 : 0,
+        allow_sc_fallback_ ? 1 : 0,
+        allow_descriptor_fallback_ ? 1 : 0,
+        allow_svd_geom_fallback_ ? 1 : 0,
+        use_scancontext_ ? 1 : 0,
+        overlap_threshold_, top_k_, min_temporal_gap_,
+        parallel_teaser_match_ ? 1 : 0, parallel_teaser_max_inflight_,
+        min_submap_gap_, geo_prefilter_max_distance_m_);
 
     // 加载 OverlapTransformer 模型（LibTorch Level 1）
     std::string model_path = cfg.overlapModelPath();
@@ -238,6 +251,13 @@ void LoopDetector::init(rclcpp::Node::SharedPtr node) {
         RCLCPP_ERROR(node->get_logger(),
             "[LOOP_FLOW][STRICT] OT mandatory mode but model is unavailable. coarse matching is blocked until %s is loadable.",
             cfg.overlapModelPath().c_str());
+        RCLCPP_ERROR(node->get_logger(),
+            "[DIAG][LOOP][E_FLOW_BLOCKED] strict OT flow blocked: model_not_loaded=%d model_path=%s "
+            "allow_sc_fallback=%d allow_descriptor_fallback=%d",
+            overlap_infer_.isModelLoaded() ? 0 : 1,
+            cfg.overlapModelPath().c_str(),
+            allow_sc_fallback_ ? 1 : 0,
+            allow_descriptor_fallback_ ? 1 : 0);
     } else if (!strict_mode && ot_preferred_flow_ && !overlap_infer_.isModelLoaded()) {
         loop_ot_unavailable_event_total_.fetch_add(1, std::memory_order_relaxed);
         if (!use_scancontext_) {
@@ -256,6 +276,9 @@ void LoopDetector::init(rclcpp::Node::SharedPtr node) {
         loop_teaser_unavailable_event_total_.fetch_add(1, std::memory_order_relaxed);
         RCLCPP_ERROR(node->get_logger(),
             "[LOOP_FLOW][STRICT] TEASER mandatory mode but USE_TEASER is OFF at build-time. geometric verification will be blocked.");
+        RCLCPP_ERROR(node->get_logger(),
+            "[DIAG][LOOP][E_GEOM_BLOCKED] strict geometry flow blocked: USE_TEASER=0 allow_svd_geom_fallback=%d",
+            allow_svd_geom_fallback_ ? 1 : 0);
     } else {
         loop_teaser_unavailable_event_total_.fetch_add(1, std::memory_order_relaxed);
         RCLCPP_WARN(node->get_logger(),

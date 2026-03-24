@@ -29,8 +29,9 @@ public:
         gps_manager_.registerAlignCallback([this](const GPSAlignResult& r) {
             GPSAlignedEvent event;
             event.success = r.success;
-            const uint64_t current_epoch = map_registry_->getAlignmentEpoch();
-            event.alignment_epoch = current_epoch + 1;
+            event.event_seq = gps_align_event_seq_.fetch_add(1, std::memory_order_relaxed) + 1;
+            // 仅携带当前观测到的 epoch 作为提示值，不做 +1 预测。
+            event.alignment_epoch = map_registry_->getAlignmentEpoch();
             if (r.success) {
                 event.R_enu_to_map = r.R_enu_to_map;
                 event.t_enu_to_map = r.t_enu_to_map;
@@ -105,6 +106,7 @@ private:
     
     std::deque<RawGPSEvent> gps_queue_;
     std::mutex queue_mutex_;
+    std::atomic<uint64_t> gps_align_event_seq_{0};
 };
 
 } // namespace automap_pro::v3

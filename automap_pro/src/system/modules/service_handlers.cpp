@@ -128,38 +128,63 @@ void AutoMapSystem::handleFinishMapping(
     const std::shared_ptr<std_srvs::srv::Trigger::Request>,
     std::shared_ptr<std_srvs::srv::Trigger::Response> res)
 {
-    RCLCPP_INFO(get_logger(), "[AutoMapSystem] Finish mapping requested. Waiting for backend to idle...");
-    
-    // 🏛️ [架构修复] 等待后端所有模块处理完成
-    // 理由：前端 (fast_livo) 处理 bag 很快，发布完所有数据后就会触发 finish。
-    // 后端 (Mapping/Optimizer) 有大量队列积压，若立即退出会导致后半段地图丢失。
-    int wait_count = 0;
-    while (!v3_context_->isAllIdle() && wait_count < 600) { // 最多等 10 分钟 (600 * 1s)
-        if (wait_count % 10 == 0) {
-            RCLCPP_INFO(get_logger(), "[AutoMapSystem] Backend still busy, waiting... (%ds)", wait_count);
-        }
-        std::this_thread::sleep_for(std::chrono::seconds(1));
-        wait_count++;
-    }
-    
-    if (wait_count >= 600) {
-        RCLCPP_WARN(get_logger(), "[AutoMapSystem] Wait for idle TIMEOUT! Forcing save and exit.");
-    } else {
-        RCLCPP_INFO(get_logger(), "[AutoMapSystem] Backend idle. Proceeding to save and exit.");
+    if (finish_mapping_in_progress_.exchange(true)) {
+        res->success = false;
+        res->message = "Finish mapping already in progress";
+        RCLCPP_WARN(get_logger(), "[AutoMapSystem] Finish mapping request ignored: already in progress.");
+        return;
     }
 
-    // 🏛️ [架构契约] 协议版本检查（即使 srv 还没更新，也要在日志中显式声明契约一致性）
-    RCLCPP_INFO(get_logger(), "[PROTOCOL] Interface Check: Backend API v%s OK", protocol::getVersionString().c_str());
-
-    std::string out_dir = getOutputDir();
-    saveMapToFiles(out_dir);
-
+    finish_mapping_requested_.store(true);
     res->success = true;
-    res->message = "Mapping finished and saved after waiting for backend idle (API v" + protocol::getVersionString() + ")";
-    
-    // 延迟退出
+    res->message = "Finish mapping accepted; running asynchronously";
+    RCLCPP_INFO(get_logger(), "[AutoMapSystem] Finish mapping accepted. Starting async finalize task.");
+
     std::thread([this]() {
+        RCLCPP_INFO(get_logger(), "[AutoMapSystem] Async finish task started. Sending QUIESCE request...");
+
+        // 🏛️ [架构契约] 发布静默请求，进入排空阶段
+        v3::SystemQuiesceRequestEvent quiesce_ev;
+        quiesce_ev.enable = true;
+        quiesce_ev.reason = "FinishMappingRequest";
+        v3_context_->eventBus()->publish(quiesce_ev);
+
+        int wait_count = 0;
+        while (!v3_context_->isAllIdle() && wait_count < 600) { // 最多等 10 分钟 (600 * 1s)
+            if (wait_count % 10 == 0) {
+                RCLCPP_INFO(get_logger(), "[AutoMapSystem] Backend still busy (draining queues), waiting... (%ds)", wait_count);
+            }
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            wait_count++;
+        }
+
+        if (wait_count >= 600) {
+            RCLCPP_WARN(get_logger(), "[AutoMapSystem] Wait for idle TIMEOUT! Forcing save and exit.");
+        } else {
+            RCLCPP_INFO(get_logger(), "[AutoMapSystem] All modules QUIESCED and IDLE. Proceeding to final save.");
+        }
+
+        // 🏛️ [架构契约] 协议版本检查（即使 srv 还没更新，也要在日志中显式声明契约一致性）
+        RCLCPP_INFO(get_logger(), "[PROTOCOL] Interface Check: Backend API v%s OK", protocol::getVersionString().c_str());
+
+        std::string out_dir = getOutputDir();
+        
+        // 🏛️ [架构加固] 显式触发一次同步保存命令
+        v3::SaveMapRequestEvent save_ev;
+        save_ev.output_dir = out_dir;
+        save_ev.completion = std::make_shared<std::promise<void>>();
+        auto future = save_ev.completion->get_future();
+        v3_context_->eventBus()->publish(save_ev);
+        
+        RCLCPP_INFO(get_logger(), "[AutoMapSystem] Waiting for final save completion...");
+        if (future.wait_for(std::chrono::minutes(5)) == std::future_status::ready) {
+            RCLCPP_INFO(get_logger(), "[AutoMapSystem] Final save COMPLETED.");
+        } else {
+            RCLCPP_ERROR(get_logger(), "[AutoMapSystem] Final save TIMEOUT (5min)!");
+        }
+
         std::this_thread::sleep_for(std::chrono::seconds(2));
+        finish_mapping_in_progress_.store(false);
         rclcpp::shutdown();
     }).detach();
 }

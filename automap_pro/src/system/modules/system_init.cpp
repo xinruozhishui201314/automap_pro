@@ -6,6 +6,7 @@
 #include "automap_pro/core/health_monitor.h"
 #include "automap_pro/core/utils.h"
 #include "automap_pro/core/protocol_contract.h" // 🏛️ [架构加固] 引入协议契约
+#include <filesystem>
 
 namespace automap_pro {
 
@@ -104,6 +105,36 @@ void AutoMapSystem::loadConfigAndInit() {
         RCLCPP_INFO(get_logger(), "[PIPELINE][SYS] step=04 ConfigManager::load path=%s", config_path.c_str());
         ConfigManager::instance().load(config_path);
         RCLCPP_INFO(get_logger(), "[PIPELINE][SYS] step=04 ConfigManager::load OK");
+        try {
+            const auto& cfg = ConfigManager::instance();
+            const std::string semantic_model = cfg.semanticModelPath();
+            const bool semantic_enabled = cfg.semanticEnabled();
+            const bool semantic_model_exists = (!semantic_model.empty() && std::filesystem::exists(semantic_model));
+            const std::string ot_model = cfg.overlapModelPath();
+            const bool ot_model_exists = (!ot_model.empty() && std::filesystem::exists(ot_model));
+            RCLCPP_INFO(
+                get_logger(),
+                "[DIAG][BOOT][CONFIG] semantic.enabled=%d semantic.model_path=%s semantic.model_exists=%d "
+                "loop.overlap_model_path=%s loop.overlap_model_exists=%d gps.enabled=%d gps.topic=%s gps.min_quality=%d gps.match_window_s=%.2f",
+                semantic_enabled ? 1 : 0, semantic_model.c_str(), semantic_model_exists ? 1 : 0,
+                ot_model.c_str(), ot_model_exists ? 1 : 0,
+                cfg.gpsEnabled() ? 1 : 0, cfg.gpsTopic().c_str(),
+                cfg.gpsMinAcceptedQualityLevel(), cfg.gpsKeyframeMatchWindowS());
+            if (semantic_enabled && !semantic_model_exists) {
+                RCLCPP_ERROR(
+                    get_logger(),
+                    "[DIAG][BOOT][E_SEMANTIC_MODEL] semantic enabled but model missing/invalid. "
+                    "path=%s exists=%d (fix semantic.model_path or provide model file)",
+                    semantic_model.c_str(), semantic_model_exists ? 1 : 0);
+            }
+            if (!cfg.gpsEnabled()) {
+                RCLCPP_WARN(
+                    get_logger(),
+                    "[DIAG][BOOT][W_GPS_DISABLED] gps sensor disabled by config; GPS constraints will not be added");
+            }
+        } catch (const std::exception& e) {
+            RCLCPP_WARN(get_logger(), "[DIAG][BOOT][W_CONFIG_DIAG] failed to dump config diagnostics: %s", e.what());
+        }
     } else {
         RCLCPP_WARN(get_logger(), "[PIPELINE][SYS] step=04 config_file parameter empty — ConfigManager not loaded from YAML");
     }
@@ -129,9 +160,25 @@ void AutoMapSystem::deferredSetupModules() {
     v3_context_->registerModule(frontend_module_);
 
     RCLCPP_INFO(get_logger(), "[PIPELINE][SYS] step=08a-2 ctor+register SemanticModule");
-    semantic_module_ = std::make_shared<v3::SemanticModule>(
-        v3_context_->eventBus(), v3_context_->mapRegistry(), shared_from_this());
-    v3_context_->registerModule(semantic_module_);
+    try {
+        semantic_module_ = std::make_shared<v3::SemanticModule>(
+            v3_context_->eventBus(), v3_context_->mapRegistry(), shared_from_this());
+        v3_context_->registerModule(semantic_module_);
+    } catch (const std::exception& e) {
+        semantic_module_.reset();
+        RCLCPP_ERROR(get_logger(),
+            "[PIPELINE][SYS] step=08a-2 semantic disabled due to init exception: %s", e.what());
+        try {
+            const auto& cfg = ConfigManager::instance();
+            const std::string semantic_model = cfg.semanticModelPath();
+            const bool exists = (!semantic_model.empty() && std::filesystem::exists(semantic_model));
+            RCLCPP_ERROR(
+                get_logger(),
+                "[DIAG][SEMANTIC][E_INIT] enabled=%d model_path=%s model_exists=%d (exact init error above)",
+                cfg.semanticEnabled() ? 1 : 0, semantic_model.c_str(), exists ? 1 : 0);
+        } catch (...) {
+        }
+    }
 
     RCLCPP_INFO(get_logger(), "[PIPELINE][SYS] step=08b ctor+register DynamicFilterModule");
     dynamic_filter_module_ = std::make_shared<v3::DynamicFilterModule>(
