@@ -314,6 +314,38 @@ download_tinyply() {
 }
 
 # =============================================================================
+# 6. ONNX Runtime (SLOAM 语义分割)
+#    版本: v1.8.2
+#    用途: 编译时若存在 docker/deps/onnxruntime，则直接使用无需 git clone
+#    说明: 需带 submodule，首次下载较慢；离线环境可先在有网络机器上执行本脚本
+# =============================================================================
+download_onnxruntime() {
+    local ONNX_VERSION="v1.8.2"
+    local ONNX_DIR="${DEPS_DIR}/onnxruntime"
+
+    log_info "检查 ONNX Runtime ${ONNX_VERSION}..."
+
+    if [ -f "${ONNX_DIR}/build.sh" ]; then
+        log_info "ONNX Runtime 已存在于 ${ONNX_DIR}，跳过"
+        return 0
+    fi
+
+    log_info "克隆 ONNX Runtime ${ONNX_VERSION}（含 submodule，可能需要数分钟）..."
+    rm -rf "${ONNX_DIR}"
+    git clone --depth 1 --branch ${ONNX_VERSION} --recursive \
+        https://github.com/Microsoft/onnxruntime "${ONNX_DIR}" || {
+        log_error "git clone onnxruntime 失败"
+        exit 1
+    }
+
+    if [ ! -f "${ONNX_DIR}/build.sh" ]; then
+        log_error "ONNX Runtime 克隆后未找到 build.sh"
+        exit 1
+    fi
+    log_info "ONNX Runtime 预下载完成: ${ONNX_DIR}"
+}
+
+# =============================================================================
 # 主流程
 # =============================================================================
 main() {
@@ -322,7 +354,7 @@ main() {
     log_info "安装目录: ${DEPS_DIR}"
 
     # 检查必要的工具
-    for cmd in curl tar sha256sum unzip; do
+    for cmd in curl tar sha256sum unzip git; do
         if ! command -v $cmd &> /dev/null; then
             log_error "缺少必要工具: $cmd"
             exit 1
@@ -343,6 +375,9 @@ main() {
 
     # 下载 tinyply（TEASER++ 依赖，避免 Docker 构建时从 GitHub 拉取超时）
     download_tinyply
+
+    # 下载 ONNX Runtime（SLOAM 语义分割，避免容器内 git clone）
+    download_onnxruntime
 
     log_info "========================================="
     log_info "所有依赖下载完成!"

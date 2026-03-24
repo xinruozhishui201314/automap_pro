@@ -38,6 +38,14 @@ SubMapManager::SubMapManager() {
     match_res_    = cfg.submapMatchRes();
     merge_res_    = cfg.submapMergeRes();
     merge_thread_count_ = cfg.backendSubmapMergeThreads();
+    retain_cloud_body_ = cfg.retainCloudBody();
+    map_statistical_filter_ = cfg.mapStatisticalFilter();
+    map_stat_filter_mean_k_ = cfg.mapStatFilterMeanK();
+    map_stat_filter_std_mul_ = cfg.mapStatFilterStdMul();
+    submap_rebuild_thresh_trans_ = cfg.submapRebuildThreshTrans();
+    submap_rebuild_thresh_rot_ = cfg.submapRebuildThreshRot();
+    parallel_voxel_downsample_ = cfg.parallelVoxelDownsample();
+    backend_verbose_trace_ = cfg.backendVerboseTrace();
     
     // ✅ P1 修复：配置检查
     bool retain_cloud = cfg.retainCloudBody();
@@ -587,13 +595,13 @@ void SubMapManager::mergeCloudToSubmap(SubMap::Ptr& sm, const KeyFrame::Ptr& kf)
     CloudXYZIPtr filtered_kf_cloud = raw_cloud;
     
     // 2.1 SOR 滤波
-    if (ConfigManager::instance().mapStatisticalFilter()) {
+    if (map_statistical_filter_) {
         CloudXYZIPtr temp(new CloudXYZI());
         try {
             pcl::StatisticalOutlierRemoval<pcl::PointXYZI> sor;
             sor.setInputCloud(raw_cloud);
-            sor.setMeanK(ConfigManager::instance().mapStatFilterMeanK());
-            sor.setStddevMulThresh(ConfigManager::instance().mapStatFilterStdMul());
+            sor.setMeanK(map_stat_filter_mean_k_);
+            sor.setStddevMulThresh(map_stat_filter_std_mul_);
             sor.filter(*temp);
             if (!temp->empty()) {
                 filtered_kf_cloud = temp;
@@ -662,7 +670,7 @@ void SubMapManager::mergeCloudToSubmap(SubMap::Ptr& sm, const KeyFrame::Ptr& kf)
         sm->merged_cloud ? sm->merged_cloud->size() : 0);
 
     // [GHOSTING_TRACE] 合并已用快照位姿 T_map_b_snapshot；与 odom 差异诊断
-    if (ConfigManager::instance().backendVerboseTrace()) {
+    if (backend_verbose_trace_) {
         const Eigen::Vector3d t = T_map_b_snapshot.translation();
         const Eigen::Vector3d t_odom = kf->T_odom_b.translation();
         const Eigen::Vector3d t_opt = kf->T_map_b_optimized.translation();
@@ -791,8 +799,8 @@ void SubMapManager::batchUpdateSubmapPoses(const std::unordered_map<int, Pose3d>
         "[V3][POSE_DIAG] Batch updated %d submaps for version %lu: max_trans_diff=%.3fm max_rot_diff=%.2fdeg",
         updated_count, version, max_trans_diff, max_rot_diff * 180.0 / M_PI);
 
-    const double kRebuildThresholdTrans = ConfigManager::instance().submapRebuildThreshTrans();
-    const double kRebuildThresholdRot = ConfigManager::instance().submapRebuildThreshRot();
+    const double kRebuildThresholdTrans = submap_rebuild_thresh_trans_;
+    const double kRebuildThresholdRot = submap_rebuild_thresh_rot_;
     const double max_rot_deg = max_rot_diff * 180.0 / M_PI;
 
     if (max_trans_diff > kRebuildThresholdTrans || max_rot_deg > kRebuildThresholdRot) {
@@ -972,7 +980,7 @@ void SubMapManager::rebuildMergedCloudFromOptimizedPoses() {
     const rclcpp::Logger log = rclcpp::get_logger("automap_system");
     RCLCPP_INFO(log, "[SubMapMgr][HBA_GHOSTING] rebuildMergedCloudFromOptimizedPoses enter (必须仅用 T_map_b_optimized 变换 cloud_body，与 buildGlobalMap 主路径一致，避免重影)");
     RCLCPP_INFO(log, "[GHOSTING_SOURCE] merged_cloud rebuild_enter pose_source=T_map_b_optimized (HBA 写回后执行，完成后 fallback_merged_cloud 与主路径一致)");
-    if (ConfigManager::instance().backendVerboseTrace()) {
+    if (backend_verbose_trace_) {
         RCLCPP_INFO(log, "[GHOSTING_TRACE] rebuildMergedCloudFromOptimizedPoses ENTER submap_count=%zu (grep GHOSTING_TRACE 查重影证据链)",
             submaps_.size());
     }
@@ -1057,7 +1065,7 @@ void SubMapManager::rebuildMergedCloudFromOptimizedPoses() {
         done_ts);
     RCLCPP_INFO(log,
         "[GHOSTING_SOURCE] merged_cloud rebuild_done (fallback 路径若被使用将与 optimized_path 一致；若 build 在 rebuild_done 之前则可能用过旧 merged_cloud→重影)");
-    if (ConfigManager::instance().backendVerboseTrace()) {
+    if (backend_verbose_trace_) {
         RCLCPP_INFO(log, "[GHOSTING_TRACE] rebuildMergedCloudFromOptimizedPoses DONE (fallback 路径此后无重影；grep GHOSTING_TRACE 查证据链)");
     }
 }
@@ -1152,7 +1160,7 @@ CloudXYZIPtr SubMapManager::buildGlobalMap(float voxel_size) const {
     RCLCPP_INFO(log, "[GLOBAL_MAP_DIAG][HBA_GHOSTING] buildGlobalMap enter voxel_size=%.3f 主路径=从 kf->cloud_body 用 T_map_b_optimized 变换；T_map_b_optimized 未优化时直接退出程序（正常建图不应出现）", voxel_size);
     
     const size_t num_submaps = submaps_.size();
-    if (ConfigManager::instance().backendVerboseTrace()) {
+    if (backend_verbose_trace_) {
         RCLCPP_INFO(log, "[GHOSTING_TRACE] buildGlobalMap ENTER voxel=%.3f submap_count=%zu (主路径=cloud_body+T_odom_b_opt 无重影；fallback=merged_cloud 若未rebuild则有重影)",
             voxel_size, num_submaps);
     }
@@ -1308,10 +1316,8 @@ CloudXYZIPtr SubMapManager::buildGlobalMap(float voxel_size) const {
         total_pts_before_transform, combined->size());
     // 若主路径无关键帧点云，记录警告并尝试回退
     if (combined->empty()) {
-        const auto& cfg = ConfigManager::instance();
-        
-        if (cfg.retainCloudBody()) {
-            SLOG_ERROR(MOD, 
+        if (retain_cloud_body_) {
+            SLOG_ERROR(MOD,
                 "🔴 P1 FALLBACK DETECTED: No keyframe clouds found despite retain_cloud_body=true!\n"
                 "   Statistics: kf_skipped_null=%zu, kf_skipped_empty=%zu, num_submaps=%zu\n"
                 "   This may indicate:\n"
@@ -1334,7 +1340,7 @@ CloudXYZIPtr SubMapManager::buildGlobalMap(float voxel_size) const {
         }
 
         used_fallback_path = true;  // 供 [GLOBAL_MAP_BLUR] 汇总判断
-        if (ConfigManager::instance().backendVerboseTrace()) {
+        if (backend_verbose_trace_) {
             RCLCPP_INFO(log, "[GHOSTING_TRACE] buildGlobalMap PATH=fallback kf_skipped_null=%zu kf_skipped_empty=%zu (merged_cloud若未rebuild→重影风险；grep GHOSTING_TRACE)",
                 kf_skipped_null, kf_skipped_empty);
         }
@@ -1376,7 +1382,7 @@ CloudXYZIPtr SubMapManager::buildGlobalMap(float voxel_size) const {
         
         RCLCPP_INFO(log, "[GLOBAL_MAP_DIAG] └─ 回退完成: combined_pts=%zu", combined->size());
     } else if (!combined->empty()) {
-        if (ConfigManager::instance().backendVerboseTrace()) {
+        if (backend_verbose_trace_) {
             RCLCPP_INFO(log, "[GHOSTING_TRACE] buildGlobalMap PATH=main combined_pts=%zu kf_used=%zu (pose=T_map_b_optimized 无重影)",
                 combined->size(), kf_used_total);
         }
@@ -1514,6 +1520,22 @@ bool SubMapManager::archiveSubmap(const SubMap::Ptr& submap, const std::string& 
             meta["gps_center"] = {submap->gps_center.x(), submap->gps_center.y(), submap->gps_center.z()};
         }
 
+        // 🏛️ [产品化增强] 保存语义地标 (Landmarks)
+        json landmarks_json = json::array();
+        for (const auto& l : submap->landmarks) {
+            if (!l) continue;
+            json l_json;
+            l_json["id"] = l->id;
+            l_json["root"] = {l->root.x(), l->root.y(), l->root.z()};
+            l_json["ray"] = {l->ray.x(), l->ray.y(), l->ray.z()};
+            l_json["radius"] = l->radius;
+            l_json["confidence"] = l->confidence;
+            landmarks_json.push_back(l_json);
+        }
+        meta["landmarks"] = landmarks_json;
+        SLOG_DEBUG(MOD, "[SEMANTIC][SubMapMgr][archiveSubmap] step=landmarks_saved sm_id={} count={}",
+                   submap->id, landmarks_json.size());
+
         // ========== [增量建图] 保存子图内所有关键帧信息 ==========
         std::vector<uint64_t> kf_ids;
         std::string kf_dir = subdir + "/keyframes";
@@ -1573,9 +1595,11 @@ bool SubMapManager::archiveSubmap(const SubMap::Ptr& submap, const std::string& 
             pcl::io::savePCDFileBinary(subdir + "/downsampled_cloud.pcd", *submap->downsampled_cloud);
         }
         submap->state = SubMapState::ARCHIVED;
+        SLOG_INFO(MOD, "[SEMANTIC][SubMapMgr][archiveSubmap] step=ok sm_id={} dir={} landmarks={}",
+                  submap->id, subdir, submap->landmarks.size());
         return true;
     } catch (const std::exception& e) {
-        SLOG_ERROR(MOD, "archiveSubmap sm_id={} failed: {}", submap->id, e.what());
+        SLOG_ERROR(MOD, "[SEMANTIC][SubMapMgr][archiveSubmap] step=FAILED sm_id={} error={}", submap->id, e.what());
         return false;
     }
 }
@@ -1583,7 +1607,10 @@ bool SubMapManager::archiveSubmap(const SubMap::Ptr& submap, const std::string& 
 bool SubMapManager::loadArchivedSubmap(const std::string& dir, int submap_id, SubMap::Ptr& out) {
     std::string subdir = dir + "/submap_" + std::to_string(submap_id);
     std::string meta_path = subdir + "/submap_meta.json";
-    if (!fs::exists(meta_path)) return false;
+    if (!fs::exists(meta_path)) {
+        SLOG_DEBUG(MOD, "[SEMANTIC][SubMapMgr][loadArchivedSubmap] step=skip reason=meta_not_found path={}", meta_path);
+        return false;
+    }
     try {
         std::ifstream ifs(meta_path);
         json meta;
@@ -1611,6 +1638,31 @@ bool SubMapManager::loadArchivedSubmap(const std::string& dir, int submap_id, Su
         if (meta.contains("gps_center") && meta["gps_center"].is_array() && meta["gps_center"].size() >= 3) {
             sm->gps_center << meta["gps_center"][0], meta["gps_center"][1], meta["gps_center"][2];
         }
+
+        // 🏛️ [产品化增强] 加载语义地标 (Landmarks)
+        if (meta.contains("landmarks") && meta["landmarks"].is_array()) {
+            const auto& landmarks_arr = meta["landmarks"];
+            for (const auto& l_json : landmarks_arr) {
+                auto l = std::make_shared<CylinderLandmark>();
+                l->id = l_json.value("id", 0ULL);
+                l->submap_id = sm->id;
+                if (l_json.contains("root") && l_json["root"].is_array() && l_json["root"].size() >= 3) {
+                    l->root << l_json["root"][0], l_json["root"][1], l_json["root"][2];
+                }
+                if (l_json.contains("ray") && l_json["ray"].is_array() && l_json["ray"].size() >= 3) {
+                    l->ray << l_json["ray"][0], l_json["ray"][1], l_json["ray"][2];
+                }
+                l->radius = l_json.value("radius", 0.1);
+                l->confidence = l_json.value("confidence", 0.0);
+                sm->landmarks.push_back(l);
+            }
+            SLOG_INFO(MOD, "[SEMANTIC][SubMapMgr][loadArchivedSubmap] step=landmarks_loaded sm_id={} count={}",
+                      submap_id, sm->landmarks.size());
+        } else {
+            SLOG_DEBUG(MOD, "[SEMANTIC][SubMapMgr][loadArchivedSubmap] step=no_landmarks sm_id={} (metadata missing or empty)",
+                       submap_id);
+        }
+
         if (meta.contains("descriptor") && meta["descriptor"].is_array()) {
             std::vector<float> d = meta["descriptor"].get<std::vector<float>>();
             if (d.size() == 256) {
@@ -1631,9 +1683,11 @@ bool SubMapManager::loadArchivedSubmap(const std::string& dir, int submap_id, Su
         if (!sm->downsampled_cloud) sm->downsampled_cloud = std::make_shared<CloudXYZI>();
 
         out = sm;
+        SLOG_INFO(MOD, "[SEMANTIC][SubMapMgr][loadArchivedSubmap] step=ok sm_id={} landmarks={} dir={}",
+                  submap_id, sm->landmarks.size(), subdir);
         return true;
     } catch (const std::exception& e) {
-        SLOG_ERROR(MOD, "loadArchivedSubmap sm_id={} failed: {}", submap_id, e.what());
+        SLOG_ERROR(MOD, "[SEMANTIC][SubMapMgr][loadArchivedSubmap] step=FAILED sm_id={} error={}", submap_id, e.what());
         return false;
     }
 }
@@ -1682,6 +1736,102 @@ void SubMapManager::updateGPSGravityCenter(const KeyFrame::Ptr& kf) {
                      active_submap_->gps_center.y(),
                      active_submap_->gps_center.z());
     }
+}
+
+void SubMapManager::associateLandmarks(SubMap::Ptr& sm, const KeyFrame::Ptr& kf) {
+    if (!sm || !kf) {
+        SLOG_DEBUG(MOD, "[SEMANTIC][SubMapMgr][associateLandmarks] step=skip reason=sm_or_kf_null");
+        return;
+    }
+    if (kf->landmarks.empty()) {
+        SLOG_DEBUG(MOD, "[SEMANTIC][SubMapMgr][associateLandmarks] step=skip kf_id={} sm_id={} reason=no_landmarks",
+                   kf->id, sm->id);
+        return;
+    }
+
+    SLOG_DEBUG(MOD, "[SEMANTIC][SubMapMgr][associateLandmarks] step=entry kf_id={} sm_id={} kf_landmarks={} sm_landmarks={}",
+               kf->id, sm->id, kf->landmarks.size(), sm->landmarks.size());
+
+    std::lock_guard<std::mutex> lk(mutex_);
+
+    // T_submap_kf 是 KF 在 Submap frame 锚点下的位姿
+    Pose3d T_s_kf = kf->T_submap_kf;
+    if (!T_s_kf.matrix().allFinite()) {
+        SLOG_WARN(MOD, "[SEMANTIC][SubMapMgr][associateLandmarks] step=skip reason=invalid_T_s_kf kf_id={} sm_id={}",
+                  kf->id, sm->id);
+        return;
+    }
+
+    size_t n_matched = 0;
+    size_t n_new = 0;
+    for (const auto& l_kf : kf->landmarks) {
+        if (!l_kf) continue;
+        
+        // 将地标从 body 系转换到 submap 锚点系
+        CylinderLandmark l_s;
+        l_s.root = T_s_kf * l_kf->root;
+        l_s.ray = (T_s_kf.rotation() * l_kf->ray).normalized();
+        l_s.radius = l_kf->radius;
+        l_s.confidence = l_kf->confidence;
+
+        // 与子图中现有的地标进行关联
+        bool associated = false;
+        int matched_idx = -1;
+        for (size_t i = 0; i < sm->landmarks.size(); ++i) {
+            auto& l_sm = sm->landmarks[i];
+            
+            // 1. 检查根节点距离 (2D 距离更适合树木)
+            double dist_xy = (l_sm->root.head<2>() - l_s.root.head<2>()).norm();
+            double dist_z = std::abs(l_sm->root.z() - l_s.root.z());
+            
+            // 2. 检查轴向夹角
+            double cos_theta = std::abs(l_sm->ray.dot(l_s.ray));
+            double angle = std::acos(std::min(1.0, cos_theta)) * 180.0 / M_PI;
+            
+            // 3. 检查半径差异
+            double radius_diff = std::abs(l_sm->radius - l_s.radius);
+
+            // 🏛️ [鲁棒性改进] 使用更严格的关联阈值
+            if (dist_xy < 0.4 && dist_z < 1.0 && angle < 10.0 && radius_diff < 0.08) {
+                // 关联成功：加权平均更新地标参数
+                // 考虑观测置信度作为权重
+                double w_old = l_sm->confidence;
+                double w_new = l_s.confidence;
+                double total_w = w_old + w_new;
+                double alpha = w_new / std::max(1e-3, total_w);
+                
+                // 限制 alpha 范围，避免单次观测影响过大
+                alpha = std::clamp(alpha, 0.05, 0.4);
+
+                l_sm->root = (1.0 - alpha) * l_sm->root + alpha * l_s.root;
+                l_sm->ray = ((1.0 - alpha) * l_sm->ray + alpha * l_s.ray).normalized();
+                l_sm->radius = (1.0 - alpha) * l_sm->radius + alpha * l_s.radius;
+                l_sm->confidence = std::max(l_sm->confidence, l_s.confidence);
+                
+                matched_idx = static_cast<int>(i);
+                associated = true;
+                break;
+            }
+        }
+
+        if (associated && matched_idx >= 0) {
+            l_kf->associated_idx = matched_idx;
+            l_kf->submap_id = sm->id;
+            n_matched++;
+        } else {
+            // 未关联，作为新地标加入
+            auto new_l = std::make_shared<CylinderLandmark>(l_s);
+            new_l->id = sm->landmarks.size();
+            sm->landmarks.push_back(new_l);
+
+            l_kf->associated_idx = static_cast<int>(new_l->id);
+            l_kf->submap_id = sm->id;
+            n_new++;
+        }
+    }
+
+    SLOG_DEBUG(MOD, "[SEMANTIC][SubMapMgr][associateLandmarks] step=done kf_id={} sm_id={} matched={} new={} sm_total={}",
+               kf->id, sm->id, n_matched, n_new, sm->landmarks.size());
 }
 
 void SubMapManager::publishEvent(const SubMap::Ptr& sm, const std::string& event) {
@@ -1866,7 +2016,7 @@ CloudXYZIPtr SubMapManager::buildGlobalMapInternal(
     if (voxel_size <= 0.0f) return combined;
 
     // 🏛️ [架构优化] 在此处读取配置并显式向下传递，避免异步/OpenMP 线程内 ConfigManager 竞争导致 SIGSEGV
-    const bool parallel = ConfigManager::instance().parallelVoxelDownsample();
+    const bool parallel = parallel_voxel_downsample_;
     CloudXYZIPtr out = utils::voxelDownsampleChunked(combined, vs, 50.0f, parallel);
     const size_t out_pts = out ? out->size() : combined->size();
     ALOG_INFO(MOD, "[tid={}] step=buildGlobalMapInternal_exit out={}", tid, out_pts);
@@ -1938,7 +2088,7 @@ CloudXYZIPtr SubMapManager::buildGlobalMapInternalFromSnapshot(
     if (voxel_size <= 0.0f) return combined;
 
     // 🏛️ [架构优化] 在此处读取配置并显式向下传递，避免异步/OpenMP 线程内 ConfigManager 竞争导致 SIGSEGV
-    const bool parallel = ConfigManager::instance().parallelVoxelDownsample();
+    const bool parallel = parallel_voxel_downsample_;
     CloudXYZIPtr out = utils::voxelDownsampleChunked(combined, vs, 50.0f, parallel);
     const size_t out_pts = out ? out->size() : combined->size();
     ALOG_INFO(MOD, "[tid={}] step=buildGlobalMapInternal_exit out={}", tid, out_pts);

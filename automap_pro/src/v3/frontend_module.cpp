@@ -1,19 +1,28 @@
 #include "automap_pro/v3/frontend_module.h"
+#include "automap_pro/backend/gps_constraint_policy.h"
 #include "automap_pro/core/config_manager.h"
 #include "automap_pro/core/logger.h"
 #include "automap_pro/core/utils.h"
 #include <pcl_conversions/pcl_conversions.h>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 
 namespace automap_pro::v3 {
 namespace {
 
-GPSQuality qualityFromHdopAndSats(double hdop, int sats) {
+// full.log 闭环：GPS 缓存命中/拒绝统计（grep GPS_CACHE KPI / GPS_CACHE VERIFY）
+std::atomic<uint64_t> g_gps_cache_get_empty_total{0};
+std::atomic<uint64_t> g_gps_cache_get_no_neighbor_total{0};
+std::atomic<uint64_t> g_gps_cache_get_reject_invalid_total{0};
+std::atomic<uint64_t> g_gps_cache_get_ok_total{0};
+
+
+GPSQuality qualityFromHdopAndSats(double hdop, int sats, double medium_max_hdop) {
     if (sats < 4 || !std::isfinite(hdop)) return GPSQuality::INVALID;
     if (hdop <= 1.0) return GPSQuality::EXCELLENT;
     if (hdop <= 2.0) return GPSQuality::HIGH;
-    if (hdop <= 5.0) return GPSQuality::MEDIUM;
+    if (hdop <= medium_max_hdop) return GPSQuality::MEDIUM;
     if (hdop <= 20.0) return GPSQuality::LOW;
     return GPSQuality::INVALID;
 }
@@ -66,6 +75,7 @@ FrontEndModule::FrontEndModule(EventBus::Ptr event_bus, MapRegistry::Ptr map_reg
     const size_t max_ingress_q = cfg.ingressQueueMaxSize();
     const size_t max_frame_q = cfg.frameQueueMaxSize();
     frame_processor_.init(max_ingress_q, max_frame_q);
+
     RCLCPP_INFO(node_->get_logger(),
                 "[PIPELINE][FE] ctor OK LivoBridge+FrameProcessor ingress_max=%zu frame_max=%zu gps=%s topic=%s",
                 max_ingress_q, max_frame_q, gps_enabled ? "on" : "off", gps_topic.c_str());
@@ -127,6 +137,14 @@ void FrontEndModule::run() {
 
         GPSMeasurement matched_gps;
         bool has_gps = gpsCacheGet(f.ts, matched_gps);
+        RCLCPP_INFO_THROTTLE(
+            node_->get_logger(), *node_->get_clock(), 20000,
+            "[GPS_CACHE][KPI] get_ok=%llu empty=%llu no_neighbor=%llu reject_invalid=%llu "
+            "(grep GPS_CACHE; enable DEBUG for GPS_CACHE VERIFY per-sample)",
+            static_cast<unsigned long long>(g_gps_cache_get_ok_total.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(g_gps_cache_get_empty_total.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(g_gps_cache_get_no_neighbor_total.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(g_gps_cache_get_reject_invalid_total.load(std::memory_order_relaxed)));
 
         SyncedFrameEvent event;
         event.timestamp = f.ts;
@@ -144,6 +162,9 @@ void FrontEndModule::run() {
 
         if (event.isValid()) {
             event_bus_->publish(event);
+            RCLCPP_DEBUG_THROTTLE(node_->get_logger(), *node_->get_clock(), 2000,
+                "[SEMANTIC][FrontEnd][run] step=publish SyncedFrameEvent ts=%.3f pts=%zu ref_version=%lu",
+                event.timestamp, event.cloud ? event.cloud->size() : 0, event.ref_map_version);
         } else {
             RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000,
                 "[V3][CONTRACT] Dropping invalid SyncedFrameEvent (NaN/null/invalid cloud_frame=%s)",
@@ -199,7 +220,8 @@ void FrontEndModule::onGPS(double ts, double lat, double lon, double alt, double
     m.altitude = alt;
     m.hdop = hdop;
     m.num_satellites = sats;
-    m.quality = qualityFromHdopAndSats(hdop, sats);
+    const double qthresh = ConfigManager::instance().gpsQualityThreshold();
+    m.quality = qualityFromHdopAndSats(hdop, sats, qthresh);
     m.is_valid = (m.quality >= GPSQuality::MEDIUM);
     m.covariance = covarianceFromGpsQuality(m.quality);
 
@@ -227,10 +249,15 @@ void FrontEndModule::gpsCacheAdd(double ts, const GPSMeasurement& m) {
 
 bool FrontEndModule::gpsCacheGet(double ts, GPSMeasurement& out_m) {
     std::lock_guard<std::mutex> lk(gps_cache_mutex_);
-    if (gps_cache_.empty()) return false;
+    if (gps_cache_.empty()) {
+        g_gps_cache_get_empty_total.fetch_add(1, std::memory_order_relaxed);
+        RCLCPP_DEBUG(node_->get_logger(),
+            "[GPS_CACHE][VERIFY] miss reason=empty_cache ts_req=%.6f", ts);
+        return false;
+    }
     
-    // 查找最近的 GPS 观测，允许最大 0.5s 的偏差 (宽松模式，适应延迟)
-    const double max_dt = 0.5;
+    // 使用配置的 keyframe_match_window_s（与 GPSManager 一致），避免硬编码 0.5s 过严导致 has_valid_gps=0、HBA gps_factors=0
+    const double max_dt = ConfigManager::instance().gpsKeyframeMatchWindowS();
     double min_dt = 1e9;
     const GPSCacheEntry* best = nullptr;
     
@@ -244,9 +271,31 @@ bool FrontEndModule::gpsCacheGet(double ts, GPSMeasurement& out_m) {
     }
     
     if (best && min_dt <= max_dt) {
+        // 使用统一约束策略：前端 keyframe 绑定与后端/HBA 使用同一质量阈值语义，避免跨模块策略漂移。
+        const auto& cfg = ConfigManager::instance();
+        const auto decision = evaluateKeyframeGpsConstraint(
+            best->m,
+            best->m.is_valid,
+            cfg.gpsMinAcceptedQualityLevel(),
+            false);
+        if (!decision.accepted) {
+            g_gps_cache_get_reject_invalid_total.fetch_add(1, std::memory_order_relaxed);
+            RCLCPP_DEBUG(node_->get_logger(),
+                "[GPS_CACHE][VERIFY] reject reason=policy_or_enu ts_req=%.6f dt=%.4f quality=%d "
+                "min_quality=%d is_valid=%d pos_enu_finite=%d hdop=%.2f reject_reason=%d",
+                ts, min_dt, static_cast<int>(best->m.quality), cfg.gpsMinAcceptedQualityLevel(),
+                best->m.is_valid ? 1 : 0, best->m.position_enu.allFinite() ? 1 : 0,
+                best->m.hdop, static_cast<int>(decision.reason));
+            return false;
+        }
         out_m = best->m;
+        g_gps_cache_get_ok_total.fetch_add(1, std::memory_order_relaxed);
         return true;
     }
+    g_gps_cache_get_no_neighbor_total.fetch_add(1, std::memory_order_relaxed);
+    RCLCPP_DEBUG(node_->get_logger(),
+        "[GPS_CACHE][VERIFY] miss reason=no_neighbor_in_window ts_req=%.6f min_dt=%.4f max_dt=%.2f",
+        ts, best ? min_dt : -1.0, max_dt);
     return false;
 }
 

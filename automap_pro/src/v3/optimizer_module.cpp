@@ -236,9 +236,33 @@ void OptimizerModule::processTaskInternal(const OptTaskItem& task) {
         case OptTaskItem::Type::GPS_BATCH_KF:
             processGPSBatchKF(task);
             break;
+        case OptTaskItem::Type::CYLINDER_LANDMARK_FACTOR:
+            processCylinderLandmarkFactor(task);
+            break;
         default:
             break;
     }
+}
+
+void OptimizerModule::processCylinderLandmarkFactor(const OptTaskItem& task) {
+    if (task.cylinder_factors.empty()) {
+        RCLCPP_DEBUG(node_->get_logger(),
+            "[SEMANTIC][Optimizer][processCylinderLandmarkFactor] step=skip reason=empty_factors kf_id=%d",
+            task.to_id);
+        return;
+    }
+
+    RCLCPP_DEBUG(node_->get_logger(),
+        "[SEMANTIC][Optimizer][processCylinderLandmarkFactor] step=entry kf_id=%d factors=%zu",
+        task.to_id, task.cylinder_factors.size());
+
+    for (const auto& factor : task.cylinder_factors) {
+        optimizer_.addCylinderFactorForKeyFrame(static_cast<int>(factor.kf_id), factor);
+    }
+
+    RCLCPP_INFO(node_->get_logger(),
+        "[SEMANTIC][Optimizer][processCylinderLandmarkFactor] step=done kf_id=%d factors=%zu → addCylinderFactorForKeyFrame",
+        task.to_id, task.cylinder_factors.size());
 }
 
 void OptimizerModule::processTask(const OptTaskItem& task) {
@@ -259,12 +283,15 @@ void OptimizerModule::processGPSBatchKF(const OptTaskItem& task) {
     size_t reject_quality = 0;
     const auto& cfg = ConfigManager::instance();
     for (const auto& kf : all_kfs) {
-        if (!kf || !kf->has_valid_gps) continue;
-        if (!gpsQualityAcceptedByPolicy(kf->gps.quality, cfg)) {
-            reject_quality++;
+        if (!kf) continue;
+        const auto decision = evaluateKeyframeGpsConstraint(
+            kf->gps, kf->has_valid_gps, cfg.gpsMinAcceptedQualityLevel(), true);
+        if (!decision.accepted) {
+            if (decision.reason == GPSConstraintRejectReason::QUALITY_BELOW_POLICY) {
+                reject_quality++;
+            }
             continue;
         }
-        if (!kf->gps.position_enu.allFinite() || !kf->gps.covariance.allFinite()) continue;
         Eigen::Vector3d pos_map = R * kf->gps.position_enu + t;
         factors.push_back({static_cast<int>(kf->id), pos_map, kf->gps.covariance});
     }
@@ -306,19 +333,41 @@ void OptimizerModule::processKeyframeCreate(const OptTaskItem& task) {
     }
     
     // 3. 添加 GPS 因子 (如果已对齐)，pos_map = R_enu_to_map * position_enu + t_enu_to_map
-    if (task.gps_aligned && kf->has_valid_gps &&
-        gpsQualityAcceptedByPolicy(kf->gps.quality, ConfigManager::instance())) {
+    // grep CONSTRAINT][GPS_KF 闭环：对齐状态 / 是否有观测 / 质量策略 / hdop
+    const auto& gcfg = ConfigManager::instance();
+    const auto gps_decision = evaluateKeyframeGpsConstraint(
+        kf->gps, kf->has_valid_gps, gcfg.gpsMinAcceptedQualityLevel(), true);
+    if (task.gps_aligned && gps_decision.accepted) {
         Eigen::Vector3d pos_map = task.gps_transform_R * kf->gps.position_enu + task.gps_transform_t;
         optimizer_.addGPSFactorForKeyFrame(kf->id, pos_map, kf->gps.covariance);
         g_gps_kf_candidates_total.fetch_add(1, std::memory_order_relaxed);
         g_gps_kf_added_total.fetch_add(1, std::memory_order_relaxed);
-    } else if (task.gps_aligned && kf->has_valid_gps) {
+        RCLCPP_INFO(node_->get_logger(),
+            "[CONSTRAINT][GPS_KF] result=ok kf_id=%lu quality=%d rank=%d min_rank=%d hdop=%.2f sats=%d "
+            "(grep CONSTRAINT GPS_KF)",
+            static_cast<unsigned long>(kf->id), static_cast<int>(kf->gps.quality),
+            gpsQualityRank(kf->gps.quality), gcfg.gpsMinAcceptedQualityLevel(),
+            kf->gps.hdop, kf->gps.num_satellites);
+    } else if (task.gps_aligned && gps_decision.reason == GPSConstraintRejectReason::QUALITY_BELOW_POLICY) {
         g_gps_kf_candidates_total.fetch_add(1, std::memory_order_relaxed);
         g_gps_kf_reject_quality_total.fetch_add(1, std::memory_order_relaxed);
         RCLCPP_INFO(node_->get_logger(),
-            "[CONSTRAINT] step=gps_kf kf_id=%lu result=skip reason=quality_below_policy quality=%d min=%d",
+            "[CONSTRAINT][GPS_KF] result=skip reason=quality_below_policy kf_id=%lu quality=%d rank=%d min_rank=%d "
+            "hdop=%.2f sats=%d (grep CONSTRAINT GPS_KF)",
             static_cast<unsigned long>(kf->id), static_cast<int>(kf->gps.quality),
-            ConfigManager::instance().gpsMinAcceptedQualityLevel());
+            gpsQualityRank(kf->gps.quality), gcfg.gpsMinAcceptedQualityLevel(),
+            kf->gps.hdop, kf->gps.num_satellites);
+    } else if (!task.gps_aligned) {
+        RCLCPP_DEBUG(node_->get_logger(),
+            "[CONSTRAINT][GPS_KF] result=skip reason=not_aligned_yet kf_id=%lu has_valid_gps=%d",
+            static_cast<unsigned long>(kf->id), kf->has_valid_gps ? 1 : 0);
+    } else if (gps_decision.reason == GPSConstraintRejectReason::NO_GPS_ON_KEYFRAME ||
+               gps_decision.reason == GPSConstraintRejectReason::ENU_NOT_FINITE ||
+               gps_decision.reason == GPSConstraintRejectReason::COV_NOT_FINITE) {
+        RCLCPP_DEBUG(node_->get_logger(),
+            "[CONSTRAINT][GPS_KF] result=skip reason=invalid_or_missing_measurement kf_id=%lu aligned=%d reject_reason=%d "
+            "(前端 GPS_CACHE 未命中/ENU未就绪/协方差异常；grep GPS_CACHE KPI)",
+            static_cast<unsigned long>(kf->id), task.gps_aligned ? 1 : 0, static_cast<int>(gps_decision.reason));
     }
 }
 

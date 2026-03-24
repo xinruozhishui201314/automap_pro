@@ -15,8 +15,10 @@
 #define CONSTRAINT_LOG(fmt, ...) \
     RCLCPP_INFO(rclcpp::get_logger("automap_system"), "[CONSTRAINT] " fmt, ##__VA_ARGS__)
 // 后端详细追踪：仅当 backend.verbose_trace=true 时输出，grep BACKEND_TRACE 构成证据链闭环
+// 使用 g_backend_verbose_trace 缓存，避免宏展开处访问 ConfigManager 单例（shutdown 时 SIGSEGV）
+namespace { bool g_backend_verbose_trace = false; }
 #define BACKEND_TRACE(fmt, ...) \
-    do { if (ConfigManager::instance().backendVerboseTrace()) \
+    do { if (g_backend_verbose_trace) \
         RCLCPP_INFO(rclcpp::get_logger("automap_system"), "[BACKEND_TRACE] " fmt, ##__VA_ARGS__); } while(0)
 
 #include <rclcpp/rclcpp.hpp>
@@ -165,13 +167,26 @@ IncrementalOptimizer::IncrementalOptimizer() {
         "[IncrementalOptimizer][LOAD_TRACE] ensureGtsamTbbSerialized done (about to read config and build ISAM2Params)");
     const auto& cfg = ConfigManager::instance();
 
+    backend_verbose_trace_ = cfg.backendVerboseTrace();
+    isam2_relin_thresh_ = cfg.isam2RelinThresh();
+    isam2_relin_skip_ = cfg.isam2RelinSkip();
+    isam2_enable_relin_ = cfg.isam2EnableRelin();
+    backend_max_pending_gps_kf_ = cfg.backendMaxPendingGpsKeyframeFactors();
+    gps_enable_dynamic_cov_ = cfg.gpsEnableDynamicCov();
+    gps_min_satellites_ = cfg.gpsMinSatellites();
+    gps_high_altitude_threshold_ = cfg.gpsHighAltitudeThreshold();
+    gps_high_altitude_scale_ = cfg.gpsHighAltitudeScale();
+    gps_enable_outlier_detection_ = cfg.gpsEnableOutlierDetection();
+    gps_outlier_cov_scale_ = cfg.gpsOutlierCovScale();
+    g_backend_verbose_trace = backend_verbose_trace_;
+
     gtsam::ISAM2Params params;
     // 重线性化阈值：误差变化超过阈值才重线性化（控制计算量）
-    params.relinearizeThreshold = cfg.isam2RelinThresh();
+    params.relinearizeThreshold = isam2_relin_thresh_;
     // 每隔几次 update 才检查重线性化（越小越精确，越慢）
-    params.relinearizeSkip      = cfg.isam2RelinSkip();
+    params.relinearizeSkip      = isam2_relin_skip_;
     // 启用/禁用重线性化
-    params.enableRelinearization = cfg.isam2EnableRelin();
+    params.enableRelinearization = isam2_enable_relin_;
     // 使用 QR 分解（更稳健，但比 Cholesky 慢）
     params.factorization = gtsam::ISAM2Params::QR;
     // 关闭线性化缓存，避免 GPS 对齐后 commitAndUpdate 时在 linearize 路径发生 double free
@@ -243,9 +258,9 @@ void IncrementalOptimizer::addSubMapNode(int sm_id, const Pose3d& init_pose, boo
             pending_values_.clear();
             current_estimate_.clear();
             gtsam::ISAM2Params params;
-            params.relinearizeThreshold = ConfigManager::instance().isam2RelinThresh();
-            params.relinearizeSkip = ConfigManager::instance().isam2RelinSkip();
-            params.enableRelinearization = ConfigManager::instance().isam2EnableRelin();
+            params.relinearizeThreshold = isam2_relin_thresh_;
+            params.relinearizeSkip = isam2_relin_skip_;
+            params.enableRelinearization = isam2_enable_relin_;
             params.factorization = gtsam::ISAM2Params::QR;
             params.cacheLinearizedFactors = true;
             isam2_ = gtsam::ISAM2(params);
@@ -853,37 +868,32 @@ void IncrementalOptimizer::addGPSFactor(
             return;
         }
 
-        // 【优化1】GPS动态协方差：基于卫星数和高度动态调整GPS协方差
+        // 【优化1】GPS动态协方差：基于卫星数和高度动态调整GPS协方差（使用构造时缓存的参数）
         // 参考：Liu et al. "Robust GPS-aided SLAM" ICRA 2023
-
-        const auto& cfg = ConfigManager::instance();
 
         // 基于卫星数调整协方差（卫星数越多，协方差越小）
         double sat_scale = 1.0;
-        if (cfg.gpsEnableDynamicCov()) {
-            int min_sats = cfg.gpsMinSatellites();
-            sat_scale = std::min(1.0, 6.0 / (double)std::max(min_sats, 4));
+        if (gps_enable_dynamic_cov_) {
+            sat_scale = std::min(1.0, 6.0 / (double)std::max(gps_min_satellites_, 4));
         }
 
         // 基于高度调整协方差（高空精度较差）
         double alt_scale = 1.0;
-        if (cfg.gpsEnableDynamicCov()) {
-            double high_alt_thresh = cfg.gpsHighAltitudeThreshold();
-            double high_alt_scale = cfg.gpsHighAltitudeScale();
-            if (std::abs(pos_map.z()) > high_alt_thresh) {
-                alt_scale = high_alt_scale;
+        if (gps_enable_dynamic_cov_) {
+            if (std::abs(pos_map.z()) > gps_high_altitude_threshold_) {
+                alt_scale = gps_high_altitude_scale_;
             }
         }
 
         // 应用动态缩放
         Eigen::Matrix3d dynamic_cov = cov3x3 * sat_scale * alt_scale;
 
-        // 【优化2】GPS异常值检测：基于历史残差统计
+        // 【优化2】GPS异常值检测：基于历史残差统计（使用构造时缓存的参数）
         // 参考：Zhang et al. "Consistent-View Bundle Adjustment" CVPR 2021
 
         Eigen::Matrix3d final_cov = dynamic_cov;
 
-        if (cfg.gpsEnableOutlierDetection() && node_exists_.count(sm_id)) {
+        if (gps_enable_outlier_detection_ && node_exists_.count(sm_id)) {
             // 获取当前估计（需检查 key 是否存在，避免 at() 抛异常）
             if (current_estimate_.exists(SM(sm_id))) {
                 try {
@@ -898,12 +908,11 @@ void IncrementalOptimizer::addGPSFactor(
 
                     // 如果残差过大，认为是异常值
                     if (residual > residual_baseline) {
-                        double outlier_scale = cfg.gpsOutlierCovScale();
-                        final_cov *= outlier_scale;  // 放大协方差，降低约束强度
+                        final_cov *= gps_outlier_cov_scale_;  // 放大协方差，降低约束强度
 
                         ALOG_DEBUG(MOD,
                                   "[GPS_OPT] GPS outlier detected: sm_id={} residual={:.2f}m baseline={:.2f}m cov_scale={:.1f}",
-                                  sm_id, residual, residual_baseline, outlier_scale);
+                                  sm_id, residual, residual_baseline, gps_outlier_cov_scale_);
                     }
                 } catch (const std::exception& e) {
                     ALOG_WARN(MOD,
@@ -1343,7 +1352,7 @@ void IncrementalOptimizer::addGPSFactorForKeyFrame(int kf_id, const Eigen::Vecto
             "[IncrementalOptimizer][BACKEND][GPS_KF] addGPSFactorForKeyFrame: kf_id=%d not in keyframe_node_exists_, defer",
             kf_id);
         // 1.2.1: pending_gps_factors_kf_ 上限，超过时 FIFO 丢弃最旧并打 WARN
-        const int max_pending = ConfigManager::instance().backendMaxPendingGpsKeyframeFactors();
+        const int max_pending = backend_max_pending_gps_kf_;
         while (static_cast<int>(pending_gps_factors_kf_.size()) >= max_pending && !pending_gps_factors_kf_.empty()) {
             pending_gps_factors_kf_.erase(pending_gps_factors_kf_.begin());
             RCLCPP_WARN(rclcpp::get_logger("automap_system"),
@@ -1371,7 +1380,7 @@ void IncrementalOptimizer::addGPSFactorForKeyFrame(int kf_id, const Eigen::Vecto
         RCLCPP_DEBUG(rclcpp::get_logger("automap_system"),
             "[IncrementalOptimizer][BACKEND][GPS_KF] addGPSFactorForKeyFrame: kf_id=%d not in current_estimate_, defer",
             kf_id);
-        const int max_pending = ConfigManager::instance().backendMaxPendingGpsKeyframeFactors();
+        const int max_pending = backend_max_pending_gps_kf_;
         while (static_cast<int>(pending_gps_factors_kf_.size()) >= max_pending && !pending_gps_factors_kf_.empty()) {
             pending_gps_factors_kf_.erase(pending_gps_factors_kf_.begin());
             RCLCPP_WARN(rclcpp::get_logger("automap_system"),
@@ -1426,6 +1435,52 @@ void IncrementalOptimizer::addGPSFactorForKeyFrame(int kf_id, const Eigen::Vecto
         "pos=[%.2f,%.2f,%.2f] vars=[%.2e,%.2e,%.2e] factor_count=%d pending_graph_size=%zu",
         kf_id, pos_map.x(), pos_map.y(), pos_map.z(),
         vars(0), vars(1), vars(2), factor_count_, pending_graph_.size());
+}
+
+void IncrementalOptimizer::addCylinderFactorForKeyFrame(int kf_id, const CylinderFactorItemKF& factor) {
+    std::unique_lock<std::shared_mutex> lk(rw_mutex_);
+
+    // 校验节点是否存在
+    if (keyframe_node_exists_.find(kf_id) == keyframe_node_exists_.end()) {
+        RCLCPP_WARN(rclcpp::get_logger("automap_system"),
+            "[SEMANTIC][Backend][addCylinderFactor] step=skip reason=kf_node_not_found kf_id=%d sm_id=%lu (KF not in graph yet)",
+            kf_id, factor.sm_id);
+        return;
+    }
+
+    if (node_exists_.find(static_cast<int>(factor.sm_id)) == node_exists_.end()) {
+        RCLCPP_WARN(rclcpp::get_logger("automap_system"),
+            "[SEMANTIC][Backend][addCylinderFactor] step=skip reason=sm_node_not_found kf_id=%d sm_id=%lu",
+            kf_id, factor.sm_id);
+        return;
+    }
+
+    if (factor.radius <= 0.0) {
+        RCLCPP_WARN(rclcpp::get_logger("automap_system"),
+            "[SEMANTIC][Backend][addCylinderFactor] step=skip reason=invalid_radius kf_id=%d radius=%.4f",
+            kf_id, factor.radius);
+        return;
+    }
+
+    // 1D Isotropic Noise Model
+    // 权重大则 sigma 小
+    double sigma = 0.1 / std::max(1e-3, factor.weight);
+    auto noise = gtsam::noiseModel::Isotropic::Sigma(1, sigma);
+
+    gtsam::Point3 point_body(factor.point_body.x(), factor.point_body.y(), factor.point_body.z());
+    gtsam::Point3 root_submap(factor.root_submap.x(), factor.root_submap.y(), factor.root_submap.z());
+    gtsam::Unit3 ray_submap(factor.ray_submap.x(), factor.ray_submap.y(), factor.ray_submap.z());
+
+    // 添加二元因子：KF 节点与 SM 锚点节点
+    pending_graph_.add(boost::make_shared<CylinderFactor>(
+        KF(kf_id), SM(static_cast<int>(factor.sm_id)),
+        point_body, root_submap, ray_submap, factor.radius, noise));
+
+    factor_count_++;
+
+    RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+        "[SEMANTIC][Backend][addCylinderFactor] step=ok kf_id=%d sm_id=%lu radius=%.3f weight=%.2f factor_count=%d",
+        kf_id, factor.sm_id, factor.radius, factor.weight, factor_count_);
 }
 
 Pose3d IncrementalOptimizer::getKeyFramePose(int kf_id) const {
@@ -2660,8 +2715,8 @@ void IncrementalOptimizer::rebuildAfterGPSAlign(const std::vector<SubmapData>& s
     std::unique_lock<std::shared_mutex> lk(rw_mutex_);
     if (!prior_noise_) return;
     gtsam::ISAM2Params params;
-    params.relinearizeThreshold = ConfigManager::instance().isam2RelinThresh();
-    params.relinearizeSkip = ConfigManager::instance().isam2RelinSkip();
+    params.relinearizeThreshold = isam2_relin_thresh_;
+    params.relinearizeSkip = isam2_relin_skip_;
     params.enableRelinearization = true;
     params.factorization = gtsam::ISAM2Params::QR;
     params.cacheLinearizedFactors = true;
@@ -2793,8 +2848,8 @@ void IncrementalOptimizer::reset() {
 
     std::unique_lock<std::shared_mutex> lk(rw_mutex_);
     gtsam::ISAM2Params params;
-    params.relinearizeThreshold = ConfigManager::instance().isam2RelinThresh();
-    params.relinearizeSkip      = ConfigManager::instance().isam2RelinSkip();
+    params.relinearizeThreshold = isam2_relin_thresh_;
+    params.relinearizeSkip      = isam2_relin_skip_;
     isam2_ = gtsam::ISAM2(params);
     pending_graph_.resize(0);
     pending_values_.clear();
@@ -3077,9 +3132,9 @@ void IncrementalOptimizer::resetForRecovery() {
 
     // 重建 ISAM2
     gtsam::ISAM2Params params;
-    params.relinearizeThreshold = ConfigManager::instance().isam2RelinThresh();
-    params.relinearizeSkip      = ConfigManager::instance().isam2RelinSkip();
-    params.enableRelinearization = ConfigManager::instance().isam2EnableRelin();
+    params.relinearizeThreshold = isam2_relin_thresh_;
+    params.relinearizeSkip      = isam2_relin_skip_;
+    params.enableRelinearization = isam2_enable_relin_;
     params.factorization = gtsam::ISAM2Params::QR;
     params.cacheLinearizedFactors = true;
     isam2_ = gtsam::ISAM2(params);

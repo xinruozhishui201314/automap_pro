@@ -1,0 +1,79 @@
+<launch>
+    <arg name="debug" default="false"/>
+    <env if="$(arg debug)" name="ROSCONSOLE_CONFIG_FILE" value="$(find ouster_decoder)/launch/debug.conf"/>
+
+    <arg name="lidar_ns" default="os_node"/>
+    <arg name="driver_ns" default="/os_node"/>
+
+    <!-- ouster: https://data.ouster.io/downloads/datasheets/datasheet-revd-v2p1-os1.pdf -->
+    <!-- anything < min_range or > max_range will be set to nan -->
+    <arg name="min_range" default="0.5"/>
+    <arg name="max_range" default="127.0"/>
+    <arg name="range_scale" default="512.0"/>
+    <!-- Gravity at philadelphia from https://www.ngs.noaa.gov/cgi-bin/grav_pdx.prl -->
+    <!-- Lat: 39.9526 N, Lon: 75.1652 W, MSL Height: 11.8872, Predicted gravity:  980184 +/- 2 milligals -->
+    <arg name="gravity" default="9.80184"/>
+    <!-- Divide one scan to n subscans, default is 1, can be 2, 4, 8, ... -->
+    <arg name="divide" default="1"/>
+    <!-- Replay mode will reinitilize when detecting forward/backward jumps -->
+    <arg name="replay" default="true"/>
+    <!-- Scale signal channel for visualization only -->
+    <arg name="vis_signal_scale" default="4.0"/>
+
+    <!-- Destagger and align are currently disabled since there's really no point in changing them -->
+    <!-- Destagger will be disabled if div_exp > 0 or subscan > 1.
+    It is strongly advised to set destagger to false. 
+    Due to the non-central projection model of the outser lidar, destaggering by pixel offset 
+    would still produce artifacts in the range image.
+    It is recommended to re-compute a range image from the point cloud if needed -->
+    <arg name="destagger" default="false"/>
+
+    <!-- imu: https://3cfeqx1hf82y3xcoull08ihx-wpengine.netdna-ssl.com/wp-content/uploads/2021/07/DS-000189-ICM-20948-v1.4.pdf -->
+    <!-- These are all continuous time noise density, need to multiply by sqrt(rate) to get distcrete time noise density -->
+    <!-- which we will do in the node, so the imu covariance is in discrete time -->
+    <!-- https://github.com/ethz-asl/kalibr/wiki/IMU-Noise-Model -->
+    <!-- acc noise density 0.00023 g/sqrt(Hz) -->
+    <!-- gyr noise density 0.00026 rad/sqrt(Hz) -->
+    <arg name="acc_noise_std" default="0.0023"/>
+    <arg name="gyr_noise_std" default="0.00026"/>
+
+    <!-- Compatible with ouster_ros  -->
+    <arg name="sensor_frame" default="os_sensor"/>
+    <arg name="lidar_frame" default="os_lidar"/>
+    <arg name="imu_frame" default="os_imu"/>
+
+    <node pkg="ouster_decoder" name="os_decoder" type="ouster_decoder" output="screen" ns="$(arg lidar_ns)">
+        <!-- params -->
+        <param name="divide" type="int" value="$(arg divide)"/>
+        <param name="replay" type="bool" value="$(arg replay)"/>
+        <param name="gravity" type="double" value="$(arg gravity)"/>
+        <param name="destagger" type="bool" value="$(arg destagger)"/>
+
+        <param name="min_range" type="double" value="$(arg min_range)"/>
+        <param name="max_range" type="double" value="$(arg max_range)"/>
+        <param name="range_scale" type="double" value="$(arg range_scale)"/>
+        <param name="vis_signal_scale" type="double" value="$(arg vis_signal_scale)"/>
+
+        <param name="acc_noise_std" type="double" value="$(arg acc_noise_std)"/>
+        <param name="gyr_noise_std" type="double" value="$(arg gyr_noise_std)"/>
+
+        <!-- frames -->
+        <param name="imu_frame" type="string" value="$(arg imu_frame)"/>
+        <param name="lidar_frame" type="string" value="$(arg lidar_frame)"/>
+        <param name="sensor_frame" type="string" value="$(arg sensor_frame)"/>
+
+        <!-- input topics -->
+        <remap from="~metadata" to="$(arg driver_ns)/metadata"/>
+        <remap from="~get_metadata" to="$(arg driver_ns)/get_metadata"/>
+        <remap from="~imu_packets" to="$(arg driver_ns)/imu_packets"/>
+        <remap from="~lidar_packets" to="$(arg driver_ns)/lidar_packets"/>
+
+        <!-- output topics -->
+        <remap from="~imu" to="imu"/>
+        <remap from="~cloud" to="cloud"/>
+        <remap from="~image" to="image"/>
+        <remap from="~camera_info" to="camera_info"/>
+        <remap from="~range" to="range"/>
+        <remap from="~signal" to="signal"/>
+    </node>
+</launch>

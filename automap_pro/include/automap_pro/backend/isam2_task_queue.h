@@ -85,6 +85,9 @@ private:
      */
     void workerLoop();
 
+    /** 构造时缓存，避免 enqueue 中访问 ConfigManager 单例（shutdown 时 worker 可能仍入队） */
+    size_t max_queue_size_ = 64;
+
     std::queue<OptimTask> queue_;
     mutable std::mutex mutex_;
     std::condition_variable cv_;

@@ -58,6 +58,7 @@ if [ -d src/overlap_transformer_ros2 ]; then
   colcon build ${COLCON_PARALLEL} --packages-select overlap_transformer_ros2 --cmake-args ${NINJA_CMAKE_ARG} -DCMAKE_BUILD_TYPE=Release
 fi
 
+HBA_INSTALL_DIR="${INSTALL_DEPS}/hba"
 if [ -d src/hba ]; then
   echo '========================================'
   echo 'Compile GTSAM first (disable TBB to avoid SIGSEGV)'
@@ -128,10 +129,26 @@ if [ -d src/hba ]; then
   mkdir -p /root/automap_ws/install
   ln -sfn /root/automap_ws/install_deps/gtsam /root/automap_ws/install/gtsam
 
-  echo '========================================'
-  echo '编译 hba (HBA-main)'
-  echo '========================================'
-  colcon build ${COLCON_PARALLEL} --packages-select hba --cmake-args ${NINJA_CMAKE_ARG} -DCMAKE_BUILD_TYPE=Release
+  # hba：已安装则跳过（colcon 产出 setup.bash，--clean 不删 install_deps）
+  NEED_HBA_BUILD=true
+  if [ -f "${HBA_INSTALL_DIR}/setup.bash" ] || [ -f "${HBA_INSTALL_DIR}/lib/libhba_core.so" ] || [ -d "${HBA_INSTALL_DIR}/lib" ]; then
+    NEED_HBA_BUILD=false
+  fi
+  if [ "$NEED_HBA_BUILD" = true ]; then
+    echo '========================================'
+    echo '编译 hba (HBA-main)（安装到 install_deps/hba）'
+    echo '========================================'
+    mkdir -p "${HBA_INSTALL_DIR}"
+    # colcon 在 --install-base 下查找依赖，需在 hba 目录内提供 gtsam 符号链接
+    ln -sfn ../gtsam "${HBA_INSTALL_DIR}/gtsam" 2>/dev/null || true
+    colcon build ${COLCON_PARALLEL} --install-base "${HBA_INSTALL_DIR}" --packages-select hba --cmake-args ${NINJA_CMAKE_ARG} -DCMAKE_BUILD_TYPE=Release
+    echo "[INFO] hba 已安装于 install_deps/hba"
+  else
+    echo "[INFO] hba 已安装于 install_deps，跳过"
+  fi
+  [ -d "${HBA_INSTALL_DIR}/lib" ] && export CMAKE_PREFIX_PATH="${HBA_INSTALL_DIR}:${CMAKE_PREFIX_PATH}"
+  [ -d "${HBA_INSTALL_DIR}/lib" ] && export LD_LIBRARY_PATH="${HBA_INSTALL_DIR}/lib:${LD_LIBRARY_PATH}"
+  ln -sfn "${HBA_INSTALL_DIR}" /root/automap_ws/install/hba 2>/dev/null || true
 fi
 
 # TEASER++ 源码（安装到 install_deps，已安装则跳过）
@@ -170,22 +187,71 @@ if [ -n "${TEASER_SRC}" ]; then
   cd /root/automap_ws
 fi
 
-# vikit_common / vikit_ros（与 GTSAM 一致：安装到 install_deps，只编译一次，已安装则跳过）
-if [ -d src/thrid_party/rpg_vikit_ros2 ]; then
+# Ceres Solver（与 GTSAM 一致：安装到 install_deps/ceres，首次编译后后续跳过）
+CERES_INSTALL_DIR="${INSTALL_DEPS}/ceres"
+CERES_SRC="/root/automap_ws/src/automap_pro/thrid_party/ceres-solver"
+if [ -d "${CERES_SRC}" ] && [ -f "${CERES_SRC}/CMakeLists.txt" ]; then
+  NEED_CERES_BUILD=false
+  if [ ! -f "${CERES_INSTALL_DIR}/lib/libceres.so" ] && [ ! -f "${CERES_INSTALL_DIR}/lib/cmake/Ceres/CeresConfig.cmake" ]; then
+    NEED_CERES_BUILD=true
+  fi
+  if [ "$NEED_CERES_BUILD" = true ]; then
+    echo '========================================'
+    echo '编译 Ceres Solver（安装到 install_deps/ceres）'
+    echo '========================================'
+    CERES_BUILD=/root/automap_ws/build_ceres
+    rm -rf "${CERES_BUILD}"
+    mkdir -p "${CERES_BUILD}" && cd "${CERES_BUILD}"
+    cmake "${CERES_SRC}" \
+        ${NINJA_CMAKE_ARG} \
+        -DCMAKE_INSTALL_PREFIX="${CERES_INSTALL_DIR}" \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DBUILD_SHARED_LIBS=ON \
+        -DBUILD_TESTING=OFF \
+        -DBUILD_EXAMPLES=OFF \
+        -DBUILD_BENCHMARKS=OFF \
+        -DBUILD_DOCUMENTATION=OFF
+    if [ -n "${NINJA_CMAKE_ARG}" ]; then ninja -j${PARALLEL_JOBS}; ninja install; else make -j${PARALLEL_JOBS}; make install; fi
+    echo "[INFO] Ceres Solver 已安装于 install_deps/ceres"
+    cd /root/automap_ws
+  else
+    echo "[INFO] Ceres Solver 已安装于 install_deps，跳过"
+  fi
+  [ -d "${CERES_INSTALL_DIR}/lib" ] && export CMAKE_PREFIX_PATH="${CERES_INSTALL_DIR}:${CMAKE_PREFIX_PATH}"
+  [ -d "${CERES_INSTALL_DIR}/lib" ] && export LD_LIBRARY_PATH="${CERES_INSTALL_DIR}/lib:${LD_LIBRARY_PATH}"
+fi
+
+# vikit_common / vikit_ros（与 GTSAM 一致：安装到 install_deps/vikit 子目录，只编译一次，已安装则跳过）
+VIKIT_INSTALL_DIR="${INSTALL_DEPS}/vikit"
+VIKIT_SRC=""
+[ -d src/thrid_party/rpg_vikit_ros2 ] && VIKIT_SRC="src/thrid_party/rpg_vikit_ros2"
+[ -z "${VIKIT_SRC}" ] && [ -d src/automap_pro/thrid_party/rpg_vikit_ros2 ] && VIKIT_SRC="src/automap_pro/thrid_party/rpg_vikit_ros2"
+if [ -n "${VIKIT_SRC}" ]; then
   NEED_VIKIT_BUILD=true
-  if [ -f "${INSTALL_DEPS}/share/vikit_common/package.xml" ] && [ -f "${INSTALL_DEPS}/share/vikit_ros/package.xml" ]; then
+  # 已安装则跳过（colcon 产出 setup.bash，--clean 不删 install_deps）
+  if [ -f "${VIKIT_INSTALL_DIR}/setup.bash" ] || [ -f "${VIKIT_INSTALL_DIR}/lib/libvikit_common.so" ] || [ -d "${VIKIT_INSTALL_DIR}/lib" ]; then
     NEED_VIKIT_BUILD=false
   elif [ -f "${INSTALL_DEPS}/lib/libvikit_common.so" ]; then
     NEED_VIKIT_BUILD=false
+    VIKIT_INSTALL_DIR="${INSTALL_DEPS}"
   fi
   if [ "$NEED_VIKIT_BUILD" = true ]; then
     echo '========================================'
-    echo '编译 vikit'
+    echo '编译 vikit（安装到 install_deps/vikit，与 GTSAM 一致）'
     echo '========================================'
-    colcon build ${COLCON_PARALLEL} --install-base "${INSTALL_DEPS}" --paths src/thrid_party/rpg_vikit_ros2/vikit_common src/thrid_party/rpg_vikit_ros2/vikit_ros --cmake-args ${NINJA_CMAKE_ARG} -DCMAKE_BUILD_TYPE=Release
-    echo "[INFO] vikit 已安装于 install_deps"
+    mkdir -p "${VIKIT_INSTALL_DIR}"
+    colcon build ${COLCON_PARALLEL} --install-base "${VIKIT_INSTALL_DIR}" --paths "${VIKIT_SRC}/vikit_common" "${VIKIT_SRC}/vikit_ros" --cmake-args ${NINJA_CMAKE_ARG} -DCMAKE_BUILD_TYPE=Release
+    echo "[INFO] vikit 已安装于 install_deps/vikit"
   else
     echo "[INFO] vikit 已安装于 install_deps，跳过"
+  fi
+  # 让 colcon/ament 找到 vikit（与 GTSAM 一致）
+  [ -d "${VIKIT_INSTALL_DIR}/lib" ] && export CMAKE_PREFIX_PATH="${VIKIT_INSTALL_DIR}:${CMAKE_PREFIX_PATH}"
+  [ -d "${VIKIT_INSTALL_DIR}/lib" ] && export LD_LIBRARY_PATH="${VIKIT_INSTALL_DIR}/lib:${LD_LIBRARY_PATH}"
+  # 独立 vikit 目录时创建符号链接，便于 overlay
+  if [ "${VIKIT_INSTALL_DIR}" != "${INSTALL_DEPS}" ]; then
+    mkdir -p /root/automap_ws/install
+    ln -sfn "${VIKIT_INSTALL_DIR}" /root/automap_ws/install/vikit 2>/dev/null || true
   fi
 fi
 
@@ -236,27 +302,105 @@ if [ -d "${LIBTORCH_INSTALL_DIR}/lib" ]; then
   export LD_LIBRARY_PATH="${LIBTORCH_INSTALL_DIR}/lib:${LD_LIBRARY_PATH}"
 fi
 
-# 后续 fast_livo / automap_pro 需要找到 gtsam、teaserpp、vikit、libtorch
-[ -f "${INSTALL_DEPS}/setup.bash" ] && source "${INSTALL_DEPS}/setup.bash"
-export CMAKE_PREFIX_PATH="${INSTALL_DEPS}/gtsam:${INSTALL_DEPS}/teaserpp:${INSTALL_DEPS}/libtorch:${INSTALL_DEPS}:${CMAKE_PREFIX_PATH}"
-export LD_LIBRARY_PATH="${INSTALL_DEPS}/gtsam/lib:${INSTALL_DEPS}/teaserpp/lib:${INSTALL_DEPS}/libtorch/lib:${LD_LIBRARY_PATH}"
+# ONNX Runtime（SLOAM 语义分割）：与 GTSAM 一致，安装到 install_deps，首次编译后后续跳过
+ONNXRUNTIME_INSTALL_DIR="${INSTALL_DEPS}/onnxruntime"
+NEED_ONNXRUNTIME_BUILD=false
+if [ ! -f "${ONNXRUNTIME_INSTALL_DIR}/lib/libonnxruntime.so" ]; then
+  NEED_ONNXRUNTIME_BUILD=true
+fi
+if [ "${ONNXRUNTIME_SKIP_BUILD:-0}" = "1" ]; then
+  NEED_ONNXRUNTIME_BUILD=false
+  echo "[INFO] ONNXRUNTIME_SKIP_BUILD=1，跳过 ONNX Runtime 编译（未安装时将使用 SLOAM stub 模式）"
+fi
+if [ "$NEED_ONNXRUNTIME_BUILD" = true ]; then
+  echo '========================================'
+  echo '编译 ONNX Runtime 到 install_deps（首次执行，后续跳过）'
+  echo '========================================'
+  ONNX_SRC_DIR="/root/automap_ws/src_onnxruntime"
+  ONNX_DEPS_MOUNTED="/root/mapping/docker/deps/onnxruntime"
+  mkdir -p "${INSTALL_DEPS}"
+  if [ ! -d "${ONNX_SRC_DIR}" ] || [ ! -f "${ONNX_SRC_DIR}/build.sh" ]; then
+    if [ -d "${ONNX_DEPS_MOUNTED}" ] && [ -f "${ONNX_DEPS_MOUNTED}/build.sh" ]; then
+      echo "[INFO] 使用挂载的 ONNX Runtime 源码: ${ONNX_DEPS_MOUNTED}（无需 git clone）"
+      rm -rf "${ONNX_SRC_DIR}"
+      cp -a "${ONNX_DEPS_MOUNTED}" "${ONNX_SRC_DIR}"
+    else
+      echo "[INFO] 未找到 docker/deps/onnxruntime，克隆 ONNX Runtime v1.8.2（含 submodule）..."
+      git clone --depth 1 --branch v1.8.2 --recursive https://github.com/Microsoft/onnxruntime "${ONNX_SRC_DIR}" || { echo "[ERROR] git clone onnxruntime 失败"; exit 1; }
+    fi
+  fi
+  cd "${ONNX_SRC_DIR}"
+  ./build.sh \
+    --config RelWithDebInfo \
+    --build_shared_lib \
+    --skip_tests \
+    --parallel "${PARALLEL_JOBS}" \
+    --cmake_extra_defines "CMAKE_INSTALL_PREFIX=${ONNXRUNTIME_INSTALL_DIR}"
+  cd build/Linux/RelWithDebInfo
+  cmake --build . --target install
+  cd /root/automap_ws
+  echo "[INFO] ONNX Runtime 已安装于 install_deps/onnxruntime"
+else
+  if [ -f "${ONNXRUNTIME_INSTALL_DIR}/lib/libonnxruntime.so" ]; then
+    echo "[INFO] ONNX Runtime 已安装于 install_deps，跳过"
+  fi
+fi
+if [ -d "${ONNXRUNTIME_INSTALL_DIR}/lib" ]; then
+  export ONNXRUNTIME_HOME="${ONNXRUNTIME_INSTALL_DIR}"
+  export LD_LIBRARY_PATH="${ONNXRUNTIME_INSTALL_DIR}/lib:${LD_LIBRARY_PATH}"
+fi
 
-# fast_livo：优先用 in-tree 直接路径，避免 colcon 对 src/fast_livo 符号链接解析后当成 automap_pro 子目录而忽略（导致 0 packages finished）
+# 后续 fast_livo / automap_pro 需要找到 gtsam、ceres、teaserpp、vikit、hba、fast_livo、libtorch、onnxruntime
+[ -f "${INSTALL_DEPS}/setup.bash" ] && source "${INSTALL_DEPS}/setup.bash"
+# vikit / hba / fast_livo 安装到 install_deps 子目录（与 GTSAM 一致），需显式加入路径
+_VIKIT_PREFIX=""
+_HBA_PREFIX=""
+_FAST_LIVO_PREFIX=""
+_CERES_PREFIX=""
+[ -d "${VIKIT_INSTALL_DIR}/lib" ] 2>/dev/null && _VIKIT_PREFIX="${VIKIT_INSTALL_DIR}"
+[ -d "${HBA_INSTALL_DIR}/lib" ] 2>/dev/null && _HBA_PREFIX="${HBA_INSTALL_DIR}"
+[ -d "${INSTALL_DEPS}/fast_livo/lib" ] 2>/dev/null && _FAST_LIVO_PREFIX="${INSTALL_DEPS}/fast_livo"
+[ -d "${INSTALL_DEPS}/ceres/lib" ] 2>/dev/null && _CERES_PREFIX="${INSTALL_DEPS}/ceres"
+export CMAKE_PREFIX_PATH="${INSTALL_DEPS}/gtsam:${_CERES_PREFIX:+${_CERES_PREFIX}:}${INSTALL_DEPS}/teaserpp:${_VIKIT_PREFIX:+${_VIKIT_PREFIX}:}${_HBA_PREFIX:+${_HBA_PREFIX}:}${_FAST_LIVO_PREFIX:+${_FAST_LIVO_PREFIX}:}${INSTALL_DEPS}/libtorch:${INSTALL_DEPS}:${CMAKE_PREFIX_PATH}"
+export LD_LIBRARY_PATH="${INSTALL_DEPS}/gtsam/lib:${_CERES_PREFIX:+${_CERES_PREFIX}/lib:}${INSTALL_DEPS}/teaserpp/lib:${_VIKIT_PREFIX:+${_VIKIT_PREFIX}/lib:}${_HBA_PREFIX:+${_HBA_PREFIX}/lib:}${_FAST_LIVO_PREFIX:+${_FAST_LIVO_PREFIX}/lib:}${INSTALL_DEPS}/libtorch/lib:${INSTALL_DEPS}/onnxruntime/lib:${LD_LIBRARY_PATH}"
+
+# fast_livo：与 GTSAM/vikit/hba 一致，安装到 install_deps/fast_livo，已安装则跳过
+FAST_LIVO_INSTALL_DIR="${INSTALL_DEPS}/fast_livo"
 FAST_LIVO_PATH=""
 [ -d src/automap_pro/src/modular/fast-livo2-humble ] && FAST_LIVO_PATH="src/automap_pro/src/modular/fast-livo2-humble"
 [ -z "${FAST_LIVO_PATH}" ] && [ -d src/fast_livo ] && FAST_LIVO_PATH="src/fast_livo"
 echo "[INFO] fast_livo 源码检查: in-tree=$([ -d src/automap_pro/src/modular/fast-livo2-humble ] && echo 存在 || echo 不存在), src/fast_livo=$([ -d src/fast_livo ] && echo 存在 || echo 不存在) → FAST_LIVO_PATH=${FAST_LIVO_PATH:-未设置}"
 if [ -n "${FAST_LIVO_PATH}" ]; then
-  echo '========================================'
-  echo '编译 fast_livo'
-  echo '========================================'
-  echo "[INFO] 使用路径: ${FAST_LIVO_PATH}（避免 symlink 导致 colcon 0 packages）"
-  colcon build ${COLCON_PARALLEL} --paths "${FAST_LIVO_PATH}" --cmake-args ${NINJA_CMAKE_ARG} -DCMAKE_BUILD_TYPE=Release
-  if [ ! -f install/fast_livo/share/fast_livo/package.xml ]; then
-    echo "[ERROR] fast_livo 编译后未找到 install/fast_livo，请检查上方 colcon 输出是否有报错"
-    exit 1
+  NEED_FAST_LIVO_BUILD=true
+  # 已安装则跳过（colcon 产出 setup.bash，--clean 不删 install_deps）
+  if [ -f "${FAST_LIVO_INSTALL_DIR}/setup.bash" ] || [ -d "${FAST_LIVO_INSTALL_DIR}/fast_livo" ] || [ -d "${FAST_LIVO_INSTALL_DIR}/lib" ] || [ -d "${FAST_LIVO_INSTALL_DIR}/share" ]; then
+    NEED_FAST_LIVO_BUILD=false
   fi
-  echo "[INFO] fast_livo 已安装于 install/fast_livo"
+  if [ "$NEED_FAST_LIVO_BUILD" = true ]; then
+    echo '========================================'
+    echo '编译 fast_livo（安装到 install_deps/fast_livo）'
+    echo '========================================'
+    echo "[INFO] 使用路径: ${FAST_LIVO_PATH}（避免 symlink 导致 colcon 0 packages）"
+    mkdir -p "${FAST_LIVO_INSTALL_DIR}"
+    colcon build ${COLCON_PARALLEL} --install-base "${FAST_LIVO_INSTALL_DIR}" --paths "${FAST_LIVO_PATH}" --cmake-args ${NINJA_CMAKE_ARG} -DCMAKE_BUILD_TYPE=Release
+    _fl_ok=false
+    [ -f "${FAST_LIVO_INSTALL_DIR}/setup.bash" ] && _fl_ok=true
+    [ -f "${FAST_LIVO_INSTALL_DIR}/share/fast_livo/package.xml" ] && _fl_ok=true
+    [ -d "${FAST_LIVO_INSTALL_DIR}/lib" ] && _fl_ok=true
+    [ -d "${FAST_LIVO_INSTALL_DIR}/share" ] && _fl_ok=true
+    [ -d "${FAST_LIVO_INSTALL_DIR}/fast_livo" ] && _fl_ok=true
+    if [ "$_fl_ok" = false ]; then
+      echo "[WARN] fast_livo 编译完成但未在预期路径找到产物，检查: ${FAST_LIVO_INSTALL_DIR}"
+      ls -la "${FAST_LIVO_INSTALL_DIR}" 2>/dev/null || true
+    fi
+    echo "[INFO] fast_livo 已安装于 install_deps/fast_livo"
+  else
+    echo "[INFO] fast_livo 已安装于 install_deps，跳过"
+  fi
+  [ -d "${FAST_LIVO_INSTALL_DIR}/lib" ] && export CMAKE_PREFIX_PATH="${FAST_LIVO_INSTALL_DIR}:${CMAKE_PREFIX_PATH}"
+  [ -d "${FAST_LIVO_INSTALL_DIR}/lib" ] && export LD_LIBRARY_PATH="${FAST_LIVO_INSTALL_DIR}/lib:${LD_LIBRARY_PATH}"
+  mkdir -p /root/automap_ws/install
+  ln -sfn "${FAST_LIVO_INSTALL_DIR}" /root/automap_ws/install/fast_livo 2>/dev/null || true
 else
   echo '[WARN] 未找到 fast_livo 源码（src/automap_pro/src/modular/fast-livo2-humble 或 src/fast_livo），跳过；运行时会报 package fast_livo not found'
 fi

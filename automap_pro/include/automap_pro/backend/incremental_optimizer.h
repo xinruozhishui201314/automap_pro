@@ -108,6 +108,9 @@ public:
     void addGPSFactorForKeyFrame(int kf_id, const Eigen::Vector3d& pos_map,
                                  const Eigen::Matrix3d& cov3x3);
 
+    /** 添加 keyframe 级别的圆柱地标因子 */
+    void addCylinderFactorForKeyFrame(int kf_id, const CylinderFactorItemKF& factor);
+
     /** 获取 keyframe 节点位姿 */
     Pose3d getKeyFramePose(int kf_id) const;
 
@@ -370,6 +373,20 @@ private:
     std::chrono::steady_clock::time_point single_node_pending_start_;
     /** 单节点pending超时阈值（毫秒），超过后强制执行优化 */
     static constexpr int kSingleNodePendingTimeoutMs = 5000;
+
+    /** 构造时缓存，避免 worker/commit 路径访问 ConfigManager 单例导致 shutdown 时 SIGSEGV */
+    bool backend_verbose_trace_{false};
+    double isam2_relin_thresh_{0.01};
+    int isam2_relin_skip_{1};
+    bool isam2_enable_relin_{true};
+    int backend_max_pending_gps_kf_{1000};
+    // addGPSFactor 用 GPS 协方差/异常值相关参数
+    bool gps_enable_dynamic_cov_{true};
+    int gps_min_satellites_{4};
+    double gps_high_altitude_threshold_{100.0};
+    double gps_high_altitude_scale_{2.0};
+    bool gps_enable_outlier_detection_{true};
+    double gps_outlier_cov_scale_{100.0};
 };
 
 } // namespace automap_pro

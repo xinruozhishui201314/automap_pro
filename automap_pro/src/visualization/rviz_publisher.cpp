@@ -121,6 +121,19 @@ void RvizPublisher::publishCurrentCloud(const CloudXYZIPtr& cloud) {
     }
 }
 
+void RvizPublisher::publishCurrentCloud(const CloudXYZIConstPtr& cloud) {
+    if (!node() || !cloud || cloud->empty()) return;
+    try {
+        sensor_msgs::msg::PointCloud2 msg;
+        pcl::toROSMsg(*cloud, msg);
+        msg.header.stamp    = node()->now();
+        msg.header.frame_id = frame_id_;
+        current_cloud_pub_->publish(msg);
+    } catch (const std::exception& e) {
+        RCLCPP_ERROR(node()->get_logger(), "[RvizPublisher] publishCurrentCloud failed: %s", e.what());
+    }
+}
+
 void RvizPublisher::publishSubmapCloud(const SubMap::Ptr& sm) {
     if (!node() || !sm || !sm->downsampled_cloud || sm->downsampled_cloud->empty()) return;
     try {

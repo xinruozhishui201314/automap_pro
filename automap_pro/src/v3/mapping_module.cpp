@@ -6,6 +6,7 @@
 #include "automap_pro/v3/map_registry.h"
 #include "automap_pro/core/data_types.h"
 #include <algorithm>
+#include <cmath>
 #include <vector>
 #include <filesystem>
 #include <chrono>
@@ -59,6 +60,11 @@ uint64_t computeBatchHash(const std::unordered_map<int, Pose3d>& sm_poses,
 MappingModule::MappingModule(EventBus::Ptr event_bus, MapRegistry::Ptr map_registry, rclcpp::Node::SharedPtr node)
     : ModuleBase("MappingModule", event_bus, map_registry), node_(node) {
     
+    const auto& cfg = ConfigManager::instance();
+    max_semantic_queue_size_ = cfg.semanticMappingQueueMaxSize();
+    max_pending_semantic_events_ = cfg.semanticPendingQueueMaxSize();
+    semantic_timestamp_match_tolerance_s_ = cfg.semanticTimestampMatchToleranceS();
+
     current_session_id_ = static_cast<uint64_t>(std::chrono::system_clock::now().time_since_epoch().count());
     processed_alignment_epoch_.store(map_registry_->getAlignmentEpoch());
 
@@ -115,15 +121,38 @@ MappingModule::MappingModule(EventBus::Ptr event_bus, MapRegistry::Ptr map_regis
             return;
         }
 
+        PoseFrame output_frame = result.pose_frame;
+        uint32_t transform_flags = static_cast<uint32_t>(OptimizationTransformFlags::NONE);
+        if (map_registry_->isGPSAligned() && output_frame != PoseFrame::MAP) {
+            Eigen::Matrix3d R_enu_to_map = Eigen::Matrix3d::Identity();
+            Eigen::Vector3d t_enu_to_map = Eigen::Vector3d::Zero();
+            map_registry_->getGPSTransform(R_enu_to_map, t_enu_to_map);
+
+            Pose3d T_map_odom = Pose3d::Identity();
+            T_map_odom.linear() = R_enu_to_map;
+            T_map_odom.translation() = t_enu_to_map;
+            if (!T_map_odom.matrix().allFinite()) {
+                RCLCPP_ERROR(node_->get_logger(),
+                    "[V3][CONTRACT] Reject HBA result: non-finite GPS transform while converting ODOM->MAP");
+                METRICS_INCREMENT(metrics::FRAME_MISMATCH_TOTAL);
+                return;
+            }
+            for (auto& [id, pose] : kf_updates) {
+                pose = T_map_odom * pose;
+            }
+            output_frame = PoseFrame::MAP;
+            transform_flags |= static_cast<uint32_t>(OptimizationTransformFlags::MAP_COMPENSATION_APPLIED);
+        }
+
         const uint64_t source_alignment_epoch = map_registry_->getAlignmentEpoch();
         const uint64_t batch_hash = computeBatchHash({}, kf_updates);
         const uint64_t version = map_registry_->updatePoses(
-            {}, kf_updates, result.pose_frame, "HBAOptimizer", source_alignment_epoch,
-            static_cast<uint32_t>(OptimizationTransformFlags::NONE), batch_hash);
+            {}, kf_updates, output_frame, "HBAOptimizer", source_alignment_epoch,
+            transform_flags, batch_hash);
         RCLCPP_INFO(node_->get_logger(),
             "[V3][HBA->REGISTRY] Applied HBA poses via MapRegistry: version=%lu pose_frame=%d kf=%zu epoch=%lu",
             static_cast<unsigned long>(version),
-            static_cast<int>(result.pose_frame),
+            static_cast<int>(output_frame),
             kf_updates.size(),
             static_cast<unsigned long>(source_alignment_epoch));
     });
@@ -205,8 +234,23 @@ MappingModule::MappingModule(EventBus::Ptr event_bus, MapRegistry::Ptr map_regis
         }
         hba_optimizer_.triggerAsync(all_frozen, loops, ev.wait_for_result, "ManualRequest");
     });
+
+    // 🏛️ [架构演进] 订阅异步语义地标
+    onEvent<SemanticLandmarkEvent>([this](const SemanticLandmarkEvent& ev) {
+        if (!running_.load()) return;
+        std::lock_guard<std::mutex> lk(queue_mutex_);
+        if (semantic_landmark_queue_.size() >= max_semantic_queue_size_) {
+            semantic_landmark_queue_.pop_front();
+            RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000,
+                "[SEMANTIC][Mapping] semantic_landmark_queue overflow, dropping oldest event (cap=%zu)",
+                max_semantic_queue_size_);
+        }
+        semantic_landmark_queue_.push_back(ev);
+        cv_.notify_one();
+    });
+
     RCLCPP_INFO(node_->get_logger(),
-                "[PIPELINE][MAP] ctor OK events=FilteredFrame+GPSAligned+OptResult+Loop+SaveMap+GlobalMap+HBA");
+                "[PIPELINE][MAP] ctor OK events=FilteredFrame+GPSAligned+OptResult+Loop+SaveMap+GlobalMap+HBA+Semantic");
     RCLCPP_INFO(node_->get_logger(),
                 "[V3][SELF_CHECK][CONTRACT] module=Mapping prequeue_valid_guard=on process_entry_guard=on safe_cloud_ds_fallback=on required_ds_subscription=on");
 }
@@ -232,6 +276,7 @@ bool MappingModule::isIdle() const {
     std::lock_guard<std::mutex> lock(queue_mutex_);
     return frame_queue_.empty() && pose_opt_queue_.empty() &&
            gps_event_queue_.empty() && command_queue_.empty() &&
+           semantic_landmark_queue_.empty() &&
            sm_manager_.isIdle(); // 🏛️ [修复] 检查点云合并子管理器是否也空闲
 }
 
@@ -243,20 +288,23 @@ void MappingModule::run() {
         FilteredFrameEventRequiredDs event;
         OptimizationResultEvent opt_ev;
         GPSAlignedEvent gps_ev;
+        SemanticLandmarkEvent sem_ev;
         Command cmd;
         bool has_frame = false;
         bool has_opt = false;
         bool has_gps_ev = false;
         bool has_cmd = false;
+        bool has_sem = false;
 
         {
             std::unique_lock<std::mutex> lock(queue_mutex_);
             cv_.wait_for(lock, std::chrono::milliseconds(100), [this] { 
-                return !running_ || !frame_queue_.empty() || !pose_opt_queue_.empty() || !gps_event_queue_.empty() || !command_queue_.empty(); 
+                return !running_ || !frame_queue_.empty() || !pose_opt_queue_.empty() || 
+                       !gps_event_queue_.empty() || !command_queue_.empty() || !semantic_landmark_queue_.empty(); 
             });
             if (!running_) break;
             
-            // 优先处理 GPS 对齐状态切换，避免在高频优化事件下饥饿。
+            // 优先处理状态变更类事件
             if (!gps_event_queue_.empty()) {
                 gps_ev = gps_event_queue_.front();
                 gps_event_queue_.pop_front();
@@ -269,6 +317,10 @@ void MappingModule::run() {
                 cmd = command_queue_.front();
                 command_queue_.pop_front();
                 has_cmd = true;
+            } else if (!semantic_landmark_queue_.empty()) {
+                sem_ev = semantic_landmark_queue_.front();
+                semantic_landmark_queue_.pop_front();
+                has_sem = true;
             } else if (!frame_queue_.empty()) {
             // 🏛️ [修复] 确定性因果序屏障：检查地图版本与对齐世代是否已在 Mapping 模块本地处理完成
                 const uint64_t target_version = frame_queue_.front().ref_map_version;
@@ -309,6 +361,8 @@ void MappingModule::run() {
             onPoseOptimized(opt_ev);
         } else if (has_gps_ev) {
             updateGPSAlignment(gps_ev);
+        } else if (has_sem) {
+            onSemanticLandmarks(sem_ev);
         } else if (has_cmd) {
             if (cmd.type == Command::Type::SAVE_MAP) {
                 SaveMapRequestEvent ev;
@@ -416,6 +470,14 @@ void MappingModule::processFrame(const FilteredFrameEventRequiredDs& event) {
     );
     
     if (!kf) return;
+    if (has_gps) {
+        RCLCPP_INFO_THROTTLE(
+            node_->get_logger(), *node_->get_clock(), 30000,
+            "[MAPPING][GPS_ATTACH] kf_id=%lu quality=%d is_valid=%d hdop=%.2f sats=%d "
+            "(闭环: 与 CONSTRAINT GPS_KF / GPS_CACHE KPI 对照)",
+            static_cast<unsigned long>(kf->id), static_cast<int>(kf->gps.quality),
+            kf->gps.is_valid ? 1 : 0, kf->gps.hdop, kf->gps.num_satellites);
+    }
     kf->livo_info = event.kf_info;
     kf->pose_frame = event.pose_frame; // 🏛️ [架构契约] 继承来源语义
 
@@ -466,6 +528,31 @@ void MappingModule::processFrame(const FilteredFrameEventRequiredDs& event) {
     
     // 同步到 submap_manager
     sm_manager_.addKeyFrame(kf);
+
+    // 🏛️ [P1 稳定性修复] 检查是否有延迟到达的语义地标，现在 KeyFrame 已经分配了 submap_id
+    SemanticLandmarkEvent deferred_ev;
+    bool has_deferred = false;
+    {
+        std::lock_guard<std::mutex> lk(pending_semantic_mutex_);
+        for (auto it = pending_semantic_landmarks_.begin(); it != pending_semantic_landmarks_.end(); ++it) {
+            const double dt = std::abs(it->timestamp - kf->timestamp);
+            if (dt <= semantic_timestamp_match_tolerance_s_) {
+                deferred_ev = *it;
+                has_deferred = true;
+                pending_semantic_landmarks_.erase(it);
+                break;
+            }
+        }
+    }
+
+    if (has_deferred) {
+        RCLCPP_INFO(node_->get_logger(),
+            "[SEMANTIC][Mapping][processFrame] step=process_deferred ts=%.3f kf_id=%lu sm_id=%d landmarks=%zu",
+            kf->timestamp, kf->id, kf->submap_id, deferred_ev.landmarks.size());
+        onSemanticLandmarks(deferred_ev);
+    }
+
+    // 🏛️ [架构演进] 语义地标现在通过 onSemanticLandmarks 异步处理，不再阻塞关键帧流程
 
     // 🏛️ [P0 优化] 重新引入基于帧数的地图发布逻辑
     // V3 架构此前仅依赖 AutoMapSystem 的 WallTimer (10s)，导致无数据时也冗余构建
@@ -903,6 +990,90 @@ Mat66d MappingModule::computeOdomInfoMatrix(const SubMap::Ptr& prev, const SubMa
     for (int i = 0; i < 3; ++i) info(i, i) = 1.0 / (trans_noise * trans_noise);
     for (int i = 3; i < 6; ++i) info(i, i) = 1.0 / (rot_noise * rot_noise);
     return info;
+}
+
+void MappingModule::onSemanticLandmarks(const SemanticLandmarkEvent& ev) {
+    if (!ev.isValid()) {
+        RCLCPP_WARN(node_->get_logger(),
+            "[SEMANTIC][Mapping][onSemanticLandmarks] step=reject reason=invalid_event ts=%.3f landmarks=%zu",
+            ev.timestamp, ev.landmarks.size());
+        return;
+    }
+
+    RCLCPP_DEBUG(node_->get_logger(),
+        "[SEMANTIC][Mapping][onSemanticLandmarks] step=entry ts=%.3f landmarks=%zu",
+        ev.timestamp, ev.landmarks.size());
+
+    auto defer_semantic_event = [this](const SemanticLandmarkEvent& pending_ev, const char* reason, uint64_t kf_id, int sm_id) {
+        std::lock_guard<std::mutex> lk(pending_semantic_mutex_);
+        if (pending_semantic_landmarks_.size() >= max_pending_semantic_events_) {
+            pending_semantic_landmarks_.pop_front();
+        }
+        pending_semantic_landmarks_.push_back(pending_ev);
+        RCLCPP_DEBUG(node_->get_logger(),
+            "[SEMANTIC][Mapping][onSemanticLandmarks] step=defer reason=%s ts=%.3f kf_id=%lu sm_id=%d pending=%zu",
+            reason, pending_ev.timestamp, static_cast<unsigned long>(kf_id), sm_id, pending_semantic_landmarks_.size());
+    };
+
+    // 1. 查找对应的关键帧
+    auto kf = map_registry_->getKeyFrameByTimestamp(ev.timestamp);
+    if (!kf) {
+        defer_semantic_event(ev, "kf_not_found", 0, -1);
+        return;
+    }
+    if (kf->submap_id < 0) {
+        defer_semantic_event(ev, "submap_id_unassigned", kf->id, kf->submap_id);
+        return;
+    }
+
+    // 2. 更新关键帧的地标
+    kf->landmarks = ev.landmarks;
+
+    // 3. 关联到子图（由 SubMapManager 内部完成互斥，避免外层重复加锁导致自锁）
+    auto sm = sm_manager_.getSubmap(static_cast<int>(kf->submap_id));
+    if (!sm) {
+        RCLCPP_WARN(node_->get_logger(),
+            "[SEMANTIC][Mapping][onSemanticLandmarks] step=sm_not_found ts=%.3f kf_id=%lu sm_id=%d → skip",
+            ev.timestamp, kf->id, kf->submap_id);
+    } else {
+        sm_manager_.associateLandmarks(sm, kf);
+        
+        // 4. 发布优化任务
+        OptTaskItem landmark_task;
+        landmark_task.type = OptTaskItem::Type::CYLINDER_LANDMARK_FACTOR;
+        landmark_task.to_id = static_cast<int>(kf->id);
+        
+        for (const auto& l_kf : kf->landmarks) {
+            if (l_kf->associated_idx >= 0 && l_kf->associated_idx < static_cast<int>(sm->landmarks.size())) {
+                const auto& l_sm = sm->landmarks[l_kf->associated_idx];
+                
+                CylinderFactorItemKF factor;
+                factor.kf_id = kf->id;
+                factor.sm_id = static_cast<uint64_t>(sm->id);
+                factor.point_body = l_kf->root; 
+                factor.root_submap = l_sm->root; 
+                factor.ray_submap = l_sm->ray;
+                factor.radius = l_sm->radius;
+                factor.weight = l_kf->confidence;
+                
+                landmark_task.cylinder_factors.push_back(factor);
+            }
+        }
+        
+        if (!landmark_task.cylinder_factors.empty()) {
+            GraphTaskEvent landmark_ev;
+            landmark_ev.task = landmark_task;
+            event_bus_->publish(landmark_ev);
+
+            RCLCPP_INFO(node_->get_logger(),
+                "[SEMANTIC][Mapping][onSemanticLandmarks] step=dispatch ts=%.3f kf_id=%lu sm_id=%d factors=%zu → GraphTaskEvent",
+                ev.timestamp, kf->id, sm->id, landmark_task.cylinder_factors.size());
+        } else {
+            RCLCPP_DEBUG(node_->get_logger(),
+                "[SEMANTIC][Mapping][onSemanticLandmarks] step=no_factors ts=%.3f kf_id=%lu sm_id=%d landmarks=%zu (none associated)",
+                ev.timestamp, kf->id, sm->id, kf->landmarks.size());
+        }
+    }
 }
 
 } // namespace automap_pro::v3

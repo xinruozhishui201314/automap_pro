@@ -110,6 +110,15 @@ HBAOptimizer::HBAOptimizer() = default;
 HBAOptimizer::~HBAOptimizer() { stop(); }
 
 void HBAOptimizer::init() {
+    const auto& cfg = ConfigManager::instance();
+    hba_enabled_ = cfg.hbaEnabled();
+    hba_gtsam_fallback_enabled_ = cfg.hbaGtsamFallbackEnabled();
+    gps_min_accepted_quality_level_ = cfg.gpsMinAcceptedQualityLevel();
+    hba_total_layers_ = cfg.hbaTotalLayers();
+    hba_thread_num_ = cfg.hbaThreadNum();
+    hba_trigger_submaps_ = cfg.hbaTriggerSubmaps();
+    hba_on_loop_ = cfg.hbaOnLoop();
+
     resolveGpsLeverArmForHba(lever_arm_);
     if (lever_arm_.norm() > 1e-12) {
         RCLCPP_INFO(rclcpp::get_logger("automap_system"),
@@ -158,25 +167,24 @@ void HBAOptimizer::stopJoinWithTimeout(std::chrono::milliseconds max_join) {
 void HBAOptimizer::onSubmapFrozen(const SubMap::Ptr& submap) {
     BACKEND_STEP("step=HBA_onSubmapFrozen_enter sm_id=%d frozen_count=%d kf_count=%zu",
         submap->id, frozen_count_ + 1, submap->keyframes.size());
-    const auto& cfg = ConfigManager::instance();
     frozen_count_++;
 
-    // 增强诊断日志：记录触发条件检查
+    // 增强诊断日志：记录触发条件检查（使用 init 缓存的 hba_trigger_submaps_/hba_on_loop_）
     RCLCPP_INFO(rclcpp::get_logger("automap_system"),
         "[HBA][CHECK] onSubmapFrozen: frozen_count=%d trigger_mod=%d hbaOnLoop=%d hbaEnabled=%d gps_aligned=%d",
-        frozen_count_, cfg.hbaTriggerSubmaps(), cfg.hbaOnLoop() ? 1 : 0,
-        ConfigManager::instance().hbaEnabled() ? 1 : 0, gps_aligned_ ? 1 : 0);
+        frozen_count_, hba_trigger_submaps_, hba_on_loop_ ? 1 : 0,
+        hba_enabled_ ? 1 : 0, gps_aligned_ ? 1 : 0);
 
-    if (frozen_count_ % cfg.hbaTriggerSubmaps() != 0) {
+    if (frozen_count_ % hba_trigger_submaps_ != 0) {
         BACKEND_STEP("step=HBA_onSubmapFrozen_skip sm_id=%d reason=trigger_mod frozen_count=%d mod=%d",
-            submap->id, frozen_count_, cfg.hbaTriggerSubmaps());
+            submap->id, frozen_count_, hba_trigger_submaps_);
         RCLCPP_INFO(rclcpp::get_logger("automap_system"),
             "[HBA][CHECK] skip: frozen_count=%d mod %d != 0",
-            frozen_count_, cfg.hbaTriggerSubmaps());
+            frozen_count_, hba_trigger_submaps_);
         return;
     }
 
-    if (!cfg.hbaOnLoop()) {
+    if (!hba_on_loop_) {
         BACKEND_STEP("step=HBA_onSubmapFrozen_skip sm_id=%d reason=hbaOnLoop_false", submap->id);
         RCLCPP_INFO(rclcpp::get_logger("automap_system"),
             "[HBA][CHECK] skip: hbaOnLoop=false");
@@ -364,7 +372,7 @@ void HBAOptimizer::onGPSAligned(
     gps_align_result_ = align_result;
 
     // GPS 对齐后立即触发一次全局优化（backend.hba.enabled=false 时跳过，仅 ISAM2+GPS）
-    if (ConfigManager::instance().hbaEnabled())
+    if (hba_enabled_)
         triggerAsync(all_submaps, loops, false, "onGPSAligned");
 }
 
@@ -511,14 +519,12 @@ HBAResult HBAOptimizer::runHBA(const PendingTask& task) {
         }
     }
 
-    // 与 ConfigManager::gpsLeverArmImu 同源刷新，避免 HBA 侧杆臂与主配置脱节
-    resolveGpsLeverArmForHba(lever_arm_);
+    // lever_arm_ 在 init() 中通过 resolveGpsLeverArmForHba 已缓存，worker 路径不再访问 ConfigManager
 
 #ifdef USE_HBA_API
-    const auto& cfg = ConfigManager::instance();
     hba_api::Config hba_cfg;
-    hba_cfg.total_layer_num = cfg.hbaTotalLayers();
-    hba_cfg.thread_num      = cfg.hbaThreadNum();
+    hba_cfg.total_layer_num = hba_total_layers_;
+    hba_cfg.thread_num      = hba_thread_num_;
     hba_cfg.voxel_size      = 0.5;
     hba_cfg.enable_gps      = task.enable_gps;
 
@@ -526,7 +532,7 @@ HBAResult HBAOptimizer::runHBA(const PendingTask& task) {
     if (task.enable_gps && gps_aligned_) {
         for (const auto& kf : task.keyframes) {
             if (kf->has_valid_gps &&
-                gpsQualityAcceptedByPolicy(kf->gps.quality, cfg)) {
+                gpsQualityAcceptedByPolicy(kf->gps.quality, gps_min_accepted_quality_level_)) {
                 hba_api::Config::GPSEntry entry;
                 entry.timestamp = kf->gps.timestamp;
                 entry.lat       = kf->gps.latitude;
@@ -604,8 +610,8 @@ HBAResult HBAOptimizer::runHBA(const PendingTask& task) {
 #elif defined(USE_GTSAM_FALLBACK)
     RCLCPP_INFO(rclcpp::get_logger("automap_system"),
         "[HBA][CONFIG] backend.hba.enable_gtsam_fallback=%d (1=run GTSAM fallback, 0=skip; verify config file has enable_gtsam_fallback: true)",
-        ConfigManager::instance().hbaGtsamFallbackEnabled() ? 1 : 0);
-    if (!ConfigManager::instance().hbaGtsamFallbackEnabled()) {
+        hba_gtsam_fallback_enabled_ ? 1 : 0);
+    if (!hba_gtsam_fallback_enabled_) {
         BACKEND_STEP("step=HBA_runHBA_skip reason=gtsam_fallback_disabled");
         RCLCPP_WARN(rclcpp::get_logger("automap_system"),
             "[HBA][BACKEND] GTSAM fallback disabled (backend.hba.enable_gtsam_fallback=false), skipping HBA");
@@ -639,8 +645,7 @@ HBAResult HBAOptimizer::runGTSAMFallback(const PendingTask& task) {
         return result;
     }
 
-    // 与主配置 gps.lever_arm_imu / 主 YAML 同目录下 sensor_config 外参一致（init 之后配置或工作目录可能才就绪）
-    resolveGpsLeverArmForHba(lever_arm_);
+    // lever_arm_ 在 init() 中已缓存，worker 路径不再访问 ConfigManager
 
     std::vector<KeyFrame::Ptr> sorted_kfs = task.keyframes;
     std::sort(sorted_kfs.begin(), sorted_kfs.end(),
@@ -836,21 +841,24 @@ HBAResult HBAOptimizer::runGTSAMFallback(const PendingTask& task) {
         if (task.enable_gps && gps_aligned_) {
             for (size_t i = 0; i < sorted_kfs.size(); ++i) {
                 const auto& kf = sorted_kfs[i];
-                if (!kf->has_valid_gps) {
-                    gps_reject_no_valid++;
-                    continue;
-                }
-                if (!gpsQualityAcceptedByPolicy(kf->gps.quality, ConfigManager::instance())) {
-                    gps_reject_quality++;
+                const auto decision = evaluateKeyframeGpsConstraint(
+                    kf->gps, kf->has_valid_gps, gps_min_accepted_quality_level_, true);
+                if (!decision.accepted) {
+                    if (decision.reason == GPSConstraintRejectReason::NO_GPS_ON_KEYFRAME) gps_reject_no_valid++;
+                    if (decision.reason == GPSConstraintRejectReason::QUALITY_BELOW_POLICY) gps_reject_quality++;
+                    if (decision.reason == GPSConstraintRejectReason::ENU_NOT_FINITE) {
+                        gps_reject_non_finite_pos++;
+                        RCLCPP_WARN(rclcpp::get_logger("automap_system"),
+                            "[HBA][GTSAM] skip GPS factor kf=%zu: non-finite position_enu", i);
+                    }
+                    if (decision.reason == GPSConstraintRejectReason::COV_NOT_FINITE) {
+                        gps_reject_non_finite_cov++;
+                        RCLCPP_WARN(rclcpp::get_logger("automap_system"),
+                            "[HBA][GTSAM] skip GPS factor kf=%zu: non-finite covariance", i);
+                    }
                     continue;
                 }
                 const auto& pos_enu = kf->gps.position_enu;
-                if (!pos_enu.allFinite()) {
-                    gps_reject_non_finite_pos++;
-                    RCLCPP_WARN(rclcpp::get_logger("automap_system"),
-                        "[HBA][GTSAM] skip GPS factor kf=%zu: non-finite position_enu", i);
-                    continue;
-                }
                 // 与 iSAM2 一致：由于地图已整体变换到 ENU 系，GPS 观测直接使用 ENU 坐标即可
                 // 🔧 [修复] GPS 杠臂补偿 (Lever-arm Compensation)
                 // 原理：pos_imu = pos_gps_antenna - R_map_body * p_lever_arm
@@ -860,12 +868,6 @@ HBAResult HBAOptimizer::runGTSAMFallback(const PendingTask& task) {
                 
                 gtsam::Point3 pt(pos_map.x(), pos_map.y(), pos_map.z());
                 Eigen::Matrix3d c = kf->gps.covariance;
-                if (!c.allFinite()) {
-                    gps_reject_non_finite_cov++;
-                    RCLCPP_WARN(rclcpp::get_logger("automap_system"),
-                        "[HBA][GTSAM] skip GPS factor kf=%zu: non-finite covariance", i);
-                    continue;
-                }
                 
                 // 🔧 [修复] GPS Z轴降权：高度观测噪声通常远大于水平方向，放大 Z 轴方差
                 double v0 = std::max(1e-6, std::min(1e6, c(0, 0)));
@@ -895,7 +897,7 @@ HBAResult HBAOptimizer::runGTSAMFallback(const PendingTask& task) {
             RCLCPP_INFO(rclcpp::get_logger("automap_system"),
                 "[CONSTRAINT_KPI][HBA] loop_added=%zu gps_added=%zu gps_reject_quality=%zu gps_min_accepted_quality_level=%d total_loop_added=%lu total_gps_added=%lu",
                 loop_factors_added, gps_factors_added, gps_reject_quality,
-                ConfigManager::instance().gpsMinAcceptedQualityLevel(),
+                gps_min_accepted_quality_level_,
                 static_cast<unsigned long>(g_hba_loop_added_total.load(std::memory_order_relaxed)),
                 static_cast<unsigned long>(g_hba_gps_added_total.load(std::memory_order_relaxed)));
         } else {

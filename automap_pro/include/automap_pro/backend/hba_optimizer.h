@@ -108,6 +108,15 @@ private:
 
     std::vector<HBADoneCallback> done_cbs_;
 
+    /** 构造/init 时缓存，避免 worker 线程访问 ConfigManager 单例导致 shutdown 时 SIGSEGV */
+    bool hba_enabled_{true};
+    bool hba_gtsam_fallback_enabled_{false};
+    int gps_min_accepted_quality_level_{3};
+    int hba_total_layers_{3};
+    int hba_thread_num_{8};
+    int hba_trigger_submaps_{10};
+    bool hba_on_loop_{false};
+
     void workerLoop();
     HBAResult runHBA(const PendingTask& task);
 #ifdef USE_GTSAM_FALLBACK

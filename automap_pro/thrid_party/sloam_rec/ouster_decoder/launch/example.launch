@@ -1,0 +1,13 @@
+<launch>
+    <arg name="debug" default="false"/>
+    <env if="$(arg debug)" name="ROSCONSOLE_CONFIG_FILE" value="$(find ouster_decoder)/launch/debug.conf"/>
+
+    <arg name="lidar_ns" default="os"/>
+
+    <node pkg="ouster_decoder" type="ouster_decoder_example" name="os_example" output="screen" ns="$(arg lidar_ns)">
+        <!-- input topics -->
+        <remap from="~cloud_me" to="cloud"/>
+        <remap from="~cloud_os" to="/os_cloud/points"/>
+    </node>
+
+</launch>

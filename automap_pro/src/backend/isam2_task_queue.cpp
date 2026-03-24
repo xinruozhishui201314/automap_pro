@@ -9,7 +9,7 @@
 
 namespace automap_pro {
 
-ISAM2TaskQueue::ISAM2TaskQueue() : running_(true) {
+ISAM2TaskQueue::ISAM2TaskQueue() : running_(true), max_queue_size_(ConfigManager::instance().isLoaded() ? static_cast<size_t>(ConfigManager::instance().maxOptimizationQueueSize()) : 64u) {
     worker_thread_ = std::thread(&ISAM2TaskQueue::workerLoop, this);
 }
 
@@ -21,12 +21,11 @@ ISAM2TaskQueue::~ISAM2TaskQueue() {
 }
 
 void ISAM2TaskQueue::enqueue(const OptimTask& task) {
-    const size_t max_sz = static_cast<size_t>(ConfigManager::instance().maxOptimizationQueueSize());
     std::lock_guard<std::mutex> lk(mutex_);
 
-    if (queue_.size() >= max_sz) {
+    if (queue_.size() >= max_queue_size_) {
         RCLCPP_WARN(rclcpp::get_logger("automap_system"),
-            "[ISAM2TaskQueue] queue full (%zu), drop task", max_sz);
+            "[ISAM2TaskQueue] queue full (%zu), drop task", max_queue_size_);
         MetricsRegistry::instance().incrementCounter("isam2_task_dropped", 1.0);
         return;
     }
@@ -37,12 +36,11 @@ void ISAM2TaskQueue::enqueue(const OptimTask& task) {
 }
 
 void ISAM2TaskQueue::enqueueMany(const std::vector<OptimTask>& tasks) {
-    const size_t max_sz = static_cast<size_t>(ConfigManager::instance().maxOptimizationQueueSize());
     std::lock_guard<std::mutex> lk(mutex_);
 
     size_t dropped = 0;
     for (const auto& t : tasks) {
-        if (queue_.size() >= max_sz) {
+        if (queue_.size() >= max_queue_size_) {
             dropped++;
             continue;
         }

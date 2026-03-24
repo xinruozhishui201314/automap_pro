@@ -31,6 +31,7 @@ using PointType    = pcl::PointXYZINormal;
 using CloudXYZI    = pcl::PointCloud<pcl::PointXYZI>;
 using CloudXYZIN   = pcl::PointCloud<PointType>;
 using CloudXYZIPtr = CloudXYZI::Ptr;
+using CloudXYZIConstPtr = CloudXYZI::ConstPtr;
 using CloudXYZINPtr = CloudXYZIN::Ptr;
 using Pose3d       = Eigen::Isometry3d;
 using Mat66d       = Eigen::Matrix<double, 6, 6>;
@@ -127,6 +128,24 @@ struct GPSMeasurement {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// 语义地标：圆柱体 (Tree Trunk)
+// ─────────────────────────────────────────────────────────────────────────────
+struct CylinderLandmark {
+    uint64_t id = 0;
+    uint64_t submap_id = 0;                          // 所属子图 ID
+    int associated_idx = -1;                        // 关联到的子图内地标索引
+    Eigen::Vector3d root = Eigen::Vector3d::Zero(); // 底部中心点 (body 系或 submap 系)
+    Eigen::Vector3d ray = Eigen::Vector3d::UnitZ(); // 轴向向量
+    double radius = 0.1;                            // 半径
+    double confidence = 0.0;                        // 拟合置信度/得分
+    
+    // 原始点云索引或简易点集（可选，用于可视化或进一步优化）
+    CloudXYZIPtr points; 
+
+    using Ptr = std::shared_ptr<CylinderLandmark>;
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
 // FAST-LIVO2 扩展关键帧信息（Composable Node 额外发布）
 // ─────────────────────────────────────────────────────────────────────────────
 struct LivoKeyFrameInfo {
@@ -168,6 +187,9 @@ struct KeyFrame {
 
     // ESIKF质量信息
     LivoKeyFrameInfo livo_info;
+
+    // 语义地标 (相对于 body 系)
+    std::vector<CylinderLandmark::Ptr> landmarks;
 
     // 图像（可选）
     cv::Mat image;
@@ -230,6 +252,9 @@ struct SubMap {
     std::vector<Eigen::MatrixXd> keyframe_scancontexts_;
     // 关键帧下采样点云（用于子图内配准）
     std::vector<CloudXYZIPtr> keyframe_clouds_ds;
+
+    // 语义地标 (相对于 submap 锚点系)
+    std::vector<CylinderLandmark::Ptr> landmarks;
 
     // 锚定位姿
     Pose3d pose_odom_anchor        = Pose3d::Identity(); // 锚点在里程计系下的位姿

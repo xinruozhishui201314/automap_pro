@@ -105,5 +105,6 @@ docker/deps/Open3D/
 docker/deps/TEASER-plusplus/
 docker/deps/gtsam/
 docker/deps/ikd-Tree/
+docker/deps/onnxruntime/
 thrid_party/ceres-solver/
 thrid_party/pip_cache/

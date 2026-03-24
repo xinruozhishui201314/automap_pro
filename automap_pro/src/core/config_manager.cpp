@@ -548,6 +548,34 @@ void ConfigManager::load(const std::string& yaml_path) {
         }
 
         config_file_path_ = yaml_path;
+
+        // 填充 ConfigSnapshot，供 worker 模块在构造/init 时获取副本，避免 shutdown 时访问单例导致 SIGSEGV
+        snapshot_.loop_max_desc_queue_size = loopMaxDescQueueSize();
+        snapshot_.loop_max_match_queue_size = loopMaxMatchQueueSize();
+        snapshot_.teaser_min_safe_inliers = teaserMinSafeInliers();
+        snapshot_.parallel_teaser_match = parallelTeaserMatch();
+        snapshot_.pose_consistency_max_trans_m = loopPoseConsistencyMaxTransDiffM();
+        snapshot_.pose_consistency_max_rot_deg = loopPoseConsistencyMaxRotDiffDeg();
+        snapshot_.backend_verbose_trace = backendVerboseTrace();
+        snapshot_.isam2_relin_thresh = isam2RelinThresh();
+        snapshot_.isam2_relin_skip = isam2RelinSkip();
+        snapshot_.isam2_enable_relin = isam2EnableRelin();
+        snapshot_.backend_max_pending_gps_kf = backendMaxPendingGpsKeyframeFactors();
+        snapshot_.max_optimization_queue_size = maxOptimizationQueueSize();
+        snapshot_.retain_cloud_body = retainCloudBody();
+        snapshot_.map_statistical_filter = mapStatisticalFilter();
+        snapshot_.map_stat_filter_mean_k = mapStatFilterMeanK();
+        snapshot_.map_stat_filter_std_mul = mapStatFilterStdMul();
+        snapshot_.submap_rebuild_thresh_trans = submapRebuildThreshTrans();
+        snapshot_.submap_rebuild_thresh_rot = submapRebuildThreshRot();
+        snapshot_.parallel_voxel_downsample = parallelVoxelDownsample();
+        snapshot_.submap_match_res = submapMatchRes();
+        snapshot_.hba_enabled = hbaEnabled();
+        snapshot_.hba_gtsam_fallback_enabled = hbaGtsamFallbackEnabled();
+        snapshot_.gps_min_accepted_quality_level = gpsMinAcceptedQualityLevel();
+        snapshot_.hba_total_layers = hbaTotalLayers();
+        snapshot_.hba_thread_num = hbaThreadNum();
+
         RCLCPP_INFO(rclcpp::get_logger("automap_system"),
             "[ConfigManager] Single config source set: %s (frontend/backend use ConfigManager::instance() only)", yaml_path.c_str());
 

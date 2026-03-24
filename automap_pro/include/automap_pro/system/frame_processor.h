@@ -134,6 +134,8 @@ private:
     // 配置
     size_t max_ingress_queue_size_;
     size_t max_frame_queue_size_;
+    /** 构造时缓存 submapMatchRes，避免 feederLoop 中访问 ConfigManager 单例导致 shutdown 时 SIGSEGV */
+    float submap_match_res_{0.4f};
     
     // 线程
     std::thread feeder_thread_;

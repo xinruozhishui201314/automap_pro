@@ -119,7 +119,7 @@ AutoMap-Pro 一键编译和运行脚本
 编译加速:
     - 默认使用宿主机 CPU 核数并行编译，并启用 Ninja 生成器；可设置环境变量覆盖线程数，例如: AUTOMAP_BUILD_JOBS=16 bash run_automap.sh --build-only --clean
 故障排查:
-    - 第三方库（GTSAM/TEASER++/vikit）安装在 automap_ws/install_deps，--clean 不会删除；需强制重编第三方时请手动: rm -rf automap_ws/install_deps
+    - 第三方库（GTSAM/Ceres/TEASER++/vikit）安装在 automap_ws/install_deps，--clean 不会删除；需强制重编第三方时请手动: rm -rf automap_ws/install_deps
     - 若编译报「CMakeCache.txt directory ... is different than ...」：脚本已自动检测并清理含 /workspace/ 的缓存；仍失败时请加 --clean 后重跑
     - 若 ros2 bag 报「yaml-cpp: bad conversion」：检查 bag 元数据或换 --storage-preset mcap 重录
     - 若 HBA 报 vector::_M_default_append：多为尚无 LIO 位姿，请确保 --config 与 bag 话题一致且 fast_livo 已正常输出
@@ -380,7 +380,7 @@ build_project() {
             ${TIME_VOLUMES} \
             -v "${WORKSPACE_DIR}:/root/automap_ws:rw" \
             "${IMAGE_NAME}" \
-            /bin/bash -c "rm -rf /root/automap_ws/build /root/automap_ws/build_teaserpp /root/automap_ws/build_sophus /root/automap_ws/build_ceres /root/automap_ws/install /root/automap_ws/log && echo 'cleaned (install_deps 保留，第三方库不重编)'" 2>&1 | add_timestamp | tee "${LOG_DIR}/clean.log"
+            /bin/bash -c "rm -rf /root/automap_ws/build /root/automap_ws/build_teaserpp /root/automap_ws/build_sophus /root/automap_ws/build_ceres /root/automap_ws/install /root/automap_ws/log && [ -d /root/automap_ws/install_deps ] && echo 'cleaned (install_deps 保留: gtsam/ceres/vikit/hba/fast_livo 不重编)' || echo 'cleaned'" 2>&1 | add_timestamp | tee "${LOG_DIR}/clean.log"
         CLEAN_EXIT=${PIPESTATUS[0]}
         set -e
         if [ "$CLEAN_EXIT" -eq 0 ]; then
@@ -408,7 +408,8 @@ build_project() {
     HAVE_FAST_LIVO_SRC=false
     [ -d "${SCRIPT_DIR}/fast-livo2-humble" ] || [ -d "${SCRIPT_DIR}/fast-livo2-humble.disabled" ] || [ -d "${PROJECT_DIR}/src/modular/fast-livo2-humble" ] || [ -d "${PROJECT_DIR}/src/modular/fast-livo2-humble.disabled" ] && HAVE_FAST_LIVO_SRC=true
     if [ "$NEED_BUILD" = false ] && [ "$HAVE_FAST_LIVO_SRC" = true ]; then
-        if [ ! -f "${WORKSPACE_DIR}/install/fast_livo/share/fast_livo/package.xml" ]; then
+        # colcon 可能使用 merged 或 isolated 布局：merged → share/fast_livo/，isolated → fast_livo/share/fast_livo/
+        if [ ! -f "${WORKSPACE_DIR}/install/fast_livo/share/fast_livo/package.xml" ] && [ ! -f "${WORKSPACE_DIR}/install_deps/fast_livo/share/fast_livo/package.xml" ] && [ ! -f "${WORKSPACE_DIR}/install_deps/fast_livo/fast_livo/share/fast_livo/package.xml" ]; then
             NEED_BUILD=true
             print_info "检测到 fast-livo2-humble 源码，但未编译，将执行完整编译"
         fi
@@ -634,15 +635,19 @@ except Exception as e:
 
     # 使用外部前端时必须有 fast_livo 已编译，否则 launch 会跳过该节点、后端无数据
     if [ "$USE_EXTERNAL_FRONTEND" = true ]; then
-        if [ ! -d "${WORKSPACE_DIR}/install/fast_livo" ] && [ ! -f "${WORKSPACE_DIR}/install/fast_livo/share/fast_livo/package.xml" ]; then
-            print_error "未找到 fast_livo 安装（install/fast_livo），无法启动前端节点，后端将一直等待数据。"
+        FAST_LIVO_INSTALLED=false
+        [ -f "${WORKSPACE_DIR}/install/fast_livo/share/fast_livo/package.xml" ] && FAST_LIVO_INSTALLED=true
+        [ -f "${WORKSPACE_DIR}/install_deps/fast_livo/share/fast_livo/package.xml" ] && FAST_LIVO_INSTALLED=true
+        [ -f "${WORKSPACE_DIR}/install_deps/fast_livo/fast_livo/share/fast_livo/package.xml" ] && FAST_LIVO_INSTALLED=true
+        if [ "$FAST_LIVO_INSTALLED" = false ]; then
+            print_error "未找到 fast_livo 安装（install/fast_livo 或 install_deps/fast_livo），无法启动前端节点，后端将一直等待数据。"
             echo ""
             echo "  若源码已在 automap_pro/src/modular/fast-livo2-humble 下，请执行完整编译（会编译 fast_livo 并安装）："
             echo "    bash run_automap.sh --offline --bag-file \"\$(pwd)/data/automap_input/M2DGR/street_03_ros2\" --config system_config_M2DGR.yaml --clean"
             echo "  编译时请查看 build.log 中 \"[INFO] fast_livo 源码检查\" 和 \"编译 fast_livo\" 是否出现；若无则容器内未找到该路径。"
             echo ""
             echo "  或使用内部前端：加参数 --no-external-frontend 再运行（若支持）。"
-            echo "  当前检查路径: ${WORKSPACE_DIR}/install/fast_livo"
+            echo "  当前检查路径: ${WORKSPACE_DIR}/install/fast_livo 或 ${WORKSPACE_DIR}/install_deps/fast_livo"
             exit 1
         fi
     fi
@@ -728,9 +733,41 @@ except Exception as e:
             if [ -d install_deps/teaserpp/lib ]; then
               export LD_LIBRARY_PATH=\"install_deps/teaserpp/lib:\$LD_LIBRARY_PATH\"
             fi
+            # Ceres Solver（圆柱拟合等）：与 GTSAM 一致，安装到 install_deps/ceres
+            if [ -d install_deps/ceres/lib ]; then
+              export LD_LIBRARY_PATH=\"install_deps/ceres/lib:\$LD_LIBRARY_PATH\"
+              export CMAKE_PREFIX_PATH=\"install_deps/ceres:\$CMAKE_PREFIX_PATH\"
+            fi
+            # hba（全局优化节点）：与 GTSAM 一致，安装到 install_deps/hba
+            if [ -f install_deps/hba/setup.bash ]; then
+              source install_deps/hba/setup.bash
+            elif [ -d install_deps/hba/lib ]; then
+              export LD_LIBRARY_PATH=\"install_deps/hba/lib:\$LD_LIBRARY_PATH\"
+              export CMAKE_PREFIX_PATH=\"install_deps/hba:\$CMAKE_PREFIX_PATH\"
+            fi
+            # vikit（fast_livo 依赖）：与 GTSAM 一致，安装到 install_deps/vikit
+            if [ -f install_deps/vikit/setup.bash ]; then
+              source install_deps/vikit/setup.bash
+            elif [ -d install_deps/vikit/lib ]; then
+              export LD_LIBRARY_PATH=\"install_deps/vikit/lib:\$LD_LIBRARY_PATH\"
+              export CMAKE_PREFIX_PATH=\"install_deps/vikit:\$CMAKE_PREFIX_PATH\"
+            elif [ -d install_deps/lib ] && [ -f install_deps/lib/libvikit_common.so ]; then
+              export LD_LIBRARY_PATH=\"install_deps/lib:\$LD_LIBRARY_PATH\"
+            fi
+            # fast_livo（前端节点）：与 GTSAM 一致，安装到 install_deps/fast_livo
+            if [ -f install_deps/fast_livo/setup.bash ]; then
+              source install_deps/fast_livo/setup.bash
+            elif [ -d install_deps/fast_livo/lib ]; then
+              export LD_LIBRARY_PATH=\"install_deps/fast_livo/lib:\$LD_LIBRARY_PATH\"
+              export CMAKE_PREFIX_PATH=\"install_deps/fast_livo:\$CMAKE_PREFIX_PATH\"
+            fi
             # LibTorch（OverlapTransformer）：与 GTSAM 一致，使用 install_deps 下预装库，避免每次编译
             if [ -d install_deps/libtorch/lib ]; then
               export LD_LIBRARY_PATH=\"install_deps/libtorch/lib:\$LD_LIBRARY_PATH\"
+            fi
+            # ONNX Runtime（SLOAM 语义分割）：与 GTSAM 一致，install_deps 安装后直接使用
+            if [ -d install_deps/onnxruntime/lib ]; then
+              export LD_LIBRARY_PATH=\"install_deps/onnxruntime/lib:\$LD_LIBRARY_PATH\"
             fi
             if [ \"\${AUTOMAP_USE_INSTALL_DEPS_GTSAM:-0}\" = \"1\" ] && [ -d install_deps/gtsam/lib ]; then
               export LD_LIBRARY_PATH=\"install_deps/gtsam/lib:\$LD_LIBRARY_PATH\"

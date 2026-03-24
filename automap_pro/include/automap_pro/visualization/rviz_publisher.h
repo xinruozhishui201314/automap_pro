@@ -47,8 +47,9 @@ public:
     /** 发布全局地图点云（自动降采样） */
     void publishGlobalMap(const CloudXYZIPtr& cloud);
 
-    /** 发布当前帧点云 */
+    /** 发布当前帧点云（接受 ConstPtr 以兼容 SyncedFrameEvent 等只读场景） */
     void publishCurrentCloud(const CloudXYZIPtr& cloud);
+    void publishCurrentCloud(const CloudXYZIConstPtr& cloud);
 
     /** 发布子图点云 */
     void publishSubmapCloud(const SubMap::Ptr& sm);

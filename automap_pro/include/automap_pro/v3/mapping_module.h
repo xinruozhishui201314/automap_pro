@@ -48,6 +48,9 @@ private:
     // 🏛️ V3: 位姿跳变修正 logic
     void onPoseOptimized(const OptimizationResultEvent& ev);
     
+    // 🏛️ [架构演进] 处理异步语义地标
+    void onSemanticLandmarks(const SemanticLandmarkEvent& ev);
+    
     /**
      * @brief 🏛️ [架构加固] 统一位姿应用网关
      * 处理坐标系补偿 (ODOM -> MAP) 并分发到各个管理器
@@ -70,6 +73,7 @@ private:
     std::deque<FilteredFrameEventRequiredDs> frame_queue_;
     std::deque<OptimizationResultEvent> pose_opt_queue_;
     std::deque<GPSAlignedEvent> gps_event_queue_;
+    std::deque<SemanticLandmarkEvent> semantic_landmark_queue_;
     
     // 🏛️ 生产级命令队列
     struct Command {
@@ -111,6 +115,13 @@ private:
     // 回环缓存（临时，用于 HBA）
     std::vector<LoopConstraint::Ptr> loop_constraints_;
     std::mutex loop_constraints_mutex_;
+
+    // 🏛️ [P1 稳定性修复] 异步语义地标待处理队列（解决 KeyFrame 尚未分配 submap_id 的竞态）
+    size_t max_semantic_queue_size_ = 4096;
+    size_t max_pending_semantic_events_ = 4096;
+    double semantic_timestamp_match_tolerance_s_ = 1e-4;
+    std::deque<SemanticLandmarkEvent> pending_semantic_landmarks_;
+    std::mutex pending_semantic_mutex_;
 };
 
 } // namespace automap_pro::v3

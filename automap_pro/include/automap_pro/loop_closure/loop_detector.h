@@ -258,6 +258,15 @@ private:
     /** 子图间回环：两关键帧对之间最小全局关键帧间隔（帧数），0=不限制 */
     int inter_submap_min_keyframe_gap_ = 20;
 
+    /** 回环位姿一致性：构造时从 ConfigManager 缓存，避免 processMatchTask 中访问单例导致 shutdown 时 SIGSEGV */
+    double pose_consistency_max_trans_m_ = 10.0;
+    double pose_consistency_max_rot_deg_ = 20.0;
+    /** 队列/匹配参数：构造时缓存，避免 worker 线程访问 ConfigManager 单例 */
+    size_t loop_max_desc_queue_size_ = 128;
+    size_t loop_max_match_queue_size_ = 128;
+    int teaser_min_safe_inliers_ = 10;
+    bool parallel_teaser_match_ = true;
+
     /** 回环检测节流：上次成功检测时的 query 关键帧 id，-1 表示未成功过 */
     int64_t last_keyframe_id_after_loop_success_ = -1;
     /** 回环检测节流：成功检测后隔多少关键帧再检测，0=不节流 */

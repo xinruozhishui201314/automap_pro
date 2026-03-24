@@ -9,6 +9,7 @@
 #include <Eigen/Dense>
 #include <rclcpp/rclcpp.hpp>
 #include "automap_pro/core/protocol_contract.h" // 🏛️ [架构加固] 注入契约
+#include "automap_pro/core/config_snapshot.h"
 
 namespace automap_pro {
 
@@ -29,6 +30,9 @@ public:
 
     /** 是否已加载过配置（任意组件可通过此判断是否可安全使用 getter） */
     bool isLoaded() const { return !config_file_path_.empty(); }
+
+    /** 返回 worker 线程安全配置快照副本。load() 后调用；模块在构造/init 时获取，worker 中只读 snapshot 不再访问本单例。 */
+    ConfigSnapshot getSnapshot() const { return snapshot_; }
     /** 当前加载的配置文件路径（唯一源；未加载时为空） */
     const std::string& configFilePath() const { return config_file_path_; }
 
@@ -65,12 +69,12 @@ public:
         if (system_queue_cached_) {
             size_t v = static_cast<size_t>(system_ingress_queue_max_size_);
             if (v < 2) return 2;
-            if (v > 256) return 256;
+            if (v > 10000) return 10000;
             return v;
         }
         int v = get<int>("system.ingress_queue_max_size", 16);
         if (v < 2) return 2;
-        if (v > 256) return 256;
+        if (v > 10000) return 10000;
         return static_cast<size_t>(v);
     }
     /** ROS2 订阅 depth：里程计/点云/KF 话题 KeepLast，过大会占内存；资源受限时可减小。默认 1000 */
@@ -562,6 +566,28 @@ public:
     int    mapStatFilterMeanK() const { return get<int>("map.statistical_filter_mean_k", 50); }
     double mapStatFilterStdMul()const { return get<double>("map.statistical_filter_std_mul", 1.0); }
 
+    // ── 语义处理 ──────────────────────────────────────────
+    // 语义模块强制默认开启：即使配置未提供该项也按开启处理
+    bool        semanticEnabled()    const { return get<bool>("semantic.enabled", true); }
+    std::string semanticModelPath()  const { return get<std::string>("semantic.model_path", ""); }
+    float       semanticFovUp()      const { return get<float>("semantic.fov_up", 22.5f); }
+    float       semanticFovDown()    const { return get<float>("semantic.fov_down", -22.5f); }
+    int         semanticImgW()       const { return get<int>("semantic.img_w", 2048); }
+    int         semanticImgH()       const { return get<int>("semantic.img_h", 64); }
+    bool        semanticDoDestagger()const { return get<bool>("semantic.do_destagger", true); }
+    size_t      semanticMappingQueueMaxSize() const {
+        int v = get<int>("semantic.mapping_queue_max_size", 4096);
+        return static_cast<size_t>(std::max(128, std::min(200000, v)));
+    }
+    size_t      semanticPendingQueueMaxSize() const {
+        int v = get<int>("semantic.pending_queue_max_size", 4096);
+        return static_cast<size_t>(std::max(128, std::min(200000, v)));
+    }
+    double      semanticTimestampMatchToleranceS() const {
+        double v = get<double>("semantic.timestamp_match_tolerance_s", 1e-4);
+        return std::max(1e-6, std::min(0.1, v));
+    }
+
     // ── 会话 ──────────────────────────────────────────────
     bool   multiSessionEnabled()const { return get<bool>("session.multi_session", false); }
     std::string sessionDir()    const { return get<std::string>("session.session_dir", ""); }
@@ -575,6 +601,9 @@ private:
     bool perf_parallel_teaser_match_{true};
     int  perf_parallel_teaser_max_inflight_{4};
     int  perf_max_optimization_queue_size_{64};
+
+    /** load() 完成后填充，供 getSnapshot() 返回；worker 模块持副本，shutdown 时不再依赖本单例 */
+    ConfigSnapshot snapshot_;
 
     YAML::Node cfg_;
     /** 加载过的配置文件路径；全工程唯一源，用于“只加载一次”守卫与 configFilePath() */

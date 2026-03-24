@@ -196,14 +196,14 @@ void DynamicFilterModule::processOne(const SyncedFrameEvent& in) {
     enforceHardCapacity();
 
     if (!apply_filter) {
-        out.cloud = in.cloud;
-        out.cloud_ds = in.cloud_ds;
+        out.cloud = in.cloud ? std::make_shared<CloudXYZI>(*in.cloud) : nullptr;
+        out.cloud_ds = in.cloud_ds ? std::make_shared<CloudXYZI>(*in.cloud_ds) : out.cloud;
         out.filtered_output_used = false;
         out.fallback_reason = FilterFallbackReason::SHADOW_MODE;
         out.output_points = out.cloud ? out.cloud->size() : 0;
     } else if (static_cloud->empty()) {
-        out.cloud = in.cloud;
-        out.cloud_ds = in.cloud_ds;
+        out.cloud = in.cloud ? std::make_shared<CloudXYZI>(*in.cloud) : nullptr;
+        out.cloud_ds = in.cloud_ds ? std::make_shared<CloudXYZI>(*in.cloud_ds) : out.cloud;
         out.filtered_output_used = false;
         out.fallback_reason = FilterFallbackReason::EMPTY_STATIC;
         out.output_points = out.cloud ? out.cloud->size() : 0;
@@ -278,8 +278,8 @@ FilteredFrameEventOptionalDs DynamicFilterModule::passthrough(
     const SyncedFrameEvent& in, FilterFallbackReason reason) const {
     FilteredFrameEventOptionalDs out;
     out.timestamp = in.timestamp;
-    out.cloud = in.cloud;
-    out.cloud_ds = in.cloud_ds;
+    out.cloud = in.cloud ? std::make_shared<CloudXYZI>(*in.cloud) : nullptr;
+    out.cloud_ds = in.cloud_ds ? std::make_shared<CloudXYZI>(*in.cloud_ds) : out.cloud;
     out.T_odom_b = in.T_odom_b;
     out.covariance = in.covariance;
     out.pose_frame = in.pose_frame;

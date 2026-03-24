@@ -1,8 +1,8 @@
 #include "automap_pro/system/frame_processor.h"
 
+#include "automap_pro/core/config_manager.h"
 #include "automap_pro/backend/incremental_optimizer.h"
 #include "automap_pro/core/logger.h"
-#include "automap_pro/core/config_manager.h"
 #include "automap_pro/core/utils.h"
 #include "automap_pro/backend/optimizer.h"
 
@@ -13,6 +13,7 @@ namespace automap_pro {
 FrameProcessor::FrameProcessor()
     : max_ingress_queue_size_(100)
     , max_frame_queue_size_(500)
+    , submap_match_res_(ConfigManager::instance().isLoaded() ? static_cast<float>(ConfigManager::instance().submapMatchRes()) : 0.4f)
     , shutdown_flag_(nullptr) {
 }
 
@@ -24,6 +25,9 @@ void FrameProcessor::init(size_t max_ingress_queue_size,
                          size_t max_frame_queue_size) {
     max_ingress_queue_size_ = max_ingress_queue_size;
     max_frame_queue_size_ = max_frame_queue_size;
+    if (ConfigManager::instance().isLoaded()) {
+        submap_match_res_ = static_cast<float>(ConfigManager::instance().submapMatchRes());
+    }
 }
 
 void FrameProcessor::start() {
@@ -167,7 +171,7 @@ void FrameProcessor::feederLoop() {
 
         // 体素下采样
         if (f.cloud && !f.cloud->empty()) {
-            float ds_res = static_cast<float>(ConfigManager::instance().submapMatchRes());
+            float ds_res = submap_match_res_;
             if (ds_res <= 0) {
                 ds_res = 0.5f;
             }

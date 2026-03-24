@@ -1,6 +1,7 @@
 #pragma once
 
 #include "automap_pro/v3/module_base.h"
+#include "automap_pro/v3/semantic_processor.h"
 #include "automap_pro/frontend/livo_bridge.h"
 #include "automap_pro/system/frame_processor.h"
 #include <deque>

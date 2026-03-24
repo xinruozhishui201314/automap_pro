@@ -57,8 +57,37 @@ def _launch_nodes_offline(context, *args, **kwargs):
     if config_path and os.path.isfile(config_path):
         try:
             import yaml as _yaml
+            _orig_config_abs = os.path.abspath(config_path)
             with open(config_path, "r", encoding="utf-8") as _f:
                 _cfg = _yaml.safe_load(_f) or {}
+            # 离线补丁会把 YAML 写到 /tmp；ConfigManager 用「配置文件路径 dirname×2」展开
+            # ${CMAKE_CURRENT_SOURCE_DIR}，对 /tmp/automap_offline_*.yaml 会得到错误根目录（如 CWD/models）。
+            # 在写入补丁前将 overlap_transformer.model_path 规范为绝对路径（相对 .../automap_pro/config/*.yaml）。
+            try:
+                _lc = _cfg.get("loop_closure")
+                if isinstance(_lc, dict):
+                    _ot = _lc.get("overlap_transformer")
+                    if isinstance(_ot, dict):
+                        _mp = (_ot.get("model_path") or "").strip()
+                        if _mp:
+                            _pkg_root = os.path.dirname(os.path.dirname(_orig_config_abs))
+                            _cmake = "${CMAKE_CURRENT_SOURCE_DIR}"
+                            if _cmake in _mp:
+                                _mp = _mp.replace(_cmake, _pkg_root)
+                            elif not os.path.isabs(_mp):
+                                _mp = os.path.abspath(
+                                    os.path.join(os.path.dirname(_orig_config_abs), _mp)
+                                )
+                            _mp = os.path.normpath(_mp)
+                            _ot["model_path"] = _mp
+                            _lc["overlap_transformer"] = _ot
+                            _cfg["loop_closure"] = _lc
+                            sys.stderr.write(
+                                "{} [OVERLAP] offline resolved model_path={}\n".format(_LP, _mp)
+                            )
+                            sys.stderr.flush()
+            except Exception as _e_res:
+                _log_launch_exception("resolve loop_closure.overlap_transformer.model_path (offline)", _e_res)
             _system = _cfg.get("system") if isinstance(_cfg.get("system"), dict) else {}
             _base_out = (_system.get("output_dir") or "").strip() or "/data/automap_output"
             _base_out = os.path.abspath(_base_out.rstrip("/"))

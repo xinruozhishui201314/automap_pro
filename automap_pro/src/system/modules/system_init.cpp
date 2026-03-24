@@ -69,23 +69,22 @@ AutoMapSystem::~AutoMapSystem() {
     RCLCPP_INFO(get_logger(), "[PIPELINE][SYS][SHUTDOWN] destructor begin (grep PIPELINE|SHUTDOWN)");
     shutdown_requested_.store(true);
 
-    // 🏛️ [修复] 关键变更：先保存地图，再停止模块
-    // 理由：stopAll() 会立即终止所有 Module 的工作循环。若先 stopAll()，
-    // 后续的 saveMapToFiles() 发出的 SaveMapRequestEvent 将由 MappingModule 处理，
-    // 如果 MappingModule 已经停止，任务将永远无法被执行，导致点云数据丢失。
+    // ── 显式 Shutdown 阶段（Option B：生命周期与析构顺序）────────────────────────────
+    // Phase 1: 保存地图（必须在 stopAll 前，否则 MappingModule 已停止无法处理 SaveMapRequestEvent）
     std::string out_dir = getOutputDir();
-    RCLCPP_INFO(get_logger(), "[PIPELINE][SYS][SHUTDOWN] step=saveMapToFiles PRIORITY_SAVE out_dir=%s", out_dir.c_str());
+    RCLCPP_INFO(get_logger(), "[PIPELINE][SYS][SHUTDOWN] phase=1 saveMapToFiles out_dir=%s", out_dir.c_str());
     saveMapToFiles(out_dir);
-
-    // saveMapToFiles 已通过 SaveMapRequestEvent.completion 等待 MappingModule 完成归档与 global_map_final
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
+    // Phase 2: 停止所有 Worker 线程（stopAll 会 join desc/match/merge/freeze/opt 等 worker）
+    // 完成后各模块 worker 不再运行，ConfigManager 等单例可安全析构
     if (v3_context_) {
-        RCLCPP_INFO(get_logger(), "[PIPELINE][SYS][SHUTDOWN] step=stop V3Context::stopAll (all V3 modules)");
+        RCLCPP_INFO(get_logger(), "[PIPELINE][SYS][SHUTDOWN] phase=2 V3Context::stopAll (join all module workers)");
         v3_context_->stopAll();
     }
 
-    RCLCPP_INFO(get_logger(), "[PIPELINE][SYS][SHUTDOWN] step=stop HealthMonitor + ErrorMonitor");
+    // Phase 3: 停止单例监控（HealthMonitor、ErrorMonitor）
+    RCLCPP_INFO(get_logger(), "[PIPELINE][SYS][SHUTDOWN] phase=3 HealthMonitor + ErrorMonitor stop");
     HealthMonitor::instance().stop();
     ErrorMonitor::instance().stop();
 
@@ -128,6 +127,11 @@ void AutoMapSystem::deferredSetupModules() {
     frontend_module_ = std::make_shared<v3::FrontEndModule>(
         v3_context_->eventBus(), v3_context_->mapRegistry(), shared_from_this());
     v3_context_->registerModule(frontend_module_);
+
+    RCLCPP_INFO(get_logger(), "[PIPELINE][SYS] step=08a-2 ctor+register SemanticModule");
+    semantic_module_ = std::make_shared<v3::SemanticModule>(
+        v3_context_->eventBus(), v3_context_->mapRegistry(), shared_from_this());
+    v3_context_->registerModule(semantic_module_);
 
     RCLCPP_INFO(get_logger(), "[PIPELINE][SYS] step=08b ctor+register DynamicFilterModule");
     dynamic_filter_module_ = std::make_shared<v3::DynamicFilterModule>(

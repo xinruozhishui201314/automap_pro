@@ -45,6 +45,7 @@ private:
     void processTaskInternal(const OptTaskItem& task);
     void processGPSBatchKF(const OptTaskItem& task);
     void processKeyframeCreate(const OptTaskItem& task);
+    void processCylinderLandmarkFactor(const OptTaskItem& task);
     Mat66d computeOdomInfoMatrixForKeyframes(const KeyFrame::Ptr& prev_kf, const KeyFrame::Ptr& curr_kf, const Pose3d& rel) const;
 
     rclcpp::Node::SharedPtr node_;

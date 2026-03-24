@@ -47,6 +47,8 @@ public:
     
     void addKeyFrame(KeyFrame::Ptr kf);
     KeyFrame::Ptr getKeyFrame(int id) const;
+    /** 根据时间戳精确查找关键帧；无时返回 nullptr */
+    KeyFrame::Ptr getKeyFrameByTimestamp(double timestamp) const;
     /** 时间戳最大的关键帧（用于与当前帧点云对齐到最新优化位姿链）；无时返回 nullptr */
     KeyFrame::Ptr getLatestKeyFrameByTimestamp() const;
     std::vector<KeyFrame::Ptr> getAllKeyFrames() const;
@@ -284,8 +286,8 @@ struct RawKFInfoEvent {
  */
 struct SyncedFrameEvent {
     double timestamp;
-    CloudXYZIPtr cloud;
-    CloudXYZIPtr cloud_ds; // Downsampled
+    CloudXYZIConstPtr cloud;
+    CloudXYZIConstPtr cloud_ds; // Downsampled
     Pose3d T_odom_b;
     Mat66d covariance;
     PoseFrame pose_frame = PoseFrame::ODOM; // 🏛️ [架构契约] 显式标注 T_odom_b 的坐标系语义
@@ -295,6 +297,9 @@ struct SyncedFrameEvent {
     // GPS 观测 (可选)
     bool has_gps = false;
     GPSMeasurement gps;
+
+    // 语义地标 (可选)
+    std::vector<CylinderLandmark::Ptr> landmarks;
 
     // 🏛️ 生产级确定性：本帧依赖的地图版本
     // MappingModule 必须等待 MapRegistry 达到此版本后才处理本帧，确保坐标系一致
@@ -314,6 +319,20 @@ struct SyncedFrameEvent {
             if (!gps.covariance.allFinite()) return false;
         }
         return true;
+    }
+};
+
+/**
+ * @brief 语义地标事件 (Semantic Landmark Event)
+ * 🏛️ [架构演进] 异步语义处理结果，解耦前端与深度学习推理。
+ * 由 SemanticModule 发布，MappingModule 订阅。
+ */
+struct SemanticLandmarkEvent {
+    double timestamp = 0.0;
+    std::vector<CylinderLandmark::Ptr> landmarks;
+
+    bool isValid() const {
+        return std::isfinite(timestamp) && !landmarks.empty();
     }
 };
 

@@ -95,6 +95,59 @@ else()
   FetchContent_MakeAvailable(nlohmann_json)
 endif()
 
+# sloam_rec（SemanticProcessor）：仅使用本包内 thrid_party/sloam_rec（勿依赖仓库外 ../thrid_party）
+set(SLOAM_REC_SLOAM_INCLUDE "${CMAKE_CURRENT_SOURCE_DIR}/thrid_party/sloam_rec/sloam/include")
+if(EXISTS "${SLOAM_REC_SLOAM_INCLUDE}/segmentation/inference.h")
+  message(STATUS "[automap_pro] sloam_rec sloam include: ${SLOAM_REC_SLOAM_INCLUDE}")
+else()
+  message(FATAL_ERROR
+    "[automap_pro] sloam_rec not found. Expected:\n  ${SLOAM_REC_SLOAM_INCLUDE}/segmentation/inference.h\n"
+    "Vendor copy: copy thrid_party/sloam_rec into ${CMAKE_CURRENT_SOURCE_DIR}/thrid_party/sloam_rec")
+endif()
+
+# ONNX Runtime（SLOAM 语义分割）：与 GTSAM 一致优先 install_deps，未找到时使用 stub
+set(_onnx_include "")
+set(_onnx_lib "")
+set(_sloam_segmentation_lib "")
+set(_install_deps_onnx "")
+if(DEFINED ENV{ONNXRUNTIME_HOME})
+  set(_install_deps_onnx "$ENV{ONNXRUNTIME_HOME}")
+endif()
+if(NOT _install_deps_onnx AND CMAKE_SOURCE_DIR)
+  get_filename_component(_ws_root "${CMAKE_SOURCE_DIR}/../.." ABSOLUTE)
+  if(EXISTS "${_ws_root}/install_deps/onnxruntime/lib/libonnxruntime.so")
+    set(_install_deps_onnx "${_ws_root}/install_deps/onnxruntime")
+  endif()
+endif()
+find_path(ONNX_INCLUDE_DIR onnxruntime_cxx_api.h
+  HINTS "${_install_deps_onnx}/include/onnxruntime/core/session"
+        /usr/local/include/onnxruntime/core/session
+  PATH_SUFFIXES onnxruntime/core/session)
+find_library(ONNX_LIBRARY onnxruntime
+  HINTS "${_install_deps_onnx}/lib" /usr/local/lib /usr/lib/x86_64-linux-gnu)
+if(ONNX_INCLUDE_DIR AND ONNX_LIBRARY)
+  set(_onnx_include "${ONNX_INCLUDE_DIR}")
+  set(_onnx_lib "${ONNX_LIBRARY}")
+  find_library(SLOAM_SEGMENTATION_LIBRARY sloam_segmentation
+    HINTS
+      "${CMAKE_SOURCE_DIR}/../../install_deps/sloam/lib"
+      "${CMAKE_SOURCE_DIR}/../install_deps/sloam/lib"
+      /usr/local/lib
+      /usr/lib/x86_64-linux-gnu
+  )
+  if(SLOAM_SEGMENTATION_LIBRARY)
+    set(_sloam_segmentation_lib "${SLOAM_SEGMENTATION_LIBRARY}")
+    set(USE_SLOAM_SEMANTIC 1)
+    message(STATUS "[automap_pro] ONNX Runtime + sloam_segmentation found: SLOAM semantic ENABLED")
+  else()
+    set(USE_SLOAM_SEMANTIC 0)
+    message(WARNING "[automap_pro] ONNX Runtime found but sloam_segmentation library missing: semantic processor will run in stub mode")
+  endif()
+else()
+  set(USE_SLOAM_SEMANTIC 0)
+  message(STATUS "[automap_pro] ONNX Runtime not found: SLOAM semantic DISABLED (stub mode)")
+endif()
+
 # Boost（lockfree SPSC 队列，用于 ingress/frame 热路径无锁）
 find_package(Boost 1.48 REQUIRED)
 message(STATUS "[automap_pro] Boost found: ${Boost_VERSION} (lockfree spsc_queue for ingress/frame queues)")
@@ -103,10 +156,20 @@ message(STATUS "[automap_pro] Boost found: ${Boost_VERSION} (lockfree spsc_queue
 find_package(GTSAM REQUIRED)
 message(STATUS "[automap_pro] GTSAM found (startup double free in lago? see docs/FIX_GTSAM_LAGO_STATIC_INIT_DOUBLE_FREE.md)")
 
-# Ceres（可选）
+# Ceres（可选，须 ≥ 2.0 以支持 SphereManifold）
 find_package(Ceres QUIET)
 if(Ceres_FOUND)
   add_definitions(-DUSE_CERES)
+  set(_ceres_ver "${Ceres_VERSION}")
+  if(NOT _ceres_ver)
+    set(_ceres_ver "${CERES_VERSION}")
+  endif()
+  if(DEFINED Ceres_VERSION AND Ceres_VERSION VERSION_LESS "2.0.0")
+    message(FATAL_ERROR "[automap_pro] Ceres ${_ceres_ver} < 2.0，无法使用 SphereManifold。请使用 thrid_party/ceres-solver 或系统 Ceres ≥ 2.0")
+  elseif(DEFINED CERES_VERSION AND CERES_VERSION VERSION_LESS "2.0.0")
+    message(FATAL_ERROR "[automap_pro] Ceres ${_ceres_ver} < 2.0，无法使用 SphereManifold。请使用 thrid_party/ceres-solver 或系统 Ceres ≥ 2.0")
+  endif()
+  message(STATUS "[automap_pro] Ceres ${_ceres_ver}: SphereManifold 已启用（圆柱拟合）")
 endif()
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -519,6 +582,8 @@ add_library(automap_system_component SHARED
   src/system/modules/service_handlers.cpp
   src/system/modules/tasks_and_utils.cpp
   src/v3/map_registry.cpp
+  src/v3/semantic_processor.cpp
+  src/v3/semantic_module.cpp
   src/v3/frontend_module.cpp
   src/v3/dynamic_filter_module.cpp
   src/v3/mapping_module.cpp
@@ -526,6 +591,14 @@ add_library(automap_system_component SHARED
   src/system/frame_processor.cpp
 )
 target_include_directories(automap_system_component PUBLIC ${AUTOMAP_INCLUDE_DIRS})
+target_include_directories(automap_system_component PRIVATE
+  "${SLOAM_REC_SLOAM_INCLUDE}"
+  "${SLOAM_REC_SLOAM_INCLUDE}/helpers")
+if(USE_SLOAM_SEMANTIC)
+  target_include_directories(automap_system_component PRIVATE "${_onnx_include}")
+  target_compile_definitions(automap_system_component PRIVATE AUTOMAP_USE_SLOAM_SEMANTIC=1)
+endif()
+# 必须与 ament_target_dependencies 一致：全部用 plain 形式，否则 CMake 报 keyword/plain 混用
 target_link_libraries(automap_system_component
   automap_core automap_frontend automap_submap
   automap_loop_closure automap_backend automap_map
@@ -533,6 +606,10 @@ target_link_libraries(automap_system_component
   Boost::boost
   ${AUTOMAP_LIBS}
 )
+if(USE_SLOAM_SEMANTIC)
+  target_link_libraries(automap_system_component "${_onnx_lib}")
+  target_link_libraries(automap_system_component "${_sloam_segmentation_lib}")
+endif()
 ament_target_dependencies(automap_system_component ${AUTOMAP_AMENT_DEPS} ament_index_cpp)
 rclcpp_components_register_node(automap_system_component
   PLUGIN "automap_pro::AutoMapSystem"

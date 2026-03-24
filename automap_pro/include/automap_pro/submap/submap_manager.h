@@ -71,6 +71,9 @@ public:
 
     // ── 查询接口 ──────────────────────────────────────────────────────────
 
+    /** 🏛️ [架构加固] 允许外部持锁读取子图状态，确保 MappingModule 与 OptimizerModule 间的线程安全 */
+    std::mutex& mutex() const { return mutex_; }
+
     SubMap::Ptr         getActiveSubmap() const;
     SubMap::Ptr         getSubmap(int id)  const;
     std::vector<SubMap::Ptr> getAllSubmaps() const;
@@ -132,6 +135,13 @@ public:
      * @param sm 要冻结的子图指针
      */
     void freezeSubmap(const SubMap::Ptr& sm);
+
+    /**
+     * @brief 关联关键帧中的语义地标到子图
+     * @param sm 子图指针
+     * @param kf 关键帧指针
+     */
+    void associateLandmarks(SubMap::Ptr& sm, const KeyFrame::Ptr& kf);
 
 private:
     std::vector<SubMap::Ptr>  submaps_;
@@ -204,6 +214,16 @@ private:
     double max_temporal_ = 60.0;    // 秒
     double match_res_    = 0.4;     // 降采样分辨率（用于回环匹配）
     double merge_res_    = 0.2;     // 降采样分辨率（合并地图，至少 0.2 避免 PCL 溢出）
+
+    /** 构造时缓存，避免 merge/freeze/build 线程访问 ConfigManager 单例导致 shutdown 时 SIGSEGV */
+    bool retain_cloud_body_{true};
+    bool map_statistical_filter_{true};
+    int map_stat_filter_mean_k_{50};
+    double map_stat_filter_std_mul_{1.0};
+    double submap_rebuild_thresh_trans_{2.0};
+    double submap_rebuild_thresh_rot_{5.0};
+    bool parallel_voxel_downsample_{true};
+    bool backend_verbose_trace_{false};
 
     std::weak_ptr<rclcpp::Node> node_;
     rclcpp::Publisher<automap_pro::msg::SubMapEventMsg>::SharedPtr event_pub_;

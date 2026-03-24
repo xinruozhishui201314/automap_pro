@@ -50,6 +50,17 @@ KeyFrame::Ptr MapRegistry::getKeyFrame(int id) const {
     return (it != keyframes_.end()) ? it->second : nullptr;
 }
 
+KeyFrame::Ptr MapRegistry::getKeyFrameByTimestamp(double timestamp) const {
+    std::lock_guard<std::mutex> lock(kf_mutex_);
+    for (const auto& [id, kf] : keyframes_) {
+        (void)id;
+        if (kf && std::abs(kf->timestamp - timestamp) < 1e-4) {
+            return kf;
+        }
+    }
+    return nullptr;
+}
+
 KeyFrame::Ptr MapRegistry::getLatestKeyFrameByTimestamp() const {
     std::lock_guard<std::mutex> lock(kf_mutex_);
     KeyFrame::Ptr best;
