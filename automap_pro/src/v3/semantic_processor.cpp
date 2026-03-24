@@ -1,6 +1,7 @@
 #include "automap_pro/v3/semantic_processor.h"
 #include "automap_pro/core/logger.h"
 #include "automap_pro/core/config_manager.h"
+#include <stdexcept>
 
 // sloam_rec：include 根目录为包内 thrid_party/sloam_rec/sloam/include（由 CMake 注入）
 #ifdef AUTOMAP_USE_SLOAM_SEMANTIC
@@ -63,15 +64,13 @@ SemanticProcessor::SemanticProcessor(const Config& config) : config_(config) {
             config.model_path.c_str(), config.fov_up, config.fov_down, config.img_w, config.img_h);
     } catch (const std::exception& e) {
         RCLCPP_ERROR(rclcpp::get_logger("automap_system"), 
-            "[SEMANTIC][Processor][INIT] step=FAILED model_path=%s error=%s → Feature DISABLED",
+            "[SEMANTIC][Processor][INIT] step=FAILED model_path=%s error=%s → abort startup",
             config.model_path.c_str(), e.what());
-        segmentator_ = nullptr;
-        instance_detector_ = nullptr;
+        throw std::runtime_error(std::string("SemanticProcessor init failed: ") + e.what());
     }
 #else
     (void)config;
-    RCLCPP_WARN(rclcpp::get_logger("automap_system"),
-        "[SEMANTIC][Processor][INIT] sloam_segmentation not linked at build time; running in stub mode");
+    throw std::runtime_error("SemanticProcessor requires AUTOMAP_USE_SLOAM_SEMANTIC=1; stub mode is forbidden");
 #endif
 }
 
@@ -169,6 +168,14 @@ std::vector<CylinderLandmark::Ptr> SemanticProcessor::process(const CloudXYZICon
     }
 
     return landmarks;
+#endif
+}
+
+bool SemanticProcessor::hasRuntimeCapability() const {
+#ifdef AUTOMAP_USE_SLOAM_SEMANTIC
+    return segmentator_ != nullptr;
+#else
+    return false;
 #endif
 }
 

@@ -282,10 +282,12 @@ void OptimizerModule::processGPSBatchKF(const OptTaskItem& task) {
     std::vector<IncrementalOptimizer::GPSFactorItemKF> factors;
     size_t reject_quality = 0;
     const auto& cfg = ConfigManager::instance();
+    const double gps_max_dt = cfg.gpsKeyframeMatchWindowS();
     for (const auto& kf : all_kfs) {
         if (!kf) continue;
+        const double gps_dt = std::abs(kf->timestamp - kf->gps.timestamp);
         const auto decision = evaluateKeyframeGpsConstraint(
-            kf->gps, kf->has_valid_gps, cfg.gpsMinAcceptedQualityLevel(), true);
+            kf->gps, kf->has_valid_gps, cfg.gpsMinAcceptedQualityLevel(), true, gps_dt, gps_max_dt);
         if (!decision.accepted) {
             if (decision.reason == GPSConstraintRejectReason::QUALITY_BELOW_POLICY) {
                 reject_quality++;
@@ -324,19 +326,15 @@ void OptimizerModule::processKeyframeCreate(const OptTaskItem& task) {
     bool is_first_kf_of_submap = (kf->id % MAX_KF_PER_SUBMAP == 0);
     optimizer_.addKeyFrameNode(kf->id, kf->T_odom_b, false, is_first_kf_of_submap);
     
-    // 2. 添加里程计因子
-    if (task.has_prev_kf && task.prev_keyframe) {
-        auto prev_kf = task.prev_keyframe;
-        Pose3d rel = prev_kf->T_odom_b.inverse() * kf->T_odom_b;
-        Mat66d info = computeOdomInfoMatrixForKeyframes(prev_kf, kf, rel);
-        optimizer_.addOdomFactorBetweenKeyframes(prev_kf->id, kf->id, rel, info);
-    }
+    // 2. 里程计 Between 因子由 IncrementalOptimizer::addKeyFrameNode 统一添加。
+    // 这里不再重复 add，避免同一 (prev, curr) 键值对被双重约束。
     
     // 3. 添加 GPS 因子 (如果已对齐)，pos_map = R_enu_to_map * position_enu + t_enu_to_map
     // grep CONSTRAINT][GPS_KF 闭环：对齐状态 / 是否有观测 / 质量策略 / hdop
     const auto& gcfg = ConfigManager::instance();
+    const double gps_dt = std::abs(kf->timestamp - kf->gps.timestamp);
     const auto gps_decision = evaluateKeyframeGpsConstraint(
-        kf->gps, kf->has_valid_gps, gcfg.gpsMinAcceptedQualityLevel(), true);
+        kf->gps, kf->has_valid_gps, gcfg.gpsMinAcceptedQualityLevel(), true, gps_dt, gcfg.gpsKeyframeMatchWindowS());
     if (task.gps_aligned && gps_decision.accepted) {
         Eigen::Vector3d pos_map = task.gps_transform_R * kf->gps.position_enu + task.gps_transform_t;
         optimizer_.addGPSFactorForKeyFrame(kf->id, pos_map, kf->gps.covariance);
@@ -363,7 +361,8 @@ void OptimizerModule::processKeyframeCreate(const OptTaskItem& task) {
             static_cast<unsigned long>(kf->id), kf->has_valid_gps ? 1 : 0);
     } else if (gps_decision.reason == GPSConstraintRejectReason::NO_GPS_ON_KEYFRAME ||
                gps_decision.reason == GPSConstraintRejectReason::ENU_NOT_FINITE ||
-               gps_decision.reason == GPSConstraintRejectReason::COV_NOT_FINITE) {
+               gps_decision.reason == GPSConstraintRejectReason::COV_NOT_FINITE ||
+               gps_decision.reason == GPSConstraintRejectReason::OUTSIDE_TIME_WINDOW) {
         RCLCPP_DEBUG(node_->get_logger(),
             "[CONSTRAINT][GPS_KF] result=skip reason=invalid_or_missing_measurement kf_id=%lu aligned=%d reject_reason=%d "
             "(前端 GPS_CACHE 未命中/ENU未就绪/协方差异常；grep GPS_CACHE KPI)",

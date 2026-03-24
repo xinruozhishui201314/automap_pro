@@ -2,6 +2,8 @@
 
 #include "automap_pro/core/config_manager.h"
 #include "automap_pro/core/data_types.h"
+#include <cmath>
+#include <limits>
 
 namespace automap_pro {
 
@@ -36,10 +38,17 @@ inline GPSConstraintDecision evaluateKeyframeGpsConstraint(
     const GPSMeasurement& gps,
     bool has_valid_gps,
     int min_accepted_level,
-    bool require_finite_covariance)
+    bool require_finite_covariance,
+    double measurement_time_abs_diff_s = -1.0,
+    double max_allowed_time_abs_diff_s = std::numeric_limits<double>::infinity())
 {
     if (!has_valid_gps) {
         return {false, GPSConstraintRejectReason::NO_GPS_ON_KEYFRAME};
+    }
+    if (std::isfinite(max_allowed_time_abs_diff_s) &&
+        measurement_time_abs_diff_s >= 0.0 &&
+        measurement_time_abs_diff_s > max_allowed_time_abs_diff_s) {
+        return {false, GPSConstraintRejectReason::OUTSIDE_TIME_WINDOW};
     }
     if (!gpsQualityAcceptedByPolicy(gps.quality, min_accepted_level)) {
         return {false, GPSConstraintRejectReason::QUALITY_BELOW_POLICY};

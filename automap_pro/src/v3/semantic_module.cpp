@@ -1,6 +1,7 @@
 #include "automap_pro/v3/semantic_module.h"
 #include "automap_pro/core/config_manager.h"
 #include "automap_pro/core/metrics.h"
+#include <stdexcept>
 
 namespace automap_pro::v3 {
 
@@ -22,11 +23,12 @@ SemanticModule::SemanticModule(EventBus::Ptr event_bus, MapRegistry::Ptr map_reg
     s_cfg.do_destagger = cfg.semanticDoDestagger();
 
     semantic_processor_ = std::make_shared<SemanticProcessor>(s_cfg);
+    semantic_runtime_ready_ = semantic_processor_ && semantic_processor_->hasRuntimeCapability();
 
     // 订阅同步帧事件
     onEvent<SyncedFrameEvent>([this](const SyncedFrameEvent& ev) {
         if (!running_.load()) return;
-        if (!semantic_processor_) return;
+        if (!semantic_runtime_ready_) return;
 
         std::lock_guard<std::mutex> lock(queue_mutex_);
         // 🏛️ [产品化加固] 背压策略：若积压过多，丢弃最旧的任务
@@ -45,9 +47,15 @@ SemanticModule::SemanticModule(EventBus::Ptr event_bus, MapRegistry::Ptr map_reg
             ev.timestamp, (ev.cloud && ev.cloud->size() > 0) ? ev.cloud->size() : 0, task_queue_.size());
     });
 
+    if (!semantic_runtime_ready_) {
+        RCLCPP_ERROR(node_->get_logger(),
+            "[SEMANTIC][Module][INIT] step=failed enabled=0 reason=processor_stub_or_unavailable queue_max=%zu",
+            kMaxQueueSize);
+        throw std::runtime_error("SemanticModule init failed: runtime semantic capability is unavailable");
+    }
     RCLCPP_INFO(node_->get_logger(),
-        "[SEMANTIC][Module][INIT] step=ok enabled=%d queue_max=%zu",
-        (semantic_processor_ != nullptr) ? 1 : 0, kMaxQueueSize);
+        "[SEMANTIC][Module][INIT] step=ok enabled=1 queue_max=%zu",
+        kMaxQueueSize);
 }
 
 void SemanticModule::start() {

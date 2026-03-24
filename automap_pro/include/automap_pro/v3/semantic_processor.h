@@ -53,6 +53,7 @@ public:
      * @return A vector of extracted CylinderLandmarks
      */
     std::vector<CylinderLandmark::Ptr> process(const CloudXYZIConstPtr& cloud);
+    bool hasRuntimeCapability() const;
 
 private:
     Config config_;

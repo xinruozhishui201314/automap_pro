@@ -32,6 +32,7 @@ private:
 
     rclcpp::Node::SharedPtr node_;
     SemanticProcessor::Ptr semantic_processor_;
+    bool semantic_runtime_ready_ = false;
 
     // 任务队列
     mutable std::mutex queue_mutex_;
