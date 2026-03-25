@@ -41,6 +41,15 @@ public:
                 event.t_enu_to_map = Eigen::Vector3d::Zero();
                 event.rmse = 0.0;
             }
+            event.meta.event_id = event.event_seq;
+            event.meta.idempotency_key = event.event_seq;
+            event.meta.producer_seq = event.event_seq;
+            event.meta.ref_version = map_registry_->getVersion();
+            event.meta.ref_epoch = event.alignment_epoch;
+            event.meta.source_ts = node_->now().seconds();
+            event.meta.publish_ts = node_->now().seconds();
+            event.meta.producer = "GPSModule";
+            event.meta.route_tag = "legacy";
 
             if (event.isValid()) {
                 RCLCPP_DEBUG(node_->get_logger(),

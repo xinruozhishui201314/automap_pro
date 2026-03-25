@@ -27,6 +27,38 @@ void Instance::findClusters(const CloudT::Ptr pc,
     euclidean_segmentation.setInputCloud(pc);
     euclidean_segmentation.segment(euclidean_labels, label_indices);
 
+    static uint64_t s_find_clusters_calls = 0;
+    ++s_find_clusters_calls;
+    if (s_find_clusters_calls <= 20 || (s_find_clusters_calls % 20) == 0) {
+      size_t finite_points = 0;
+      for (const auto& p : pc->points) {
+        if (std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z)) {
+          ++finite_points;
+        }
+      }
+      size_t max_label_points = 0;
+      size_t labels_gt1 = 0;
+      for (const auto& idx : label_indices) {
+        const size_t n = idx.indices.size();
+        if (n > max_label_points) max_label_points = n;
+        if (n > 1) ++labels_gt1;
+      }
+      const bool organized = (pc->width > 1 && pc->height > 1 &&
+                              pc->size() == static_cast<size_t>(pc->width) * static_cast<size_t>(pc->height));
+      const double finite_ratio = 100.0 * static_cast<double>(finite_points) /
+                                  static_cast<double>(std::max<size_t>(1, pc->size()));
+      std::cout << "[Trellis][CLUSTER_INPUT_DIAG] calls=" << s_find_clusters_calls
+                << " cloud_wh=" << pc->width << "x" << pc->height
+                << " organized=" << (organized ? 1 : 0)
+                << " points=" << pc->size()
+                << " finite_points=" << finite_points
+                << " finite_ratio=" << finite_ratio << "%"
+                << " labels_total=" << label_indices.size()
+                << " labels_gt1=" << labels_gt1
+                << " max_label_points=" << max_label_points
+                << std::endl;
+    }
+
     // pcl::PCDWriter writer;
     // for (size_t i = 0; i < label_indices.size (); i++){
     //   // std::cout << "LABEL INDICES SIZE: " << label_indices.at(i).indices.size() << std::endl;
@@ -105,8 +137,17 @@ void Instance::findTrees(const CloudT::Ptr pc,
     pcl::PointCloud<pcl::Label>& euclidean_labels,
     std::vector<pcl::PointIndices>& label_indices, std::vector<std::vector<TreeVertex>>& landmarks){
 
+    size_t labels_total = label_indices.size();
+    size_t pass_cluster_points = 0;
+    size_t pass_tree_vertices = 0;
+    size_t max_cluster_points = 0;
+    size_t max_tree_vertices = 0;
+
     for (size_t i = 0; i < label_indices.size(); i++){
-      if (label_indices.at(i).indices.size () > 80){
+      const size_t cluster_points = label_indices.at(i).indices.size();
+      if (cluster_points > max_cluster_points) max_cluster_points = cluster_points;
+      if (cluster_points > static_cast<size_t>(params_.min_cluster_points)){
+        ++pass_cluster_points;
         std::vector<TreeVertex> tree;
         for (int row_idx = pc->height - 1; row_idx >= 0; --row_idx) {
           CloudT::Ptr beam(new CloudT);
@@ -121,13 +162,30 @@ void Instance::findTrees(const CloudT::Ptr pc,
             if(v.isValid) tree.push_back(v);
           }
         }
-        if(tree.size() > 16){
+        if(tree.size() > static_cast<size_t>(params_.min_tree_vertices)){
+          ++pass_tree_vertices;
+          if (tree.size() > max_tree_vertices) max_tree_vertices = tree.size();
           if(tree.size() > 56) {
             tree.resize(56);
           }
           landmarks.push_back(tree);
+        } else if (tree.size() > max_tree_vertices) {
+          max_tree_vertices = tree.size();
         }
       }
+    }
+    static uint64_t s_find_trees_calls = 0;
+    ++s_find_trees_calls;
+    if (s_find_trees_calls <= 20 || (s_find_trees_calls % 20) == 0) {
+      std::cout << "[Trellis][DIAG] calls=" << s_find_trees_calls
+                << " labels_total=" << labels_total
+                << " pass_cluster_points_gt" << params_.min_cluster_points << "=" << pass_cluster_points
+                << " pass_tree_vertices_gt" << params_.min_tree_vertices << "=" << pass_tree_vertices
+                << " out_landmarks=" << landmarks.size()
+                << " max_cluster_points=" << max_cluster_points
+                << " max_tree_vertices=" << max_tree_vertices
+                << " cloud_wh=" << pc->width << "x" << pc->height
+                << std::endl;
     }
 }
 

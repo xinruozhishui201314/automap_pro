@@ -6,6 +6,9 @@
 #include <atomic>
 #include <chrono>
 #include <deque>
+#include <limits>
+#include <thread>
+#include <vector>
 
 namespace automap_pro::v3 {
 
@@ -32,26 +35,32 @@ protected:
 
 private:
     void processTask(const SyncedFrameEvent& event);
+    void processTask(const SyncedFrameEvent& event, size_t worker_idx);
+    void workerLoop(size_t worker_idx);
+    void maybeAdjustActiveWorkersLocked(double now_s);
     void enqueueTaskLocked(const SyncedFrameEvent& ev);
-    void flushPendingKeyframeTasksLocked();
-    void handleSyncedFrameEvent(const SyncedFrameEvent& ev);
-    bool normalizeSemanticInputFrame(const SyncedFrameEvent& in, SyncedFrameEvent& out) const;
+    void handleGraphTaskEvent(const GraphTaskEvent& ev);
     void tryRecoverFromDegradedState(double now_s);
-    void retryPendingFramesLocked();
 
     rclcpp::Node::SharedPtr node_;
-    SemanticProcessor::Ptr semantic_processor_;
+    std::vector<SemanticProcessor::Ptr> semantic_processors_;
+    std::vector<std::thread> worker_threads_;
+    size_t worker_thread_count_{1};
+    std::atomic<size_t> active_worker_count_{1};
+    size_t min_worker_count_{1};
+    double next_scale_eval_s_{0.0};
+    double autoscale_eval_interval_s_{1.0};
+    double autoscale_high_watermark_{0.7};
+    double autoscale_low_watermark_{0.2};
+    mutable std::mutex processor_mutex_;
     std::atomic<bool> semantic_runtime_ready_{false};
     SemanticProcessor::Config semantic_cfg_;
 
     // 任务队列
     mutable std::mutex queue_mutex_;
     std::deque<SyncedFrameEvent> task_queue_;
-    std::deque<SyncedFrameEvent> pending_keyframe_queue_;
     static constexpr size_t kMaxQueueSize = 5; // 限制队列长度，防止积压导致高延迟
     static constexpr size_t kCoalesceThreshold = 2; // 队列拥塞时合并为最新帧，避免语义线程长期处理陈旧数据
-    static constexpr size_t kMaxPendingKeyframeQueueSize = 32; // 关键帧信息晚到时短暂缓存，避免误丢真正关键帧
-    static constexpr double kPendingTaskMaxAgeSec = 0.5;       // 超过该时长仍无法确认关键帧则丢弃
 
     // 🏛️ [产品化加固] 自动降级策略：连续多次崩溃或异常后自动停用语义模块
     std::atomic<int> consecutive_errors_{0};
@@ -70,23 +79,20 @@ private:
     std::atomic<uint64_t> backpressure_drops_{0};
     std::atomic<uint64_t> skipped_non_keyframe_{0};
     std::atomic<uint64_t> skipped_duplicate_keyframe_{0};
-    std::atomic<uint64_t> pending_requeued_{0};
-    std::atomic<uint64_t> pending_dropped_{0};
+    std::atomic<uint64_t> gate_accept_total_{0};
+    std::atomic<uint64_t> sem_event_publish_total_{0};
+    std::atomic<uint64_t> sem_event_drop_no_landmark_total_{0};
+    std::atomic<uint64_t> semantic_event_seq_{0};
     // dt = |frame_ts - kf_ts| 统计桶（秒）
     // [0,0.01], (0.01,0.03], (0.03,0.05], (0.05,0.10], (0.10,0.20], (0.20,0.50], >0.50, missing_kf_ts
     std::array<std::atomic<uint64_t>, 8> dt_hist_bins_{
         std::atomic<uint64_t>{0}, std::atomic<uint64_t>{0}, std::atomic<uint64_t>{0}, std::atomic<uint64_t>{0},
         std::atomic<uint64_t>{0}, std::atomic<uint64_t>{0}, std::atomic<uint64_t>{0}, std::atomic<uint64_t>{0}};
     std::array<uint64_t, 8> dt_hist_last_snapshot_{{0, 0, 0, 0, 0, 0, 0, 0}};
-    // pending 生命周期样本（仅记录因超龄丢弃的 age 秒），用于 P50/P90/P99 估计
-    std::deque<double> pending_drop_age_samples_sec_;
-    static constexpr size_t kMaxPendingAgeSamples = 2048;
     std::chrono::steady_clock::time_point last_stats_log_tp_{std::chrono::steady_clock::now()};
     std::chrono::steady_clock::time_point last_dt_delta_log_tp_{std::chrono::steady_clock::now()};
-    bool keyframes_only_{false};
-    double keyframe_time_tolerance_s_{0.03};
-    std::atomic<double> latest_kf_ts_seen_{-1.0};
     std::atomic<double> last_enqueued_kf_ts_{-1.0};
+    std::atomic<uint64_t> last_keyframe_task_id_{std::numeric_limits<uint64_t>::max()};
 };
 
 } // namespace automap_pro::v3

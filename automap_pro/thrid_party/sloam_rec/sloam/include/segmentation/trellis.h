@@ -30,13 +30,17 @@ public:
    */
   struct Params {
     // Parameters for vertex construction
-    float beam_cluster_threshold;
-    float max_dist_to_centroid;
-    int min_vertex_size;
+    float beam_cluster_threshold = 0.1f;
+    float max_dist_to_centroid = 0.2f;
+    int min_vertex_size = 2;
 
     // Parameters to determine valid landmark
-    int min_landmark_size;
-    float min_landmark_height;
+    int min_landmark_size = 4;
+    float min_landmark_height = 1.0f;
+
+    // Trellis hard gates (diagnostic configurable; defaults preserve legacy behavior)
+    int min_cluster_points = 80;
+    int min_tree_vertices = 16;
   };
 
   explicit Instance();

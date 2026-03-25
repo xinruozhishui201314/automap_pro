@@ -63,6 +63,9 @@ performance:
   parallel_teaser_max_inflight: 4  # 并发限流：并行 TEASER 最大 in-flight
   max_optimization_queue_size: 128 # 高资源可 128，减少优化任务丢弃
 
+orchestrator:
+  takeover_enabled: false
+
 # ┌─────────────────────────────────────────────────────────────────────────────
 # 二、前端参数
 # └─────────────────────────────────────────────────────────────────────────────
@@ -99,9 +102,35 @@ frontend:
 # ── 2.2c 语义模块（SLOAM 语义分割 + 树干地标）───────────────────────────────
 semantic:
   enabled: true
+  # 可选后端：sloam | lsk3dnet（纯 TorchScript 距离图）| lsk3dnet_hybrid（Python spconv 骨干 + LibTorch 分类头）
+  model_type: "sloam"
   # 离线 launch 会将 ${CMAKE_CURRENT_SOURCE_DIR} 解析为仓库绝对路径并写入 /tmp 补丁配置。
   # 若该路径不存在，离线 launch 会自动尝试仓库 models 下其它 segmentator onnx 候选。
   model_path: "${CMAKE_CURRENT_SOURCE_DIR}/models/squeezesegV2_segmentator.onnx"
+  lsk3dnet:
+    # model_type=lsk3dnet 时使用的 TorchScript 路径
+    model_path: "${CMAKE_CURRENT_SOURCE_DIR}/models/lsk3dnet.ts"
+    # cpu | cuda:0 | cuda:1
+    device: "cpu"
+    # ── lsk3dnet_hybrid 专用（需 USE_TORCH 编译 + 本机 Python 含 torch/spconv 与权重一致）──
+    # repo_root: LSK3DNet-main 根目录（含 network/、scripts/lsk3dnet_hybrid_worker.py）
+    # config_yaml / checkpoint / classifier_torchscript：可为绝对路径，或相对 repo_root
+    # classifier：用 LSK3DNet-main/scripts/export_lsk3dnet_classifier_torchscript.py 从同一 checkpoint 导出
+    # repo_root: ""
+    # config_yaml: "config/lk-semantickitti_erk_finetune.yaml"
+    # checkpoint: "output_skitti/your.pt"
+    # classifier_torchscript: "${CMAKE_CURRENT_SOURCE_DIR}/models/lsk_classifier.ts"
+    # python: "python3"
+    # worker_script: ""   # 留空则优先 share/automap_pro/lsk3dnet_scripts/（安装后），否则 repo_root/scripts/
+    # 生产闭环（推荐）:
+    # 1) 用 export_lsk3dnet_classifier_torchscript.py 导出 .pt，会生成同名的 .meta.json（SHA256 + feat_dim）
+    # 2) hybrid_normal_mode=range 需 LSK 的 c_gen_normal_map；无扩展时用 zeros 仅调试
+    # 3) normal_fov_* / normal_proj_* 应与训练时 dataset 距离图参数一致（默认 3,-25,64,900）
+    # hybrid_normal_mode: "range"
+    # normal_fov_up_deg: 3.0
+    # normal_fov_down_deg: -25.0
+    # normal_proj_h: 64
+    # normal_proj_w: 900
   # 模型自描述驱动:
   # 0 = 自动从 ONNX 输入/输出维度读取（推荐，换模型无需改代码）
   input_channels: 0
@@ -117,9 +146,49 @@ semantic:
   img_w: 2048
   img_h: 64
   do_destagger: true
+  # 实例聚类参数（默认沿用历史值）
+  # 验证档（仅配置）: 放宽聚类门限，适配关键帧稀疏点云
+  beam_cluster_threshold: 0.5
+  max_dist_to_centroid: 0.35
+  min_vertex_size: 2
+  min_landmark_size: 2
+  min_landmark_height: 0.5
+  # 语义并行 worker 数：0=自动（按 system.num_threads 推导），建议 2~6；核数小时设 1~2
+  worker_threads: 0
+  autoscale:
+    # 动态扩缩容评估周期(秒)
+    eval_interval_s: 1.0
+    # 队列使用率高水位（0~1），超过后倾向扩容
+    high_watermark: 0.7
+    # 队列使用率低水位（0~1），低于后倾向缩容
+    low_watermark: 0.2
+    # 动态缩容时保留的最小活跃 worker 数
+    min_active_workers: 2
   # 仅对关键帧做语义，显著降低推理负载；关键帧判定基于 frame_ts 与 kf_info.timestamp 时间对齐
-  keyframes_only: true
+  # 验证档（仅配置）: 临时对所有帧做语义，验证稀疏关键帧是否为主因
+  keyframes_only: false
   keyframe_time_tolerance_s: 0.03
+  # 诊断开关（默认关闭，不改变主流程）
+  diag:
+    enable_detailed_stats: true
+    log_class_histogram: true
+    class_hist_top_k: 8
+    class_hist_interval_frames: 20
+    # 调试：打印全部类别（类别 -> 像素数/点数）
+    dump_all_classes: true
+    # 调试：每个类别额外打印的点数量（0=不打印；>0=上限；-1=打印该类别全部点）
+    dump_points_per_class_limit: -1
+    # 最小回退补丁：恢复默认，不覆盖 tree_label（避免与 255 掩码语义冲突）
+    # -2: 不覆盖（默认）；-1: 自动；>=0: 强制 maskCloud 使用指定类 id
+    override_tree_class_id: 19
+    # default | relaxed（relaxed 用于快速验证“聚类阈值过严”）
+    cluster_profile: "relaxed"
+    # 诊断验证补丁：切到 dense_for_clustering，对齐 sloam_rec 原始链路输入形态。
+    # sparse | dense_for_clustering（仅影响 automap_pro 调用方式，不改第三方代码）
+    cluster_input_mode: "dense_for_clustering"
+    # Trellis 硬门限（默认保持官方/历史行为，仅用于诊断验证“是否门限最后一环”）
+    trellis_min_cluster_points: 20
+    trellis_min_tree_vertices: 3
 
 # ── 2.2b 动态点过滤（FrontEnd->DynamicFilter->Mapping）──────────────────────
 dynamic_filter:
@@ -194,8 +263,8 @@ fast_livo:
   preprocess:                              # LiDAR 预处理（M2DGR Velodyne VLP-32C）
     lidar_type:       2         # 2=Velodyne
     scan_line:        32
-    point_filter_num: 4
-    filter_size_surf: 0.4      # 原 0.25，减小以改善点云密度、减轻模糊
+    point_filter_num: 1
+    filter_size_surf: 0.1      # 验证档（仅配置）: 减小下采样，提升语义输入密度
     blind:            1.0       # 最小量程约 1.0 m
 
   vio:                                     # VIO（仅 img_en=1 生效）
@@ -225,9 +294,9 @@ fast_livo:
     dept_err:        0.02
     beam_err:        0.05
     min_eigen_value: 0.0025
-    voxel_size:      2.0
+    voxel_size:      0.2
     max_layer:       2
-    max_points_num:  50
+    max_points_num:  500
     sigma_num:       3.0
     min_iterations:  5
     layer_init_num:  [5, 5, 5, 5, 5]

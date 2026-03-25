@@ -205,7 +205,12 @@ void AutoMapSystem::deferredSetupModules() {
         v3_context_->eventBus(), v3_context_->mapRegistry(), shared_from_this());
     v3_context_->registerModule(optimizer_module_);
 
-    RCLCPP_INFO(get_logger(), "[PIPELINE][SYS] step=08g ctor+register MappingModule (SubMap+HBA)");
+    RCLCPP_INFO(get_logger(), "[PIPELINE][SYS] step=08g ctor+register MapOrchestrator (observe/advice)");
+    map_orchestrator_ = std::make_shared<v3::MapOrchestrator>(
+        v3_context_->eventBus(), v3_context_->mapRegistry(), shared_from_this());
+    v3_context_->registerModule(map_orchestrator_);
+
+    RCLCPP_INFO(get_logger(), "[PIPELINE][SYS] step=08h ctor+register MappingModule (SubMap+HBA)");
     mapping_module_ = std::make_shared<v3::MappingModule>(
         v3_context_->eventBus(), v3_context_->mapRegistry(), shared_from_this());
     v3_context_->registerModule(mapping_module_);

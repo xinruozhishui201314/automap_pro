@@ -490,6 +490,16 @@ void Segmentation::_makeTensor(std::vector<std::vector<float>>& projected_data, 
 }
 
 void Segmentation::_destaggerCloud(const Cloud::Ptr cloud, Cloud::Ptr& outCloud){
+  const size_t expected_dense_points = static_cast<size_t>(_img_h) * static_cast<size_t>(_img_w);
+  if (!outCloud) {
+    outCloud.reset(new Cloud);
+  }
+  // Enforce output buffer shape; trellis expects organized HxW cloud.
+  outCloud->points.resize(expected_dense_points);
+  outCloud->width = _img_w;
+  outCloud->height = _img_h;
+  outCloud->is_dense = false;  // contains NaN holes by design
+
   bool col_valid = true;
 
   for(auto irow = 0; irow < _img_h; irow++){
@@ -566,28 +576,64 @@ void Segmentation::maskCloud(const Cloud::Ptr cloud,
 
   pcl::copyPointCloud(*tempCloud, *outCloud);
   if(dense){
-    // destagger. TODO: Do this with mask    
-    // Adapted from Chao's driver
-    if (_do_destagger){
-      const size_t expected_dense_points = static_cast<size_t>(_img_h) * static_cast<size_t>(_img_w);
-      if (tempCloud->size() != expected_dense_points) {
-        std::cerr << "[Segmentation][maskCloud][DENSE_LAYOUT_MISMATCH] "
-                  << "requested_dense=1 do_destagger=1 temp_cloud_size=" << tempCloud->size()
-                  << " expected=" << expected_dense_points
-                  << " action=fallback_to_sparse_output" << std::endl;
-        outCloud = tempCloud;
-        outCloud->width = outCloud->points.size();
-        outCloud->height = 1;
-        outCloud->is_dense = false;
-        return;
+    const size_t expected_dense_points = static_cast<size_t>(_img_h) * static_cast<size_t>(_img_w);
+    Cloud::Ptr dense_cloud(new Cloud);
+    dense_cloud->points.resize(expected_dense_points);
+    Point nan_pt;
+    nan_pt.x = nan_pt.y = nan_pt.z = std::numeric_limits<float>::quiet_NaN();
+    nan_pt.intensity = 0.0f;
+    for (auto& p : dense_cloud->points) p = nan_pt;
+
+    size_t matched_points = 0;
+    size_t unique_pixels = 0;
+    size_t overwrite_pixels = 0;
+    for (size_t i = 0; i < cloud_n; ++i) {
+      const size_t proj_idx = static_cast<size_t>(proj_ys[i]) * static_cast<size_t>(_img_w) +
+                              static_cast<size_t>(proj_xs[i]);
+      if (proj_idx >= expected_dense_points) continue;
+      if (mask.data[proj_idx] != val) continue;
+
+      ++matched_points;
+      Point& dst = dense_cloud->points[proj_idx];
+      if (std::isfinite(dst.x) && std::isfinite(dst.y) && std::isfinite(dst.z)) {
+        ++overwrite_pixels;
+      } else {
+        ++unique_pixels;
       }
-      _destaggerCloud(tempCloud, outCloud);
+      dst = cloud->points[i];
+    }
+
+    // Always emit organized HxW output for trellis, even when source cloud is sparse.
+    if (_do_destagger) {
+      _destaggerCloud(dense_cloud, outCloud);
     } else {
-       outCloud = tempCloud;
+      outCloud = dense_cloud;
     }
     outCloud->width = _img_w;
     outCloud->height = _img_h;
-    outCloud->is_dense = true;
+    outCloud->is_dense = false;  // contains NaN holes by design
+
+    const bool organized = (outCloud->size() == expected_dense_points &&
+                            outCloud->width == static_cast<uint32_t>(_img_w) &&
+                            outCloud->height == static_cast<uint32_t>(_img_h));
+    const double fill_ratio = 100.0 * static_cast<double>(unique_pixels) /
+                              static_cast<double>(std::max<size_t>(1, expected_dense_points));
+    std::cout << "[Segmentation][maskCloud][DENSE_REBUILD] "
+              << "matched_points=" << matched_points
+              << " unique_pixels=" << unique_pixels
+              << " overwrite_pixels=" << overwrite_pixels
+              << " fill_ratio=" << fill_ratio << "%"
+              << " output_wh=" << outCloud->width << "x" << outCloud->height
+              << " organized=" << (organized ? 1 : 0)
+              << " source_temp_size=" << tempCloud->size()
+              << std::endl;
+    if (!organized) {
+      std::cerr << "[Segmentation][maskCloud][DENSE_REBUILD_ERROR] "
+                << "postcondition_failed points=" << outCloud->size()
+                << " expected=" << expected_dense_points
+                << " wh=" << outCloud->width << "x" << outCloud->height
+                << std::endl;
+    }
   } else {
     outCloud->width = outCloud->points.size();
     outCloud->height = 1;
@@ -639,6 +685,26 @@ void Segmentation::_mask(const float* output, const std::vector<size_t>& invalid
   #pragma omp parallel for if(invalid_idxs.size() > 1000)
   for (size_t i = 0; i < invalid_idxs.size(); ++i) {
       mask_ptr[invalid_idxs[i]] = 0;
+  }
+
+  static uint64_t s_mask_calls = 0;
+  ++s_mask_calls;
+  if (s_mask_calls <= 20 || (s_mask_calls % 20) == 0) {
+      size_t class255 = 0;
+      size_t nonzero = 0;
+      for (int i = 0; i < channel_offset; ++i) {
+          const unsigned char v = mask_ptr[i];
+          if (v == 255) ++class255;
+          if (v != 0) ++nonzero;
+      }
+      const double total = static_cast<double>(std::max(1, channel_offset));
+      std::cout << "[Segmentation][MaskDiag] calls=" << s_mask_calls
+                << " tree_class_id=" << _tree_class_id
+                << " class255=" << class255
+                << " class255_ratio=" << (100.0 * static_cast<double>(class255) / total) << "%"
+                << " nonzero_ratio=" << (100.0 * static_cast<double>(nonzero) / total) << "%"
+                << " invalid_pixels=" << invalid_idxs.size()
+                << std::endl;
   }
 }
 

@@ -167,6 +167,8 @@ void DynamicFilterModule::processOne(const SyncedFrameEvent& in) {
     out.gps = in.gps;
     out.ref_map_version = in.ref_map_version;
     out.ref_alignment_epoch = in.ref_alignment_epoch;
+    out.meta = in.meta;
+    out.processing_state = in.processing_state;
     out.input_points = in.cloud ? in.cloud->size() : 0;
     out.filter_executed = true;
     out.filtered_output_used = false;
@@ -289,6 +291,8 @@ FilteredFrameEventOptionalDs DynamicFilterModule::passthrough(
     out.gps = in.gps;
     out.ref_map_version = in.ref_map_version;
     out.ref_alignment_epoch = in.ref_alignment_epoch;
+    out.meta = in.meta;
+    out.processing_state = in.processing_state;
     out.filter_executed = false;
     out.filtered_output_used = false;
     out.fallback_reason = reason;

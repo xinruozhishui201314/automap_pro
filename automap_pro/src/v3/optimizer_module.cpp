@@ -52,6 +52,11 @@ uint64_t computeBatchHash(const std::unordered_map<int, automap_pro::Pose3d>& sm
     }
     return h;
 }
+
+uint64_t semanticTraceId(uint64_t kf_id, double ts) {
+    const uint64_t ts_us = std::isfinite(ts) ? static_cast<uint64_t>(std::max(0.0, ts) * 1e6) : 0ull;
+    return (kf_id << 20) ^ ts_us;
+}
 } // namespace
 
 namespace automap_pro::v3 {
@@ -87,6 +92,7 @@ OptimizerModule::OptimizerModule(EventBus::Ptr event_bus, MapRegistry::Ptr map_r
             std::unordered_map<uint64_t, Pose3d> kf_updates = res.keyframe_poses;
             PoseFrame output_frame = res.pose_frame;
             uint32_t transform_flags = static_cast<uint32_t>(OptimizationTransformFlags::NONE);
+            const double publish_ts = node_->now().seconds();
 
             // Keep Optimizer->MapRegistry contract consistent with Mapping gateway:
             // once GPS aligned, convert ODOM results to MAP before writing into SSoT.
@@ -109,6 +115,25 @@ OptimizerModule::OptimizerModule(EventBus::Ptr event_bus, MapRegistry::Ptr map_r
                 for (auto& [id, pose] : kf_updates) pose = T_map_odom * pose;
                 output_frame = PoseFrame::MAP;
                 transform_flags |= static_cast<uint32_t>(OptimizationTransformFlags::MAP_COMPENSATION_APPLIED);
+            }
+            OptimizationDeltaEvent delta_ev;
+            delta_ev.alignment_epoch = source_alignment_epoch;
+            delta_ev.pose_frame = output_frame;
+            delta_ev.submap_delta = sm_updates;
+            delta_ev.keyframe_delta = kf_updates;
+            delta_ev.producer = "OptimizerModule";
+            delta_ev.meta.event_id = map_registry_->getVersion() + 1;
+            delta_ev.meta.idempotency_key = computeBatchHash(sm_updates, kf_updates);
+            if (delta_ev.meta.idempotency_key == 0) delta_ev.meta.idempotency_key = delta_ev.meta.event_id;
+            delta_ev.meta.producer_seq = delta_ev.meta.event_id;
+            delta_ev.meta.ref_version = map_registry_->getVersion();
+            delta_ev.meta.ref_epoch = source_alignment_epoch;
+            delta_ev.meta.source_ts = publish_ts;
+            delta_ev.meta.publish_ts = publish_ts;
+            delta_ev.meta.producer = "OptimizerModule";
+            delta_ev.meta.route_tag = "legacy";
+            if (delta_ev.isValid()) {
+                event_bus_->publish(delta_ev);
             }
             uint64_t batch_hash = computeBatchHash(sm_updates, kf_updates);
             return map_registry_->updatePoses(
@@ -251,18 +276,27 @@ void OptimizerModule::processCylinderLandmarkFactor(const OptTaskItem& task) {
             task.to_id);
         return;
     }
+    uint64_t kf_id = static_cast<uint64_t>(task.to_id);
+    double approx_ts = 0.0;
+    if (!task.cylinder_factors.empty()) {
+        kf_id = task.cylinder_factors.front().kf_id;
+        if (auto kf = map_registry_->getKeyFrame(static_cast<int>(kf_id))) {
+            approx_ts = kf->timestamp;
+        }
+    }
+    const uint64_t trace_id = semanticTraceId(kf_id, approx_ts);
 
     RCLCPP_DEBUG(node_->get_logger(),
-        "[SEMANTIC][Optimizer][processCylinderLandmarkFactor] step=entry kf_id=%d factors=%zu",
-        task.to_id, task.cylinder_factors.size());
+        "[SEMANTIC][Optimizer][processCylinderLandmarkFactor] step=entry trace=%lu kf_id=%d factors=%zu",
+        static_cast<unsigned long>(trace_id), task.to_id, task.cylinder_factors.size());
 
     for (const auto& factor : task.cylinder_factors) {
         optimizer_.addCylinderFactorForKeyFrame(static_cast<int>(factor.kf_id), factor);
     }
 
     RCLCPP_INFO(node_->get_logger(),
-        "[SEMANTIC][Optimizer][processCylinderLandmarkFactor] step=done kf_id=%d factors=%zu → addCylinderFactorForKeyFrame",
-        task.to_id, task.cylinder_factors.size());
+        "[CHAIN][B5 SEM->OPT] action=factor_applied trace=%lu kf_id=%d factors=%zu",
+        static_cast<unsigned long>(trace_id), task.to_id, task.cylinder_factors.size());
 }
 
 void OptimizerModule::processTask(const OptTaskItem& task) {

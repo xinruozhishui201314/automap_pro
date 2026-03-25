@@ -1,6 +1,7 @@
 #pragma once
 
 #include "automap_pro/core/data_types.h"
+#include "automap_pro/v3/semantic_segmentor.h"
 #include <memory>
 #include <vector>
 #include <string>
@@ -8,10 +9,6 @@
 #include <atomic>
 #include <chrono>
 
-// Forward declarations from sloam_rec
-namespace seg {
-    class Segmentation;
-}
 class Instance;
 struct FeatureModelParams;
 
@@ -26,7 +23,21 @@ public:
     using Ptr = std::shared_ptr<SemanticProcessor>;
 
     struct Config {
+        std::string model_type = "sloam";  // sloam | lsk3dnet | lsk3dnet_hybrid
         std::string model_path;
+        std::string lsk3dnet_model_path;
+        std::string lsk3dnet_device = "cpu";
+        std::string lsk3dnet_repo_root;
+        std::string lsk3dnet_config_yaml;
+        std::string lsk3dnet_checkpoint;
+        std::string lsk3dnet_classifier_torchscript;
+        std::string lsk3dnet_python_exe = "python3";
+        std::string lsk3dnet_worker_script;
+        std::string lsk3dnet_hybrid_normal_mode = "range";
+        float lsk3dnet_normal_fov_up_deg = 3.0f;
+        float lsk3dnet_normal_fov_down_deg = -25.0f;
+        int lsk3dnet_normal_proj_h = 64;
+        int lsk3dnet_normal_proj_w = 900;
         float fov_up = 22.5f;
         float fov_down = -22.5f;
         int img_w = 2048;
@@ -49,6 +60,19 @@ public:
         float default_tree_radius = 0.1f;
         float max_tree_radius = 0.5f;
         float max_axis_theta = 15.0f; // degrees from vertical
+
+        // Diagnostic toggles (default off to preserve behavior)
+        bool diag_enable_detailed_stats = false;
+        bool diag_log_class_histogram = false;
+        int diag_class_hist_top_k = 8;
+        int diag_class_hist_interval_frames = 50;
+        int diag_override_tree_class_id = -2;  // -2: no override; -1: auto; >=0: force class id
+        std::string diag_cluster_profile = "default";  // default | relaxed
+        std::string diag_cluster_input_mode = "sparse";  // sparse | dense_for_clustering
+        bool diag_dump_all_classes = false;  // dump per-class pixel/point stats
+        int diag_dump_points_per_class_limit = 0;  // 0 disables point samples
+        int diag_trellis_min_cluster_points = 80;  // keep legacy default
+        int diag_trellis_min_tree_vertices = 16;   // keep legacy default
     };
 
     explicit SemanticProcessor(const Config& config);
@@ -64,7 +88,7 @@ public:
 
 private:
     Config config_;
-    std::shared_ptr<seg::Segmentation> segmentator_;
+    std::unique_ptr<ISemanticSegmentor> segmentor_;
     std::unique_ptr<Instance> instance_detector_;
     std::unique_ptr<FeatureModelParams> fm_params_;
     mutable std::recursive_mutex resource_mutex_;

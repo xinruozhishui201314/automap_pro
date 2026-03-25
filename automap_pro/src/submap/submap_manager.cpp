@@ -349,19 +349,30 @@ void SubMapManager::freezeActiveSubmap() {
 }
 
 void SubMapManager::freezeActiveSubmap(const SubMap::Ptr& sm) {
-    if (!sm || sm->state != SubMapState::ACTIVE) {
-        SLOG_WARN(MOD, "freezeActiveSubmap(sm) invalid: state={}",
-                   sm ? static_cast<int>(sm->state) : -1);
-        return;
+    bool detached_active = false;
+    {
+        // Keep submap state transition and active pointer handoff atomic to avoid
+        // appending new keyframes into a just-frozen submap.
+        std::lock_guard<std::mutex> lk(mutex_);
+        if (!sm || sm->state != SubMapState::ACTIVE) {
+            SLOG_WARN(MOD, "freezeActiveSubmap(sm) invalid: state={}",
+                       sm ? static_cast<int>(sm->state) : -1);
+            return;
+        }
+        sm->state = SubMapState::FROZEN;
+        if (active_submap_ == sm) {
+            active_submap_ = nullptr;
+            detached_active = true;
+        }
     }
 
     RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-        "[SubMapMgr][FREEZE_STEP] enter freeze sm_id=%d (async post-process)", sm->id);
+        "[SubMapMgr][FREEZE_STEP] enter freeze sm_id=%d (async post-process, detached_active=%d)",
+        sm->id, detached_active ? 1 : 0);
 
     SLOG_START_SPAN(MOD, "freeze_submap");
 
     try {
-        sm->state = SubMapState::FROZEN;
         publishEvent(sm, "FROZEN");
         METRICS_INCREMENT(metrics::SUBMAPS_FROZEN);
         SLOG_EVENT(MOD, "submap_frozen", "SubMap #{} state=FROZEN (post-process enqueue)", sm->id);

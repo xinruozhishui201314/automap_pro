@@ -4,6 +4,7 @@
 #include "automap_pro/v3/semantic_processor.h"
 #include "automap_pro/frontend/livo_bridge.h"
 #include "automap_pro/system/frame_processor.h"
+#include <atomic>
 #include <deque>
 #include <mutex>
 
@@ -86,6 +87,17 @@ private:
     // 同步用数据（从 AutoMapSystem 移来）
     mutable std::mutex data_mutex_;
     LivoKeyFrameInfo last_livo_info_;
+    std::atomic<uint64_t> kf_info_recv_total_{0};
+    std::atomic<uint64_t> kf_info_invalid_ts_total_{0};
+    std::atomic<double> kf_info_last_valid_ts_{-1.0};
+    std::atomic<uint64_t> kf_info_cache_miss_total_{0};
+    std::atomic<uint64_t> kf_info_cache_empty_total_{0};
+    std::atomic<uint64_t> kf_info_cache_no_leq_total_{0};
+    std::atomic<uint64_t> kf_info_fallback_invalid_total_{0};
+    std::atomic<uint64_t> kf_info_map_hint_recovered_total_{0};
+    std::atomic<uint64_t> cloud_recv_total_{0};
+    std::atomic<uint64_t> synced_publish_total_{0};
+    std::atomic<uint64_t> event_seq_{0};
     Pose3d last_odom_pose_ = Pose3d::Identity();
     double last_odom_ts_ = -1.0;
     Mat66d last_cov_ = Mat66d::Identity() * 1e-4;

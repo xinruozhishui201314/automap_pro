@@ -37,6 +37,15 @@ void LivoBridge::init(rclcpp::Node::SharedPtr node) {
     kfinfo_sub_ = node->create_subscription<automap_pro::msg::KeyFrameInfoMsg>(
         cfg.fastLivoKFInfoTopic(), odom_kfinfo_qos,
         std::bind(&LivoBridge::onKFInfo, this, std::placeholders::_1));
+    kfinfo_diag_timer_ = node->create_wall_timer(
+        std::chrono::seconds(30),
+        [this]() {
+            if (kfinfo_count_.load(std::memory_order_relaxed) == 0 && kfinfo_sub_) {
+                RCLCPP_WARN(node_->get_logger(),
+                    "[CHAIN][B1 LIVO->FE] kfinfo still 0 after 30s topic=%s. If this dataset/fast_livo has no keyframe_info publisher, set semantic.keyframes_only=false.",
+                    ConfigManager::instance().fastLivoKFInfoTopic().c_str());
+            }
+        });
 
     gps_topic_ = cfg.gpsTopic();
     gps_msg_count_.store(0);
@@ -69,6 +78,11 @@ void LivoBridge::init(rclcpp::Node::SharedPtr node) {
         cfg.fastLivoKFInfoTopic().c_str(),
         cfg.gpsEnabled() ? cfg.gpsTopic().c_str() : "disabled");
     RCLCPP_INFO(node->get_logger(),
+        "[CHAIN][B1 CONFIG] odom_topic=%s cloud_topic=%s kfinfo_topic=%s",
+        cfg.fastLivoOdomTopic().c_str(),
+        cfg.fastLivoCloudTopic().c_str(),
+        cfg.fastLivoKFInfoTopic().c_str());
+    RCLCPP_INFO(node->get_logger(),
         "[LivoBridge][FLOW] fast_livo publishes odom then cloud per frame; backend triggers KF on cloud (pose=last_odom)");
 }
 
@@ -98,6 +112,15 @@ void LivoBridge::init(rclcpp::Node::SharedPtr node, bool gps_enabled, const std:
     kfinfo_sub_ = node->create_subscription<automap_pro::msg::KeyFrameInfoMsg>(
         cfg.fastLivoKFInfoTopic(), odom_kfinfo_qos,
         std::bind(&LivoBridge::onKFInfo, this, std::placeholders::_1));
+    kfinfo_diag_timer_ = node->create_wall_timer(
+        std::chrono::seconds(30),
+        [this]() {
+            if (kfinfo_count_.load(std::memory_order_relaxed) == 0 && kfinfo_sub_) {
+                RCLCPP_WARN(node_->get_logger(),
+                    "[CHAIN][B1 LIVO->FE] kfinfo still 0 after 30s topic=%s. If this dataset/fast_livo has no keyframe_info publisher, set semantic.keyframes_only=false.",
+                    ConfigManager::instance().fastLivoKFInfoTopic().c_str());
+            }
+        });
 
     std::string topic = gps_topic.empty() ? cfg.gpsTopic() : gps_topic;
     gps_topic_ = topic;
@@ -137,6 +160,11 @@ void LivoBridge::init(rclcpp::Node::SharedPtr node, bool gps_enabled, const std:
         cfg.fastLivoCloudTopic().c_str(), odom_cloud_depth,
         cfg.fastLivoKFInfoTopic().c_str(),
         gps_enabled ? topic.c_str() : "disabled");
+    RCLCPP_INFO(node->get_logger(),
+        "[CHAIN][B1 CONFIG] odom_topic=%s cloud_topic=%s kfinfo_topic=%s",
+        cfg.fastLivoOdomTopic().c_str(),
+        cfg.fastLivoCloudTopic().c_str(),
+        cfg.fastLivoKFInfoTopic().c_str());
     RCLCPP_INFO(node->get_logger(),
         "[LivoBridge][FLOW] fast_livo publishes odom then cloud per frame; backend triggers KF on cloud (pose=last_odom)");
 }
@@ -285,8 +313,7 @@ void LivoBridge::onCloud(const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
 }
 
 void LivoBridge::onKFInfo(const automap_pro::msg::KeyFrameInfoMsg::SharedPtr msg) {
-    static std::atomic<uint32_t> kfinfo_count{0};
-    kfinfo_count++;
+    const auto kfinfo_count = kfinfo_count_.fetch_add(1, std::memory_order_relaxed) + 1;
 
     LivoKeyFrameInfo info;
     info.timestamp        = msg->timestamp;
@@ -297,11 +324,34 @@ void LivoBridge::onKFInfo(const automap_pro::msg::KeyFrameInfoMsg::SharedPtr msg
     info.gyro_bias  = Eigen::Vector3d(msg->gyro_bias[0], msg->gyro_bias[1], msg->gyro_bias[2]);
     info.accel_bias = Eigen::Vector3d(msg->accel_bias[0], msg->accel_bias[1], msg->accel_bias[2]);
 
+    const bool valid_ts = std::isfinite(info.timestamp) && info.timestamp > 0.0;
+    if (!valid_ts) {
+        kfinfo_invalid_ts_count_.fetch_add(1, std::memory_order_relaxed);
+        RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 2000,
+            "[LivoBridge][KFINFO_DIAG] invalid_ts count=%lu ts=%.6f cloud_points=%u cloud_valid=%d",
+            static_cast<unsigned long>(kfinfo_count), info.timestamp,
+            static_cast<unsigned int>(info.cloud_point_count), info.cloud_valid ? 1 : 0);
+    } else {
+        kfinfo_last_valid_ts_.store(info.timestamp, std::memory_order_relaxed);
+    }
+    if (info.is_degenerate) {
+        kfinfo_degenerate_count_.fetch_add(1, std::memory_order_relaxed);
+    }
+
     if (kfinfo_count == 1 || (kfinfo_count % 200 == 0)) {
         RCLCPP_INFO(node_->get_logger(),
-            "[LivoBridge][DATA] kfinfo count=%u ts=%.3f cov_norm=%.4f degen=%d",
-            kfinfo_count.load(), info.timestamp, info.esikf_cov_norm, info.is_degenerate ? 1 : 0);
+            "[LivoBridge][DATA] kfinfo count=%lu ts=%.3f cov_norm=%.4f degen=%d",
+            static_cast<unsigned long>(kfinfo_count), info.timestamp, info.esikf_cov_norm, info.is_degenerate ? 1 : 0);
     }
+    RCLCPP_INFO_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000,
+        "[LivoBridge][KFINFO_DIAG] total=%lu invalid_ts=%lu degenerate=%lu invalid_ratio=%.3f last_valid_ts=%.3f",
+        static_cast<unsigned long>(kfinfo_count_.load(std::memory_order_relaxed)),
+        static_cast<unsigned long>(kfinfo_invalid_ts_count_.load(std::memory_order_relaxed)),
+        static_cast<unsigned long>(kfinfo_degenerate_count_.load(std::memory_order_relaxed)),
+        static_cast<double>(kfinfo_invalid_ts_count_.load(std::memory_order_relaxed)) /
+            static_cast<double>(std::max<uint64_t>(1, kfinfo_count_.load(std::memory_order_relaxed))),
+        kfinfo_last_valid_ts_.load(std::memory_order_relaxed));
+
     for (auto& cb : kfinfo_cbs_) {
         try {
             cb(info);

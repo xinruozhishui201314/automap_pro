@@ -4,6 +4,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <filesystem>
 #include <limits>
+#include <chrono>
 
 namespace fs = std::filesystem;
 
@@ -292,6 +293,17 @@ uint64_t MapRegistry::updatePoses(const std::unordered_map<int, Pose3d>& sm_upda
     result_ev.source_module = source_module;
     result_ev.transform_applied_flags = transform_applied_flags;
     result_ev.batch_hash = batch_hash;
+    const double publish_ts = std::chrono::duration<double>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    result_ev.meta.event_id = result_ev.event_id;
+    result_ev.meta.idempotency_key = (batch_hash != 0) ? batch_hash : result_ev.event_id;
+    result_ev.meta.producer_seq = result_ev.event_id;
+    result_ev.meta.ref_version = result_ev.version;
+    result_ev.meta.ref_epoch = result_ev.alignment_epoch;
+    result_ev.meta.source_ts = publish_ts;
+    result_ev.meta.publish_ts = publish_ts;
+    result_ev.meta.producer = source_module;
+    result_ev.meta.route_tag = "legacy";
     event_bus_->publish(result_ev);
 
     // 发布地图变更事件

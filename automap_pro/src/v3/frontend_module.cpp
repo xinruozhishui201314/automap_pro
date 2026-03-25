@@ -4,12 +4,19 @@
 #include "automap_pro/core/logger.h"
 #include "automap_pro/core/utils.h"
 #include <pcl_conversions/pcl_conversions.h>
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <ctime>
 
 namespace automap_pro::v3 {
 namespace {
+uint64_t makeEventId(double ts, uint64_t seq) {
+    const uint64_t ts_us = std::isfinite(ts) ? static_cast<uint64_t>(std::max(0.0, ts) * 1e6) : 0ull;
+    return (seq << 20) ^ ts_us;
+}
+
 
 // full.log 闭环：GPS 缓存命中/拒绝统计（grep GPS_CACHE KPI / GPS_CACHE VERIFY）
 std::atomic<uint64_t> g_gps_cache_get_empty_total{0};
@@ -56,8 +63,9 @@ FrontEndModule::FrontEndModule(EventBus::Ptr event_bus, MapRegistry::Ptr map_reg
     : ModuleBase("FrontEndModule", event_bus, map_registry), node_(node) {
     
     const auto& cfg = ConfigManager::instance();
-    bool gps_enabled = cfg.gpsEnabled();
-    std::string gps_topic = cfg.gpsTopic();
+    const auto frontend_cfg = cfg.frontendDomain();
+    bool gps_enabled = frontend_cfg.gps_enabled;
+    std::string gps_topic = frontend_cfg.gps_topic;
     
     livo_bridge_.init(node, gps_enabled, gps_topic);
     
@@ -74,8 +82,8 @@ FrontEndModule::FrontEndModule(EventBus::Ptr event_bus, MapRegistry::Ptr map_reg
         this->onGPS(ts, lat, lon, alt, hdop, sats);
     });
 
-    const size_t max_ingress_q = cfg.ingressQueueMaxSize();
-    const size_t max_frame_q = cfg.frameQueueMaxSize();
+    const size_t max_ingress_q = frontend_cfg.ingress_queue_max_size;
+    const size_t max_frame_q = frontend_cfg.frame_queue_max_size;
     frame_processor_.init(max_ingress_q, max_frame_q);
     RCLCPP_INFO(node_->get_logger(),
         "[DIAG][GPS_CACHE][CONFIG] gps_enabled=%d gps_topic=%s quality_threshold_hdop=%.2f min_quality=%d "
@@ -164,6 +172,7 @@ void FrontEndModule::run() {
 
         Pose3d pose = Pose3d::Identity();
         Mat66d cov = Mat66d::Identity() * 1e-4;
+        const char* pose_source = "cache_interp";
 
         if (!odomCacheGet(f.ts, pose, cov)) {
             // 插值失败时（多线程调度 / 短时滞后 / 历史边界）用最近一次里程计，与 LivoBridge「cloud 配 last odom」一致；过大时间差仍丢弃，避免错配
@@ -172,6 +181,7 @@ void FrontEndModule::run() {
             if (last_odom_ts_ >= 0.0 && std::abs(f.ts - last_odom_ts_) <= kMaxCloudOdomSkewS) {
                 pose = last_odom_pose_;
                 cov = last_cov_;
+                pose_source = "last_odom_fallback";
             } else {
                 continue;
             }
@@ -179,19 +189,46 @@ void FrontEndModule::run() {
 
         LivoKeyFrameInfo kfinfo_copy;
         bool kfinfo_from_cache = kfinfoCacheGet(f.ts, kfinfo_copy);
+        const char* kf_source = kfinfo_from_cache ? "cache_leq_ts" : "fallback_last_livo";
         if (!kfinfo_from_cache) {
+            kf_info_cache_miss_total_.fetch_add(1, std::memory_order_relaxed);
             std::lock_guard<std::mutex> lk(data_mutex_);
             kfinfo_copy = last_livo_info_;
             RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 2000,
                 "[SEMANTIC][FrontEnd][KFINFO] source=fallback_last_livo frame_ts=%.3f fallback_kf_ts=%.3f",
                 f.ts, kfinfo_copy.timestamp);
         }
-        const bool kf_ts_valid = std::isfinite(kfinfo_copy.timestamp) && (kfinfo_copy.timestamp > 0.0);
+        bool kf_ts_valid = std::isfinite(kfinfo_copy.timestamp) && (kfinfo_copy.timestamp > 0.0);
+        if (!kf_ts_valid) {
+            kf_info_fallback_invalid_total_.fetch_add(1, std::memory_order_relaxed);
+            // 兜底：当 kf_info 话题缺失或迟到时，尝试按帧时间从 MapRegistry 恢复关键帧提示，避免语义链路长期 kf_ts=0。
+            auto kf_hint = map_registry_->getKeyFrameByTimestamp(
+                f.ts, ConfigManager::instance().semanticKeyframeTimeToleranceS());
+            if (kf_hint && std::isfinite(kf_hint->timestamp) && kf_hint->timestamp > 0.0) {
+                kfinfo_copy.timestamp = kf_hint->timestamp;
+                kfinfo_copy.cloud_valid = true;
+                kf_ts_valid = true;
+                kf_source = "map_registry_hint";
+                kf_info_map_hint_recovered_total_.fetch_add(1, std::memory_order_relaxed);
+                RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 2000,
+                    "[SEMANTIC][FrontEnd][KFINFO] source=map_registry_hint frame_ts=%.3f recovered_kf_ts=%.3f kf_id=%lu",
+                    f.ts, kfinfo_copy.timestamp, static_cast<unsigned long>(kf_hint->id));
+            }
+        }
         const double kf_dt = kf_ts_valid ? std::abs(f.ts - kfinfo_copy.timestamp) : -1.0;
         RCLCPP_INFO_THROTTLE(node_->get_logger(), *node_->get_clock(), 2000,
             "[SEMANTIC][FrontEnd][KFINFO] source=%s frame_ts=%.3f kf_ts=%.3f dt=%.3f valid=%d",
-            kfinfo_from_cache ? "cache_leq_ts" : "fallback_last_livo",
+            kf_source,
             f.ts, kfinfo_copy.timestamp, kf_dt, kf_ts_valid ? 1 : 0);
+        RCLCPP_INFO_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000,
+            "[SEMANTIC][FrontEnd][KFINFO_DIAG] recv=%lu cache_miss=%lu cache_empty=%lu cache_no_leq=%lu fallback_invalid=%lu map_hint_recovered=%lu last_valid_ts=%.3f",
+            static_cast<unsigned long>(kf_info_recv_total_.load(std::memory_order_relaxed)),
+            static_cast<unsigned long>(kf_info_cache_miss_total_.load(std::memory_order_relaxed)),
+            static_cast<unsigned long>(kf_info_cache_empty_total_.load(std::memory_order_relaxed)),
+            static_cast<unsigned long>(kf_info_cache_no_leq_total_.load(std::memory_order_relaxed)),
+            static_cast<unsigned long>(kf_info_fallback_invalid_total_.load(std::memory_order_relaxed)),
+            static_cast<unsigned long>(kf_info_map_hint_recovered_total_.load(std::memory_order_relaxed)),
+            kf_info_last_valid_ts_.load(std::memory_order_relaxed));
 
         GPSMeasurement matched_gps;
         bool has_gps = gpsCacheGet(f.ts, matched_gps);
@@ -217,9 +254,32 @@ void FrontEndModule::run() {
         event.cloud_frame = ConfigManager::instance().frontendCloudFrame();
         event.ref_map_version = map_registry_->getVersion();
         event.ref_alignment_epoch = map_registry_->getAlignmentEpoch();
+        const uint64_t seq = event_seq_.fetch_add(1, std::memory_order_relaxed) + 1;
+        event.meta.event_id = makeEventId(event.timestamp, seq);
+        event.meta.idempotency_key = event.meta.event_id;
+        event.meta.producer_seq = seq;
+        event.meta.ref_version = event.ref_map_version;
+        event.meta.ref_epoch = event.ref_alignment_epoch;
+        event.meta.source_ts = event.timestamp;
+        event.meta.publish_ts = node_->now().seconds();
+        event.meta.producer = "FrontEndModule";
+        event.meta.route_tag = "legacy";
+        event.processing_state = throttle_active_.load() ? ProcessingState::DEGRADED : ProcessingState::NORMAL;
 
         if (event.isValid()) {
             event_bus_->publish(event);
+            const auto published = synced_publish_total_.fetch_add(1, std::memory_order_relaxed) + 1;
+            RCLCPP_INFO_THROTTLE(node_->get_logger(), *node_->get_clock(), 2000,
+                "[CHAIN][B2 FE->SEM] publish_synced=%lu ts=%.3f kf_source=%s kf_valid=%d kf_dt=%.3f pts=%zu pose_src=%s cloud_in=%lu kf_recv=%lu",
+                static_cast<unsigned long>(published),
+                event.timestamp,
+                kf_source,
+                kf_ts_valid ? 1 : 0,
+                kf_dt,
+                event.cloud ? event.cloud->size() : 0,
+                pose_source,
+                static_cast<unsigned long>(cloud_recv_total_.load(std::memory_order_relaxed)),
+                static_cast<unsigned long>(kf_info_recv_total_.load(std::memory_order_relaxed)));
             RCLCPP_DEBUG_THROTTLE(node_->get_logger(), *node_->get_clock(), 2000,
                 "[SEMANTIC][FrontEnd][run] step=publish SyncedFrameEvent ts=%.3f pts=%zu ref_version=%lu",
                 event.timestamp, event.cloud ? event.cloud->size() : 0, event.ref_map_version);
@@ -248,18 +308,56 @@ void FrontEndModule::onOdometry(double ts, const Pose3d& pose, const Mat66d& cov
 }
 
 void FrontEndModule::onCloud(double ts, const CloudXYZIPtr& cloud) {
+    const auto cloud_total = cloud_recv_total_.fetch_add(1, std::memory_order_relaxed) + 1;
     RawCloudEvent ev;
     ev.timestamp = ts;
     ev.cloud = cloud;
     event_bus_->publish(ev);
 
     frame_processor_.pushFrame(ts, cloud);
+    RCLCPP_INFO_THROTTLE(node_->get_logger(), *node_->get_clock(), 2000,
+        "[CHAIN][B1 LIVO->FE] cloud_in=%lu pushed=1 ts=%.3f pts=%zu kfinfo_in=%lu last_kf_valid_ts=%.3f",
+        static_cast<unsigned long>(cloud_total),
+        ts,
+        cloud ? cloud->size() : 0,
+        static_cast<unsigned long>(kf_info_recv_total_.load(std::memory_order_relaxed)),
+        kf_info_last_valid_ts_.load(std::memory_order_relaxed));
 }
 
 void FrontEndModule::onKFInfo(const LivoKeyFrameInfo& info) {
     RawKFInfoEvent ev;
     ev.info = info;
     event_bus_->publish(ev);
+
+    const auto recv_total = kf_info_recv_total_.fetch_add(1, std::memory_order_relaxed) + 1;
+    const bool valid_ts = std::isfinite(info.timestamp) && (info.timestamp > 0.0);
+    if (!valid_ts) {
+        const auto invalid_total = kf_info_invalid_ts_total_.fetch_add(1, std::memory_order_relaxed) + 1;
+        RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 2000,
+            "[SEMANTIC][KFINFO_DIAG] invalid_kf_ts recv_total=%lu invalid_total=%lu ts=%.6f cloud_points=%u degenerate=%d cloud_valid=%d",
+            static_cast<unsigned long>(recv_total),
+            static_cast<unsigned long>(invalid_total),
+            info.timestamp,
+            static_cast<unsigned int>(info.cloud_point_count),
+            info.is_degenerate ? 1 : 0,
+            info.cloud_valid ? 1 : 0);
+    } else {
+        kf_info_last_valid_ts_.store(info.timestamp, std::memory_order_relaxed);
+    }
+    RCLCPP_INFO_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000,
+        "[SEMANTIC][KFINFO_DIAG] recv_total=%lu invalid_total=%lu invalid_ratio=%.3f last_valid_ts=%.3f",
+        static_cast<unsigned long>(kf_info_recv_total_.load(std::memory_order_relaxed)),
+        static_cast<unsigned long>(kf_info_invalid_ts_total_.load(std::memory_order_relaxed)),
+        static_cast<double>(kf_info_invalid_ts_total_.load(std::memory_order_relaxed)) /
+            static_cast<double>(std::max<uint64_t>(1, kf_info_recv_total_.load(std::memory_order_relaxed))),
+        kf_info_last_valid_ts_.load(std::memory_order_relaxed));
+    RCLCPP_INFO_THROTTLE(node_->get_logger(), *node_->get_clock(), 2000,
+        "[CHAIN][B1 LIVO->FE] kfinfo_in=%lu ts=%.3f valid=%d cloud_valid=%d degen=%d",
+        static_cast<unsigned long>(recv_total),
+        info.timestamp,
+        valid_ts ? 1 : 0,
+        info.cloud_valid ? 1 : 0,
+        info.is_degenerate ? 1 : 0);
 
     { std::lock_guard<std::mutex> lk(data_mutex_); last_livo_info_ = info; }
     kfinfoCacheAdd(info.timestamp, info);
@@ -446,12 +544,26 @@ void FrontEndModule::kfinfoCacheAdd(double ts, const LivoKeyFrameInfo& info) {
 
 bool FrontEndModule::kfinfoCacheGet(double ts, LivoKeyFrameInfo& out_info) {
     std::lock_guard<std::mutex> lk(kfinfo_cache_mutex_);
-    if (kfinfo_cache_.empty()) return false;
+    if (kfinfo_cache_.empty()) {
+        kf_info_cache_empty_total_.fetch_add(1, std::memory_order_relaxed);
+        RCLCPP_DEBUG_THROTTLE(node_->get_logger(), *node_->get_clock(), 2000,
+            "[SEMANTIC][FrontEnd][KFINFO_CACHE] miss reason=empty ts_req=%.3f",
+            ts);
+        return false;
+    }
     const KFinfoCacheEntry* best = nullptr;
     for (auto it = kfinfo_cache_.rbegin(); it != kfinfo_cache_.rend(); ++it) {
         if (it->ts <= ts) { best = &(*it); break; }
     }
-    if (!best) return false;
+    if (!best) {
+        kf_info_cache_no_leq_total_.fetch_add(1, std::memory_order_relaxed);
+        const double oldest = kfinfo_cache_.front().ts;
+        const double newest = kfinfo_cache_.back().ts;
+        RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 2000,
+            "[SEMANTIC][FrontEnd][KFINFO_CACHE] miss reason=no_leq ts_req=%.3f window=[%.3f,%.3f] size=%zu",
+            ts, oldest, newest, kfinfo_cache_.size());
+        return false;
+    }
     out_info = best->info;
     return true;
 }

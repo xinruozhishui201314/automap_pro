@@ -12,6 +12,7 @@
 #include "automap_pro/v3/semantic_module.h"
 #include "automap_pro/v3/dynamic_filter_module.h"
 #include "automap_pro/v3/mapping_module.h"
+#include "automap_pro/v3/map_orchestrator.h"
 
 #include <rclcpp/rclcpp.hpp>
 #include <nav_msgs/msg/path.hpp>
@@ -61,6 +62,7 @@ private:
     std::shared_ptr<v3::FrontEndModule> frontend_module_;
     std::shared_ptr<v3::SemanticModule> semantic_module_;
     std::shared_ptr<v3::DynamicFilterModule> dynamic_filter_module_;
+    std::shared_ptr<v3::MapOrchestrator> map_orchestrator_;
     std::shared_ptr<v3::MappingModule> mapping_module_;
 
     // ── 状态与生命周期 ──────────────────────────────────────────────────────

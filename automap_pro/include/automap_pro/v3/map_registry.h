@@ -14,8 +14,45 @@
 #include <vector>
 #include <atomic>
 #include <string>
+#include <cmath>
+#include <cstdint>
 
 namespace automap_pro::v3 {
+
+enum class ProcessingState : uint8_t {
+    NORMAL = 0,
+    DEGRADED = 1,
+    RECOVERING = 2
+};
+
+struct EventMeta {
+    uint64_t event_id = 0;
+    uint64_t idempotency_key = 0;
+    uint64_t producer_seq = 0;
+    uint64_t ref_version = 0;
+    uint64_t ref_epoch = 0;
+    double source_ts = 0.0;
+    double publish_ts = 0.0;
+    std::string producer = "unknown";
+    std::string route_tag = "legacy";
+
+    bool isValid() const {
+        if (event_id == 0 || idempotency_key == 0 || producer_seq == 0) return false;
+        if (ref_epoch == 0) return false;
+        if (!std::isfinite(source_ts) || !std::isfinite(publish_ts)) return false;
+        if (producer.empty()) return false;
+        return true;
+    }
+};
+
+struct RouteAdviceEvent {
+    EventMeta meta;
+    std::string event_type;
+    std::string suggested_owner;
+    bool takeover_enabled = false;
+    bool fallback_to_legacy = true;
+    std::string reason;
+};
 
 enum class OptimizationTransformFlags : uint32_t {
     NONE = 0u,
@@ -218,10 +255,12 @@ struct GPSAlignedEvent {
     Eigen::Matrix3d R_enu_to_map;
     Eigen::Vector3d t_enu_to_map;
     double rmse = 0.0;
+    EventMeta meta;
 
     bool isValid() const {
         if (event_seq == 0) return false;
         if (!R_enu_to_map.allFinite() || !t_enu_to_map.allFinite()) return false;
+        if (!meta.isValid()) return false;
         if (success) return std::isfinite(rmse);
         return true;
     }
@@ -256,13 +295,31 @@ struct OptimizationResultEvent {
     uint32_t transform_applied_flags = 0;
     uint64_t batch_hash = 0;
     PoseFrame pose_frame = PoseFrame::MAP; // 🏛️ [架构加固] 显式标注位姿坐标系
+    EventMeta meta;
 
     bool isValid() const {
         if (event_id == 0 || version == 0 || alignment_epoch == 0) return false;
         if (pose_frame == PoseFrame::UNKNOWN) return false;
         if (source_module.empty()) return false;
+        if (!meta.isValid()) return false;
         for (const auto& [id, pose] : submap_poses) if (!pose.matrix().allFinite()) return false;
         for (const auto& [id, pose] : keyframe_poses) if (!pose.matrix().allFinite()) return false;
+        return true;
+    }
+};
+
+struct OptimizationDeltaEvent {
+    EventMeta meta;
+    uint64_t alignment_epoch = 0;
+    PoseFrame pose_frame = PoseFrame::UNKNOWN;
+    std::unordered_map<int, Pose3d> submap_delta;
+    std::unordered_map<uint64_t, Pose3d> keyframe_delta;
+    std::string producer = "unknown";
+
+    bool isValid() const {
+        if (!meta.isValid()) return false;
+        if (alignment_epoch == 0) return false;
+        if (pose_frame == PoseFrame::UNKNOWN) return false;
         return true;
     }
 };
@@ -309,6 +366,8 @@ struct SyncedFrameEvent {
     // MappingModule 必须等待 MapRegistry 达到此版本后才处理本帧，确保坐标系一致
     uint64_t ref_map_version = 0;
     uint64_t ref_alignment_epoch = 0;
+    EventMeta meta;
+    ProcessingState processing_state = ProcessingState::NORMAL;
 
     bool isValid() const {
         if (!std::isfinite(timestamp)) return false;
@@ -316,6 +375,7 @@ struct SyncedFrameEvent {
         if (!T_odom_b.matrix().allFinite()) return false;
         if (!covariance.allFinite()) return false;
         if (ref_alignment_epoch == 0) return false;
+        if (!meta.isValid()) return false;
         if (pose_frame == PoseFrame::UNKNOWN) return false;
         if (cloud_frame != "body" && cloud_frame != "world") return false;
         if (has_gps) {
@@ -336,9 +396,11 @@ struct SemanticLandmarkEvent {
     double keyframe_timestamp_hint = 0.0; // 关键帧模式下由前端 KFInfo 时间透传，优先用于绑定 KeyFrame
     uint64_t keyframe_id_hint = 0;        // 关键帧 ID 提示（优先于时间戳匹配）
     std::vector<CylinderLandmark::Ptr> landmarks;
+    EventMeta meta;
+    ProcessingState processing_state = ProcessingState::NORMAL;
 
     bool isValid() const {
-        return std::isfinite(timestamp) && !landmarks.empty();
+        return std::isfinite(timestamp) && !landmarks.empty() && meta.isValid();
     }
 };
 
@@ -382,6 +444,8 @@ struct FilteredFrameEventOptionalDs {
     GPSMeasurement gps;
     uint64_t ref_map_version = 0;
     uint64_t ref_alignment_epoch = 0;
+    EventMeta meta;
+    ProcessingState processing_state = ProcessingState::NORMAL;
 
     // filtering diagnostics
     bool filter_executed = false;
@@ -398,6 +462,7 @@ struct FilteredFrameEventOptionalDs {
         if (!T_odom_b.matrix().allFinite()) return false;
         if (!covariance.allFinite()) return false;
         if (ref_alignment_epoch == 0) return false;
+        if (!meta.isValid()) return false;
         if (pose_frame == PoseFrame::UNKNOWN) return false;
         if (cloud_frame != "body" && cloud_frame != "world") return false;
         if (filtered_output_used && !filter_executed) return false;
@@ -427,6 +492,8 @@ struct FilteredFrameEventRequiredDs : public FilteredFrameEventOptionalDs {
 
 struct GraphTaskEvent {
     OptTaskItem task;
+    EventMeta meta;
+    ProcessingState processing_state = ProcessingState::NORMAL;
 };
 
 struct GPSAlignRequestEvent {
@@ -466,6 +533,7 @@ struct GlobalMapBuildResultEvent {
 struct SystemQuiesceRequestEvent {
     bool enable = true;
     std::string reason = "manual";
+    EventMeta meta;
 };
 
 /**
@@ -476,6 +544,8 @@ struct BackpressureWarningEvent {
     std::string module_name;
     float queue_usage_ratio; // 0.0 ~ 1.0
     bool critical = false;
+    ProcessingState processing_state = ProcessingState::DEGRADED;
+    EventMeta meta;
 };
 
 struct ModuleStatus {

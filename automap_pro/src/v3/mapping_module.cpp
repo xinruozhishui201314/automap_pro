@@ -55,16 +55,28 @@ uint64_t computeBatchHash(const std::unordered_map<int, Pose3d>& sm_poses,
     }
     return h;
 }
+
+uint64_t semanticTraceId(uint64_t kf_id, double ts) {
+    const uint64_t ts_us = std::isfinite(ts) ? static_cast<uint64_t>(std::max(0.0, ts) * 1e6) : 0ull;
+    return (kf_id << 20) ^ ts_us;
+}
+
+uint64_t makeEventId(double ts, uint64_t seq) {
+    const uint64_t ts_us = std::isfinite(ts) ? static_cast<uint64_t>(std::max(0.0, ts) * 1e6) : 0ull;
+    return (seq << 20) ^ ts_us;
+}
 } // namespace
 
 MappingModule::MappingModule(EventBus::Ptr event_bus, MapRegistry::Ptr map_registry, rclcpp::Node::SharedPtr node)
     : ModuleBase("MappingModule", event_bus, map_registry), node_(node) {
-    
+
     const auto& cfg = ConfigManager::instance();
-    max_frame_queue_size_ = cfg.mappingFrameQueueMaxSize();
-    max_semantic_queue_size_ = cfg.semanticMappingQueueMaxSize();
-    max_pending_semantic_events_ = cfg.semanticPendingQueueMaxSize();
-    semantic_timestamp_match_tolerance_s_ = cfg.semanticTimestampMatchToleranceS();
+    const auto mapping_cfg = cfg.mappingDomain();
+    const auto semantic_cfg = cfg.semanticDomain();
+    max_frame_queue_size_ = mapping_cfg.frame_queue_max_size;
+    max_semantic_queue_size_ = semantic_cfg.mapping_queue_max_size;
+    max_pending_semantic_events_ = semantic_cfg.pending_queue_max_size;
+    semantic_timestamp_match_tolerance_s_ = mapping_cfg.semantic_timestamp_match_tolerance_s;
 
     current_session_id_ = static_cast<uint64_t>(std::chrono::system_clock::now().time_since_epoch().count());
     processed_alignment_epoch_.store(map_registry_->getAlignmentEpoch());
@@ -196,12 +208,28 @@ MappingModule::MappingModule(EventBus::Ptr event_bus, MapRegistry::Ptr map_regis
                 warn.module_name = name_;
                 warn.queue_usage_ratio = 1.0f;
                 warn.critical = true;
+                warn.meta.event_id = warn.meta.idempotency_key =
+                    makeEventId(node_->now().seconds(), graph_event_seq_.fetch_add(1, std::memory_order_relaxed) + 1);
+                warn.meta.producer_seq = warn.meta.event_id;
+                warn.meta.ref_version = map_registry_->getVersion();
+                warn.meta.ref_epoch = map_registry_->getAlignmentEpoch();
+                warn.meta.source_ts = ev.timestamp;
+                warn.meta.publish_ts = node_->now().seconds();
+                warn.meta.producer = "MappingModule";
                 event_bus_->publish(warn);
             } else if (frame_queue_.size() > max_frame_queue_size_ * 0.8) {
                 BackpressureWarningEvent warn;
                 warn.module_name = name_;
                 warn.queue_usage_ratio = static_cast<float>(frame_queue_.size()) / max_frame_queue_size_;
                 warn.critical = false;
+                warn.meta.event_id = warn.meta.idempotency_key =
+                    makeEventId(node_->now().seconds(), graph_event_seq_.fetch_add(1, std::memory_order_relaxed) + 1);
+                warn.meta.producer_seq = warn.meta.event_id;
+                warn.meta.ref_version = map_registry_->getVersion();
+                warn.meta.ref_epoch = map_registry_->getAlignmentEpoch();
+                warn.meta.source_ts = ev.timestamp;
+                warn.meta.publish_ts = node_->now().seconds();
+                warn.meta.producer = "MappingModule";
                 event_bus_->publish(warn);
             }
             frame_queue_.push_back(ev);
@@ -226,6 +254,12 @@ MappingModule::MappingModule(EventBus::Ptr event_bus, MapRegistry::Ptr map_regis
         }
         std::lock_guard<std::mutex> lock(queue_mutex_);
         pose_opt_queue_.push_back(ev);
+        cv_.notify_one();
+    });
+    onEvent<OptimizationDeltaEvent>([this](const OptimizationDeltaEvent& ev) {
+        if (!running_.load()) return;
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        pose_delta_queue_.push_back(ev);
         cv_.notify_one();
     });
 
@@ -277,9 +311,24 @@ MappingModule::MappingModule(EventBus::Ptr event_bus, MapRegistry::Ptr map_regis
         this->quiesce(ev.enable);
     });
 
+    onEvent<RouteAdviceEvent>([this](const RouteAdviceEvent& ev) {
+        if (!ev.meta.isValid()) return;
+        if (ev.event_type != "SyncedFrameEvent" && ev.event_type != "OptimizationResultEvent") return;
+        route_advice_recv_total_.fetch_add(1, std::memory_order_relaxed);
+        route_takeover_enabled_.store(ev.takeover_enabled, std::memory_order_relaxed);
+        RCLCPP_INFO_THROTTLE(node_->get_logger(), *node_->get_clock(), 2000,
+            "[ORCH][ROUTE_ADVICE] event=%s takeover=%d fallback_legacy=%d reason=%s recv_total=%lu",
+            ev.event_type.c_str(),
+            ev.takeover_enabled ? 1 : 0,
+            ev.fallback_to_legacy ? 1 : 0,
+            ev.reason.c_str(),
+            static_cast<unsigned long>(route_advice_recv_total_.load(std::memory_order_relaxed)));
+    });
+
     // 🏛️ [架构演进] 订阅异步语义地标
     onEvent<SemanticLandmarkEvent>([this](const SemanticLandmarkEvent& ev) {
         if (!running_.load()) return;
+        const auto sem_in = semantic_in_total_.fetch_add(1, std::memory_order_relaxed) + 1;
         std::lock_guard<std::mutex> lk(queue_mutex_);
         if (semantic_landmark_queue_.size() >= max_semantic_queue_size_) {
             semantic_landmark_queue_.pop_front();
@@ -288,6 +337,12 @@ MappingModule::MappingModule(EventBus::Ptr event_bus, MapRegistry::Ptr map_regis
                 max_semantic_queue_size_);
         }
         semantic_landmark_queue_.push_back(ev);
+        RCLCPP_INFO_THROTTLE(node_->get_logger(), *node_->get_clock(), 2000,
+            "[CHAIN][B3 MAP_IN] sem_in=%lu queue_size=%zu ts=%.3f landmarks=%zu",
+            static_cast<unsigned long>(sem_in),
+            semantic_landmark_queue_.size(),
+            ev.timestamp,
+            ev.landmarks.size());
         cv_.notify_one();
     });
 
@@ -316,7 +371,7 @@ void MappingModule::stop() {
 
 bool MappingModule::isIdle() const {
     std::lock_guard<std::mutex> lock(queue_mutex_);
-    return frame_queue_.empty() && pose_opt_queue_.empty() &&
+    return frame_queue_.empty() && pose_opt_queue_.empty() && pose_delta_queue_.empty() &&
            gps_event_queue_.empty() && command_queue_.empty() &&
            semantic_landmark_queue_.empty() &&
            sm_manager_.isIdle(); // 🏛️ [修复] 检查点云合并子管理器是否也空闲
@@ -329,11 +384,13 @@ void MappingModule::run() {
         updateHeartbeat();
         FilteredFrameEventRequiredDs event;
         OptimizationResultEvent opt_ev;
+        OptimizationDeltaEvent delta_ev;
         GPSAlignedEvent gps_ev;
         SemanticLandmarkEvent sem_ev;
         Command cmd;
         bool has_frame = false;
         bool has_opt = false;
+        bool has_delta = false;
         bool has_gps_ev = false;
         bool has_cmd = false;
         bool has_sem = false;
@@ -342,7 +399,7 @@ void MappingModule::run() {
             std::unique_lock<std::mutex> lock(queue_mutex_);
             cv_.wait_for(lock, std::chrono::milliseconds(100), [this] { 
                 return !running_ || !frame_queue_.empty() || !pose_opt_queue_.empty() || 
-                       !gps_event_queue_.empty() || !command_queue_.empty() || !semantic_landmark_queue_.empty(); 
+                       !pose_delta_queue_.empty() || !gps_event_queue_.empty() || !command_queue_.empty() || !semantic_landmark_queue_.empty(); 
             });
             if (!running_) break;
             
@@ -351,6 +408,10 @@ void MappingModule::run() {
                 gps_ev = gps_event_queue_.front();
                 gps_event_queue_.pop_front();
                 has_gps_ev = true;
+            } else if (!pose_delta_queue_.empty()) {
+                delta_ev = pose_delta_queue_.front();
+                pose_delta_queue_.pop_front();
+                has_delta = true;
             } else if (!pose_opt_queue_.empty()) {
                 opt_ev = pose_opt_queue_.front();
                 pose_opt_queue_.pop_front();
@@ -399,7 +460,9 @@ void MappingModule::run() {
             }
         }
 
-        if (has_opt) {
+        if (has_delta) {
+            onPoseDelta(delta_ev);
+        } else if (has_opt) {
             onPoseOptimized(opt_ev);
         } else if (has_gps_ev) {
             updateGPSAlignment(gps_ev);
@@ -594,7 +657,24 @@ void MappingModule::processFrame(const FilteredFrameEventRequiredDs& event) {
     task_ev.task.gps_transform_R = R_snapshot;
     task_ev.task.gps_transform_t = t_snapshot;
     
-    event_bus_->publish(task_ev);
+    publishGraphTaskEvent(task_ev, kf->timestamp);
+    const uint64_t trace_id = semanticTraceId(kf->id, kf->timestamp);
+    size_t frame_q_size = 0;
+    size_t sem_q_size = 0;
+    {
+        std::lock_guard<std::mutex> lk(queue_mutex_);
+        frame_q_size = frame_queue_.size();
+        sem_q_size = semantic_landmark_queue_.size();
+    }
+    RCLCPP_INFO_THROTTLE(node_->get_logger(), *node_->get_clock(), 2000,
+        "[CHAIN][B2 MAP->SEM] action=publish_kf trace=%lu kf_id=%lu ts=%.3f cloud_pts=%zu ds_pts=%zu q_frame=%zu q_sem=%zu",
+        static_cast<unsigned long>(trace_id),
+        static_cast<unsigned long>(kf->id),
+        kf->timestamp,
+        cloud ? cloud->size() : 0,
+        cloud_ds ? cloud_ds->size() : 0,
+        frame_q_size,
+        sem_q_size);
     
     // 同步到 submap_manager
     sm_manager_.addKeyFrame(kf);
@@ -669,7 +749,7 @@ void MappingModule::onSubmapFrozen(const SubMap::Ptr& submap) {
     node_ev.task.to_id = submap->id;
     node_ev.task.rel_pose = submap->pose_odom_anchor;
     node_ev.task.fixed = (count == 1);
-    event_bus_->publish(node_ev);
+    publishGraphTaskEvent(node_ev, submap->t_end);
 
     // 子图间里程计因子：用冻结顺序上的「上一块」子图，避免 getFrozenSubmaps()（持 SubMapManager::mutex_，与 merge 长临界区死锁）
     {
@@ -685,7 +765,7 @@ void MappingModule::onSubmapFrozen(const SubMap::Ptr& submap) {
             odom_ev.task.to_id = submap->id;
             odom_ev.task.rel_pose = rel;
             odom_ev.task.info_matrix = info;
-            event_bus_->publish(odom_ev);
+            publishGraphTaskEvent(odom_ev, submap->t_end);
         }
         prev_frozen_for_odom_ = submap;
     }
@@ -693,7 +773,7 @@ void MappingModule::onSubmapFrozen(const SubMap::Ptr& submap) {
     // 强制更新
     GraphTaskEvent force_ev;
     force_ev.task.type = OptTaskItem::Type::FORCE_UPDATE;
-    event_bus_->publish(force_ev);
+    publishGraphTaskEvent(force_ev, submap->t_end);
 
     // HBA 触发（子图列表来自 MapRegistry，避免 SubMapManager::mutex_）
     if (ConfigManager::instance().hbaEnabled() && ConfigManager::instance().hbaOnLoop()) {
@@ -818,7 +898,7 @@ void MappingModule::updateGPSAlignment(const GPSAlignedEvent& ev) {
         batch_task.t_enu_to_map = ev.t_enu_to_map;
         GraphTaskEvent task_ev;
         task_ev.task = batch_task;
-        event_bus_->publish(task_ev);
+        publishGraphTaskEvent(task_ev, node_->now().seconds());
         RCLCPP_DEBUG(node_->get_logger(),
             "[V3][DIAG] step=updateGPSAlignment enqueue GPS_BATCH_KF (grep V3 DIAG)");
     }
@@ -829,7 +909,35 @@ void MappingModule::onPoseOptimized(const OptimizationResultEvent& ev) {
         RCLCPP_WARN(node_->get_logger(), "[V3][CONTRACT] Reject optimization event: module is stopping/stopped");
         return;
     }
+    legacy_opt_observe_total_.fetch_add(1, std::memory_order_relaxed);
     if (!shouldAcceptOptimizationEvent(ev)) return;
+    if (route_takeover_enabled_.load(std::memory_order_relaxed)) {
+        legacy_opt_skip_takeover_total_.fetch_add(1, std::memory_order_relaxed);
+        uint64_t delta_hash = 0;
+        {
+            std::lock_guard<std::mutex> lk(delta_consistency_mutex_);
+            auto it = recent_delta_hash_by_version_.find(ev.version);
+            if (it != recent_delta_hash_by_version_.end()) delta_hash = it->second;
+        }
+        const uint64_t opt_hash = (ev.batch_hash != 0) ? ev.batch_hash : computeBatchHash(ev.submap_poses, ev.keyframe_poses);
+        if (delta_hash != 0 && opt_hash != 0 && delta_hash != opt_hash) {
+            consistency_mismatch_total_.fetch_add(1, std::memory_order_relaxed);
+            RCLCPP_ERROR_THROTTLE(node_->get_logger(), *node_->get_clock(), 2000,
+                "[V3][CONSISTENCY] delta/hash mismatch version=%lu delta_hash=%lu opt_hash=%lu mismatch_total=%lu",
+                static_cast<unsigned long>(ev.version),
+                static_cast<unsigned long>(delta_hash),
+                static_cast<unsigned long>(opt_hash),
+                static_cast<unsigned long>(consistency_mismatch_total_.load(std::memory_order_relaxed)));
+        }
+        RCLCPP_INFO_THROTTLE(node_->get_logger(), *node_->get_clock(), 2000,
+            "[V3][TAKEOVER] legacy_opt_observe=%lu skipped_apply=%lu delta_apply=%lu delta_reject=%lu mismatch=%lu",
+            static_cast<unsigned long>(legacy_opt_observe_total_.load(std::memory_order_relaxed)),
+            static_cast<unsigned long>(legacy_opt_skip_takeover_total_.load(std::memory_order_relaxed)),
+            static_cast<unsigned long>(delta_apply_total_.load(std::memory_order_relaxed)),
+            static_cast<unsigned long>(delta_reject_total_.load(std::memory_order_relaxed)),
+            static_cast<unsigned long>(consistency_mismatch_total_.load(std::memory_order_relaxed)));
+        return;
+    }
     RCLCPP_INFO(node_->get_logger(),
         "[V3][POSE_DIAG] Gateway entry: event_id=%lu version=%lu pose_frame=%d sm=%zu kf=%zu src=%s flags=0x%x hash=%lu",
         static_cast<unsigned long>(ev.event_id),
@@ -841,8 +949,40 @@ void MappingModule::onPoseOptimized(const OptimizationResultEvent& ev) {
     
     // 🏛️ [架构加固] 统一通过语义网关应用位姿
     const bool applied = applyOptimizedPoses(ev.submap_poses, ev.keyframe_poses, ev.pose_frame, ev.version);
+    if (applied) {
+        legacy_opt_apply_total_.fetch_add(1, std::memory_order_relaxed);
+    }
     if (applied && ev.source_module == "HBAOptimizer") {
         sm_manager_.rebuildMergedCloudFromOptimizedPoses();
+    }
+}
+
+void MappingModule::onPoseDelta(const OptimizationDeltaEvent& ev) {
+    if (!running_.load()) return;
+    if (!shouldAcceptOptimizationDelta(ev)) {
+        delta_reject_total_.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    const uint64_t target_version = std::max<uint64_t>(processed_map_version_.load() + 1, ev.meta.ref_version + 1);
+    const bool applied = applyOptimizedPoses(ev.submap_delta, ev.keyframe_delta, ev.pose_frame, target_version);
+    if (applied) {
+        delta_apply_total_.fetch_add(1, std::memory_order_relaxed);
+        const uint64_t delta_hash = computeBatchHash(ev.submap_delta, ev.keyframe_delta);
+        {
+            std::lock_guard<std::mutex> lk(delta_consistency_mutex_);
+            recent_delta_hash_by_version_[target_version] = delta_hash;
+            if (recent_delta_hash_by_version_.size() > 64) {
+                auto it = recent_delta_hash_by_version_.begin();
+                recent_delta_hash_by_version_.erase(it);
+            }
+        }
+        RCLCPP_INFO_THROTTLE(node_->get_logger(), *node_->get_clock(), 2000,
+            "[V3][DELTA] applied=%lu rejected=%lu producer=%s ref_v=%lu ref_e=%lu",
+            static_cast<unsigned long>(delta_apply_total_.load(std::memory_order_relaxed)),
+            static_cast<unsigned long>(delta_reject_total_.load(std::memory_order_relaxed)),
+            ev.producer.c_str(),
+            static_cast<unsigned long>(ev.meta.ref_version),
+            static_cast<unsigned long>(ev.meta.ref_epoch));
     }
 }
 
@@ -1067,6 +1207,14 @@ bool MappingModule::shouldAcceptOptimizationEvent(const OptimizationResultEvent&
     return true;
 }
 
+bool MappingModule::shouldAcceptOptimizationDelta(const OptimizationDeltaEvent& ev) const {
+    if (!ev.isValid()) return false;
+    const uint64_t local_epoch = processed_alignment_epoch_.load(std::memory_order_relaxed);
+    if (ev.alignment_epoch != local_epoch) return false;
+    if (ev.meta.ref_epoch != local_epoch) return false;
+    return ev.meta.ref_version >= processed_map_version_.load(std::memory_order_relaxed);
+}
+
 void MappingModule::handleSaveMap(const SaveMapRequestEvent& ev) {
     auto all_submaps = sm_manager_.getAllSubmaps();
     RCLCPP_INFO(node_->get_logger(), "[V3][MappingModule] Saving %zu submaps to %s", 
@@ -1125,6 +1273,22 @@ Mat66d MappingModule::computeOdomInfoMatrix(const SubMap::Ptr& prev, const SubMa
     return info;
 }
 
+void MappingModule::publishGraphTaskEvent(GraphTaskEvent& ev, double source_ts) {
+    const uint64_t seq = graph_event_seq_.fetch_add(1, std::memory_order_relaxed) + 1;
+    const double now_ts = node_->now().seconds();
+    ev.meta.event_id = makeEventId(source_ts, seq);
+    ev.meta.idempotency_key = ev.meta.event_id;
+    ev.meta.producer_seq = seq;
+    ev.meta.ref_version = map_registry_->getVersion();
+    ev.meta.ref_epoch = map_registry_->getAlignmentEpoch();
+    ev.meta.source_ts = std::isfinite(source_ts) ? source_ts : now_ts;
+    ev.meta.publish_ts = now_ts;
+    ev.meta.producer = "MappingModule";
+    ev.meta.route_tag = route_takeover_enabled_.load(std::memory_order_relaxed) ? "orchestrated" : "legacy";
+    ev.processing_state = quiescing_.load() ? ProcessingState::DEGRADED : ProcessingState::NORMAL;
+    event_bus_->publish(ev);
+}
+
 void MappingModule::onSemanticLandmarks(const SemanticLandmarkEvent& ev) {
     if (!ev.isValid()) {
         RCLCPP_WARN(node_->get_logger(),
@@ -1133,12 +1297,16 @@ void MappingModule::onSemanticLandmarks(const SemanticLandmarkEvent& ev) {
         return;
     }
 
+    const uint64_t trace_id = semanticTraceId(
+        ev.keyframe_id_hint != 0 ? ev.keyframe_id_hint : static_cast<uint64_t>(std::max(0.0, ev.timestamp) * 1000.0),
+        ev.timestamp);
     RCLCPP_DEBUG(node_->get_logger(),
-        "[SEMANTIC][Mapping][onSemanticLandmarks] step=entry ts=%.3f landmarks=%zu",
-        ev.timestamp, ev.landmarks.size());
+        "[SEMANTIC][Mapping][onSemanticLandmarks] step=entry trace=%lu ts=%.3f landmarks=%zu",
+        static_cast<unsigned long>(trace_id), ev.timestamp, ev.landmarks.size());
 
-    auto defer_semantic_event = [this](const SemanticLandmarkEvent& pending_ev, const char* reason, uint64_t kf_id, int sm_id) {
+    auto defer_semantic_event = [this, trace_id](const SemanticLandmarkEvent& pending_ev, const char* reason, uint64_t kf_id, int sm_id) {
         std::lock_guard<std::mutex> lk(pending_semantic_mutex_);
+        semantic_defer_total_.fetch_add(1, std::memory_order_relaxed);
         if (pending_semantic_landmarks_.size() >= max_pending_semantic_events_) {
             pending_semantic_landmarks_.pop_front();
             
@@ -1159,6 +1327,15 @@ void MappingModule::onSemanticLandmarks(const SemanticLandmarkEvent& ev) {
         RCLCPP_DEBUG(node_->get_logger(),
             "[SEMANTIC][Mapping][onSemanticLandmarks] step=defer reason=%s ts=%.3f kf_id=%lu sm_id=%d pending=%zu",
             reason, pending_ev.timestamp, static_cast<unsigned long>(kf_id), sm_id, pending_semantic_landmarks_.size());
+        RCLCPP_INFO_THROTTLE(node_->get_logger(), *node_->get_clock(), 2000,
+            "[CHAIN][B3 MAP_IN] action=defer trace=%lu reason=%s sem_defer=%lu pending=%zu ts=%.3f kf_id=%lu sm_id=%d",
+            static_cast<unsigned long>(trace_id),
+            reason,
+            static_cast<unsigned long>(semantic_defer_total_.load(std::memory_order_relaxed)),
+            pending_semantic_landmarks_.size(),
+            pending_ev.timestamp,
+            static_cast<unsigned long>(kf_id),
+            sm_id);
     };
 
     // 1. 查找对应的关键帧（优先 keyframe_id_hint，其次 keyframe timestamp hint，再兜底语义事件时间戳）
@@ -1175,10 +1352,16 @@ void MappingModule::onSemanticLandmarks(const SemanticLandmarkEvent& ev) {
         kf = map_registry_->getKeyFrameByTimestamp(ev.timestamp, semantic_timestamp_match_tolerance_s_);
     }
     if (!kf) {
+        RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 2000,
+            "[CHAIN][B4 SEM_RESOLVE] action=reject trace=%lu reason=kf_not_found ts=%.3f reason_code=E_KF_NOT_FOUND",
+            static_cast<unsigned long>(trace_id), ev.timestamp);
         defer_semantic_event(ev, "kf_not_found", 0, -1);
         return;
     }
     if (kf->submap_id < 0) {
+        RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 2000,
+            "[CHAIN][B4 SEM_RESOLVE] action=reject trace=%lu reason=submap_unassigned ts=%.3f kf_id=%lu reason_code=E_SUBMAP_UNASSIGNED",
+            static_cast<unsigned long>(trace_id), ev.timestamp, static_cast<unsigned long>(kf->id));
         defer_semantic_event(ev, "submap_id_unassigned", kf->id, kf->submap_id);
         return;
     }
@@ -1232,11 +1415,20 @@ void MappingModule::onSemanticLandmarks(const SemanticLandmarkEvent& ev) {
         if (!landmark_task.cylinder_factors.empty()) {
             GraphTaskEvent landmark_ev;
             landmark_ev.task = landmark_task;
-            event_bus_->publish(landmark_ev);
+            publishGraphTaskEvent(landmark_ev, ev.timestamp);
+            const auto dispatched = semantic_dispatch_total_.fetch_add(1, std::memory_order_relaxed) + 1;
 
             RCLCPP_INFO(node_->get_logger(),
                 "[SEMANTIC][Mapping][onSemanticLandmarks] step=dispatch ts=%.3f kf_id=%lu sm_id=%d factors=%zu → GraphTaskEvent",
                 ev.timestamp, kf->id, sm->id, landmark_task.cylinder_factors.size());
+            RCLCPP_INFO_THROTTLE(node_->get_logger(), *node_->get_clock(), 2000,
+                "[CHAIN][B3 MAP_IN] action=dispatch trace=%lu sem_dispatch=%lu ts=%.3f kf_id=%lu sm_id=%d factors=%zu",
+                static_cast<unsigned long>(trace_id),
+                static_cast<unsigned long>(dispatched),
+                ev.timestamp,
+                static_cast<unsigned long>(kf->id),
+                sm->id,
+                landmark_task.cylinder_factors.size());
         } else {
             RCLCPP_DEBUG(node_->get_logger(),
                 "[SEMANTIC][Mapping][onSemanticLandmarks] step=no_factors ts=%.3f kf_id=%lu sm_id=%d landmarks=%zu (none associated)",

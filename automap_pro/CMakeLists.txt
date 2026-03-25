@@ -646,10 +646,15 @@ add_library(automap_system_component SHARED
   src/system/modules/service_handlers.cpp
   src/system/modules/tasks_and_utils.cpp
   src/v3/map_registry.cpp
+  src/v3/semantic_segmentor_factory.cpp
+  src/v3/sloam_semantic_segmentor.cpp
+  src/v3/lsk3dnet_semantic_segmentor.cpp
+  src/v3/lsk3dnet_hybrid_semantic_segmentor.cpp
   src/v3/semantic_processor.cpp
   src/v3/semantic_module.cpp
   src/v3/frontend_module.cpp
   src/v3/dynamic_filter_module.cpp
+  src/v3/map_orchestrator.cpp
   src/v3/mapping_module.cpp
   src/v3/optimizer_module.cpp
   src/system/frame_processor.cpp
@@ -735,6 +740,11 @@ install(PROGRAMS launch/run_under_gdb.sh DESTINATION share/${PROJECT_NAME}/launc
 install(DIRECTORY rviz/ DESTINATION share/${PROJECT_NAME}/rviz)
 install(PROGRAMS scripts/plot_accuracy_curves.py DESTINATION share/${PROJECT_NAME}/scripts)
 install(PROGRAMS scripts/convert_ot_pth_to_torchscript.py DESTINATION share/${PROJECT_NAME}/scripts)
+install(PROGRAMS scripts/verify_lsk3dnet_hybrid_classifier.py DESTINATION share/${PROJECT_NAME}/scripts)
+install(PROGRAMS
+  thrid_party/LSK3DNet-main/scripts/lsk3dnet_hybrid_worker.py
+  thrid_party/LSK3DNet-main/scripts/export_lsk3dnet_classifier_torchscript.py
+  DESTINATION share/${PROJECT_NAME}/lsk3dnet_scripts)
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/models")
   install(DIRECTORY models/ DESTINATION share/${PROJECT_NAME} FILES_MATCHING PATTERN "*.pt" PATTERN "*.pth.tar")
 endif()

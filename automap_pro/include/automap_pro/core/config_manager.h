@@ -16,6 +16,32 @@ namespace automap_pro {
 
 class ConfigManager {
 public:
+    struct FrontendConfigView {
+        std::string cloud_frame;
+        size_t ingress_queue_max_size = 16;
+        size_t frame_queue_max_size = 500;
+        std::string gps_topic;
+        bool gps_enabled = false;
+    };
+    struct SemanticConfigView {
+        bool enabled = true;
+        std::string model_path;
+        int worker_threads = 0;
+        size_t mapping_queue_max_size = 4096;
+        size_t pending_queue_max_size = 4096;
+    };
+    struct MappingConfigView {
+        size_t frame_queue_max_size = 1024;
+        double semantic_timestamp_match_tolerance_s = 1e-4;
+        double max_reasonable_velocity_mps = 50.0;
+        double max_reasonable_jump_m = 10.0;
+    };
+    struct OptimizerConfigView {
+        std::string frame_policy = "compat";
+        bool hba_enabled = true;
+        int process_every_n_frames = 5;
+    };
+
     static ConfigManager& instance() {
         static ConfigManager inst;
         return inst;
@@ -34,6 +60,39 @@ public:
 
     /** 返回 worker 线程安全配置快照副本。load() 后调用；模块在构造/init 时获取，worker 中只读 snapshot 不再访问本单例。 */
     ConfigSnapshot getSnapshot() const { return snapshot_; }
+    FrontendConfigView frontendDomain() const {
+        FrontendConfigView v;
+        v.cloud_frame = frontendCloudFrame();
+        v.ingress_queue_max_size = ingressQueueMaxSize();
+        v.frame_queue_max_size = frameQueueMaxSize();
+        v.gps_topic = gpsTopic();
+        v.gps_enabled = gpsEnabled();
+        return v;
+    }
+    SemanticConfigView semanticDomain() const {
+        SemanticConfigView v;
+        v.enabled = semanticEnabled();
+        v.model_path = semanticModelPath();
+        v.worker_threads = semanticWorkerThreads();
+        v.mapping_queue_max_size = semanticMappingQueueMaxSize();
+        v.pending_queue_max_size = semanticPendingQueueMaxSize();
+        return v;
+    }
+    MappingConfigView mappingDomain() const {
+        MappingConfigView v;
+        v.frame_queue_max_size = mappingFrameQueueMaxSize();
+        v.semantic_timestamp_match_tolerance_s = semanticTimestampMatchToleranceS();
+        v.max_reasonable_velocity_mps = mappingMaxReasonableVelocityMps();
+        v.max_reasonable_jump_m = mappingMaxReasonableJumpM();
+        return v;
+    }
+    OptimizerConfigView optimizerDomain() const {
+        OptimizerConfigView v;
+        v.frame_policy = contractFramePolicy();
+        v.hba_enabled = hbaEnabled();
+        v.process_every_n_frames = backendProcessEveryNFrames();
+        return v;
+    }
     /** 当前加载的配置文件路径（唯一源；未加载时为空） */
     const std::string& configFilePath() const { return config_file_path_; }
 
@@ -540,6 +599,7 @@ public:
     bool parallelTeaserMatch() const { return perf_parallel_teaser_match_; }
     int parallelTeaserMaxInflight() const { return std::max(1, perf_parallel_teaser_max_inflight_); }
     int maxOptimizationQueueSize() const { return perf_max_optimization_queue_size_; }
+    bool orchestratorTakeoverEnabled() const { return get<bool>("orchestrator.takeover_enabled", false); }
 
     // ── iSAM2 ─────────────────────────────────────────────
     double isam2RelinThresh()   const { return get<double>("backend.isam2.relinearize_threshold", 0.01); }
@@ -587,7 +647,27 @@ public:
     // ── 语义处理 ──────────────────────────────────────────
     // 语义模块强制默认开启：即使配置未提供该项也按开启处理
     bool        semanticEnabled()    const { return get<bool>("semantic.enabled", true); }
+    std::string semanticModelType()  const { return get<std::string>("semantic.model_type", "sloam"); }
     std::string semanticModelPath()  const { return get<std::string>("semantic.model_path", ""); }
+    std::string semanticLsk3dnetModelPath() const { return get<std::string>("semantic.lsk3dnet.model_path", ""); }
+    std::string semanticLsk3dnetDevice() const { return get<std::string>("semantic.lsk3dnet.device", "cpu"); }
+    /** lsk3dnet_hybrid：LSK3DNet 源码根目录（含 network/、scripts/） */
+    std::string semanticLsk3dnetRepoRoot() const { return get<std::string>("semantic.lsk3dnet.repo_root", ""); }
+    std::string semanticLsk3dnetConfigYaml() const { return get<std::string>("semantic.lsk3dnet.config_yaml", ""); }
+    std::string semanticLsk3dnetCheckpoint() const { return get<std::string>("semantic.lsk3dnet.checkpoint", ""); }
+    std::string semanticLsk3dnetClassifierTorchscript() const {
+        return get<std::string>("semantic.lsk3dnet.classifier_torchscript", "");
+    }
+    std::string semanticLsk3dnetPython() const { return get<std::string>("semantic.lsk3dnet.python", "python3"); }
+    std::string semanticLsk3dnetWorkerScript() const { return get<std::string>("semantic.lsk3dnet.worker_script", ""); }
+    /** lsk3dnet_hybrid：法线模式 range=与训练一致的距离图法线（utils.normalmap），zeros=调试 */
+    std::string semanticLsk3dnetHybridNormalMode() const {
+        return get<std::string>("semantic.lsk3dnet.hybrid_normal_mode", "range");
+    }
+    float semanticLsk3dnetNormalFovUpDeg() const { return get<float>("semantic.lsk3dnet.normal_fov_up_deg", 3.0f); }
+    float semanticLsk3dnetNormalFovDownDeg() const { return get<float>("semantic.lsk3dnet.normal_fov_down_deg", -25.0f); }
+    int semanticLsk3dnetNormalProjH() const { return get<int>("semantic.lsk3dnet.normal_proj_h", 64); }
+    int semanticLsk3dnetNormalProjW() const { return get<int>("semantic.lsk3dnet.normal_proj_w", 900); }
     float       semanticFovUp()      const { return get<float>("semantic.fov_up", 22.5f); }
     float       semanticFovDown()    const { return get<float>("semantic.fov_down", -22.5f); }
     int         semanticImgW()       const { return get<int>("semantic.img_w", 2048); }
@@ -608,6 +688,91 @@ public:
     std::vector<float> semanticInputMean() const;
     std::vector<float> semanticInputStd() const;
     bool        semanticDoDestagger()const { return get<bool>("semantic.do_destagger", true); }
+    float       semanticBeamClusterThreshold() const {
+        float v = get<float>("semantic.beam_cluster_threshold", 0.1f);
+        return std::max(0.001f, std::min(10.0f, v));
+    }
+    float       semanticMaxDistToCentroid() const {
+        float v = get<float>("semantic.max_dist_to_centroid", 0.2f);
+        return std::max(0.001f, std::min(10.0f, v));
+    }
+    int         semanticMinVertexSize() const {
+        int v = get<int>("semantic.min_vertex_size", 2);
+        return std::max(1, std::min(1000, v));
+    }
+    int         semanticMinLandmarkSize() const {
+        int v = get<int>("semantic.min_landmark_size", 4);
+        return std::max(1, std::min(1000, v));
+    }
+    float       semanticMinLandmarkHeight() const {
+        float v = get<float>("semantic.min_landmark_height", 1.0f);
+        return std::max(0.0f, std::min(100.0f, v));
+    }
+    // 诊断开关（默认关闭，确保主流程行为不变）
+    bool        semanticDiagEnableDetailedStats() const {
+        return get<bool>("semantic.diag.enable_detailed_stats", false);
+    }
+    bool        semanticDiagLogClassHistogram() const {
+        return get<bool>("semantic.diag.log_class_histogram", false);
+    }
+    int         semanticDiagClassHistTopK() const {
+        int v = get<int>("semantic.diag.class_hist_top_k", 8);
+        return std::max(1, std::min(32, v));
+    }
+    int         semanticDiagClassHistIntervalFrames() const {
+        int v = get<int>("semantic.diag.class_hist_interval_frames", 50);
+        return std::max(1, std::min(5000, v));
+    }
+    bool        semanticDiagDumpAllClasses() const {
+        return get<bool>("semantic.diag.dump_all_classes", false);
+    }
+    int         semanticDiagDumpPointsPerClassLimit() const {
+        int v = get<int>("semantic.diag.dump_points_per_class_limit", 0);
+        // 0: disable samples, >0: per-class sample cap, <0: dump all points in class
+        return std::max(-1, std::min(100000000, v));
+    }
+    // -2: 不覆盖（默认）；-1: 自动；>=0: 强制指定类 id
+    int         semanticDiagOverrideTreeClassId() const {
+        int v = get<int>("semantic.diag.override_tree_class_id", -2);
+        return std::max(-2, std::min(511, v));
+    }
+    // default | relaxed（只用于快速诊断）
+    std::string semanticDiagClusterProfile() const {
+        return get<std::string>("semantic.diag.cluster_profile", "default");
+    }
+    // sparse(default) | dense_for_clustering
+    std::string semanticDiagClusterInputMode() const {
+        return get<std::string>("semantic.diag.cluster_input_mode", "sparse");
+    }
+    // Trellis hard gates (diagnostic configurable). Defaults preserve legacy behavior.
+    int         semanticDiagTrellisMinClusterPoints() const {
+        int v = get<int>("semantic.diag.trellis_min_cluster_points", 80);
+        return std::max(1, std::min(100000, v));
+    }
+    int         semanticDiagTrellisMinTreeVertices() const {
+        int v = get<int>("semantic.diag.trellis_min_tree_vertices", 16);
+        return std::max(1, std::min(10000, v));
+    }
+    int         semanticWorkerThreads() const {
+        int v = get<int>("semantic.worker_threads", 0);  // 0 = auto
+        return std::max(0, std::min(32, v));
+    }
+    double      semanticAutoscaleEvalIntervalS() const {
+        double v = get<double>("semantic.autoscale.eval_interval_s", 1.0);
+        return std::max(0.1, std::min(30.0, v));
+    }
+    double      semanticAutoscaleHighWatermark() const {
+        double v = get<double>("semantic.autoscale.high_watermark", 0.7);
+        return std::max(0.1, std::min(0.99, v));
+    }
+    double      semanticAutoscaleLowWatermark() const {
+        double v = get<double>("semantic.autoscale.low_watermark", 0.2);
+        return std::max(0.0, std::min(0.95, v));
+    }
+    int         semanticAutoscaleMinActiveWorkers() const {
+        int v = get<int>("semantic.autoscale.min_active_workers", 2);
+        return std::max(1, std::min(32, v));
+    }
     bool        semanticKeyframesOnly() const { return get<bool>("semantic.keyframes_only", false); }
     double      semanticKeyframeTimeToleranceS() const {
         double v = get<double>("semantic.keyframe_time_tolerance_s", 0.03);

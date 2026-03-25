@@ -8,6 +8,7 @@
 #include <future>
 #include <memory>
 #include <mutex>
+#include <unordered_map>
 
 namespace automap_pro::v3 {
 
@@ -47,6 +48,7 @@ private:
 
     // 🏛️ V3: 位姿跳变修正 logic
     void onPoseOptimized(const OptimizationResultEvent& ev);
+    void onPoseDelta(const OptimizationDeltaEvent& ev);
     
     // 🏛️ [架构演进] 处理异步语义地标
     void onSemanticLandmarks(const SemanticLandmarkEvent& ev);
@@ -59,9 +61,11 @@ private:
                              const std::unordered_map<uint64_t, Pose3d>& kf_poses, 
                              PoseFrame frame, uint64_t version);
     bool shouldAcceptOptimizationEvent(const OptimizationResultEvent& ev);
+    bool shouldAcceptOptimizationDelta(const OptimizationDeltaEvent& ev) const;
 
     // 辅助函数
     Mat66d computeOdomInfoMatrix(const SubMap::Ptr& prev, const SubMap::Ptr& curr, const Pose3d& rel) const;
+    void publishGraphTaskEvent(GraphTaskEvent& ev, double source_ts);
 
     // 🏛️ 生产级权限隔离：MappingModule 拥有创建权 (Ownership of Managers)
     KeyFrameManager kf_manager_;
@@ -72,6 +76,7 @@ private:
 
     std::deque<FilteredFrameEventRequiredDs> frame_queue_;
     std::deque<OptimizationResultEvent> pose_opt_queue_;
+    std::deque<OptimizationDeltaEvent> pose_delta_queue_;
     std::deque<GPSAlignedEvent> gps_event_queue_;
     std::deque<SemanticLandmarkEvent> semantic_landmark_queue_;
     
@@ -108,6 +113,20 @@ private:
     std::atomic<int> frozen_submap_count_{0};
     std::atomic<int> processed_frame_count_{0}; // 🏛️ [P0 优化] 记录处理帧数以执行按帧频率的地图构建触发
     std::atomic<int> optimized_apply_count_{0}; // 优化结果应用计数，用于节流优化驱动的全局地图构建
+    std::atomic<uint64_t> semantic_in_total_{0};
+    std::atomic<uint64_t> semantic_defer_total_{0};
+    std::atomic<uint64_t> semantic_dispatch_total_{0};
+    std::atomic<uint64_t> graph_event_seq_{0};
+    std::atomic<uint64_t> route_advice_recv_total_{0};
+    std::atomic<bool> route_takeover_enabled_{false};
+    std::atomic<uint64_t> delta_apply_total_{0};
+    std::atomic<uint64_t> delta_reject_total_{0};
+    std::atomic<uint64_t> legacy_opt_observe_total_{0};
+    std::atomic<uint64_t> legacy_opt_apply_total_{0};
+    std::atomic<uint64_t> legacy_opt_skip_takeover_total_{0};
+    std::atomic<uint64_t> consistency_mismatch_total_{0};
+    mutable std::mutex delta_consistency_mutex_;
+    std::unordered_map<uint64_t, uint64_t> recent_delta_hash_by_version_;
 
     /// 上一次已冻结子图（仅用于子图间 ODOM 因子）。禁止在冻结回调里调用 getFrozenSubmaps()（会与 merge 持锁竞态）。
     SubMap::Ptr prev_frozen_for_odom_;

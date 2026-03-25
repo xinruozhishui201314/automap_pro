@@ -85,11 +85,16 @@ private:
     std::atomic<int>   empty_cloud_count_{0};
     std::atomic<int>   pcl_conversion_error_count_{0};
     std::atomic<int>   invalid_point_cloud_count_{0};
+    std::atomic<uint64_t> kfinfo_count_{0};
+    std::atomic<uint64_t> kfinfo_invalid_ts_count_{0};
+    std::atomic<uint64_t> kfinfo_degenerate_count_{0};
+    std::atomic<double> kfinfo_last_valid_ts_{-1.0};
     std::atomic<int>   gps_msg_count_{0};   // 收到的 NavSatFix 消息总数（含无 fix），用于诊断“无 GPS 数据”
     double             last_odom_ts_ = 0.0;
     double             last_cloud_ts_ = 0.0;
     std::string        gps_topic_;         // 当前订阅的 GPS 话题名（诊断用）
     rclcpp::TimerBase::SharedPtr gps_diag_timer_;  // 延迟诊断：若超时仍 0 条则打 WARN
+    rclcpp::TimerBase::SharedPtr kfinfo_diag_timer_;  // 延迟诊断：若长期 0 条，提示上游未发布
 
     std::vector<OdomCallback>   odom_cbs_;
     std::vector<CloudCallback>  cloud_cbs_;
