@@ -15,6 +15,13 @@ You are working on a **large-scale production codebase**. Every response MUST fo
 - **NEVER assume** an import path is correct. VERIFY the file exists and exports what you expect.
 - If you are uncertain about ANY fact, explicitly state: `"⚠️ I need to verify: [specific thing]"` and then use tools to verify before proceeding.
 
+## PRINCIPLE 1a: OFFICIAL SOURCES FOR FIXES
+
+When debugging or implementing a fix that depends on **external or platform behavior** (language, compiler, stdlib, major libraries, ROS/middleware, build systems, OS packages):
+- **Consult official documentation or release notes** (vendor/manufacturer/project primary docs) before settling on API usage, flags, deprecations, or error semantics.
+- **Do not** rely on stale training cutoffs or unverified blog summaries as the sole basis for a fix when authoritative docs are available.
+- In the response, **name the official source** (doc page, section, or version) when it materially drives the diagnosis or patch.
+
 ## PRINCIPLE 2: THINK IN SYSTEMS, NOT FILES
 
 Before making ANY change, answer these questions (internally or explicitly):
@@ -75,6 +82,7 @@ Every conclusion MUST have an evidence chain:
 ❌ **DO NOT** assume the happy path is the only path
 ❌ **DO NOT** fix symptoms — find and fix the root cause
 ❌ **DO NOT** say "the rest of the code looks fine" without actually reading it
+❌ **DO NOT** fix toolchain, API, or library behavior from memory alone when official documentation exists and is relevant
 
 ## PRINCIPLE 7: BEFORE WRITING ANY CODE
 
@@ -87,6 +95,7 @@ Complete this pre-flight checklist:
 - [ ] I have checked for similar patterns elsewhere in the codebase
 - [ ] I have verified my change doesn't break any existing contract/interface
 - [ ] I have considered edge cases and error paths
+- [ ] Where the fix depends on external/platform semantics, I have consulted **official documentation** (or stated explicitly that none applies) and aligned the change with it
 
 ## PRINCIPLE 8: LARGE CODEBASE NAVIGATION STRATEGY
 

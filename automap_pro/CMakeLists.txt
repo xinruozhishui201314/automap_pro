@@ -97,7 +97,6 @@ endif()
 
 # sloam_rec（SemanticProcessor）：仅使用本包内 thrid_party/sloam_rec（勿依赖仓库外 ../thrid_party）
 set(SLOAM_REC_SLOAM_INCLUDE "${CMAKE_CURRENT_SOURCE_DIR}/thrid_party/sloam_rec/sloam/include")
-option(AUTOMAP_REQUIRE_SEMANTIC "Require non-stub semantic pipeline" ON)
 if(EXISTS "${SLOAM_REC_SLOAM_INCLUDE}/segmentation/inference.h")
   message(STATUS "[automap_pro] sloam_rec sloam include: ${SLOAM_REC_SLOAM_INCLUDE}")
 else()
@@ -106,7 +105,7 @@ else()
     "Vendor copy: copy thrid_party/sloam_rec into ${CMAKE_CURRENT_SOURCE_DIR}/thrid_party/sloam_rec")
 endif()
 
-# ONNX Runtime（SLOAM 语义分割）：与 GTSAM 一致优先 install_deps，未找到时使用 stub
+# ONNX Runtime（SLOAM 语义分割）：与 GTSAM 一致优先 install_deps；未找到则配置失败（禁止 stub）
 set(_onnx_include "")
 set(_onnx_lib "")
 set(_sloam_segmentation_lib "")
@@ -163,53 +162,213 @@ if(ONNX_INCLUDE_DIR AND ONNX_LIBRARY)
     set(_sloam_seg_src_inference "${CMAKE_CURRENT_SOURCE_DIR}/thrid_party/sloam_rec/sloam/src/segmentation/inference.cpp")
     set(_sloam_seg_src_trellis "${CMAKE_CURRENT_SOURCE_DIR}/thrid_party/sloam_rec/sloam/src/segmentation/trellis.cpp")
     if(EXISTS "${_sloam_seg_src_inference}" AND EXISTS "${_sloam_seg_src_trellis}")
-      add_library(automap_sloam_segmentation STATIC
-        "${_sloam_seg_src_inference}"
-        "${_sloam_seg_src_trellis}")
-      target_include_directories(automap_sloam_segmentation PUBLIC
-        "${SLOAM_REC_SLOAM_INCLUDE}"
-        "${SLOAM_REC_SLOAM_INCLUDE}/segmentation"
-        "${SLOAM_REC_SLOAM_INCLUDE}/helpers"
-        "${_onnx_include}")
-      # sloam_rec headers include ROS2 message/cv_bridge headers directly.
-      ament_target_dependencies(automap_sloam_segmentation
-        geometry_msgs
-        sensor_msgs
-        cv_bridge)
-      target_link_libraries(automap_sloam_segmentation
-        ${PCL_LIBRARIES}
-        ${OpenCV_LIBS}
-        Eigen3::Eigen
-        "${_onnx_lib}")
-      set(_sloam_segmentation_target automap_sloam_segmentation)
-      set(USE_SLOAM_SEMANTIC 1)
-      message(WARNING
-        "[automap_pro] Prebuilt sloam_segmentation not found. "
-        "Using in-tree source fallback target: automap_sloam_segmentation")
-    else()
-      set(USE_SLOAM_SEMANTIC 0)
-      if(AUTOMAP_REQUIRE_SEMANTIC)
-        message(FATAL_ERROR
-          "[automap_pro] Semantic pipeline is REQUIRED but sloam_segmentation library is missing.\n"
-          "Searched paths: ${_sloam_seg_hints}\n"
-          "Also checked in-tree fallback sources:\n"
-          "  ${_sloam_seg_src_inference}\n"
-          "  ${_sloam_seg_src_trellis}\n"
-          "Please build/install sloam_segmentation first, or set SLOAM_HOME / SLOAM_SEGMENTATION_LIB_DIR.")
-      else()
-        message(WARNING "[automap_pro] ONNX Runtime found but sloam_segmentation library missing: semantic processor will run in stub mode")
+      # 先解析 cv_bridge 头路径，再 add_library。Isaac/部分 apt 的 ros-*-cv-bridge 可能仅有 CMake 无 include。
+      # STATIC 库：显式注入 cv_bridge 头路径。不可 ament_target_dependencies（plain link 与下方 PUBLIC 冲突）。
+      # IMPORTED 目标的 INTERFACE_INCLUDE_DIRECTORIES 常为 $<INSTALL_INTERFACE:include>；从 cv_bridge_DIR 推导 .../include。
+      message(STATUS "[automap_pro][cv_bridge] in-tree automap_sloam_segmentation: resolving include dir (cv_bridge.h shim or ROS2 official cv_bridge.hpp)")
+      set(_automap_cv_inc "")
+      set(_automap_cv_method "")
+      set(_cb_cfg "")
+      set(_cb_c "")
+      set(_cb_y "")
+      set(_try1_hdr "n/a")
+      set(_try1_hpp "n/a")
+      set(_try2_hdr "n/a")
+      set(_try2_hpp "n/a")
+      if(DEFINED cv_bridge_DIR AND EXISTS "${cv_bridge_DIR}")
+        get_filename_component(_cb_cfg "${cv_bridge_DIR}" ABSOLUTE)
+        get_filename_component(_cb_a "${_cb_cfg}" DIRECTORY)
+        get_filename_component(_cb_b "${_cb_a}" DIRECTORY)
+        get_filename_component(_cb_c "${_cb_b}" DIRECTORY)
+        set(_try1_hdr "${_cb_c}/include/cv_bridge/cv_bridge.h")
+        set(_try1_hpp "${_cb_c}/include/cv_bridge/cv_bridge/cv_bridge.hpp")
+        if(EXISTS "${_try1_hdr}")
+          set(_automap_cv_inc "${_cb_c}/include")
+          set(_automap_cv_method "cv_bridge_DIR + 3x get_filename_component(DIRECTORY) -> distro_prefix/include")
+        elseif(EXISTS "${_try1_hpp}")
+          set(_automap_cv_inc "${_cb_c}/include")
+          set(_automap_cv_method "cv_bridge_DIR + 3x dirname -> include (ros-jazzy official cv_bridge.hpp)")
+        else()
+          # 仅当 cv_bridge_DIR 指向 .../share/cv_bridge（无 cmake 子目录）时，2 次 dirname 才是 distro 根。
+          # 若为 .../share/cv_bridge/cmake，2 次 dirname 会得到 .../share，错误（曾误生成 .../share/include/...）。
+          get_filename_component(_cb_leaf "${_cb_cfg}" NAME)
+          if(NOT _cb_leaf STREQUAL "cmake")
+            get_filename_component(_cb_x "${_cb_cfg}" DIRECTORY)
+            get_filename_component(_cb_y "${_cb_x}" DIRECTORY)
+            set(_try2_hdr "${_cb_y}/include/cv_bridge/cv_bridge.h")
+            set(_try2_hpp "${_cb_y}/include/cv_bridge/cv_bridge/cv_bridge.hpp")
+            if(EXISTS "${_try2_hdr}")
+              set(_automap_cv_inc "${_cb_y}/include")
+              set(_automap_cv_method "cv_bridge_DIR + 2x get_filename_component(DIRECTORY) -> distro_prefix/include")
+            elseif(EXISTS "${_try2_hpp}")
+              set(_automap_cv_inc "${_cb_y}/include")
+              set(_automap_cv_method "cv_bridge_DIR + 2x dirname -> include (ros-jazzy official cv_bridge.hpp)")
+            endif()
+          else()
+            set(_try2_hdr "n/a (cv_bridge_DIR ends with cmake; try1 is the only dirname-based path)")
+          endif()
+        endif()
       endif()
+      # 部分发行版/镜像的 cv_bridge 头文件不在「dirname(cv_bridge_DIR) 推导」路径；直接扫盘（先于 find_path）
+      if(NOT _automap_cv_inc)
+        file(GLOB _automap_cv_glob
+          "/opt/ros/*/include/cv_bridge/cv_bridge.h"
+          "/opt/ros/*/include/cv_bridge/cv_bridge/cv_bridge.hpp"
+          "/usr/include/cv_bridge/cv_bridge.h")
+        list(LENGTH _automap_cv_glob _automap_cv_glob_n)
+        if(_automap_cv_glob_n GREATER 0)
+          list(GET _automap_cv_glob 0 _automap_cv_hit)
+          get_filename_component(_d1 "${_automap_cv_hit}" DIRECTORY)
+          get_filename_component(_d2 "${_d1}" DIRECTORY)
+          get_filename_component(_d3 "${_d2}" DIRECTORY)
+          if(_automap_cv_hit MATCHES "cv_bridge\\.hpp$")
+            set(_automap_cv_inc "${_d3}")
+            set(_automap_cv_method "file(GLOB .../cv_bridge/cv_bridge/cv_bridge.hpp) -> ROS2 official pool layout")
+          else()
+            set(_automap_cv_inc "${_d2}")
+            set(_automap_cv_method "file(GLOB .../cv_bridge/cv_bridge.h) -> parent of cv_bridge dir")
+          endif()
+          message(STATUS "[automap_pro][cv_bridge] glob hit: ${_automap_cv_glob} -> include ${_automap_cv_inc}")
+        endif()
+      endif()
+      if(NOT _automap_cv_inc)
+        # 清除旧缓存，避免先前 NOTFOUND 导致永久失败
+        unset(_automap_cv_bridge_include_dir CACHE)
+        set(_ros_inc_hint "")
+        if(DEFINED ENV{ROS_DISTRO} AND NOT "$ENV{ROS_DISTRO}" STREQUAL "")
+          set(_tmp_ros_inc "/opt/ros/$ENV{ROS_DISTRO}/include")
+          if(EXISTS "${_tmp_ros_inc}")
+            set(_ros_inc_hint "${_tmp_ros_inc}")
+          endif()
+        endif()
+        # 注意：PATH_SUFFIXES 会追加到每个 PATH/HINT，故不要把已是 .../include 的路径与 PATH_SUFFIXES include 混用（会变成 .../include/include）。
+        set(_cv_full_hints "")
+        if(_cb_c)
+          list(APPEND _cv_full_hints "${_cb_c}/include")
+        endif()
+        if(_ros_inc_hint)
+          list(APPEND _cv_full_hints "${_ros_inc_hint}")
+        endif()
+        list(APPEND _cv_full_hints /opt/ros/jazzy/include /opt/ros/humble/include /usr/include)
+        find_path(_automap_cv_bridge_include_dir
+          NAMES cv_bridge/cv_bridge.h cv_bridge/cv_bridge.hpp cv_bridge/cv_bridge/cv_bridge.hpp
+          HINTS ${_cv_full_hints}
+          NO_DEFAULT_PATH)
+        if(NOT _automap_cv_bridge_include_dir)
+          unset(_automap_cv_bridge_include_dir CACHE)
+          find_path(_automap_cv_bridge_include_dir
+            NAMES cv_bridge/cv_bridge.h cv_bridge/cv_bridge.hpp cv_bridge/cv_bridge/cv_bridge.hpp
+            PATHS ${CMAKE_PREFIX_PATH}
+            PATH_SUFFIXES include
+            NO_DEFAULT_PATH)
+        endif()
+        if(NOT _automap_cv_bridge_include_dir)
+          unset(_automap_cv_bridge_include_dir CACHE)
+          find_path(_automap_cv_bridge_include_dir
+            NAMES cv_bridge/cv_bridge.h cv_bridge/cv_bridge.hpp cv_bridge/cv_bridge/cv_bridge.hpp
+            PATHS ${_cv_full_hints})
+        endif()
+        if(NOT _automap_cv_bridge_include_dir)
+          unset(_automap_cv_bridge_include_dir CACHE)
+          find_path(_automap_cv_bridge_include_dir
+            NAMES cv_bridge/cv_bridge.h cv_bridge/cv_bridge.hpp cv_bridge/cv_bridge/cv_bridge.hpp
+            PATHS ${CMAKE_PREFIX_PATH}
+            PATH_SUFFIXES include)
+        endif()
+        if(NOT _automap_cv_bridge_include_dir)
+          unset(_automap_cv_bridge_include_dir CACHE)
+          find_path(_automap_cv_bridge_include_dir
+            NAMES cv_bridge/cv_bridge.h cv_bridge/cv_bridge.hpp cv_bridge/cv_bridge/cv_bridge.hpp)
+        endif()
+        if(_automap_cv_bridge_include_dir)
+          set(_automap_cv_inc "${_automap_cv_bridge_include_dir}")
+          set(_automap_cv_method "find_path(cv_bridge headers: .h / .hpp / official .hpp path)")
+        endif()
+      endif()
+      if(_automap_cv_inc)
+        find_package(Sophus REQUIRED)
+        add_library(automap_sloam_segmentation STATIC
+          "${_sloam_seg_src_inference}"
+          "${_sloam_seg_src_trellis}")
+        target_include_directories(automap_sloam_segmentation PUBLIC
+          "${SLOAM_REC_SLOAM_INCLUDE}"
+          "${SLOAM_REC_SLOAM_INCLUDE}/segmentation"
+          "${SLOAM_REC_SLOAM_INCLUDE}/helpers"
+          "${_onnx_include}")
+        target_include_directories(automap_sloam_segmentation PRIVATE "${_automap_cv_inc}")
+        message(STATUS "[automap_pro][cv_bridge] OK  PRIVATE include: ${_automap_cv_inc}")
+        message(STATUS "[automap_pro][cv_bridge] OK  method: ${_automap_cv_method}")
+        target_link_libraries(automap_sloam_segmentation PUBLIC
+          cv_bridge::cv_bridge
+          Sophus::Sophus
+          ${PCL_LIBRARIES}
+          ${OpenCV_LIBS}
+          Eigen3::Eigen
+          "${_onnx_lib}")
+        set(_sloam_segmentation_target automap_sloam_segmentation)
+        set(USE_SLOAM_SEMANTIC 1)
+        message(WARNING
+          "[automap_pro] Prebuilt sloam_segmentation not found. "
+          "Using in-tree source fallback target: automap_sloam_segmentation")
+      else()
+        message(STATUS "[automap_pro][cv_bridge] FAIL could not resolve include dir — full diagnostics:")
+        if(DEFINED cv_bridge_DIR)
+          message(STATUS "[automap_pro][cv_bridge]   cv_bridge_DIR=${cv_bridge_DIR}")
+        else()
+          message(STATUS "[automap_pro][cv_bridge]   cv_bridge_DIR=(undefined after find_package)")
+        endif()
+        message(STATUS "[automap_pro][cv_bridge]   normalized _cb_cfg=${_cb_cfg}")
+        message(STATUS "[automap_pro][cv_bridge]   try1 header: ${_try1_hdr}")
+        if(_try1_hdr STREQUAL "n/a")
+          message(STATUS "[automap_pro][cv_bridge]   try1 EXISTS=n/a")
+        elseif(EXISTS "${_try1_hdr}")
+          message(STATUS "[automap_pro][cv_bridge]   try1 EXISTS=yes")
+        else()
+          message(STATUS "[automap_pro][cv_bridge]   try1 EXISTS=no")
+        endif()
+        message(STATUS "[automap_pro][cv_bridge]   try1 official hpp: ${_try1_hpp}")
+        if(_try1_hpp STREQUAL "n/a")
+          message(STATUS "[automap_pro][cv_bridge]   try1 hpp EXISTS=n/a")
+        elseif(EXISTS "${_try1_hpp}")
+          message(STATUS "[automap_pro][cv_bridge]   try1 hpp EXISTS=yes")
+        else()
+          message(STATUS "[automap_pro][cv_bridge]   try1 hpp EXISTS=no")
+        endif()
+        message(STATUS "[automap_pro][cv_bridge]   try2 header: ${_try2_hdr}")
+        if(_try2_hdr STREQUAL "n/a")
+          message(STATUS "[automap_pro][cv_bridge]   try2 EXISTS=n/a")
+        elseif(EXISTS "${_try2_hdr}")
+          message(STATUS "[automap_pro][cv_bridge]   try2 EXISTS=yes")
+        else()
+          message(STATUS "[automap_pro][cv_bridge]   try2 EXISTS=no")
+        endif()
+        message(STATUS "[automap_pro][cv_bridge]   try2 official hpp: ${_try2_hpp}")
+        if(_try2_hpp STREQUAL "n/a")
+          message(STATUS "[automap_pro][cv_bridge]   try2 hpp EXISTS=n/a")
+        elseif(EXISTS "${_try2_hpp}")
+          message(STATUS "[automap_pro][cv_bridge]   try2 hpp EXISTS=yes")
+        else()
+          message(STATUS "[automap_pro][cv_bridge]   try2 hpp EXISTS=no")
+        endif()
+        message(STATUS "[automap_pro][cv_bridge]   find_path result _automap_cv_bridge_include_dir=${_automap_cv_bridge_include_dir}")
+        message(STATUS "[automap_pro][cv_bridge]   CMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH}")
+        message(STATUS "[automap_pro][cv_bridge] hint: Jazzy 官方 deb 提供 cv_bridge/cv_bridge/cv_bridge.hpp；脚本可从 pool 合并 ros-jazzy-cv-bridge_* 并写 cv_bridge.h 兼容层。")
+        message(FATAL_ERROR
+          "[automap_pro] in-tree sloam_segmentation 需要 cv_bridge 可解析的 include（cv_bridge.h 兼容层或官方 cv_bridge.hpp 树），但未找到（见上方 [automap_pro][cv_bridge]）。"
+          "禁止进入 stub：请使用 scripts/build_inside_container.sh 中的官方 pool deb（ros-jazzy-cv-bridge 固定版本）或正确安装 ros-<distro>-cv-bridge。")
+      endif()
+    else()
+      message(FATAL_ERROR
+        "[automap_pro] 未找到 sloam_segmentation 库，且 in-tree 源码不完整（需 inference.cpp + trellis.cpp）。\n"
+        "Searched paths: ${_sloam_seg_hints}\n"
+        "Expected sources:\n  ${_sloam_seg_src_inference}\n  ${_sloam_seg_src_trellis}\n"
+        "请安装预编译库并设置 SLOAM_HOME / SLOAM_SEGMENTATION_LIB_DIR，或补全 thrid_party/sloam_rec 源码。")
     endif()
   endif()
 else()
-  set(USE_SLOAM_SEMANTIC 0)
-  if(AUTOMAP_REQUIRE_SEMANTIC)
-    message(FATAL_ERROR
-      "[automap_pro] Semantic pipeline is REQUIRED but ONNX Runtime was not found.\n"
-      "Set ONNXRUNTIME_HOME or install onnxruntime in install_deps.")
-  else()
-    message(STATUS "[automap_pro] ONNX Runtime not found: SLOAM semantic DISABLED (stub mode)")
-  endif()
+  message(FATAL_ERROR
+    "[automap_pro] ONNX Runtime 未找到（需要 onnxruntime_cxx_api.h 与 libonnxruntime）。"
+    "请设置 ONNXRUNTIME_HOME 或提供 workspace/install_deps/onnxruntime。")
 endif()
 
 # Boost（lockfree SPSC 队列，用于 ingress/frame 热路径无锁）
@@ -221,6 +380,26 @@ find_package(GTSAM REQUIRED)
 message(STATUS "[automap_pro] GTSAM found (startup double free in lago? see docs/FIX_GTSAM_LAGO_STATIC_INIT_DOUBLE_FREE.md)")
 
 # Ceres（可选，须 ≥ 2.0 以支持 SphereManifold）
+# build_inside_container 将 Ceres 安装到 workspace install_deps/ceres；colcon 调用 cmake 时常未继承 shell 的 CMAKE_PREFIX_PATH
+set(_automap_ceres_prefix "${CMAKE_CURRENT_SOURCE_DIR}/../../install_deps/ceres")
+if(EXISTS "${_automap_ceres_prefix}/lib/cmake/Ceres/CeresConfig.cmake" OR EXISTS "${_automap_ceres_prefix}/lib64/cmake/Ceres/CeresConfig.cmake")
+  list(PREPEND CMAKE_PREFIX_PATH "${_automap_ceres_prefix}")
+  message(STATUS "[automap_pro] Ceres search prefix: ${_automap_ceres_prefix}")
+endif()
+# Debian/Ubuntu multiarch: libceres-dev installs CeresConfig under lib/<triplet>/cmake/Ceres; plain
+# find_package(Ceres) may not discover it without Ceres_DIR / CMAKE_PREFIX_PATH.
+if(NOT EXISTS "${_automap_ceres_prefix}/lib/cmake/Ceres/CeresConfig.cmake" AND NOT EXISTS "${_automap_ceres_prefix}/lib64/cmake/Ceres/CeresConfig.cmake")
+  foreach(_ceres_cmake IN ITEMS
+      "/usr/lib/x86_64-linux-gnu/cmake/Ceres"
+      "/usr/lib/aarch64-linux-gnu/cmake/Ceres"
+      "/usr/lib/cmake/Ceres")
+    if(EXISTS "${_ceres_cmake}/CeresConfig.cmake")
+      set(Ceres_DIR "${_ceres_cmake}")
+      message(STATUS "[automap_pro] Ceres search: system package at ${Ceres_DIR}")
+      break()
+    endif()
+  endforeach()
+endif()
 find_package(Ceres QUIET)
 if(Ceres_FOUND)
   add_definitions(-DUSE_CERES)
@@ -234,6 +413,17 @@ if(Ceres_FOUND)
     message(FATAL_ERROR "[automap_pro] Ceres ${_ceres_ver} < 2.0，无法使用 SphereManifold。请使用 thrid_party/ceres-solver 或系统 Ceres ≥ 2.0")
   endif()
   message(STATUS "[automap_pro] Ceres ${_ceres_ver}: SphereManifold 已启用（圆柱拟合）")
+endif()
+
+# in-tree automap_sloam_segmentation（trellis.cpp）依赖 Ceres，须在 find_package(Ceres) 之后链接
+if(TARGET automap_sloam_segmentation)
+  if(Ceres_FOUND)
+    target_link_libraries(automap_sloam_segmentation PUBLIC Ceres::ceres)
+  else()
+    message(FATAL_ERROR
+      "[automap_pro] in-tree automap_sloam_segmentation 需要 Ceres（sloam trellis.cpp），但未找到 Ceres。\n"
+      "请安装 libceres-dev（≥2.0），或编译 thrid_party/ceres-solver 到 install_deps/ceres（需含 lib/cmake/Ceres/CeresConfig.cmake），并确保 CMAKE_PREFIX_PATH 包含该前缀。")
+  endif()
 endif()
 
 # ─────────────────────────────────────────────────────────────────────────────

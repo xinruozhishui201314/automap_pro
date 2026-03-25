@@ -462,6 +462,7 @@ public:
                          .to(infer_device);
         torch::Tensor logits;
         {
+            detail_hybrid::HybridSharedState& st = detail_hybrid::hybridState();
             std::lock_guard<std::mutex> lock(st.mu);
             logits = st.classifier.forward({tfeat}).toTensor().to(torch::kCPU);
         }

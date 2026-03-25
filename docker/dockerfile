@@ -209,7 +209,7 @@ RUN echo "" && \
     libfmt-dev \
     libspdlog-dev \
     # 地理坐标 (GPS 处理)
-    libgeographic-dev \
+    libgeographiclib-dev \
     geographiclib-tools \
     # FLANN (PCL 依赖)
     libflann-dev \

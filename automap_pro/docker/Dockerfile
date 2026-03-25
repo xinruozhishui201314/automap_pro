@@ -9,7 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-pip python3-dev python3-setuptools \
     libboost-all-dev libeigen3-dev libflann-dev \
     libpcl-dev libopencv-dev \
-    libgeographic-dev \
+    libgeographiclib-dev \
     libgtest-dev libyaml-cpp-dev \
     nlohmann-json3-dev \
     pkg-config \

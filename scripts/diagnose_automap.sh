@@ -182,8 +182,8 @@ diagnose_precheck() {
     print_section "【3】运行前环境检查"
     
     # Docker 镜像
-    if docker images | grep -q "automap-env.*humble"; then
-        print_info "Docker 镜像: automap-env:humble ✓"
+    if docker images | grep -qE "automap-env|isaac/ros|nvcr.io/nvidia/isaac"; then
+        print_info "Docker 镜像: 已检测到 automap-env 或 NGC Isaac 相关镜像 ✓"
     else
         print_warn "Docker 镜像未找到（首次运行需构建）"
     fi

@@ -2,10 +2,13 @@
 #include <boost/make_shared.hpp>
 #include <array>
 #include <atomic>
+#include <vector>
 #include <csignal>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <strings.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 namespace {
@@ -98,6 +101,44 @@ int envIntOr(const char* name, int fallback) {
   return static_cast<int>(parsed);
 }
 
+/** AUTOMAP_SLOAM_ONNX_CUDA: 1 / true / yes / on → 尝试使用 ONNX Runtime CUDA EP（需 GPU 版 ORT + 驱动）。 */
+bool envFlagTrue(const char* name) {
+  const char* v = std::getenv(name);
+  if (!v || *v == '\0') return false;
+  if (std::strcmp(v, "1") == 0) return true;
+  return ::strcasecmp(v, "true") == 0 || ::strcasecmp(v, "yes") == 0 || ::strcasecmp(v, "on") == 0;
+}
+
+/**
+ * 探测 libonnxruntime_providers_cuda.so，避免在 CPU 版 ORT 上 Append CUDA EP 导致启动失败。
+ * 搜索顺序: AUTOMAP_ONNXRUNTIME_LIB_DIR → ONNXRUNTIME_HOME/lib → 常见容器路径。
+ */
+bool sloamOnnxCudaProviderAvailable(std::string* detail) {
+  std::vector<std::string> libdirs;
+  if (const char* d = std::getenv("AUTOMAP_ONNXRUNTIME_LIB_DIR")) {
+    if (*d) libdirs.emplace_back(d);
+  }
+  if (const char* home = std::getenv("ONNXRUNTIME_HOME")) {
+    if (*home) libdirs.emplace_back(std::string(home) + "/lib");
+  }
+  libdirs.emplace_back("/root/automap_ws/install_deps/onnxruntime/lib");
+
+  for (const auto& dir : libdirs) {
+    const std::string cuda_so = dir + "/libonnxruntime_providers_cuda.so";
+    struct stat st {};
+    if (::stat(cuda_so.c_str(), &st) == 0 && S_ISREG(st.st_mode)) {
+      if (detail) *detail = "using " + cuda_so;
+      return true;
+    }
+  }
+  if (detail) {
+    *detail =
+        "libonnxruntime_providers_cuda.so not found (set AUTOMAP_ONNXRUNTIME_LIB_DIR or ONNXRUNTIME_HOME; "
+        "GPU EP requires ORT built with ONNXRUNTIME_USE_CUDA=1 / --use_cuda)";
+  }
+  return false;
+}
+
 double nowMs() {
   using clock = std::chrono::steady_clock;
   return std::chrono::duration<double, std::milli>(clock::now().time_since_epoch()).count();
@@ -166,8 +207,17 @@ Segmentation::Segmentation(const std::string modelFilePath,
   installSegmentationCrashHandlerOnce();
 
   const std::string sessionName = "SLOAMSeg";
-  // specify number of CPU threads allowed for semantic segmentation inference to use
-  _startONNXSession(sessionName, modelFilePath, false, 3);
+  bool use_cuda = envFlagTrue("AUTOMAP_SLOAM_ONNX_CUDA");
+  std::string cuda_detail;
+  if (use_cuda && !sloamOnnxCudaProviderAvailable(&cuda_detail)) {
+    std::cout << "[Segmentation] AUTOMAP_SLOAM_ONNX_CUDA set but CUDA EP unavailable: " << cuda_detail
+              << " — falling back to CPU EP." << std::endl;
+    use_cuda = false;
+  } else if (use_cuda) {
+    std::cout << "[Segmentation] AUTOMAP_SLOAM_ONNX_CUDA: " << cuda_detail << std::endl;
+  }
+  // numThreads: CUDA EP 下仍保留 ORT 线程配置（主要由 AUTOMAP_ORT_* 环境变量控制）
+  _startONNXSession(sessionName, modelFilePath, use_cuda, 3);
 }
 
 void Segmentation::_startONNXSession(const std::string sessionName, const std::string modelFilePath, bool useCUDA, size_t numThreads){

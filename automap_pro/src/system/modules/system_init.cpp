@@ -6,6 +6,7 @@
 #include "automap_pro/core/health_monitor.h"
 #include "automap_pro/core/utils.h"
 #include "automap_pro/core/protocol_contract.h" // 🏛️ [架构加固] 引入协议契约
+#include <pcl_conversions/pcl_conversions.h>
 #include <filesystem>
 
 namespace automap_pro {

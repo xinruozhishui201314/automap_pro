@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# 在「与 run_automap.sh 相同」的 automap-env:humble 镜像中执行命令，便于导出 ONNX 等。
+# 在「与 run_automap.sh 相同」的 Docker 镜像中执行命令（默认 NGC Isaac / Jazzy，见 scripts/automap_docker_defaults.sh）。
 #
 # 挂载与 run_automap 构建/运行一致：
 #   - automap_ws → /root/automap_ws
@@ -35,7 +35,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-IMAGE_NAME="${AUTOMAP_DOCKER_IMAGE:-automap-env:humble}"
+# shellcheck source=scripts/automap_docker_defaults.sh
+source "${SCRIPT_DIR}/scripts/automap_docker_defaults.sh"
 WORKSPACE_DIR="${SCRIPT_DIR}/automap_ws"
 PROJECT_DIR="${SCRIPT_DIR}/automap_pro"
 DATA_DIR="${SCRIPT_DIR}/data"
@@ -80,6 +81,10 @@ if [[ $# -lt 1 ]]; then
 fi
 
 mkdir -p "${DATA_DIR}" "${WORKSPACE_DIR}"
+AUTOMAP_CACHE_HOST="${SCRIPT_DIR}/thrid_party/automap_cache"
+mkdir -p "${AUTOMAP_CACHE_HOST}/pip" "${AUTOMAP_CACHE_HOST}/libtorch" "${AUTOMAP_CACHE_HOST}/git" \
+  "${AUTOMAP_CACHE_HOST}/apt/archives/partial" "${AUTOMAP_CACHE_HOST}/xdg"
+AUTOMAP_CACHE_MOUNT="-v ${AUTOMAP_CACHE_HOST}:/root/automap_download_cache:rw"
 
 GPU_ARGS=( )
 if [[ "${USE_GPU}" -eq 1 ]]; then
@@ -88,7 +93,11 @@ fi
 
 # 与 run_automap 一致：可选加载 ROS/工作空间（导出一般不需要 install，但保留 source 无害）
 INNER_PREFIX='set -e
-source /opt/ros/humble/setup.bash 2>/dev/null || true
+if [[ -f /root/scripts/automap_download_defaults.sh ]]; then
+  source /root/scripts/automap_download_defaults.sh
+  automap_configure_apt_cache
+fi
+source /opt/ros/'"${AUTOMAP_ROS_DISTRO}"'/setup.bash 2>/dev/null || true
 if [[ -f /root/automap_ws/install/setup.bash ]]; then source /root/automap_ws/install/setup.bash; fi
 if [[ -f /root/automap_ws/install_deps/setup.bash ]]; then source /root/automap_ws/install_deps/setup.bash; fi
 '
@@ -100,8 +109,22 @@ done
 
 docker run --rm \
   ${TIME_VOLUMES} \
+  ${AUTOMAP_CACHE_MOUNT} \
   "${GPU_ARGS[@]}" \
   --net=host \
+  -e AUTOMAP_DOWNLOAD_CACHE=/root/automap_download_cache \
+  -e PIP_CACHE_DIR=/root/automap_download_cache/pip \
+  -e AUTOMAP_UBUNTU_MIRROR="${AUTOMAP_UBUNTU_MIRROR:-http://mirrors.aliyun.com/ubuntu}" \
+  -e AUTOMAP_LIBTORCH_DOWNLOAD_BASE="${AUTOMAP_LIBTORCH_DOWNLOAD_BASE:-https://mirrors.tuna.tsinghua.edu.cn/pytorch-wheels/libtorch}" \
+  -e AUTOMAP_USE_OFFICIAL_LIBTORCH="${AUTOMAP_USE_OFFICIAL_LIBTORCH:-0}" \
+  -e AUTOMAP_PYG_WHEEL_BASE="${AUTOMAP_PYG_WHEEL_BASE:-https://data.pyg.org/whl}" \
+  -e AUTOMAP_USE_OFFICIAL_PYPI="${AUTOMAP_USE_OFFICIAL_PYPI:-0}" \
+  -e AUTOMAP_PIP_INDEX="${AUTOMAP_PIP_INDEX:-}" \
+  -e AUTOMAP_ONNXRUNTIME_GIT_URL="${AUTOMAP_ONNXRUNTIME_GIT_URL:-}" \
+  -e LSK_PYTORCH_WHL_INDEX="${LSK_PYTORCH_WHL_INDEX:-}" \
+  -e LSK_PYTORCH_WHL_INDEX_DEFAULT_BASE="${LSK_PYTORCH_WHL_INDEX_DEFAULT_BASE:-}" \
+  $( [ -n "${PIP_INDEX+x}" ] && [ -n "${PIP_INDEX}" ] && printf '%s\n' "-e PIP_INDEX=${PIP_INDEX}" ) \
+  -e AUTOMAP_LSK3DNET_PYTHON="${AUTOMAP_LSK3DNET_PYTHON:-}" \
   -e OMP_NUM_THREADS=1 \
   -e MKL_NUM_THREADS=1 \
   -v "${WORKSPACE_DIR}:/root/automap_ws:rw" \

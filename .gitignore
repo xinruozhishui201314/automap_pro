@@ -21,6 +21,9 @@ automap_pro/thrid_party/**/docs/*.gif
 docker/*.tar
 docker/*.tar.gz
 
+# 宿主机下载缓存（pip / LibTorch / ONNX 源码快照，由 run_automap 等挂载到容器）
+thrid_party/automap_cache/
+
 # ========== Docker 依赖（构建产物，可重新下载）==========
 docker/deps/downloads/
 docker/deps/*/bin/

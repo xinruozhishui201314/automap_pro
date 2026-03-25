@@ -7,6 +7,7 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+SCRIPT_DIR="$PROJECT_ROOT" source "${PROJECT_ROOT}/scripts/automap_docker_defaults.sh"
 
 echo "========================================="
 echo "AutoMap Pro 编译错误快速修复"
@@ -44,10 +45,10 @@ docker run --rm \
     --net=host \
     -v "${PROJECT_ROOT}/automap_ws:/root/automap_ws:rw" \
     -v "${PROJECT_ROOT}/automap_pro:/root/automap_ws/src/automap_pro:ro" \
-    automap-env:humble \
+    "${IMAGE_NAME}" \
     /bin/bash -c "
         set -e
-        source /opt/ros/humble/setup.bash
+        source /opt/ros/${AUTOMAP_ROS_DISTRO}/setup.bash
         cd /root/automap_ws
 
         # 删除旧的 automap_pro 编译产物

@@ -16,9 +16,17 @@ When a user reports a bug, error, or unexpected behavior, follow this EXACT proc
 
 ## PHASE 4: INVESTIGATION (The deep dive)
 
+- Trace code, logs, configs, and reproduction as usual.
+- When the failure involves **libraries, compilers, ROS/middleware, OS packages, or vendor APIs**, open **official documentation or release notes** for the relevant version and confirm expected behavior, deprecations, and error codes — do not guess from memory alone.
+- Record which official sources were used (title, section, or URL) when they change the diagnosis.
+
 ## PHASE 5: SOLUTION DESIGN
 
+- Prefer designs that match **documented** contracts; if the codebase intentionally diverges from upstream docs, say so explicitly.
+
 ## PHASE 6: IMPLEMENTATION
+
+- Before finalizing the patch, re-check official material for any API, flag, or ABI you are changing so the fix matches the **supported** usage for the project’s pinned or target version.
 
 ## PHASE 7: REPORT
 

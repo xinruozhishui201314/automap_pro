@@ -240,8 +240,7 @@ Host (Ubuntu)
 
 ### B. 构建期强约束（必须满足）
 
-- CMake 默认启用 `AUTOMAP_REQUIRE_SEMANTIC=ON`
-- 若 ONNX Runtime 或 `sloam_segmentation` 缺失，配置阶段直接 `FATAL_ERROR`
+- 若 ONNX Runtime 不可用，或既无预编译 `sloam_segmentation` 又无法完成 in-tree 编译（含 `cv_bridge` 头），配置阶段直接 `FATAL_ERROR`（禁止 stub）
 - 只有依赖齐全时，才会定义 `AUTOMAP_USE_SLOAM_SEMANTIC=1`
 
 ### C. 构建验收清单（必须逐条确认）
@@ -259,8 +258,8 @@ bash run_automap.sh --build-only --clean
 
 若看到以下任一信息即为失败（不得继续运行）：
 
-- `Semantic pipeline is REQUIRED but ONNX Runtime was not found`
-- `Semantic pipeline is REQUIRED but sloam_segmentation library is missing`
+- `ONNX Runtime 未找到`
+- `cv_bridge/cv_bridge.h` 无法解析，或 `sloam_segmentation` / in-tree 源码路径不满足
 
 ### D. 运行验收清单（必须逐条确认）
 

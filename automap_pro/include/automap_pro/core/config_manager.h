@@ -658,7 +658,15 @@ public:
     std::string semanticLsk3dnetClassifierTorchscript() const {
         return get<std::string>("semantic.lsk3dnet.classifier_torchscript", "");
     }
-    std::string semanticLsk3dnetPython() const { return get<std::string>("semantic.lsk3dnet.python", "python3"); }
+    /** lsk3dnet_hybrid 子进程解释器；环境变量 AUTOMAP_LSK3DNET_PYTHON 优先于 YAML（便于 Docker 指向 install_deps/lsk3dnet_venv）。 */
+    std::string semanticLsk3dnetPython() const {
+        if (const char* e = std::getenv("AUTOMAP_LSK3DNET_PYTHON")) {
+            if (e[0] != '\0') {
+                return std::string(e);
+            }
+        }
+        return get<std::string>("semantic.lsk3dnet.python", "python3");
+    }
     std::string semanticLsk3dnetWorkerScript() const { return get<std::string>("semantic.lsk3dnet.worker_script", ""); }
     /** lsk3dnet_hybrid：法线模式 range=与训练一致的距离图法线（utils.normalmap），zeros=调试 */
     std::string semanticLsk3dnetHybridNormalMode() const {

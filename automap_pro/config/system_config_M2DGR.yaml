@@ -110,8 +110,8 @@ semantic:
   lsk3dnet:
     # model_type=lsk3dnet 时使用的 TorchScript 路径
     model_path: "${CMAKE_CURRENT_SOURCE_DIR}/models/lsk3dnet.ts"
-    # cpu | cuda:0 | cuda:1
-    device: "cpu"
+    # cpu | cuda:0 | cuda:1（默认 sloam 时本段不生效；切到 lsk3dnet 时 RTX 50 等建议 cuda:0）
+    device: "cuda:0"
     # ── lsk3dnet_hybrid 专用（需 USE_TORCH 编译 + 本机 Python 含 torch/spconv 与权重一致）──
     # repo_root: LSK3DNet-main 根目录（含 network/、scripts/lsk3dnet_hybrid_worker.py）
     # config_yaml / checkpoint / classifier_torchscript：可为绝对路径，或相对 repo_root
@@ -120,7 +120,8 @@ semantic:
     # config_yaml: "config/lk-semantickitti_erk_finetune.yaml"
     # checkpoint: "output_skitti/your.pt"
     # classifier_torchscript: "${CMAKE_CURRENT_SOURCE_DIR}/models/lsk_classifier.ts"
-    # python: "python3"
+    # python: "python3"   # hybrid 推荐: /root/automap_ws/install_deps/lsk3dnet_venv/bin/python3（AUTOMAP_SETUP_LSK3DNET_VENV=1 编译后）
+    # 或设环境变量 AUTOMAP_LSK3DNET_PYTHON（优先于本字段）
     # worker_script: ""   # 留空则优先 share/automap_pro/lsk3dnet_scripts/（安装后），否则 repo_root/scripts/
     # 生产闭环（推荐）:
     # 1) 用 export_lsk3dnet_classifier_torchscript.py 导出 .pt，会生成同名的 .meta.json（SHA256 + feat_dim）

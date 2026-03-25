@@ -105,16 +105,25 @@ find_package(Sophus REQUIRED)
 find_package(Boost REQUIRED COMPONENTS thread)
 find_package(fmt REQUIRED)
 
+# ROS 2 Jazzy 等：SophusConfig 常只导出 Sophus::Sophus，Sophus_INCLUDE_DIRS 可能为空；须链接目标以传递 sophus 头文件路径
+if(TARGET Sophus::Sophus)
+  set(_FAST_LIVO_SOPHUS Sophus::Sophus)
+else()
+  set(_FAST_LIVO_SOPHUS ${Sophus_LIBRARIES})
+endif()
+
 # Include directories for dependencies
 include_directories(
   ${EIGEN3_INCLUDE_DIR}
   ${PCL_INCLUDE_DIRS}
   ${OpenCV_INCLUDE_DIRS}
-  ${Sophus_INCLUDE_DIRS}
   ${vikit_common_INCLUDE_DIRS}
   ${vikit_ros_INCLUDE_DIRS}
   include
 )
+if(Sophus_INCLUDE_DIRS)
+  include_directories(${Sophus_INCLUDE_DIRS})
+endif()
 
 set(dependencies
   rclcpp
@@ -157,11 +166,12 @@ ament_target_dependencies(laser_mapping ${dependencies})
 # vikit_common and vikit_ros are linked via ament_target_dependencies above
 target_link_libraries(laser_mapping
     ${COMMON_DEPENDENCIES}
+    ${_FAST_LIVO_SOPHUS}
 )
-target_link_libraries(vio ${COMMON_DEPENDENCIES})
-target_link_libraries(lio utils ${COMMON_DEPENDENCIES})
-target_link_libraries(pre ${COMMON_DEPENDENCIES})
-target_link_libraries(imu_proc ${COMMON_DEPENDENCIES})
+target_link_libraries(vio ${COMMON_DEPENDENCIES} ${_FAST_LIVO_SOPHUS})
+target_link_libraries(lio utils ${COMMON_DEPENDENCIES} ${_FAST_LIVO_SOPHUS})
+target_link_libraries(pre ${COMMON_DEPENDENCIES} ${_FAST_LIVO_SOPHUS})
+target_link_libraries(imu_proc ${COMMON_DEPENDENCIES} ${_FAST_LIVO_SOPHUS})
 
 # Add the main executable
 add_executable(fastlivo_mapping src/main.cpp)
@@ -177,7 +187,7 @@ target_link_libraries(fastlivo_mapping
   imu_proc
   ${PCL_LIBRARIES}
   ${OpenCV_LIBRARIES}
-  ${Sophus_LIBRARIES}
+  ${_FAST_LIVO_SOPHUS}
   ${Boost_LIBRARIES}
 )
 

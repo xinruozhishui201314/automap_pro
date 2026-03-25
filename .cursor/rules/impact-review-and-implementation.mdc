@@ -89,6 +89,7 @@ During implementation:
 - preserve compatibility unless explicitly told otherwise
 - avoid unrelated cleanup unless required for correctness
 - keep naming, contracts, and behavior consistent across touched layers
+- when behavior depends on **language, compiler, libraries, ROS/middleware, or vendor APIs**, **confirm against official documentation** for the version in use before treating the change as final
 
 ### If you edit code
 After editing, summarize:

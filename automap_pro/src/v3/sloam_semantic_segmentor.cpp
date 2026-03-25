@@ -9,6 +9,18 @@
 
 namespace automap_pro::v3 {
 
+namespace {
+
+/** SLOAM Segmentation API takes non-const Ptr; we only have ConstPtr. Alias shares ownership; SLOAM run/maskCloud only read points. */
+inline CloudXYZIPtr sloamInputCloudPtr(const CloudXYZIConstPtr& cloud) {
+    if (!cloud) {
+        return nullptr;
+    }
+    return CloudXYZIPtr(cloud, const_cast<CloudXYZI*>(cloud.get()));
+}
+
+}  // namespace
+
 class SloamSemanticSegmentor final : public ISemanticSegmentor {
 public:
     explicit SloamSemanticSegmentor(const SegmentorConfig& cfg) {
@@ -34,7 +46,7 @@ public:
     void run(const CloudXYZIConstPtr& cloud, cv::Mat& mask, SemanticSegResult* result) override {
 #ifdef AUTOMAP_USE_SLOAM_SEMANTIC
         const auto t0 = std::chrono::steady_clock::now();
-        segmentator_->run(cloud, mask);
+        segmentator_->run(sloamInputCloudPtr(cloud), mask);
         if (result != nullptr) {
             const auto t1 = std::chrono::steady_clock::now();
             result->success = true;
@@ -51,7 +63,8 @@ public:
     void maskCloud(const CloudXYZIConstPtr& cloud, const cv::Mat& mask, CloudXYZIPtr& out_cloud,
                    int tree_label, bool dense_for_clustering) override {
 #ifdef AUTOMAP_USE_SLOAM_SEMANTIC
-        segmentator_->maskCloud(cloud, mask, out_cloud, tree_label, dense_for_clustering);
+        segmentator_->maskCloud(sloamInputCloudPtr(cloud), mask, out_cloud,
+                                static_cast<unsigned char>(tree_label), dense_for_clustering);
 #else
         (void)cloud;
         (void)mask;

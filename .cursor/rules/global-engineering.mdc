@@ -27,6 +27,12 @@ Do not present guesses as established facts.
 - Do not only patch the visible error point.
 - Look for upstream triggers, invalid state propagation, contract mismatches, hidden coupling, stale assumptions, and systemic causes.
 
+## 3a. Consult official sources when diagnosing and fixing
+When the issue or fix involves **language semantics**, **compiler or toolchain behavior**, **third-party or system libraries**, **frameworks** (e.g. ROS, middleware), **OS or distribution packages**, or **vendor APIs**:
+- Read **primary official material** first: upstream docs, manuals, release notes, migration guides, and spec pages — not only memory, forum guesses, or unverified secondary posts.
+- If the fix hinges on documented behavior, **tie the change to what the official source states** (quote, section, or version) so the reasoning is auditable.
+- If official docs contradict local assumptions, treat the documented contract as default unless the project explicitly documents an intentional deviation or pinned version.
+
 ## 4. Think in systems, not only files
 When relevant, inspect beyond the current file:
 - call chain

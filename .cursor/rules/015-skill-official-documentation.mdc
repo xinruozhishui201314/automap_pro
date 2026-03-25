@@ -1,0 +1,42 @@
+---
+description: "Skill: Consult official documentation when diagnosing bugs or designing fixes that depend on external or platform behavior. Use for compiler errors, library APIs, ROS/middleware, OS packages, and vendor integrations."
+globs:
+alwaysApply: false
+---
+
+# SKILL: OFFICIAL DOCUMENTATION FOR DIAGNOSIS AND FIXES
+
+## When to use this skill
+
+Activate when any of the following are in play:
+
+- Compiler, linker, or build-system errors or flags
+- Language or standard-library semantics and deprecations
+- Third-party libraries, SDKs, or vendor APIs
+- ROS, middleware, or distributed-system contracts
+- OS, container, or distribution package behavior
+- Version upgrades, migrations, or compatibility questions
+
+Purely local application logic with no external contract ambiguity may not require this skill.
+
+## Mandatory behavior
+
+1. **Identify the authoritative source** for the component and version in use (project-pinned or environment-reported): upstream project docs, language spec or reference, vendor manual, or official release notes — not random tutorials as the sole authority.
+
+2. **Read before concluding**: Look up the specific API, flag, error code, or migration step in that source. Use web fetch, packaged docs, or versioned doc URLs as available.
+
+3. **Cite in the work product**: When official material drives the diagnosis or patch, name it (document title, section heading, version, or stable URL). If no official doc exists, state that explicitly and list what was checked.
+
+4. **Reconcile with the repo**: If local code contradicts official docs, treat that as a risk to call out; fixes should either align with documented usage or document a deliberate, version-pinned exception in project terms.
+
+## Do not
+
+- Ship fixes that depend on undocumented or guessed behavior when primary docs exist.
+- Substitute outdated blog posts for current release notes when upgrading or debugging version-specific failures.
+
+## Related rules
+
+- `global-engineering.mdc` §3a
+- `001-core-analysis-methodology.mdc` PRINCIPLE 1a and PRINCIPLE 7 checklist
+- `bug-analysis.mdc` phases 4 and 6
+- `002-troubleshooting-sop.mdc` phases 4–6

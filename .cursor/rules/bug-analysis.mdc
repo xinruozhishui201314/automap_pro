@@ -123,15 +123,19 @@ Prioritize:
 - highest-signal validation steps
 - the smallest next step that meaningfully reduces uncertainty
 
+For issues involving **external tools, libraries, language/runtime, or platform behavior**, include validation steps against **official documentation or release notes** for the version in use (expected semantics, breaking changes, known issues).
+
 ### Output
 Provide:
 - Candidate-by-candidate validation plan
 - Smallest next debugging step
 - Notes on what static analysis can and cannot confirm
+- When applicable: which **official sources** were consulted and what they establish
 
 ### Do not
 - Ask for everything at once if a smaller targeted check would do.
 - Pretend missing runtime evidence is already known.
+- Rely only on unofficial writeups when primary vendor or upstream docs are available and relevant.
 
 ---
 
@@ -171,15 +175,18 @@ Propose a fix approach that addresses root cause, not only the symptom.
   - balanced fix
   - ideal long-term correction
 - Note trade-offs if the fix is intentionally partial.
+- If the fix depends on **documented** library, API, or toolchain behavior, cite **official documentation** (or standard/spec) so the approach is verifiable.
 
 ### Output
 Provide:
 - Fix options
 - Recommended direction
 - Why it is root-cause-oriented
+- References to official material when they constrain or justify the fix
 
 ### Do not
 - Suggest a patch that only suppresses the symptom without discussing trade-offs.
+- Propose API or flag usage that contradicts official docs for the target version without explicitly acknowledging and mitigating the mismatch.
 
 ---
 

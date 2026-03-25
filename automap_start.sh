@@ -3,7 +3,7 @@
 # AutoMap-Pro v2.0  一键编译 & 运行脚本
 #
 # 特性：
-#   - Docker 镜像：automap-env:humble
+#   - Docker 镜像：默认 NGC Isaac ROS（Jazzy，适配 RTX 50 等）；可设 AUTOMAP_DOCKER_IMAGE=automap-env:humble
 #   - 工作空间内无符号链接（源码直接复制进容器）
 #   - 全局 spdlog 日志（文件 + 彩色 stdout）
 #   - 离线模式自动回放 nya_02_ros2
@@ -32,8 +32,8 @@ set -euo pipefail
 # 路径与全局变量
 # ─────────────────────────────────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-IMAGE_NAME="automap-env:humble"
-IMAGE_ARCHIVE="${SCRIPT_DIR}/docker/automap-env_humble.tar"
+# shellcheck source=scripts/automap_docker_defaults.sh
+source "${SCRIPT_DIR}/scripts/automap_docker_defaults.sh"
 
 # 容器内路径
 CONTAINER_WS="/workspace/automap_ws"
@@ -118,12 +118,16 @@ preflight_check() {
     log_ok "Docker 运行正常"
 
     if ! docker image inspect "${IMAGE_NAME}" &>/dev/null; then
-        if [[ -f "${IMAGE_ARCHIVE}" ]]; then
+        if [[ -n "${IMAGE_ARCHIVE}" ]] && [[ -f "${IMAGE_ARCHIVE}" ]]; then
             log_info "加载镜像 ${IMAGE_ARCHIVE} ..."
             docker load -i "${IMAGE_ARCHIVE}"
             log_ok "镜像已加载: ${IMAGE_NAME}"
+        elif [[ "${IMAGE_NAME}" == nvcr.io/* ]] || [[ "${IMAGE_NAME}" == ghcr.io/* ]]; then
+            log_info "拉取镜像 ${IMAGE_NAME} ..."
+            docker pull "${IMAGE_NAME}"
+            log_ok "镜像已就绪: ${IMAGE_NAME}"
         else
-            log_error "镜像 ${IMAGE_NAME} 不存在，且未找到 ${IMAGE_ARCHIVE}"
+            log_error "镜像 ${IMAGE_NAME} 不存在；未找到 tar ${IMAGE_ARCHIVE:-（未配置）}，且非可 pull 的 nvcr.io/ghcr.io 镜像"
             exit 1
         fi
     else
@@ -187,7 +191,7 @@ log_sec()   { echo -e "\n\033[0;36m\033[1m══ $* ══\033[0m"; }
 cd "${CONTAINER_WS}"
 # ROS setup.bash 可能引用未设置变量（如 AMENT_TRACE_SETUP_FILES），临时关闭 -u
 set +u
-source /opt/ros/humble/setup.bash
+source /opt/ros/${AUTOMAP_ROS_DISTRO:-humble}/setup.bash
 set -u
 
 # ── 清理（可选） ──────────────────────────────────────────────────────────────
@@ -430,6 +434,7 @@ do_build() {
         -e CONTAINER_WS="${CONTAINER_WS}" \
         -e BUILD_TYPE="${BUILD_TYPE}" \
         -e DO_CLEAN="${DO_CLEAN}" \
+        -e AUTOMAP_ROS_DISTRO="${AUTOMAP_ROS_DISTRO}" \
         -e AUTOMAP_LOG_LEVEL="debug" \
         -w "${CONTAINER_WS}" \
         "${IMAGE_NAME}" \
@@ -472,7 +477,7 @@ do_run() {
     local run_cmd="
 set -uo pipefail
 set +u
-source /opt/ros/humble/setup.bash
+source /opt/ros/${AUTOMAP_ROS_DISTRO}/setup.bash
 source ${CONTAINER_WS}/install/setup.bash
 set -u
 
@@ -683,6 +688,7 @@ exit \${EXIT_CODE}
         --ipc=host \
         -e DISPLAY="${DISPLAY:-:0}" \
         -e NVIDIA_DRIVER_CAPABILITIES=all \
+        -e AUTOMAP_ROS_DISTRO="${AUTOMAP_ROS_DISTRO}" \
         -e AUTOMAP_LOG_LEVEL=info \
         "${vol_args[@]}" \
         -w "${CONTAINER_WS}" \
