@@ -19,8 +19,8 @@
 #   LSK_PYTORCH_WHL_INDEX    覆盖 LSK 脚本中 torch 的 --index-url（默认上海交大 pytorch-wheels/{cu118|cu121|cu124}）
 #   AUTOMAP_ONNXRUNTIME_GIT_URL  覆盖 ONNX Runtime git 地址（默认经 ghfast 加速 GitHub）
 #   AUTOMAP_UBUNTU_MIRROR        apt 用 Ubuntu 仓库根 URL（默认阿里云；官方 archive.ubuntu.com 可自设）
-#   AUTOMAP_LIBTORCH_DOWNLOAD_BASE  LibTorch zip 镜像根（与官方路径 libtorch/... 对齐，默认清华 tuna）
-#   AUTOMAP_USE_OFFICIAL_LIBTORCH=1  强制从 download.pytorch.org 下载 LibTorch zip
+#   AUTOMAP_LIBTORCH_DOWNLOAD_BASE  LibTorch zip 根 URL（与官方路径 libtorch/cu128/... 对齐；默认即官方 download.pytorch.org）
+#   AUTOMAP_USE_OFFICIAL_LIBTORCH=1  解析 URL 时不做镜像替换（默认同官方时等价）
 #   AUTOMAP_PYG_WHEEL_BASE     PyG -f 索引根（默认 data.pyg.org/whl；国内无通用镜像时保持官方）
 # shellcheck shell=bash
 
@@ -45,8 +45,8 @@ fi
 # LSK venv：torch/torchvision 的 wheel 索引（上海交大镜像，与官方 cu 版本对应）
 export LSK_PYTORCH_WHL_INDEX_DEFAULT_BASE="${LSK_PYTORCH_WHL_INDEX_DEFAULT_BASE:-https://mirror.sjtu.edu.cn/pytorch-wheels}"
 
-# LibTorch 预编译 zip（build_inside_container）：路径同官方，仅替换为清华 tuna 的 libtorch 镜像
-export AUTOMAP_LIBTORCH_DOWNLOAD_BASE="${AUTOMAP_LIBTORCH_DOWNLOAD_BASE:-https://mirrors.tuna.tsinghua.edu.cn/pytorch-wheels/libtorch}"
+# LibTorch 预编译 zip（build_inside_container）：默认官方（清华 tuna pytorch-wheels/libtorch 无有效 cu* 目录，会 404）
+export AUTOMAP_LIBTORCH_DOWNLOAD_BASE="${AUTOMAP_LIBTORCH_DOWNLOAD_BASE:-https://download.pytorch.org/libtorch}"
 export AUTOMAP_USE_OFFICIAL_LIBTORCH="${AUTOMAP_USE_OFFICIAL_LIBTORCH:-0}"
 
 # PyTorch Geometric 扩展 wheel 目录索引（torch-scatter 等；国内无稳定全量镜像时默认仍指向官方）

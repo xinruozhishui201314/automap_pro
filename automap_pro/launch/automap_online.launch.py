@@ -3,6 +3,7 @@
 # 全工程唯一配置：仅使用 config:= 传入的 YAML；fast-livo2、overlap_transformer、HBA、automap_system 均从此 config 读参
 
 import os
+import sys
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, ExecuteProcess, OpaqueFunction
@@ -33,8 +34,9 @@ def _launch_nodes_with_system_config(context, *args, **kwargs):
 
     # 从 system_config 生成各组件参数（launch 与 params_from_system_config 同目录）
     launch_dir = os.path.dirname(os.path.abspath(__file__))
-    if launch_dir not in __import__("sys").path:
-        __import__("sys").path.insert(0, launch_dir)
+    if launch_dir not in sys.path:
+        sys.path.insert(0, launch_dir)
+    from rviz_utils import is_rviz2_installed
     try:
         from params_from_system_config import (
             load_system_config,
@@ -142,25 +144,31 @@ def _launch_nodes_with_system_config(context, *args, **kwargs):
     )
     nodes.append(automap_node)
 
-    # 两个 RViz：前端仅显示 LIO/前端，后端仅显示全局地图/优化/回环/GPS/子图
-    rviz_frontend_node = Node(
-        package="rviz2",
-        executable="rviz2",
-        name="rviz_frontend",
-        arguments=["-d", rviz_frontend_config],
-        output="screen",
-        condition=IfCondition(PythonExpression([LaunchConfiguration("use_rviz"), " == 'true'"])),
-    )
-    nodes.append(rviz_frontend_node)
-    rviz_backend_node = Node(
-        package="rviz2",
-        executable="rviz2",
-        name="rviz_backend",
-        arguments=["-d", rviz_backend_config],
-        output="screen",
-        condition=IfCondition(PythonExpression([LaunchConfiguration("use_rviz"), " == 'true'"])),
-    )
-    nodes.append(rviz_backend_node)
+    # 两个 RViz：仅在 use_rviz 且系统存在 rviz2 可执行文件时加入（避免条件 Node 仍触发包解析失败）
+    use_rviz_lc = LaunchConfiguration("use_rviz")
+    use_rviz_val = use_rviz_lc.perform(context).strip().lower() == "true"
+    if use_rviz_val:
+        if not is_rviz2_installed():
+            sys.stderr.write(
+                "[automap_online] [WARN] use_rviz=true 但系统无可用 rviz2；跳过 RViz。"
+                "可 apt 安装 ros-{}-rviz2 或传 use_rviz:=false\n".format(
+                    os.environ.get("ROS_DISTRO", "<distro>")))
+            sys.stderr.flush()
+        else:
+            nodes.append(Node(
+                package="rviz2",
+                executable="rviz2",
+                name="rviz_frontend",
+                arguments=["-d", rviz_frontend_config],
+                output="screen",
+            ))
+            nodes.append(Node(
+                package="rviz2",
+                executable="rviz2",
+                name="rviz_backend",
+                arguments=["-d", rviz_backend_config],
+                output="screen",
+            ))
 
     static_tf = Node(
         package="tf2_ros",

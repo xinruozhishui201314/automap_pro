@@ -108,11 +108,18 @@ BAG_RATE="0.5"  # 默认 0.5 倍速回放，缓解 LIO 处理压力；可改为 
 BUILD_ONLY=false
 RUN_ONLY=false
 USE_RVIZ=true
+# --no-rviz / --rviz 显式设置时为 true（用于离线模式默认关闭 RViz）
+RVIZ_CLI_SET=false
 CLEAN_BUILD=false
 USE_EXTERNAL_FRONTEND=true
 USE_EXTERNAL_OVERLAP=false
 RUN_AUTOMAP_UNDER_GDB=false
 RUN_FAST_LIVO_UNDER_GDB=false
+# --gdb 调试默认镜像（可用 AUTOMAP_GDB_DOCKER_IMAGE 覆盖）
+AUTOMAP_GDB_DOCKER_IMAGE="${AUTOMAP_GDB_DOCKER_IMAGE:-automap-pro:latest}"
+# 默认关闭构建/依赖安装阶段（build_inside_container），避免重复执行 build.log 中的大量操作。
+# 需要恢复时可显式设 AUTOMAP_ENABLE_BUILD_STEPS=1。
+AUTOMAP_ENABLE_BUILD_STEPS="${AUTOMAP_ENABLE_BUILD_STEPS:-0}"
 # 离线模式是否在启动前清空输出目录（默认 true=每次离线重新建图，避免沿用上次结果）
 CLEAN_OUTPUT_ON_OFFLINE=true
 # 宿主机日志目录：编译输出 → build.log，运行输出 → full.log
@@ -140,6 +147,7 @@ AutoMap-Pro 一键编译和运行脚本
     --build-only       仅编译不运行
     --run-only         仅运行不编译（假设已编译）
     --no-rviz          不启动 RViz 可视化
+    --rviz             启动 RViz（离线模式默认不启 RViz 时用于强制开启）
     --no-external-frontend 使用自研前端（默认使用 fast-livo2-humble）
     --external-overlap  使用 OverlapTransformer 服务作为回环描述子（需 config 中 loop_closure.overlap_transformer.mode: external_service）
     --clean            清理编译产物后重新编译
@@ -167,10 +175,12 @@ AutoMap-Pro 一键编译和运行脚本
 
 Docker / GPU 环境变量（可选）:
     - AUTOMAP_DOCKER_IMAGE   覆盖默认镜像（默认 NGC Isaac ROS，适配 RTX 50 等；旧环境可设为 automap-env:humble）
+    - AUTOMAP_GDB_DOCKER_IMAGE  带 --gdb/--gdb-frontend 时使用的镜像（默认 automap-pro:latest）
+    - AUTOMAP_ENABLE_BUILD_STEPS  是否执行 build_inside_container 编译/依赖安装（默认 0=关闭；设 1 才执行）
     - AUTOMAP_ROS_DISTRO     容器内 ROS 发行版（默认随镜像推断：Isaac→jazzy，自建→humble）
     - AUTOMAP_IMAGE_ARCHIVE  本地 docker load 的 .tar 路径；设为空字符串可跳过 tar 仅 pull
-    - AUTOMAP_PREFER_RUNTIME_SNAPSHOT  默认 1：若存在 thrid_party/automap_cache/docker/automap-pro-runtime.tar（或本地已有 automap-pro-runtime:latest）则优先使用，跳过远程 pull
-    - AUTOMAP_SAVE_RUNTIME_SNAPSHOT  默认 1：允许在运行成功后保存快照
+    - AUTOMAP_PREFER_RUNTIME_SNAPSHOT  自建 humble + tar 流程默认 1（优先 load 快照）；NGC Isaac 默认镜像下默认 0（始终用 pull 的基础镜像，不写 runtime tar）
+    - AUTOMAP_SAVE_RUNTIME_SNAPSHOT  同上：Isaac 默认 0（运行结束不 commit/save）；humble 默认 1
     - AUTOMAP_SAVE_SNAPSHOT_AFTER_BUILD  默认与 AUTOMAP_SAVE_RUNTIME_SNAPSHOT 相同：编译成功后将编译容器 commit+save 为同一路径 tar（下次直接 load）；置 0 可禁用。成功后会将本次会话的运行镜像改为快照标签，使同一次命令中的「运行」也基于最新层
     - AUTOMAP_SNAPSHOT_SAVE_MODE  默认 first：仅当尚无 automap-pro-runtime.tar 时保存（省磁盘/时间）；设为 always 则每次成功运行都更新快照 tar
     - AUTOMAP_BUILD_SNAPSHOT_CONTAINER_NAME  编译阶段临时容器名（默认 automap-pro-build-snapshot）
@@ -183,7 +193,7 @@ Docker / GPU 环境变量（可选）:
     - AUTOMAP_ALWAYS_BUILD=1  每次启动均执行完整编译（忽略「已安装」跳过逻辑；与 --clean 不同，不删除 install_deps）
     - LIBTORCH_SKIP_DOWNLOAD=1  不下载 LibTorch（须已有 install_deps/libtorch）
     - AUTOMAP_SKIP_CUDA_TOOLKIT_APT=1  不 apt 安装 nvidia-cuda-toolkit（须已有 nvcc 或挂载 CUDA）
-    - LIBTORCH_URL           固定 LibTorch zip URL（不设则按 nvcc 选包，且默认从清华 tuna 镜像拉取，与 AUTOMAP_LIBTORCH_DOWNLOAD_BASE / AUTOMAP_USE_OFFICIAL_LIBTORCH 相关）
+    - LIBTORCH_URL           固定 LibTorch zip URL（不设则按 GPU/nvcc 选包；默认从 download.pytorch.org/libtorch 拉取，可用 AUTOMAP_LIBTORCH_DOWNLOAD_BASE 换镜像根）
     - LIBTORCH_PREFER=cpu    强制下载 CPU 版 LibTorch（纯 CPU 机器）
     - ONNXRUNTIME_USE_CUDA   Isaac 镜像未设置时默认为 1（尝试 CUDA EP）；显式 0 可强制 CPU 构建 ORT（需 cuDNN 头文件才可能产出 GPU EP）
     - AUTOMAP_STRICT_BLACKWELL_STACK  默认 1：检测到 RTX 50 系时校验 CUDA≥12.8（优先 nvcc；NGC 无 nvcc 时用 nvidia-smi 的 CUDA Version）、LibTorch cu128、ONNX CUDA 时存在 cuDNN。设为 0 可跳过（不推荐）
@@ -207,7 +217,7 @@ LSK3DNet（hybrid / 验证脚本）:
     - 宿主机目录: thrid_party/automap_cache/ → 容器 /root/automap_download_cache（pip、LibTorch zip、ONNX git 快照、apt .deb、XDG 杂项缓存）；docker/automap-pro-runtime.tar 为可选「运行时快照」供下次 ensure_image 优先加载
     - AUTOMAP_USE_OFFICIAL_PYPI=1    不使用国内 PyPI 镜像（仍保留 pip 本地缓存）
     - AUTOMAP_PIP_INDEX              自定义 PyPI 镜像（默认阿里云 simple；官方: https://pypi.org/simple）
-    - AUTOMAP_LIBTORCH_DOWNLOAD_BASE LibTorch zip 镜像根路径（默认清华 tuna …/libtorch；官方: AUTOMAP_USE_OFFICIAL_LIBTORCH=1）
+    - AUTOMAP_LIBTORCH_DOWNLOAD_BASE LibTorch zip 根路径（默认官方 download.pytorch.org/libtorch；有可用镜像时自设并保证目录结构与官方一致）
     - AUTOMAP_PYG_WHEEL_BASE         PyG torch-scatter 等 -f 索引根（默认 data.pyg.org/whl）
     - AUTOMAP_ONNXRUNTIME_GIT_URL    自定义 ONNX Runtime git 地址（默认经 ghfast.top 代理 GitHub）
 故障排查:
@@ -218,6 +228,18 @@ LSK3DNet（hybrid / 验证脚本）:
     - 若 automap_system 报 undefined symbol keyframeCount：需重新编译 automap_pro（已补全 SubMapManager 实现）
 
 EOF
+}
+
+# 调试模式镜像策略：
+# 带 --gdb / --gdb-frontend 时，按用户要求优先使用 automap-pro:latest（或 AUTOMAP_GDB_DOCKER_IMAGE）
+apply_gdb_image_policy() {
+    if [ "$RUN_AUTOMAP_UNDER_GDB" = true ] || [ "$RUN_FAST_LIVO_UNDER_GDB" = true ]; then
+        IMAGE_NAME="${AUTOMAP_GDB_DOCKER_IMAGE}"
+        AUTOMAP_BASE_DOCKER_IMAGE="${AUTOMAP_GDB_DOCKER_IMAGE}"
+        # 调试场景固定用指定镜像，避免被 runtime snapshot 覆盖。
+        AUTOMAP_PREFER_RUNTIME_SNAPSHOT=0
+        print_info "GDB 调试模式：使用指定镜像 ${IMAGE_NAME}"
+    fi
 }
 
 # ==================== 解析命令行参数 ====================
@@ -254,6 +276,12 @@ parse_args() {
                 ;;
             --no-rviz)
                 USE_RVIZ=false
+                RVIZ_CLI_SET=true
+                shift
+                ;;
+            --rviz)
+                USE_RVIZ=true
+                RVIZ_CLI_SET=true
                 shift
                 ;;
             --no-external-frontend)
@@ -327,6 +355,8 @@ add_timestamp() {
     while IFS= read -r line; do
         echo "$(date '+%Y-%m-%d %H:%M:%S') $line"
     done
+    # read hits EOF with status 1; force success so pipefail reflects real upstream failures.
+    return 0
 }
 
 # 检测 fast_livo 是否已安装到工作空间（merged / isolated / install_deps 分步安装均覆盖）
@@ -347,6 +377,40 @@ automap_fast_livo_installed() {
         fi
     fi
     return 1
+}
+
+# 编译后复检：确保 automap_system 链接到当前 install_deps/ceres 可用 SONAME。
+# 当前工程统一目标为 libceres.so.3（Ceres 2.1.x）。
+automap_verify_ceres_needed_postbuild() {
+    local so_path="${WORKSPACE_DIR}/install/automap_pro/lib/libautomap_system_component.so"
+    local expected="libceres.so.3"
+    if [ ! -f "${so_path}" ]; then
+        print_error "编译后复检失败：未找到 ${so_path}"
+        return 1
+    fi
+    if ! command -v readelf >/dev/null 2>&1; then
+        print_warning "未找到 readelf，跳过 Ceres NEEDED 复检"
+        return 0
+    fi
+    local needed
+    needed="$(readelf -d "${so_path}" 2>/dev/null | sed -n "s/.*Shared library: \[\(libceres\.so\.[0-9][0-9]*\)\].*/\1/p" | head -n1)"
+    if [ -z "${needed}" ]; then
+        print_error "编译后复检失败：${so_path} 未检出 libceres.so.X 依赖"
+        return 1
+    fi
+    local match=""
+    [ -f "${WORKSPACE_DIR}/install_deps/ceres/lib/${needed}" ] && match="${WORKSPACE_DIR}/install_deps/ceres/lib/${needed}"
+    [ -z "${match}" ] && [ -f "${WORKSPACE_DIR}/install_deps/ceres/lib64/${needed}" ] && match="${WORKSPACE_DIR}/install_deps/ceres/lib64/${needed}"
+    if [ -z "${match}" ]; then
+        print_error "编译后复检失败：NEEDED=${needed}，但 install_deps/ceres 下无同名库（lib/lib64）"
+        return 1
+    fi
+    if [ "${needed}" != "${expected}" ]; then
+        print_error "编译后复检失败：NEEDED=${needed}，期望 ${expected}（需重编译并确保链接到 install_deps/ceres）"
+        return 1
+    fi
+    print_success "✓ 编译后复检通过：automap_system NEEDED=${needed}，可用库=${match}"
+    return 0
 }
 
 # 容器与宿主机时间同步：挂载宿主机时区与时间（不修改镜像，仅脚本内生效）
@@ -577,6 +641,24 @@ build_project() {
             print_info "检测到 fast-livo2-humble 源码，但未找到 fast_livo 安装产物，将执行完整编译"
         fi
     fi
+    # Ceres ABI/SONAME 预检：若 install 的 automap_system 依赖 libceres.so.X，
+    # 但 install_deps/ceres 下无对应 SONAME，会在运行期 class_loader/dlopen 崩溃。
+    # 这里提前触发重编译，让链接阶段与 install_deps/ceres 保持一致。
+    if [ "$NEED_BUILD" = false ] && [ -f "${AUTOMAP_SO}" ]; then
+        if command -v readelf >/dev/null 2>&1; then
+            CERES_NEEDED="$(readelf -d "${AUTOMAP_SO}" 2>/dev/null | sed -n "s/.*Shared library: \[\(libceres\.so\.[0-9][0-9]*\)\].*/\1/p" | head -n1)"
+            if [ -n "${CERES_NEEDED}" ]; then
+                CERES_MATCH=""
+                [ -f "${WORKSPACE_DIR}/install_deps/ceres/lib/${CERES_NEEDED}" ] && CERES_MATCH="${WORKSPACE_DIR}/install_deps/ceres/lib/${CERES_NEEDED}"
+                [ -z "${CERES_MATCH}" ] && [ -f "${WORKSPACE_DIR}/install_deps/ceres/lib64/${CERES_NEEDED}" ] && CERES_MATCH="${WORKSPACE_DIR}/install_deps/ceres/lib64/${CERES_NEEDED}"
+                if [ -z "${CERES_MATCH}" ]; then
+                    NEED_BUILD=true
+                    print_warning "检测到 automap_system 依赖 ${CERES_NEEDED}，但 install_deps/ceres 未找到同名库；将重新编译以消除 Ceres SONAME 不匹配"
+                    print_info "当前 install_deps/ceres 可用库: $(ls "${WORKSPACE_DIR}/install_deps/ceres/lib"/libceres.so* "${WORKSPACE_DIR}/install_deps/ceres/lib64"/libceres.so* 2>/dev/null | xargs -r -n1 basename | tr '\n' ' ')"
+                fi
+            fi
+        fi
+    fi
     if [ "$NEED_BUILD" = false ] && [ "$CLEAN_BUILD" = false ]; then
         print_info "项目已编译，跳过编译步骤"
         print_info "如需重新编译，请使用 --clean 参数"
@@ -646,7 +728,7 @@ build_project() {
           -e AUTOMAP_DOWNLOAD_CACHE=/root/automap_download_cache \
           -e PIP_CACHE_DIR=/root/automap_download_cache/pip \
           -e AUTOMAP_UBUNTU_MIRROR="${AUTOMAP_UBUNTU_MIRROR:-http://mirrors.aliyun.com/ubuntu}" \
-          -e AUTOMAP_LIBTORCH_DOWNLOAD_BASE="${AUTOMAP_LIBTORCH_DOWNLOAD_BASE:-https://mirrors.tuna.tsinghua.edu.cn/pytorch-wheels/libtorch}" \
+          -e AUTOMAP_LIBTORCH_DOWNLOAD_BASE="${AUTOMAP_LIBTORCH_DOWNLOAD_BASE:-https://download.pytorch.org/libtorch}" \
           -e AUTOMAP_USE_OFFICIAL_LIBTORCH="${AUTOMAP_USE_OFFICIAL_LIBTORCH:-0}" \
           -e AUTOMAP_PYG_WHEEL_BASE="${AUTOMAP_PYG_WHEEL_BASE:-https://data.pyg.org/whl}" \
           -e AUTOMAP_USE_OFFICIAL_PYPI="${AUTOMAP_USE_OFFICIAL_PYPI:-0}" \
@@ -692,6 +774,13 @@ build_project() {
     fi
 
     print_success "✓ 项目编译成功"
+    if ! automap_verify_ceres_needed_postbuild; then
+        if [ "${_SAVE_SNAP_AFTER_BUILD}" = "1" ]; then
+            docker rm -f "${AUTOMAP_BUILD_SNAPSHOT_CONTAINER_NAME}" 2>/dev/null || true
+        fi
+        print_error "✗ Ceres 编译后复检未通过。建议执行: bash run_automap.sh --clean（不要 --run-only）"
+        exit 1
+    fi
     if [ "${_SAVE_SNAP_AFTER_BUILD}" = "1" ]; then
         if automap_commit_and_save_runtime_snapshot "${AUTOMAP_BUILD_SNAPSHOT_CONTAINER_NAME}" "post-build"; then
             IMAGE_NAME="${AUTOMAP_RUNTIME_SNAPSHOT_TAG}"
@@ -780,6 +869,8 @@ run_system() {
 
     # 容器内使用的启动参数（config 用容器内路径；bag_file 用 /data 挂载路径）
     CONTAINER_LAUNCH_ARGS="config:=${CONTAINER_CONFIG_PATH} rate:=${BAG_RATE} ${RVIZ_ARG} ${EXT_FRONTEND_ARG} ${EXT_OVERLAP_ARG}"
+    # 传入容器，在 ros2 launch 前对 bag 目录再跑一次 metadata 修复（补宿主机权限或未修复之隙）
+    CONTAINER_OFFLINE_BAG_PATH=""
     if [ "$MODE" = "offline" ] && [ -n "$BAG_FILE" ]; then
         if [[ "$BAG_FILE" == "${DATA_DIR}"* ]]; then
             CONTAINER_BAG_FILE="/data/${BAG_FILE#${DATA_DIR}/}"
@@ -787,6 +878,7 @@ run_system() {
             CONTAINER_BAG_FILE="$BAG_FILE"
         fi
         CONTAINER_LAUNCH_ARGS="${CONTAINER_LAUNCH_ARGS} bag_file:=${CONTAINER_BAG_FILE}"
+        CONTAINER_OFFLINE_BAG_PATH="${CONTAINER_BAG_FILE}"
         # 修复 ros2 bag metadata.yaml 中 offered_qos_profiles: [] 导致的 yaml-cpp "bad conversion"（line 25 附近）
         BAG_DIR="$BAG_FILE"
         [ -f "$BAG_DIR" ] && BAG_DIR="$(dirname "$BAG_DIR")"
@@ -803,7 +895,7 @@ run_system() {
             fi
             FIX_SCRIPT="${SCRIPT_DIR}/scripts/fix_ros2_bag_metadata.py"
             if [ -f "$FIX_SCRIPT" ]; then
-                if python3 "$FIX_SCRIPT" "$BAG_DIR" 2>/dev/null; then
+                if ROS_DISTRO="${AUTOMAP_ROS_DISTRO}" python3 "$FIX_SCRIPT" "$BAG_DIR" --qos-style auto --ros-distro "${AUTOMAP_ROS_DISTRO}" 2>/dev/null; then
                     print_info "[BAG] 已修复 metadata.yaml（避免 ros2 bag play bad conversion）"
                 else
                     FIX_ERR="$?"
@@ -841,6 +933,7 @@ except Exception as e:
         fi
     elif [ "$MODE" = "offline" ]; then
         CONTAINER_LAUNCH_ARGS="${CONTAINER_LAUNCH_ARGS} bag_file:=/data/mapping"
+        CONTAINER_OFFLINE_BAG_PATH="/data/mapping"
     fi
     if [ "$RUN_AUTOMAP_UNDER_GDB" = true ]; then
         CONTAINER_LAUNCH_ARGS="${CONTAINER_LAUNCH_ARGS} run_automap_under_gdb:=true"
@@ -851,6 +944,21 @@ except Exception as e:
         CONTAINER_LAUNCH_ARGS="${CONTAINER_LAUNCH_ARGS} run_fast_livo_under_gdb:=true"
         LAUNCH_ARGS="${LAUNCH_ARGS} run_fast_livo_under_gdb:=true"
         print_info "GDB 调试: fastlivo_mapping 将在 GDB 下运行，崩溃时自动打印 bt full（用于定位前端 SIGSEGV）"
+    fi
+    # 运行前校验：优先使用 install_deps/ceres；若缺失则回退镜像系统 Ceres（按用户运行环境继续启动）。
+    if [ -f "${WORKSPACE_DIR}/install/automap_pro/lib/libautomap_system_component.so" ] && command -v readelf >/dev/null 2>&1; then
+        _need_ceres="$(readelf -d "${WORKSPACE_DIR}/install/automap_pro/lib/libautomap_system_component.so" 2>/dev/null | sed -n "s/.*Shared library: \[\(libceres\.so\.[0-9][0-9]*\)\].*/\1/p" | head -n1)"
+        if [ -n "${_need_ceres}" ]; then
+            _has_ceres=""
+            [ -f "${WORKSPACE_DIR}/install_deps/ceres/lib/${_need_ceres}" ] && _has_ceres="${WORKSPACE_DIR}/install_deps/ceres/lib/${_need_ceres}"
+            [ -z "${_has_ceres}" ] && [ -f "${WORKSPACE_DIR}/install_deps/ceres/lib64/${_need_ceres}" ] && _has_ceres="${WORKSPACE_DIR}/install_deps/ceres/lib64/${_need_ceres}"
+            if [ -z "${_has_ceres}" ]; then
+                print_warning "automap_system 依赖 ${_need_ceres}，但 install_deps/ceres 下不存在同名库；将回退使用镜像系统 Ceres。"
+                print_warning "如后续运行出现找不到 ${_need_ceres}，再执行重编译：bash run_automap.sh --clean（不要 --run-only）。"
+            else
+                print_info "检测到本地 Ceres 库：${_has_ceres}"
+            fi
+        fi
     fi
 
     print_info "启动命令: ros2 launch ${LAUNCH_SPEC} ${LAUNCH_ARGS}"
@@ -904,7 +1012,8 @@ except Exception as e:
     echo "[DIAG] 故障定位: grep -E 'LINK_4_PARAMS|FAST_LIVO_PARAMS|BAG|HBA|config_file param|undefined symbol|camera_loader|parameter_blackboard' 可精准查看参数与符号问题"
     echo "[DIAG] 若出现 undefined symbol buildGlobalMap → 请勿使用 --run-only，重新执行本脚本以触发 automap_pro 完整编译"
     echo "[DIAG] 若出现 Camera model not specified → 查看 [FAST_LIVO_PARAMS] parameter_blackboard.model 及 [fast_livo] [DIAG] parameter_blackboard.model"
-    echo "[DIAG] 若出现 Exception on parsing info file / bad conversion → 脚本已尝试修复 metadata；未修复时请手动: python3 scripts/fix_ros2_bag_metadata.py <bag目录>"
+    echo "[DIAG] 若出现 Exception on parsing info file / bad conversion → 宿主机与容器启动前均会尝试修复 metadata；未修复时请: chmod u+w <bag>/metadata.yaml && python3 scripts/fix_ros2_bag_metadata.py <bag目录>"
+    echo "[DIAG] 若出现 libceres.so 找不到 → 确认 install_deps/ceres 下 lib 或 lib64 已安装，且运行脚本已为 LD_LIBRARY_PATH 注入（与 build_inside_container 行为一致）"
     echo "[DIAG] 若出现 HBA vector::_M_default_append 或 pose_size=0 → 查看 [HBA] [DATA] lio_pose_orig.size 与 [HBA] [FATAL]；确保 bag 回放且 fast_livo 先输出位姿"
     echo "[DIAG] 若无 GPS（轨迹 CSV 无 gps_x/gps_y/gps_z）：grep -E 'LivoBridge\\[GPS\\]|GPS_DIAG|TRAJ_LOG no GPS' 日志；M2DGR 使用 sensor.gps.topic=/ublox/fix，须与 bag 话题一致"
     echo ""
@@ -950,7 +1059,7 @@ except Exception as e:
         -e AUTOMAP_DOWNLOAD_CACHE=/root/automap_download_cache \
         -e PIP_CACHE_DIR=/root/automap_download_cache/pip \
         -e AUTOMAP_UBUNTU_MIRROR="${AUTOMAP_UBUNTU_MIRROR:-http://mirrors.aliyun.com/ubuntu}" \
-        -e AUTOMAP_LIBTORCH_DOWNLOAD_BASE="${AUTOMAP_LIBTORCH_DOWNLOAD_BASE:-https://mirrors.tuna.tsinghua.edu.cn/pytorch-wheels/libtorch}" \
+        -e AUTOMAP_LIBTORCH_DOWNLOAD_BASE="${AUTOMAP_LIBTORCH_DOWNLOAD_BASE:-https://download.pytorch.org/libtorch}" \
         -e AUTOMAP_USE_OFFICIAL_LIBTORCH="${AUTOMAP_USE_OFFICIAL_LIBTORCH:-0}" \
         -e AUTOMAP_PYG_WHEEL_BASE="${AUTOMAP_PYG_WHEEL_BASE:-https://data.pyg.org/whl}" \
         -e AUTOMAP_USE_OFFICIAL_PYPI="${AUTOMAP_USE_OFFICIAL_PYPI:-0}" \
@@ -965,8 +1074,10 @@ except Exception as e:
         -e TBB_NUM_THREADS=1 \
         -e AUTOMAP_GTSAM_SERIAL=1 \
         -e AUTOMAP_ROS_DISTRO="${AUTOMAP_ROS_DISTRO}" \
+        -e AUTOMAP_USE_RVIZ="${USE_RVIZ}" \
         -e AUTOMAP_SLOAM_ONNX_CUDA="${AUTOMAP_SLOAM_ONNX_CUDA:-1}" \
         -e AUTOMAP_ENSURE_GDB="${AUTOMAP_ENSURE_GDB}" \
+        -e AUTOMAP_OFFLINE_BAG_PATH="${CONTAINER_OFFLINE_BAG_PATH}" \
         -e AUTOMAP_ONNXRUNTIME_LIB_DIR="${AUTOMAP_ONNXRUNTIME_LIB_DIR:-}" \
         -e AUTOMAP_LSK3DNET_PYTHON="${AUTOMAP_LSK3DNET_PYTHON:-}" \
         -v /tmp/.X11-unix:/tmp/.X11-unix:rw \
@@ -1020,6 +1131,17 @@ except Exception as e:
                 fi
               fi
             fi
+            # 启用 RViz 时运行期安装 ros-<distro>-rviz2（与手动执行 apt install ros-jazzy-rviz2 等价；精简镜像常缺该包）
+            if [ \"\${AUTOMAP_USE_RVIZ}\" = \"true\" ]; then
+              if command -v apt-get >/dev/null 2>&1 && command -v dpkg >/dev/null 2>&1; then
+                if ! dpkg -s \"ros-\${AUTOMAP_ROS_DISTRO}-rviz2\" >/dev/null 2>&1; then
+                  echo \"[INFO] AUTOMAP_USE_RVIZ=true：正在 apt install ros-\${AUTOMAP_ROS_DISTRO}-rviz2 …\" 1>&2
+                  DEBIAN_FRONTEND=noninteractive apt-get update -qq \
+                    && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \"ros-\${AUTOMAP_ROS_DISTRO}-rviz2\" \
+                    || echo \"[WARN] ros-\${AUTOMAP_ROS_DISTRO}-rviz2 安装失败，可加 --no-rviz 或检查 apt 源/网络\" 1>&2
+                fi
+              fi
+            fi
             # 优先使用 build_gtsam_no_tbb 编译的 GTSAM，避免与镜像/install_deps 中的 GTSAM 冲突（如 undefined symbol: NonlinearFactor::rekey）
             # 编译 GTSAM：在 automap_ws 下执行 scripts/build_gtsam_no_tbb.sh，或容器内 /root/automap_ws 下已有该目录
             if [ -d build_gtsam_no_tbb/gtsam ] && [ -f build_gtsam_no_tbb/gtsam/libgtsam.so ]; then
@@ -1037,10 +1159,19 @@ except Exception as e:
             if [ -d install_deps/teaserpp/lib ]; then
               export LD_LIBRARY_PATH=\"install_deps/teaserpp/lib:\$LD_LIBRARY_PATH\"
             fi
-            # Ceres Solver（圆柱拟合等）：与 GTSAM 一致，安装到 install_deps/ceres
-            if [ -d install_deps/ceres/lib ]; then
-              export LD_LIBRARY_PATH=\"install_deps/ceres/lib:\$LD_LIBRARY_PATH\"
+            # Ceres Solver：与 scripts/build_inside_container.sh 一致，须同时覆盖 lib 与 lib64（仅一侧存在时以往会漏设 LD_LIBRARY_PATH → libceres.so 找不到）
+            if [ -d install_deps/ceres ]; then
               export CMAKE_PREFIX_PATH=\"install_deps/ceres:\$CMAKE_PREFIX_PATH\"
+              [ -d install_deps/ceres/lib ] && export LD_LIBRARY_PATH=\"install_deps/ceres/lib:\$LD_LIBRARY_PATH\"
+              [ -d install_deps/ceres/lib64 ] && export LD_LIBRARY_PATH=\"install_deps/ceres/lib64:\$LD_LIBRARY_PATH\"
+            fi
+            # 离线 bag：容器内再修复 metadata（宿主机未写回或权限失败时，/data 常为 rw）
+            if [ -n \"\${AUTOMAP_OFFLINE_BAG_PATH:-}\" ]; then
+              _bagp=\"\${AUTOMAP_OFFLINE_BAG_PATH}\"
+              [ -f \"\${_bagp}\" ] && _bagp=\"\$(dirname \"\${_bagp}\")\"
+              if [ -d \"\${_bagp}\" ] && [ -f \"\${_bagp}/metadata.yaml\" ] && [ -f /root/automap_ws/src/automap_pro/scripts/fix_ros2_bag_metadata.py ]; then
+                ROS_DISTRO=\"${AUTOMAP_ROS_DISTRO}\" python3 /root/automap_ws/src/automap_pro/scripts/fix_ros2_bag_metadata.py \"\${_bagp}\" --qos-style auto --ros-distro \"${AUTOMAP_ROS_DISTRO}\" 1>&2 || true
+              fi
             fi
             # hba（全局优化节点）：与 GTSAM 一致，安装到 install_deps/hba
             if [ -f install_deps/hba/setup.bash ]; then
@@ -1097,7 +1228,8 @@ except Exception as e:
         echo "  - 退出码 127:  undefined symbol → 请勿用 --run-only，重新执行以触发 automap_pro 编译"
         echo "  - 退出码 245:  fast_livo segfault → 检查 [FAST_LIVO_PARAMS] parameter_blackboard.model 及 config 中 fast_livo 节"
         echo "  - 退出码 -6:    SIGABRT(如 HBA vector::_M_default_append) → 查看 [HBA] [FATAL]/[HBA][layer] 或 [camera_loader]；pose_size=0 时需 bag 回放且 fast_livo 先出位姿"
-        echo "  - yaml-cpp bad conversion: 脚本已尝试修复 metadata；未生效时请: python3 scripts/fix_ros2_bag_metadata.py <bag目录>"
+        echo "  - yaml-cpp bad conversion: 脚本已在宿主机/容器内尝试修复 metadata；未生效时请: chmod u+w <bag>/metadata.yaml && python3 scripts/fix_ros2_bag_metadata.py <bag目录>"
+        echo "  - libceres.so.* not found: 优先检查镜像系统是否已安装对应 SONAME；若需本地覆盖再确认 install_deps/ceres/lib 与 lib64 已注入 LD_LIBRARY_PATH"
         echo "[ERROR] 精准定位: grep -E 'EXCEPTION|ERROR|FATAL|undefined symbol|what\\(\\)|\\[HBA\\]|\\[camera_loader\\]|\\[BAG\\]' 上述输出"
         exit "$DOCKER_EXIT"
     fi
@@ -1114,6 +1246,7 @@ main() {
 
     # 解析参数
     parse_args "$@"
+    apply_gdb_image_policy
 
     # 未指定 --log-dir 时使用带时间戳子目录，便于区分每次运行
     if [ "${LOG_DIR_USER_SET}" != "true" ] && [ "${LOG_USE_TIMESTAMP_SUBDIR}" = "true" ]; then
@@ -1145,7 +1278,16 @@ main() {
         fi
     fi
 
-    build_project
+    if [ "${AUTOMAP_ENABLE_BUILD_STEPS}" = "1" ]; then
+        build_project
+    else
+        if [ "$BUILD_ONLY" = true ]; then
+            print_warning "已关闭构建阶段（AUTOMAP_ENABLE_BUILD_STEPS=0）；--build-only 将不执行任何 build.log 对应操作。"
+            print_info "如需恢复执行，请显式设置: AUTOMAP_ENABLE_BUILD_STEPS=1"
+            exit 0
+        fi
+        print_info "已关闭 build_inside_container 相关操作（AUTOMAP_ENABLE_BUILD_STEPS=0），跳过编译/依赖安装阶段。"
+    fi
     run_system
 
     print_success "✓ 所有操作完成"

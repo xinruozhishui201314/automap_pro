@@ -3,6 +3,7 @@
 # 从 system_config.yaml 读取并启动：fast-livo2、overlap_transformer_ros2、HBA、automap_system
 
 import os
+import sys
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, OpaqueFunction
@@ -20,8 +21,9 @@ def _launch_nodes_incremental(context, *args, **kwargs):
     if not os.path.isfile(rviz_backend_config):
         rviz_backend_config = os.path.join(pkg_share, "rviz", "automap.rviz")
     launch_dir = os.path.dirname(os.path.abspath(__file__))
-    if launch_dir not in __import__("sys").path:
-        __import__("sys").path.insert(0, launch_dir)
+    if launch_dir not in sys.path:
+        sys.path.insert(0, launch_dir)
+    from rviz_utils import is_rviz2_installed
     try:
         from params_from_system_config import (
             load_system_config,
@@ -112,14 +114,21 @@ def _launch_nodes_incremental(context, *args, **kwargs):
         remappings=[("/livox/lidar", "/livox/lidar"), ("/livox/imu", "/livox/imu"), ("/gps/fix", "/gps/fix")],
     ))
     if use_rviz_val:
-        nodes.append(Node(
-            package="rviz2", executable="rviz2", name="rviz_frontend",
-            arguments=["-d", rviz_frontend_config], output="screen",
-        ))
-        nodes.append(Node(
-            package="rviz2", executable="rviz2", name="rviz_backend",
-            arguments=["-d", rviz_backend_config], output="screen",
-        ))
+        if not is_rviz2_installed():
+            sys.stderr.write(
+                "[automap_incremental] [WARN] use_rviz=true 但系统无可用 rviz2；跳过 RViz。"
+                "可 apt 安装 ros-{}-rviz2 或传 use_rviz:=false\n".format(
+                    os.environ.get("ROS_DISTRO", "<distro>")))
+            sys.stderr.flush()
+        else:
+            nodes.append(Node(
+                package="rviz2", executable="rviz2", name="rviz_frontend",
+                arguments=["-d", rviz_frontend_config], output="screen",
+            ))
+            nodes.append(Node(
+                package="rviz2", executable="rviz2", name="rviz_backend",
+                arguments=["-d", rviz_backend_config], output="screen",
+            ))
     nodes.append(Node(
         package="tf2_ros", executable="static_transform_publisher", name="world_map_tf",
         arguments=["0", "0", "0", "0", "0", "0", "world", "map"],
@@ -135,7 +144,10 @@ def generate_launch_description():
         DeclareLaunchArgument("prev_session", default_value="", description="Path to previous session directory"),
         DeclareLaunchArgument("output_dir", default_value="/data/automap_output", description="Output directory"),
         DeclareLaunchArgument("session_id", default_value="1", description="Session ID"),
-        DeclareLaunchArgument("use_rviz", default_value="true", description="Whether to start RViz"),
+        DeclareLaunchArgument(
+            "use_rviz", default_value="true",
+            description="Whether to start RViz",
+        ),
         DeclareLaunchArgument("use_external_frontend", default_value="true", description="true=use verified fast_livo node (modular); false=use internal FastLIVO2Wrapper (ESIKF)"),
         DeclareLaunchArgument("use_external_overlap", default_value="true", description="Launch OverlapTransformer descriptor; true=使用 pretrained_overlap_transformer.pth.tar 做回环粗匹配"),
         DeclareLaunchArgument("use_hba", default_value="true", description="Launch HBA backend node (params from system_config.backend.hba)"),

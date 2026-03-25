@@ -11,8 +11,8 @@
 # 显式不设 tar（仅 pull / build）：
 #   export AUTOMAP_IMAGE_ARCHIVE=
 #
-# 运行时快照（由 run_automap.sh 在首次成功运行后写入 thrid_party/automap_cache/docker/，下次优先 docker load）：
-#   AUTOMAP_PREFER_RUNTIME_SNAPSHOT / AUTOMAP_RUNTIME_SNAPSHOT_TAR / AUTOMAP_RUNTIME_SNAPSHOT_TAG — 见 run_automap.sh 帮助
+# 运行时快照（自建 humble 镜像默认开启；NGC Isaac 默认关闭，见文件末尾）：
+#   AUTOMAP_PREFER_RUNTIME_SNAPSHOT / AUTOMAP_SAVE_RUNTIME_SNAPSHOT / AUTOMAP_RUNTIME_SNAPSHOT_TAR — 见 run_automap.sh 帮助
 #
 # shellcheck shell=bash
 : "${SCRIPT_DIR:?SCRIPT_DIR must be set before sourcing automap_docker_defaults.sh}"
@@ -36,4 +36,11 @@ else
     IMAGE_ARCHIVE="${SCRIPT_DIR}/docker/automap-env_humble.tar"
   fi
   AUTOMAP_ROS_DISTRO="${AUTOMAP_ROS_DISTRO:-humble}"
+fi
+
+# 使用 NGC Isaac / 可直接 pull 的基础镜像时，默认不再维护本地 runtime 快照（docker commit + save tar）。
+# 工作区与依赖缓存仍走宿主机挂载；需要离线快照时可显式设置 AUTOMAP_PREFER_RUNTIME_SNAPSHOT=1 等。
+if [[ "${IMAGE_NAME}" == *"nvcr.io/nvidia/isaac/"* ]] || [[ "${IMAGE_NAME}" == *"/isaac/ros"* ]]; then
+  AUTOMAP_PREFER_RUNTIME_SNAPSHOT="${AUTOMAP_PREFER_RUNTIME_SNAPSHOT:-0}"
+  AUTOMAP_SAVE_RUNTIME_SNAPSHOT="${AUTOMAP_SAVE_RUNTIME_SNAPSHOT:-0}"
 fi

@@ -416,6 +416,7 @@ if command -v apt-get >/dev/null 2>&1; then
     "ros-${ROS_DISTRO_NAME}-image-transport" \
     "ros-${ROS_DISTRO_NAME}-message-filters" \
     "ros-${ROS_DISTRO_NAME}-sophus" \
+    "ros-${ROS_DISTRO_NAME}-rviz2" \
     libpcap-dev \
     libgeographiclib-dev \
     libceres-dev \
@@ -713,12 +714,13 @@ fi
 
 # ---- LibTorch 预编译包 URL（OverlapTransformer / LibTorch C++）----
 # 优先级: LIBTORCH_URL > LIBTORCH_PREFER=cpu > nvcc 检测 CUDA 版本 > 默认 cu124（新 GPU / CUDA 12.x）
-# 默认将 download.pytorch.org/libtorch 换为 AUTOMAP_LIBTORCH_DOWNLOAD_BASE（清华 tuna）；官方源: AUTOMAP_USE_OFFICIAL_LIBTORCH=1
+# 默认使用官方 https://download.pytorch.org/libtorch（清华 tuna …/pytorch-wheels/libtorch 下已无有效 libtorch/cu* 树，会 404）
+# 可选: AUTOMAP_LIBTORCH_DOWNLOAD_BASE=与官方同路径的镜像根；AUTOMAP_USE_OFFICIAL_LIBTORCH=1 强制不用镜像重写
 # 镜像下载失败时自动再试官方同路径（禁回退: AUTOMAP_LIBTORCH_NO_OFFICIAL_FALLBACK=1）
 # 纯 CPU 环境可设: LIBTORCH_PREFER=cpu 或显式 LIBTORCH_URL=...cpu...
 automap_resolve_libtorch_url() {
   local _off="https://download.pytorch.org/libtorch"
-  local _mir="${AUTOMAP_LIBTORCH_DOWNLOAD_BASE:-https://mirrors.tuna.tsinghua.edu.cn/pytorch-wheels/libtorch}"
+  local _mir="${AUTOMAP_LIBTORCH_DOWNLOAD_BASE:-${_off}}"
   local u=""
   if [ -n "${LIBTORCH_URL:-}" ]; then
     printf '%s' "${LIBTORCH_URL}"
@@ -969,7 +971,7 @@ if [ "$NEED_LIBTORCH_DOWNLOAD" = true ]; then
     fi
     echo "[INFO] 下载 LibTorch（成功后写入缓存）: ${LIBTORCH_URL}"
     _LT_OFF_BASE="https://download.pytorch.org/libtorch"
-    _LT_MIR_BASE="${AUTOMAP_LIBTORCH_DOWNLOAD_BASE:-https://mirrors.tuna.tsinghua.edu.cn/pytorch-wheels/libtorch}"
+    _LT_MIR_BASE="${AUTOMAP_LIBTORCH_DOWNLOAD_BASE:-${_LT_OFF_BASE}}"
     rm -f "${LIBTORCH_ZIP}"
     if ! automap_download_to_file "${LIBTORCH_URL}" "${LIBTORCH_ZIP}"; then
       rm -f "${LIBTORCH_ZIP}"
@@ -1239,7 +1241,12 @@ if [ -f "${INSTALL_DEPS}/ceres/lib/cmake/Ceres/CeresConfig.cmake" ] || [ -f "${I
   _CERES_PREFIX="${INSTALL_DEPS}/ceres"
 fi
 export CMAKE_PREFIX_PATH="${INSTALL_DEPS}/gtsam:${_CERES_PREFIX:+${_CERES_PREFIX}:}${INSTALL_DEPS}/teaserpp:${_VIKIT_PREFIX:+${_VIKIT_PREFIX}:}${_HBA_PREFIX:+${_HBA_PREFIX}:}${_FAST_LIVO_PREFIX:+${_FAST_LIVO_PREFIX}:}${INSTALL_DEPS}/libtorch:${INSTALL_DEPS}:${CMAKE_PREFIX_PATH}"
-export LD_LIBRARY_PATH="${INSTALL_DEPS}/gtsam/lib:${_CERES_PREFIX:+${_CERES_PREFIX}/lib:}${INSTALL_DEPS}/teaserpp/lib:${_VIKIT_PREFIX:+${_VIKIT_PREFIX}/lib:}${_HBA_PREFIX:+${_HBA_PREFIX}/lib:}${_FAST_LIVO_PREFIX:+${_FAST_LIVO_PREFIX}/lib:}${INSTALL_DEPS}/libtorch/lib:${INSTALL_DEPS}/onnxruntime/lib:${LD_LIBRARY_PATH}"
+export LD_LIBRARY_PATH="${INSTALL_DEPS}/gtsam/lib:${INSTALL_DEPS}/teaserpp/lib:${_VIKIT_PREFIX:+${_VIKIT_PREFIX}/lib:}${_HBA_PREFIX:+${_HBA_PREFIX}/lib:}${_FAST_LIVO_PREFIX:+${_FAST_LIVO_PREFIX}/lib:}${INSTALL_DEPS}/libtorch/lib:${INSTALL_DEPS}/onnxruntime/lib:${LD_LIBRARY_PATH}"
+# Ceres：与源码安装布局一致，同时 prepend lib 与 lib64（与 run_automap.sh 运行时注入一致）
+if [ -n "${_CERES_PREFIX}" ]; then
+  [ -d "${_CERES_PREFIX}/lib64" ] && export LD_LIBRARY_PATH="${_CERES_PREFIX}/lib64:${LD_LIBRARY_PATH}"
+  [ -d "${_CERES_PREFIX}/lib" ] && export LD_LIBRARY_PATH="${_CERES_PREFIX}/lib:${LD_LIBRARY_PATH}"
+fi
 
 # fast_livo：与 GTSAM/vikit/hba 一致，安装到 install_deps/fast_livo，已安装则跳过
 FAST_LIVO_INSTALL_DIR="${INSTALL_DEPS}/fast_livo"
@@ -1444,11 +1451,22 @@ echo ""
 echo "[INFO] 开始编译 automap_pro..."
 automap_log_progress "colcon：automap_pro（主工程，日志同时写入 /tmp/automap_build.log）…"
 
+# 强制统一 Ceres：automap_pro 必须绑定 install_deps/ceres，避免复用旧缓存中的系统 Ceres_DIR（如 /usr/.../Ceres -> libceres.so.4）。
+_CERES_CMAKE_DIR=""
+if [ -f "${INSTALL_DEPS}/ceres/lib/cmake/Ceres/CeresConfig.cmake" ]; then
+  _CERES_CMAKE_DIR="${INSTALL_DEPS}/ceres/lib/cmake/Ceres"
+elif [ -f "${INSTALL_DEPS}/ceres/lib64/cmake/Ceres/CeresConfig.cmake" ]; then
+  _CERES_CMAKE_DIR="${INSTALL_DEPS}/ceres/lib64/cmake/Ceres"
+fi
+if [ -n "${_CERES_CMAKE_DIR}" ]; then
+  echo "[INFO] automap_pro Ceres_DIR 强制为: ${_CERES_CMAKE_DIR}"
+fi
+
 # 无 pipefail 时 colcon|tee 的管道退出码为 tee(0)，set -e 不会失败退出；子 shell + pipefail 保证 colcon 非零即失败
 set +e
 (
   set -o pipefail
-  colcon build ${COLCON_PARALLEL} --event-handlers status+ console_direct+ --packages-select automap_pro --cmake-args ${NINJA_CMAKE_ARG} -DCMAKE_BUILD_TYPE=Release -DNLOHMANN_JSON_LOCAL=/root/automap_ws/src/thrid_party/nlohmann-json3 -DSCANCONTEXT_ROOT=/root/automap_ws/automap_pro_thrid_party_scancontext 2>&1 | tee /tmp/automap_build.log
+  colcon build ${COLCON_PARALLEL} --event-handlers status+ console_direct+ --packages-select automap_pro --cmake-force-configure --cmake-args ${NINJA_CMAKE_ARG} -DCMAKE_BUILD_TYPE=Release -DNLOHMANN_JSON_LOCAL=/root/automap_ws/src/thrid_party/nlohmann-json3 -DSCANCONTEXT_ROOT=/root/automap_ws/automap_pro_thrid_party_scancontext ${_CERES_CMAKE_DIR:+-DCeres_DIR=${_CERES_CMAKE_DIR}} 2>&1 | tee /tmp/automap_build.log
 )
 BUILD_EXIT_CODE=$?
 set -e

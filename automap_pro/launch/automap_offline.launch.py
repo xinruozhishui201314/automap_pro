@@ -170,6 +170,7 @@ def _launch_nodes_offline(context, *args, **kwargs):
     launch_dir = os.path.dirname(os.path.abspath(__file__))
     if launch_dir not in sys.path:
         sys.path.insert(0, launch_dir)
+    from rviz_utils import is_rviz2_installed
     ot_params = {"model_path": ""}
     fl2_params = {}
     hba_params = {}
@@ -348,17 +349,24 @@ def _launch_nodes_offline(context, *args, **kwargs):
         sys.stderr.flush()
     use_rviz_val = LaunchConfiguration("use_rviz", default="true").perform(context).strip().lower() == "true"
     if use_rviz_val:
-        try:
-            nodes.append(Node(
-                package="rviz2", executable="rviz2", name="rviz_frontend",
-                arguments=["-d", rviz_frontend_config], output="screen",
-            ))
-            nodes.append(Node(
-                package="rviz2", executable="rviz2", name="rviz_backend",
-                arguments=["-d", rviz_backend_config], output="screen",
-            ))
-        except Exception as e:
-            _log_launch_exception("创建 rviz2 Node", e)
+        if not is_rviz2_installed():
+            sys.stderr.write(
+                "{} [WARN] use_rviz=true 但系统无可用 rviz2 可执行文件（常见于 Jazzy/Isaac 精简镜像未安装 "
+                "ros-{}-rviz2）；跳过 RViz。安装该 deb 或传 use_rviz:=false\n".format(
+                    _LP, os.environ.get("ROS_DISTRO", "<distro>")))
+            sys.stderr.flush()
+        else:
+            try:
+                nodes.append(Node(
+                    package="rviz2", executable="rviz2", name="rviz_frontend",
+                    arguments=["-d", rviz_frontend_config], output="screen",
+                ))
+                nodes.append(Node(
+                    package="rviz2", executable="rviz2", name="rviz_backend",
+                    arguments=["-d", rviz_backend_config], output="screen",
+                ))
+            except Exception as e:
+                _log_launch_exception("创建 rviz2 Node", e)
     try:
         nodes.append(Node(
             package="tf2_ros", executable="static_transform_publisher", name="world_map_tf",
@@ -483,7 +491,10 @@ def generate_launch_description():
         DeclareLaunchArgument("config", default_value=config_default, description="Path to system_config.yaml"),
         DeclareLaunchArgument("bag_file", default_value=os.path.expanduser("~/data/mapping.db3"), description="Path to rosbag2"),
         DeclareLaunchArgument("rate", default_value="0.5", description="Playback rate (0.5=half speed, 1.0=realtime)"),
-        DeclareLaunchArgument("use_rviz", default_value="true", description="Whether to start RViz"),
+        DeclareLaunchArgument(
+            "use_rviz", default_value="true",
+            description="Whether to start RViz",
+        ),
         DeclareLaunchArgument("use_external_frontend", default_value="true", description="true=use verified fast_livo node (modular); false=use internal FastLIVO2Wrapper (ESIKF)"),
         DeclareLaunchArgument("use_external_overlap", default_value="true", description="Launch OverlapTransformer descriptor; true=使用 pretrained_overlap_transformer.pth.tar 做回环粗匹配"),
         DeclareLaunchArgument("use_hba", default_value="false", description="Launch standalone HBA node (reads pose.json at startup; offline 时默认 false 避免零位姿崩溃，优化由 automap_system 内 HBAOptimizer 负责)"),

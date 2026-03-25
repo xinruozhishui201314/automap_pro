@@ -379,16 +379,22 @@ message(STATUS "[automap_pro] Boost found: ${Boost_VERSION} (lockfree spsc_queue
 find_package(GTSAM REQUIRED)
 message(STATUS "[automap_pro] GTSAM found (startup double free in lago? see docs/FIX_GTSAM_LAGO_STATIC_INIT_DOUBLE_FREE.md)")
 
-# Ceres（可选，须 ≥ 2.0 以支持 SphereManifold）
-# build_inside_container 将 Ceres 安装到 workspace install_deps/ceres；colcon 调用 cmake 时常未继承 shell 的 CMAKE_PREFIX_PATH
+# Ceres（须 ≥ 2.0 以支持 SphereManifold）
+# 统一策略：若 workspace 已安装 install_deps/ceres，则编译与运行只使用该前缀下的 Ceres（与 run_automap.sh / build_inside_container 一致），
+# 避免与系统 libceres-dev（不同 SONAME，如 libceres.so.4）混链导致运行期 dlopen 失败。
 set(_automap_ceres_prefix "${CMAKE_CURRENT_SOURCE_DIR}/../../install_deps/ceres")
-if(EXISTS "${_automap_ceres_prefix}/lib/cmake/Ceres/CeresConfig.cmake" OR EXISTS "${_automap_ceres_prefix}/lib64/cmake/Ceres/CeresConfig.cmake")
-  list(PREPEND CMAKE_PREFIX_PATH "${_automap_ceres_prefix}")
-  message(STATUS "[automap_pro] Ceres search prefix: ${_automap_ceres_prefix}")
+set(_automap_ceres_cmake_dir "")
+if(EXISTS "${_automap_ceres_prefix}/lib/cmake/Ceres/CeresConfig.cmake")
+  set(_automap_ceres_cmake_dir "${_automap_ceres_prefix}/lib/cmake/Ceres")
+elseif(EXISTS "${_automap_ceres_prefix}/lib64/cmake/Ceres/CeresConfig.cmake")
+  set(_automap_ceres_cmake_dir "${_automap_ceres_prefix}/lib64/cmake/Ceres")
 endif()
-# Debian/Ubuntu multiarch: libceres-dev installs CeresConfig under lib/<triplet>/cmake/Ceres; plain
-# find_package(Ceres) may not discover it without Ceres_DIR / CMAKE_PREFIX_PATH.
-if(NOT EXISTS "${_automap_ceres_prefix}/lib/cmake/Ceres/CeresConfig.cmake" AND NOT EXISTS "${_automap_ceres_prefix}/lib64/cmake/Ceres/CeresConfig.cmake")
+if(_automap_ceres_cmake_dir)
+  set(Ceres_DIR "${_automap_ceres_cmake_dir}" CACHE PATH "[automap_pro] Ceres from install_deps (unified)" FORCE)
+  list(PREPEND CMAKE_PREFIX_PATH "${_automap_ceres_prefix}")
+  message(STATUS "[automap_pro] Ceres: unified install_deps prefix=${_automap_ceres_prefix} (Ceres_DIR=${Ceres_DIR})")
+else()
+  # 无 install_deps/ceres 时（例如宿主机仅做开发）：回退系统多路径 CeresConfig
   foreach(_ceres_cmake IN ITEMS
       "/usr/lib/x86_64-linux-gnu/cmake/Ceres"
       "/usr/lib/aarch64-linux-gnu/cmake/Ceres"

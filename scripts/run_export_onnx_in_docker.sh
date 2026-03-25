@@ -115,7 +115,7 @@ docker run --rm \
   -e AUTOMAP_DOWNLOAD_CACHE=/root/automap_download_cache \
   -e PIP_CACHE_DIR=/root/automap_download_cache/pip \
   -e AUTOMAP_UBUNTU_MIRROR="${AUTOMAP_UBUNTU_MIRROR:-http://mirrors.aliyun.com/ubuntu}" \
-  -e AUTOMAP_LIBTORCH_DOWNLOAD_BASE="${AUTOMAP_LIBTORCH_DOWNLOAD_BASE:-https://mirrors.tuna.tsinghua.edu.cn/pytorch-wheels/libtorch}" \
+  -e AUTOMAP_LIBTORCH_DOWNLOAD_BASE="${AUTOMAP_LIBTORCH_DOWNLOAD_BASE:-https://download.pytorch.org/libtorch}" \
   -e AUTOMAP_USE_OFFICIAL_LIBTORCH="${AUTOMAP_USE_OFFICIAL_LIBTORCH:-0}" \
   -e AUTOMAP_PYG_WHEEL_BASE="${AUTOMAP_PYG_WHEEL_BASE:-https://data.pyg.org/whl}" \
   -e AUTOMAP_USE_OFFICIAL_PYPI="${AUTOMAP_USE_OFFICIAL_PYPI:-0}" \
