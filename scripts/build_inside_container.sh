@@ -740,6 +740,30 @@ automap_resolve_libtorch_url() {
   local _off="https://download.pytorch.org/libtorch"
   local _mir="${AUTOMAP_LIBTORCH_DOWNLOAD_BASE:-${_off}}"
   local u=""
+  # 直配版本：LIBTORCH_VERSION=2.7.0+cu128 或 2.5.1+cpu（无需手写完整 URL）
+  # 优先级低于 LIBTORCH_URL（显式 URL 始终最高）
+  if [ -n "${LIBTORCH_VERSION:-}" ]; then
+    local _lt_ver="${LIBTORCH_VERSION}"
+    local _lt_variant="${_lt_ver##*+}"
+    if [ "${_lt_variant}" = "${_lt_ver}" ]; then
+      echo "[ERROR] LIBTORCH_VERSION 格式无效: ${LIBTORCH_VERSION}（期望如 2.7.0+cu128 或 2.5.1+cpu）" >&2
+      return 1
+    fi
+    local _lt_path="${_lt_variant}"
+    if [ "${_lt_variant}" = "cpu" ]; then
+      _lt_path="cpu"
+    elif ! printf '%s' "${_lt_variant}" | grep -qE '^cu[0-9]{3}$'; then
+      echo "[ERROR] LIBTORCH_VERSION 后缀无效: ${_lt_variant}（仅支持 cpu 或 cuXXX）" >&2
+      return 1
+    fi
+    local _lt_ver_enc="${_lt_ver//+/%2B}"
+    u="${_off}/${_lt_path}/libtorch-cxx11-abi-shared-with-deps-${_lt_ver_enc}.zip"
+    if [ "${AUTOMAP_USE_OFFICIAL_LIBTORCH:-0}" != "1" ] && [ -n "$u" ]; then
+      u="${u/${_off}/${_mir}}"
+    fi
+    printf '%s' "$u"
+    return 0
+  fi
   if [ -n "${LIBTORCH_URL:-}" ]; then
     printf '%s' "${LIBTORCH_URL}"
     return
@@ -1046,8 +1070,66 @@ PY
   return 0
 }
 
+# 在系统存在多套 CUDA 时，优先切换到与当前 LibTorch 版本匹配的工具链（nvcc + libnvrtc）。
+# 目标：避免 nvcc/libnvrtc 与 LibTorch cuXXX 不一致导致 NVRTC 运行期失败。
+automap_try_align_cuda_toolchain_with_libtorch() {
+  local lt_tag=""
+  local lt_mm=""
+  local cur_nvcc_mm=""
+  local c p v
+
+  if [ -n "${LIBTORCH_URL:-}" ]; then
+    lt_tag=$(printf '%s' "${LIBTORCH_URL}" | sed -n 's/.*\(cu[0-9][0-9][0-9]\).*/\1/p' | head -n1)
+  fi
+  if [ -z "${lt_tag}" ] && [ -f "${LIBTORCH_INSTALL_DIR}/share/cmake/Torch/TorchConfig.cmake" ]; then
+    lt_tag=$(grep -oE 'cu[0-9]{3}' "${LIBTORCH_INSTALL_DIR}/share/cmake/Torch/TorchConfig.cmake" | head -n1 || true)
+  fi
+  if [ -z "${lt_tag}" ] && [ -f "${LIBTORCH_INSTALL_DIR}/lib/libtorch.so" ] && command -v strings >/dev/null 2>&1; then
+    lt_tag=$(strings "${LIBTORCH_INSTALL_DIR}/lib/libtorch.so" 2>/dev/null | grep -oE 'cu[0-9]{3}' | head -n1 || true)
+  fi
+  [ -z "${lt_tag}" ] && return 0
+
+  case "${lt_tag}" in
+    cu121) lt_mm="12.1" ;;
+    cu124) lt_mm="12.4" ;;
+    cu126) lt_mm="12.6" ;;
+    cu128) lt_mm="12.8" ;;
+    *) return 0 ;;
+  esac
+
+  if command -v nvcc >/dev/null 2>&1; then
+    cur_nvcc_mm=$(nvcc --version 2>/dev/null | sed -n 's/.*release \([0-9]*\.[0-9]*\).*/\1/p' | head -n1)
+  fi
+  if [ -n "${cur_nvcc_mm}" ] && [ "${cur_nvcc_mm}" = "${lt_mm}" ]; then
+    return 0
+  fi
+
+  # 常见安装路径优先；仅在版本完全匹配时切换
+  for c in "/usr/local/cuda-${lt_mm}" "/usr/local/cuda-${lt_mm%.*}" "/usr/local/cuda" "/usr/lib/cuda"; do
+    [ -x "${c}/bin/nvcc" ] || continue
+    v=$("${c}/bin/nvcc" --version 2>/dev/null | sed -n 's/.*release \([0-9]*\.[0-9]*\).*/\1/p' | head -n1)
+    [ "${v}" = "${lt_mm}" ] || continue
+    if [ -f "${c}/lib64/libnvrtc.so" ] || [ -f "${c}/targets/x86_64-linux/lib/libnvrtc.so" ]; then
+      export CUDA_HOME="${c}"
+      export PATH="${CUDA_HOME}/bin:${PATH}"
+      if [ -d "${CUDA_HOME}/lib64" ]; then
+        export LD_LIBRARY_PATH="${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}"
+      fi
+      if [ -d "${CUDA_HOME}/targets/x86_64-linux/lib" ]; then
+        export LD_LIBRARY_PATH="${CUDA_HOME}/targets/x86_64-linux/lib:${LD_LIBRARY_PATH}"
+      fi
+      echo "[INFO] 已切换 CUDA 工具链以匹配 LibTorch(${lt_tag}): CUDA_HOME=${CUDA_HOME} nvcc=${v}"
+      return 0
+    fi
+  done
+
+  echo "[WARN] 未找到与 LibTorch(${lt_tag}) 匹配的本地 CUDA 工具链（期望 ${lt_mm}）。若后续 NVRTC 报错，请安装对应 CUDA toolkit 并设置 CUDA_HOME。" >&2
+  return 0
+}
+
 # LibTorch（OverlapTransformer 推理）：与 GTSAM 一致，安装到 install_deps，仅下载解压一次，不随工程重复编译
 LIBTORCH_INSTALL_DIR="${INSTALL_DEPS}/libtorch"
+LIBTORCH_URL_RECORD_FILE="${INSTALL_DEPS}/.libtorch_source_url"
 NEED_LIBTORCH_DOWNLOAD=false
 if [ ! -f "${LIBTORCH_INSTALL_DIR}/share/cmake/Torch/TorchConfig.cmake" ] && [ ! -f "${LIBTORCH_INSTALL_DIR}/lib/libtorch.so" ]; then
   NEED_LIBTORCH_DOWNLOAD=true
@@ -1055,6 +1137,29 @@ fi
 if [ "${LIBTORCH_SKIP_DOWNLOAD:-0}" = "1" ]; then
   NEED_LIBTORCH_DOWNLOAD=false
   echo "[INFO] LIBTORCH_SKIP_DOWNLOAD=1，跳过 LibTorch 下载（请确保已手动放置到 ${LIBTORCH_INSTALL_DIR}）"
+fi
+# 目标 URL 变化时：删除本地旧版本后重下，并把新 URL 落盘，下次直接复用
+if [ "${AUTOMAP_PREBUILT_INSTALL_DEPS:-0}" != "1" ] && [ "${LIBTORCH_SKIP_DOWNLOAD:-0}" != "1" ]; then
+  _lt_url_from_env=0
+  [ -n "${LIBTORCH_URL:-}" ] && _lt_url_from_env=1
+  if [ -z "${LIBTORCH_URL:-}" ]; then
+    LIBTORCH_URL="$(automap_resolve_libtorch_url)"
+  fi
+  if [ -f "${LIBTORCH_INSTALL_DIR}/share/cmake/Torch/TorchConfig.cmake" ] || [ -f "${LIBTORCH_INSTALL_DIR}/lib/libtorch.so" ]; then
+    _lt_recorded_url=""
+    if [ -f "${LIBTORCH_URL_RECORD_FILE}" ]; then
+      _lt_recorded_url="$(tr -d '\r\n' < "${LIBTORCH_URL_RECORD_FILE}")"
+    fi
+    if [ -n "${_lt_recorded_url}" ] && [ "${_lt_recorded_url}" != "${LIBTORCH_URL}" ]; then
+      echo "[INFO] 检测到 LibTorch 目标版本变化（旧 URL: ${_lt_recorded_url}；新 URL: ${LIBTORCH_URL}），将删除本地旧版本并重新下载"
+      rm -rf "${LIBTORCH_INSTALL_DIR}"
+      NEED_LIBTORCH_DOWNLOAD=true
+    elif [ -z "${_lt_recorded_url}" ] && [ "${_lt_url_from_env}" = "1" ]; then
+      echo "[INFO] 检测到显式 LIBTORCH_URL 且本地无 URL 记录，为避免复用旧版本将删除本地 LibTorch 并重新下载"
+      rm -rf "${LIBTORCH_INSTALL_DIR}"
+      NEED_LIBTORCH_DOWNLOAD=true
+    fi
+  fi
 fi
 # Blackwell + 已存在的非 cu128 LibTorch（曾由 apt nvcc 12.0 误选 cu121）：删除并强制重下 cu128
 if [ "${AUTOMAP_PREBUILT_INSTALL_DEPS:-0}" != "1" ] && \
@@ -1084,7 +1189,6 @@ if [ "$NEED_LIBTORCH_DOWNLOAD" = true ]; then
   echo '========================================'
   automap_log_progress "LibTorch：准备下载或从缓存复制（大文件时请等待）…"
   if [ -z "${LIBTORCH_URL:-}" ]; then
-    LIBTORCH_URL="$(automap_resolve_libtorch_url)"
     echo "[INFO] LibTorch URL（自动解析，可用 LIBTORCH_URL / LIBTORCH_PREFER=cpu 覆盖）: ${LIBTORCH_URL}"
   else
     echo "[INFO] LibTorch URL（来自环境变量 LIBTORCH_URL）: ${LIBTORCH_URL}"
@@ -1151,12 +1255,16 @@ if [ "$NEED_LIBTORCH_DOWNLOAD" = true ]; then
   unzip -q -o "${LIBTORCH_ZIP}" -d "${INSTALL_DEPS}"
   rm -f "${LIBTORCH_ZIP}"
   if [ -d "${INSTALL_DEPS}/libtorch" ]; then
+    printf '%s\n' "${LIBTORCH_URL}" > "${LIBTORCH_URL_RECORD_FILE}"
     echo "[INFO] LibTorch 已安装于 install_deps/libtorch"
   else
     echo "[ERROR] 解压后未找到 ${INSTALL_DEPS}/libtorch"; exit 1
   fi
 else
   if [ -f "${LIBTORCH_INSTALL_DIR}/share/cmake/Torch/TorchConfig.cmake" ] || [ -f "${LIBTORCH_INSTALL_DIR}/lib/libtorch.so" ]; then
+    if [ -n "${LIBTORCH_URL:-}" ]; then
+      printf '%s\n' "${LIBTORCH_URL}" > "${LIBTORCH_URL_RECORD_FILE}"
+    fi
     echo "[INFO] LibTorch 已安装于 install_deps，跳过下载与解压（删除 ${LIBTORCH_INSTALL_DIR} 后才会重新拉取）"
   fi
 fi
@@ -1173,6 +1281,7 @@ if [ -d "${LIBTORCH_INSTALL_DIR}/lib" ]; then
 fi
 
 automap_ensure_cuda_toolkit_for_libtorch_cmake
+automap_try_align_cuda_toolchain_with_libtorch
 
 automap_verify_blackwell_accel_stack || exit 1
 automap_verify_cuda_stack_unified || exit 1
