@@ -485,6 +485,7 @@ public:
     // ── OverlapTransformer ────────────────────────────────
     /** 返回 model_path，${CMAKE_CURRENT_SOURCE_DIR} 已在 load() 中展开为配置所在包根目录；未加载时走 get() */
     std::string overlapModelPath()   const;
+    bool   overlapUseCuda()          const { return get<bool>("loop_closure.overlap_transformer.use_cuda", true); }
     int    rangeImageH()             const { return get<int>("loop_closure.overlap_transformer.proj_H", 64); }
     int    rangeImageW()             const { return get<int>("loop_closure.overlap_transformer.proj_W", 900); }
     float  fovUp()                   const { return get<float>("loop_closure.overlap_transformer.fov_up",   3.0f); }
@@ -647,7 +648,7 @@ public:
     // ── 语义处理 ──────────────────────────────────────────
     // 语义模块强制默认开启：即使配置未提供该项也按开启处理
     bool        semanticEnabled()    const { return get<bool>("semantic.enabled", true); }
-    std::string semanticModelType()  const { return get<std::string>("semantic.model_type", "sloam"); }
+    std::string semanticModelType()  const { return get<std::string>("semantic.model_type", "lsk3dnet"); }
     std::string semanticModelPath()  const { return get<std::string>("semantic.model_path", ""); }
     std::string semanticLsk3dnetModelPath() const { return get<std::string>("semantic.lsk3dnet.model_path", ""); }
     std::string semanticLsk3dnetDevice() const { return get<std::string>("semantic.lsk3dnet.device", "cpu"); }
@@ -680,6 +681,7 @@ public:
     float       semanticFovDown()    const { return get<float>("semantic.fov_down", -22.5f); }
     int         semanticImgW()       const { return get<int>("semantic.img_w", 2048); }
     int         semanticImgH()       const { return get<int>("semantic.img_h", 64); }
+    int         semanticBatchSize()  const { return std::max(1, std::min(32, get<int>("semantic.batch_size", 1))); }
     int         semanticInputChannels() const {
         int v = get<int>("semantic.input_channels", 0);  // 0 = auto by model
         return std::max(0, std::min(32, v));
@@ -891,7 +893,11 @@ private:
 
         // 仅在 load() 过程中或缓存未命中时尝试访问原始 YAML（此时应持锁或单线程）
         try {
-            YAML::Node node = cfg_;
+            // IMPORTANT: yaml-cpp's operator[] on a non-const Node can mutate the underlying tree
+            // (e.g., by creating missing keys). Since YAML::Node is a shared handle type, that can
+            // accidentally mutate `cfg_` even inside this const method. Clone defensively so lookups
+            // never affect the live config tree used by the rest of the system.
+            YAML::Node node = YAML::Clone(cfg_);
             std::istringstream ss(key);
             std::string token;
             bool found = true;

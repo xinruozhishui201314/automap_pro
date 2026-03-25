@@ -18,6 +18,7 @@
 #include <nav_msgs/msg/path.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/msg/imu.hpp>
+#include <std_msgs/msg/bool.hpp>
 
 // 本包消息类型
 #include <automap_pro/msg/mapping_status_msg.hpp>
@@ -76,6 +77,7 @@ private:
     // ── 发布者 (面向外部系统) ───────────────────────────────────────────────
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr      global_map_pub_;
     rclcpp::Publisher<automap_pro::msg::MappingStatusMsg>::SharedPtr status_pub_;
+    rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr                ready_pub_;
 
     // ── 服务接口 ────────────────────────────────────────────────────────────
     rclcpp::Service<automap_pro::srv::SaveMap>::SharedPtr        save_map_srv_;

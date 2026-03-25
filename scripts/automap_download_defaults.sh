@@ -31,6 +31,20 @@ mkdir -p "${CACHE_ROOT}/pip" "${CACHE_ROOT}/libtorch" "${CACHE_ROOT}/git" \
 export PIP_CACHE_DIR="${PIP_CACHE_DIR:-${CACHE_ROOT}/pip}"
 export XDG_CACHE_HOME="${XDG_CACHE_HOME:-${CACHE_ROOT}/xdg}"
 
+# pip (>=23/24+) 会在 cache dir 不归当前用户所有时禁用缓存。
+# 这里做 best-effort 修复：将挂载的 cache 目录 chown 为当前容器用户，避免出现：
+#   "WARNING: The directory '.../pip' is not owned or is not writable ... The cache has been disabled."
+# 说明：该目录通常是宿主机挂载，chown 会同步到宿主机（缓存目录可接受）。
+if command -v id >/dev/null 2>&1; then
+  _uid="$(id -u 2>/dev/null || true)"
+  _gid="$(id -g 2>/dev/null || true)"
+  if [ -n "${_uid}" ] && [ -n "${_gid}" ]; then
+    mkdir -p "${PIP_CACHE_DIR}" "${XDG_CACHE_HOME}" 2>/dev/null || true
+    chown -R "${_uid}:${_gid}" "${PIP_CACHE_DIR}" "${XDG_CACHE_HOME}" 2>/dev/null || true
+    chmod -R u+rwX,go+rX "${PIP_CACHE_DIR}" "${XDG_CACHE_HOME}" 2>/dev/null || true
+  fi
+fi
+
 # 长耗时步骤前调用，便于在 build.log / automap.log 中区分「进行中」与「卡住」（宿主 tee 会为每行加时间戳）
 automap_log_progress() {
   echo "[PROGRESS] $*"

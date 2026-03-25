@@ -23,6 +23,26 @@
 
 namespace automap_pro::v3 {
 
+namespace {
+
+int resolveTreeLabel(const SemanticProcessor::Config& cfg) {
+    if (cfg.diag_override_tree_class_id >= 0) {
+        return cfg.diag_override_tree_class_id;
+    }
+    if (cfg.tree_class_id >= 0) {
+        return cfg.tree_class_id;
+    }
+    // Auto fallback by backend contract:
+    // - sloam writes trunk as 255 in its mask output.
+    // - lsk3dnet/lsk3dnet_hybrid outputs learning-label IDs; SemanticKITTI trunk=16.
+    if (cfg.model_type == "lsk3dnet" || cfg.model_type == "lsk3dnet_hybrid") {
+        return 16;
+    }
+    return 255;
+}
+
+}  // namespace
+
 struct CylinderFittingCost {
     CylinderFittingCost(const Eigen::Vector3d& point) : point_(point) {}
 
@@ -217,6 +237,19 @@ std::vector<CylinderLandmark::Ptr> SemanticProcessor::process(const CloudXYZICon
         const auto t2 = std::chrono::steady_clock::now();
         const auto processed = processed_frames_.load(std::memory_order_relaxed) + 1;
 
+        // High-signal segmentation log: first few frames + periodic + always on failure
+        if (!seg_result.success || processed <= 5 || (processed % 50 == 0)) {
+            RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                "[SEMANTIC][Processor][SEG] frame=%lu backend=%s success=%d infer_ms=%.2f msg=%s mask_wh=%dx%d cloud_pts=%zu",
+                static_cast<unsigned long>(processed),
+                seg_result.backend_name.empty() ? "(unknown)" : seg_result.backend_name.c_str(),
+                seg_result.success ? 1 : 0,
+                seg_result.inference_ms,
+                seg_result.message.empty() ? "(none)" : seg_result.message.c_str(),
+                mask.cols, mask.rows,
+                flipped_cloud->size());
+        }
+
         const bool log_class_hist = config_.diag_log_class_histogram;
         const bool dump_all_classes = config_.diag_dump_all_classes;
         if ((log_class_hist || dump_all_classes) &&
@@ -379,9 +412,7 @@ std::vector<CylinderLandmark::Ptr> SemanticProcessor::process(const CloudXYZICon
 
         // 2. Mask Tree Points
         CloudXYZIPtr tree_cloud(new CloudXYZI());
-        const int tree_label = (config_.diag_override_tree_class_id >= 0)
-            ? config_.diag_override_tree_class_id
-            : 255;
+        const int tree_label = resolveTreeLabel(config_);
         const bool dense_for_clustering = (config_.diag_cluster_input_mode == "dense_for_clustering");
         segmentor_->maskCloud(flipped_cloud, mask, tree_cloud, tree_label, dense_for_clustering);
         const auto t3 = std::chrono::steady_clock::now();

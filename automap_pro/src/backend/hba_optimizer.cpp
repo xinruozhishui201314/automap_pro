@@ -1046,9 +1046,24 @@ HBAResult HBAOptimizer::runGTSAMFallback(const PendingTask& task) {
         size_t landmark_factors_added = 0;
         for (const auto& factor : task.semantic_factors) {
             auto it_kf = kf_id_to_idx.find(factor.kf_id);
-            if (it_kf == kf_id_to_idx.end()) continue;
+            if (it_kf == kf_id_to_idx.end()) {
+                RCLCPP_WARN(rclcpp::get_logger("automap_system"),
+                    "[HBA][SEMANTIC][VALIDATION] kf_id=%lu not found in HBA task sorted_kfs, skip landmark factor", factor.kf_id);
+                continue;
+            }
 
-            if (task.submap_anchor_poses.find(static_cast<int>(factor.sm_id)) == task.submap_anchor_poses.end()) continue;
+            if (task.submap_anchor_poses.find(static_cast<int>(factor.sm_id)) == task.submap_anchor_poses.end()) {
+                RCLCPP_WARN(rclcpp::get_logger("automap_system"),
+                    "[HBA][SEMANTIC][VALIDATION] sm_id=%lu anchor not found in HBA task, skip landmark factor", factor.sm_id);
+                continue;
+            }
+
+            // 数值合法性检查
+            if (!factor.point_body.allFinite() || !factor.root_submap.allFinite() || !factor.ray_submap.allFinite()) {
+                RCLCPP_WARN(rclcpp::get_logger("automap_system"),
+                    "[HBA][SEMANTIC][VALIDATION] Landmark factor for kf=%lu sm=%lu has NaN/Inf, skip", factor.kf_id, factor.sm_id);
+                continue;
+            }
 
             // 1D Isotropic Noise Model (与 IncrementalOptimizer 保持一致)
             double sigma = 0.1 / std::max(1e-3, factor.weight);
@@ -1196,9 +1211,17 @@ HBAResult HBAOptimizer::runGTSAMFallback(const PendingTask& task) {
 
         logFactorErrors(graph_copy, initial_copy, "BEFORE");
 
-        gtsam::Values optimized = opt.optimize();
-        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-            "[HBA][GTSAM] LM optimize() exit iterations done. final_error=%.6g", graph_copy.error(optimized));
+        gtsam::Values optimized;
+        try {
+            gtsam::LevenbergMarquardtOptimizer opt(graph_copy, initial_copy);
+            optimized = opt.optimize();
+            RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                "[HBA][GTSAM] LM optimize() exit iterations done. final_error=%.6g", graph_copy.error(optimized));
+        } catch (const std::exception& e) {
+            RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+                "[HBA][GTSAM][EXCEPTION] LM Optimization CRASHED: %s. Returning empty result to prevent system death.", e.what());
+            return result;
+        }
 
         logFactorErrors(graph_copy, optimized, "AFTER");
 

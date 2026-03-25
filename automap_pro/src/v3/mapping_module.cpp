@@ -105,7 +105,13 @@ MappingModule::MappingModule(EventBus::Ptr event_bus, MapRegistry::Ptr map_regis
             METRICS_INCREMENT(metrics::UNKNOWN_FRAME_RESULT_TOTAL);
             return;
         }
-        if (ConfigManager::instance().contractFramePolicy() == "strict_map_only" && result.pose_frame != PoseFrame::MAP) {
+        if (ConfigManager::instance().contractFramePolicy() == "strict_map_only" &&
+            result.pose_frame != PoseFrame::MAP &&
+            !map_registry_->isGPSAligned()) {
+            RCLCPP_WARN(node_->get_logger(),
+                "[V3][CONTRACT] strict_map_only bypassed before GPS alignment: accepting non-MAP HBA result");
+        } else if (ConfigManager::instance().contractFramePolicy() == "strict_map_only" &&
+                   result.pose_frame != PoseFrame::MAP) {
             RCLCPP_ERROR(node_->get_logger(), "[V3][CONTRACT] strict_map_only rejects non-MAP HBA result");
             METRICS_INCREMENT(metrics::FRAME_MISMATCH_TOTAL);
             return;
@@ -377,122 +383,158 @@ bool MappingModule::isIdle() const {
            sm_manager_.isIdle(); // 🏛️ [修复] 检查点云合并子管理器是否也空闲
 }
 
+std::vector<std::pair<std::string, size_t>> MappingModule::queueDepths() const {
+    std::lock_guard<std::mutex> lock(queue_mutex_);
+    size_t pending_sem = 0;
+    {
+        std::lock_guard<std::mutex> sem_lock(pending_semantic_mutex_);
+        pending_sem = pending_semantic_landmarks_.size();
+    }
+    return {
+        {"frame_queue", frame_queue_.size()},
+        {"pose_opt_queue", pose_opt_queue_.size()},
+        {"pose_delta_queue", pose_delta_queue_.size()},
+        {"gps_event_queue", gps_event_queue_.size()},
+        {"command_queue", command_queue_.size()},
+        {"semantic_landmark_queue", semantic_landmark_queue_.size()},
+        {"pending_semantic_landmarks", pending_sem},
+    };
+}
+
+std::string MappingModule::idleDetail() const {
+    const bool sm_idle = sm_manager_.isIdle();
+    if (!sm_idle) {
+        return "SubMapManager busy(merge/freeze-post)";
+    }
+    return "";
+}
+
 void MappingModule::run() {
     RCLCPP_INFO(node_->get_logger(), "[V3][MappingModule] Started worker thread");
     
     while (running_) {
-        updateHeartbeat();
-        FilteredFrameEventRequiredDs event;
-        OptimizationResultEvent opt_ev;
-        OptimizationDeltaEvent delta_ev;
-        GPSAlignedEvent gps_ev;
-        SemanticLandmarkEvent sem_ev;
-        Command cmd;
-        bool has_frame = false;
-        bool has_opt = false;
-        bool has_delta = false;
-        bool has_gps_ev = false;
-        bool has_cmd = false;
-        bool has_sem = false;
+        try {
+            updateHeartbeat();
+            FilteredFrameEventRequiredDs event;
+            OptimizationResultEvent opt_ev;
+            OptimizationDeltaEvent delta_ev;
+            GPSAlignedEvent gps_ev;
+            SemanticLandmarkEvent sem_ev;
+            Command cmd;
+            bool has_frame = false;
+            bool has_opt = false;
+            bool has_delta = false;
+            bool has_gps_ev = false;
+            bool has_cmd = false;
+            bool has_sem = false;
 
-        {
-            std::unique_lock<std::mutex> lock(queue_mutex_);
-            cv_.wait_for(lock, std::chrono::milliseconds(100), [this] { 
-                return !running_ || !frame_queue_.empty() || !pose_opt_queue_.empty() || 
-                       !pose_delta_queue_.empty() || !gps_event_queue_.empty() || !command_queue_.empty() || !semantic_landmark_queue_.empty(); 
-            });
-            if (!running_) break;
-            
-            // 优先处理状态变更类事件
-            if (!gps_event_queue_.empty()) {
-                gps_ev = gps_event_queue_.front();
-                gps_event_queue_.pop_front();
-                has_gps_ev = true;
-            } else if (!pose_delta_queue_.empty()) {
-                delta_ev = pose_delta_queue_.front();
-                pose_delta_queue_.pop_front();
-                has_delta = true;
-            } else if (!pose_opt_queue_.empty()) {
-                opt_ev = pose_opt_queue_.front();
-                pose_opt_queue_.pop_front();
-                has_opt = true;
-            } else if (!command_queue_.empty()) {
-                cmd = command_queue_.front();
-                command_queue_.pop_front();
-                has_cmd = true;
-            } else if (!semantic_landmark_queue_.empty()) {
-                sem_ev = semantic_landmark_queue_.front();
-                semantic_landmark_queue_.pop_front();
-                has_sem = true;
-            } else if (!frame_queue_.empty()) {
-            // 🏛️ [修复] 确定性因果序屏障：检查地图版本与对齐世代是否已在 Mapping 模块本地处理完成
-                const uint64_t target_version = frame_queue_.front().ref_map_version;
-                const uint64_t target_epoch = frame_queue_.front().ref_alignment_epoch;
-                const uint64_t registry_version = map_registry_->getVersion();
-                const uint64_t current_epoch = processed_alignment_epoch_.load();
+            {
+                std::unique_lock<std::mutex> lock(queue_mutex_);
+                cv_.wait_for(lock, std::chrono::milliseconds(100), [this] { 
+                    return !running_ || !frame_queue_.empty() || !pose_opt_queue_.empty() || 
+                           !pose_delta_queue_.empty() || !gps_event_queue_.empty() || !command_queue_.empty() || !semantic_landmark_queue_.empty(); 
+                });
+                if (!running_) break;
                 
-                if (target_epoch == current_epoch && target_version <= registry_version) {
-                    event = frame_queue_.front();
-                    frame_queue_.pop_front();
-                    has_frame = true;
-                    last_barrier_wait_start_time_ = -1.0; // 重置计时
-                } else {
-                    // 🏛️ [P1 稳定性修复] 引入屏障超时机制，防止后端（Optimizer）卡死导致前端无限阻塞内存撑爆
-                    double now_s = node_->now().seconds();
-                    if (last_barrier_wait_start_time_ < 0) {
-                        last_barrier_wait_start_time_ = now_s;
-                    }
+                // 优先处理状态变更类事件
+                if (!gps_event_queue_.empty()) {
+                    gps_ev = gps_event_queue_.front();
+                    gps_event_queue_.pop_front();
+                    has_gps_ev = true;
+                } else if (!pose_delta_queue_.empty()) {
+                    delta_ev = pose_delta_queue_.front();
+                    pose_delta_queue_.pop_front();
+                    has_delta = true;
+                } else if (!pose_opt_queue_.empty()) {
+                    opt_ev = pose_opt_queue_.front();
+                    pose_opt_queue_.pop_front();
+                    has_opt = true;
+                } else if (!command_queue_.empty()) {
+                    cmd = command_queue_.front();
+                    command_queue_.pop_front();
+                    has_cmd = true;
+                } else if (!semantic_landmark_queue_.empty()) {
+                    sem_ev = semantic_landmark_queue_.front();
+                    semantic_landmark_queue_.pop_front();
+                    has_sem = true;
+                } else if (!frame_queue_.empty()) {
+                // 🏛️ [修复] 确定性因果序屏障：检查地图版本与对齐世代是否已在 Mapping 模块本地处理完成
+                    const uint64_t target_version = frame_queue_.front().ref_map_version;
+                    const uint64_t target_epoch = frame_queue_.front().ref_alignment_epoch;
+                    const uint64_t registry_version = map_registry_->getVersion();
+                    const uint64_t current_epoch = processed_alignment_epoch_.load();
                     
-                    if (now_s - last_barrier_wait_start_time_ > 5.0) {
-                        RCLCPP_ERROR(node_->get_logger(),
-                            "[CRITICAL_V3][MappingModule] Barrier TIMEOUT (5s)! Drop blocked frame: target_ref=%lu registry_version=%lu target_epoch=%lu current_epoch=%lu.",
-                            target_version, registry_version, target_epoch, current_epoch);
+                    if (target_epoch == current_epoch && target_version <= registry_version) {
+                        event = frame_queue_.front();
                         frame_queue_.pop_front();
-                        METRICS_INCREMENT(metrics::STALE_VERSION_DROP_TOTAL);
-                        last_barrier_wait_start_time_ = -1.0;
+                        has_frame = true;
+                        last_barrier_wait_start_time_ = -1.0; // 重置计时
                     } else {
-                        // 地图版本尚未追上，本轮循环跳过处理新帧，等待优化结果入队并处理
-                        RCLCPP_DEBUG_THROTTLE(node_->get_logger(), *node_->get_clock(), 1000,
-                            "[V3][MappingModule] Frame blocked by LOCAL barrier: frame_ref=%lu registry_version=%lu frame_epoch=%lu local_epoch=%lu (waiting...)",
-                            target_version, registry_version, target_epoch, current_epoch);
+                        // 🏛️ [P1 稳定性修复] 引入屏障超时机制，防止后端（Optimizer）卡死导致前端无限阻塞内存撑爆
+                        double now_s = node_->now().seconds();
+                        if (last_barrier_wait_start_time_ < 0) {
+                            last_barrier_wait_start_time_ = now_s;
+                        }
+                        
+                        if (now_s - last_barrier_wait_start_time_ > 5.0) {
+                            RCLCPP_ERROR(node_->get_logger(),
+                                "[CRITICAL_V3][MappingModule] Barrier TIMEOUT (5s)! Drop blocked frame: target_ref=%lu registry_version=%lu target_epoch=%lu current_epoch=%lu.",
+                                target_version, registry_version, target_epoch, current_epoch);
+                            frame_queue_.pop_front();
+                            METRICS_INCREMENT(metrics::STALE_VERSION_DROP_TOTAL);
+                            last_barrier_wait_start_time_ = -1.0;
+                        } else {
+                            // 地图版本尚未追上，本轮循环跳过处理新帧，等待优化结果入队并处理
+                            RCLCPP_DEBUG_THROTTLE(node_->get_logger(), *node_->get_clock(), 1000,
+                                "[V3][MappingModule] Frame blocked by LOCAL barrier: frame_ref=%lu registry_version=%lu frame_epoch=%lu local_epoch=%lu (waiting...)",
+                                target_version, registry_version, target_epoch, current_epoch);
+                        }
                     }
                 }
             }
-        }
 
-        if (has_delta) {
-            onPoseDelta(delta_ev);
-        } else if (has_opt) {
-            onPoseOptimized(opt_ev);
-        } else if (has_gps_ev) {
-            updateGPSAlignment(gps_ev);
-        } else if (has_sem) {
-            onSemanticLandmarks(sem_ev);
-        } else if (has_cmd) {
-            if (cmd.type == Command::Type::SAVE_MAP) {
-                SaveMapRequestEvent ev;
-                ev.output_dir = cmd.output_dir;
-                try {
-                    handleSaveMap(ev);
-                } catch (const std::exception& e) {
-                    RCLCPP_ERROR(node_->get_logger(),
-                        "[V3][MappingModule] SaveMap command failed: %s", e.what());
-                }
-                if (cmd.save_completion) {
+            if (has_delta) {
+                onPoseDelta(delta_ev);
+            } else if (has_opt) {
+                onPoseOptimized(opt_ev);
+            } else if (has_gps_ev) {
+                updateGPSAlignment(gps_ev);
+            } else if (has_sem) {
+                onSemanticLandmarks(sem_ev);
+            } else if (has_cmd) {
+                if (cmd.type == Command::Type::SAVE_MAP) {
+                    SaveMapRequestEvent ev;
+                    ev.output_dir = cmd.output_dir;
                     try {
-                        cmd.save_completion->set_value();
-                    } catch (const std::future_error&) {
-                        // already satisfied
+                        handleSaveMap(ev);
+                    } catch (const std::exception& e) {
+                        RCLCPP_ERROR(node_->get_logger(),
+                            "[V3][MappingModule] SaveMap command failed: %s", e.what());
                     }
+                    if (cmd.save_completion) {
+                        try {
+                            cmd.save_completion->set_value();
+                        } catch (const std::future_error&) {
+                            // already satisfied
+                        }
+                    }
+                } else {
+                    GlobalMapBuildRequestEvent ev;
+                    ev.voxel_size = cmd.voxel_size;
+                    ev.async = cmd.async;
+                    handleGlobalMapBuild(ev);
                 }
-            } else if (cmd.type == Command::Type::BUILD_GLOBAL_MAP) {
-                GlobalMapBuildRequestEvent ev;
-                ev.voxel_size = cmd.voxel_size;
-                ev.async = cmd.async;
-                handleGlobalMapBuild(ev);
+            } else if (has_frame) {
+                processFrame(event);
             }
-        } else if (has_frame) {
-            processFrame(event);
+        } catch (const std::exception& e) {
+            RCLCPP_ERROR(node_->get_logger(),
+                "[V3][MappingModule][EXCEPTION] run loop caught: %s (isolate+continue)", e.what());
+            METRICS_INCREMENT(metrics::ERRORS_TOTAL);
+        } catch (...) {
+            RCLCPP_ERROR(node_->get_logger(),
+                "[V3][MappingModule][EXCEPTION] run loop unknown exception (isolate+continue)");
+            METRICS_INCREMENT(metrics::ERRORS_TOTAL);
         }
     }
 }
@@ -1147,7 +1189,14 @@ bool MappingModule::shouldAcceptOptimizationEvent(const OptimizationResultEvent&
         METRICS_INCREMENT(metrics::UNKNOWN_FRAME_RESULT_TOTAL);
         return false;
     }
-    if (ConfigManager::instance().contractFramePolicy() == "strict_map_only" && ev.pose_frame != PoseFrame::MAP) {
+    if (ConfigManager::instance().contractFramePolicy() == "strict_map_only" &&
+        ev.pose_frame != PoseFrame::MAP &&
+        !map_registry_->isGPSAligned()) {
+        RCLCPP_WARN(node_->get_logger(),
+            "[V3][CONTRACT] strict_map_only bypassed before GPS alignment: accepting event pose_frame=%d",
+            static_cast<int>(ev.pose_frame));
+    } else if (ConfigManager::instance().contractFramePolicy() == "strict_map_only" &&
+               ev.pose_frame != PoseFrame::MAP) {
         RCLCPP_ERROR(node_->get_logger(),
             "[V3][CONTRACT] Reject event by frame_policy=strict_map_only: pose_frame=%d",
             static_cast<int>(ev.pose_frame));

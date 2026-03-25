@@ -14,12 +14,22 @@
 #include <sstream>
 #include <iomanip>
 #include <thread>
-#ifdef USE_TORCH
 #include <ament_index_cpp/get_package_share_directory.hpp>
+#ifdef USE_TORCH
 #include <ATen/Context.h>
+#include <torch/script.h>
+#include <torch/version.h>
 #endif
 
 namespace automap_pro {
+
+namespace {
+bool isNvrtcArchError(const std::exception& e) {
+    const std::string msg = e.what();
+    return msg.find("nvrtc") != std::string::npos &&
+           msg.find("gpu-architecture") != std::string::npos;
+}
+}  // namespace
 
 OverlapTransformerInfer::OverlapTransformerInfer() {
     const auto& cfg = ConfigManager::instance();
@@ -31,7 +41,6 @@ OverlapTransformerInfer::OverlapTransformerInfer() {
 }
 
 bool OverlapTransformerInfer::loadModel(const std::string& model_path, bool use_cuda) {
-#ifdef USE_TORCH
     std::lock_guard<std::mutex> lk(mutex_);
     if (model_path.empty()) {
         ALOG_WARN(MOD, "[OT] model_path empty; overlapTransformer.pt will not be loaded (use ScanContext or fallback).");
@@ -50,8 +59,15 @@ bool OverlapTransformerInfer::loadModel(const std::string& model_path, bool use_
             // 回退：安装空间下模型可能在 share/automap_pro/models/
             std::string fallback;
             try {
-                fallback = ament_index_cpp::get_package_share_directory("automap_pro") + "/models/overlapTransformer.pt";
-                if (std::filesystem::exists(fallback) && std::filesystem::is_regular_file(fallback)) {
+                // 尝试 .pt 和 .onnx 两种后缀
+                std::string base = ament_index_cpp::get_package_share_directory("automap_pro") + "/models/overlapTransformer";
+                if (std::filesystem::exists(base + ".onnx")) {
+                    fallback = base + ".onnx";
+                } else if (std::filesystem::exists(base + ".pt")) {
+                    fallback = base + ".pt";
+                }
+                
+                if (!fallback.empty() && std::filesystem::exists(fallback) && std::filesystem::is_regular_file(fallback)) {
                     path_to_load = fallback;
                     p = std::filesystem::path(path_to_load);
                     ALOG_INFO(MOD, "[OT] Using fallback model path (install space): {}", path_to_load);
@@ -62,21 +78,51 @@ bool OverlapTransformerInfer::loadModel(const std::string& model_path, bool use_
                 fallback.clear();
             }
             if (fallback.empty() || !std::filesystem::exists(p) || !std::filesystem::is_regular_file(p)) {
-                ALOG_ERROR(MOD, "[OT] Model file not found or not a file: {} (overlapTransformer.pt NOT loaded)", path_to_load);
+                ALOG_ERROR(MOD, "[OT] Model file not found or not a file: {} (model NOT loaded)", path_to_load);
                 model_loaded_ = false;
                 return false;
             }
         }
     } catch (const std::exception& e) {
-        ALOG_ERROR(MOD, "[OT] Path check failed for '{}': {} (overlapTransformer.pt NOT loaded)", model_path, e.what());
+        ALOG_ERROR(MOD, "[OT] Path check failed for '{}': {} (model NOT loaded)", model_path, e.what());
         model_loaded_ = false;
         return false;
     }
-    ALOG_INFO(MOD, "[OT] Loading OverlapTransformer model: {} (H={} W={})", path_to_load, proj_H_, proj_W_);
+
+    // 优先处理 ONNX 模型（支持 TensorRT 加速）
+    std::filesystem::path p_final(path_to_load);
+    if (p_final.extension() == ".onnx") {
+        ALOG_INFO(MOD, "[OT] Loading OverlapTransformer model (ONNX): {} (H={} W={})", path_to_load, proj_H_, proj_W_);
+        onnx_model_ = std::make_shared<OnnxSession>();
+        if (onnx_model_->loadModel(path_to_load, use_cuda)) {
+            model_loaded_ = true;
+            use_cuda_ = use_cuda;
+            ALOG_INFO(MOD, "[OT] ONNX Model loaded OK: path={} device={} H={} W={}",
+                      path_to_load, use_cuda_ ? "CUDA/TensorRT" : "CPU", proj_H_, proj_W_);
+            return true;
+        } else {
+            onnx_model_ = nullptr;
+            model_loaded_ = false;
+            return false;
+        }
+    }
+
+#ifdef USE_TORCH
+    ALOG_INFO(MOD, "[OT] Loading OverlapTransformer model (LibTorch): {} (H={} W={})", path_to_load, proj_H_, proj_W_);
     try {
         // 禁用 MKLDNN/DNNL 后端，避免 dnnl::impl::lru_primitive_cache_t::get 多线程/缓存竞态导致 SIGSEGV（full.log 中崩溃栈）
         at::globalContext().setUserEnabledMkldnn(false);
         ALOG_INFO(MOD, "[OT] MKLDNN disabled (use native CPU impl to avoid DNNL cache crash)");
+
+        // 🛑 [FIX] 针对 RTX 5080 (Blackwell) 崩溃修复：在旧版 LibTorch 关闭 TensorExpr fuser。
+        // 新版 LibTorch 已移除此 API，需条件编译避免构建失败。
+#if defined(TORCH_VERSION_MAJOR) && (TORCH_VERSION_MAJOR < 2)
+        torch::jit::setTensorExprFuserEnabled(false);
+        ALOG_INFO(MOD, "[OT] TensorExpr fuser disabled (legacy LibTorch API)");
+#else
+        ALOG_INFO(MOD, "[OT] Skip TensorExpr fuser toggle: API removed in this LibTorch version");
+#endif
+
         // 限制 LibTorch 内部线程数为 1，进一步降低竞态风险
         torch::set_num_threads(1);
         // 加载 TorchScript .pt 模型（由 gen_libtorch_model.py 生成）
@@ -265,6 +311,44 @@ Eigen::VectorXf OverlapTransformerInfer::inferWithTorch(
 }
 #endif
 
+Eigen::VectorXf OverlapTransformerInfer::inferWithOnnx(
+    const std::vector<float>& range_img) const
+{
+    if (!onnx_model_) return Eigen::VectorXf::Zero(256);
+
+    std::vector<int64_t> input_dims = {1, 1, static_cast<int64_t>(proj_H_), static_cast<int64_t>(proj_W_)};
+    
+    // ONNX Runtime 需要 float* 数据。直接使用 range_img 的副本（推理是并行的，需确保数据生命周期）
+    std::vector<float> input_data = range_img; 
+
+    Ort::Value input_tensor = onnx_model_->createTensor<float>(
+        input_data.data(), input_data.size(), input_dims);
+
+    std::vector<Ort::Value> inputs;
+    inputs.push_back(std::move(input_tensor));
+
+    auto outputs = onnx_model_->forward(inputs);
+    if (outputs.empty()) {
+        ALOG_ERROR(MOD, "[OT] ONNX inference returned no outputs");
+        return Eigen::VectorXf::Zero(256);
+    }
+
+    // 假设输出是 [1, 256] 或 [256]
+    float* output_data = outputs[0].GetTensorMutableData<float>();
+    auto tensor_info = outputs[0].GetTensorTypeAndShapeInfo();
+    size_t output_size = tensor_info.GetElementCount();
+
+    Eigen::VectorXf desc = Eigen::Map<Eigen::VectorXf>(output_data, output_size);
+    
+    // L2 归一化（ONNX 模型内部可能没包含 normalize 算子）
+    float norm = desc.norm();
+    if (norm > 1e-6f) {
+        desc /= norm;
+    }
+
+    return desc;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // FPFH 全局直方图 fallback（Level 3）
 // ─────────────────────────────────────────────────────────────────────────────
@@ -311,7 +395,6 @@ Eigen::VectorXf OverlapTransformerInfer::computeDescriptor(
     
     Eigen::VectorXf desc;
 
-#ifdef USE_TORCH
     if (model_loaded_) {
         std::lock_guard<std::mutex> lk(mutex_);
         auto range_img = generateRangeImage(cloud);
@@ -324,8 +407,42 @@ Eigen::VectorXf OverlapTransformerInfer::computeDescriptor(
                   tid, lwp, call_index);
         std::cerr << "[OT_CRASH_LOC] step=about_to_forward tid=" << tid << " lwp=" << lwp << " call=" << call_index << std::endl;
 
-        desc = inferWithTorch(range_img);
-        ALOG_INFO(MOD, "[OT_CRASH_LOC] step=infer_returned tid={} lwp={} call={}", tid, lwp, call_index);
+        if (onnx_model_) {
+            desc = inferWithOnnx(range_img);
+            ALOG_INFO(MOD, "[OT_CRASH_LOC] step=infer_returned_onnx tid={} lwp={} call={}", tid, lwp, call_index);
+        } else {
+#ifdef USE_TORCH
+            try {
+                desc = inferWithTorch(range_img);
+                ALOG_INFO(MOD, "[OT_CRASH_LOC] step=infer_returned tid={} lwp={} call={}", tid, lwp, call_index);
+            } catch (const std::exception& e) {
+                // ... existing exception handling ...
+                ALOG_ERROR(MOD,
+                    "[OT][EXCEPTION] inferWithTorch failed: {} (device={} call={} pts={})",
+                    e.what(), use_cuda_ ? "CUDA" : "CPU", call_index, cloud ? cloud->size() : 0u);
+
+                // Blackwell + older LibTorch may throw NVRTC arch errors in TE kernels.
+                // Degrade to CPU model in-process so the pipeline continues.
+                if (use_cuda_ && isNvrtcArchError(e)) {
+                    ALOG_WARN(MOD, "[OT][RECOVER] NVRTC arch mismatch detected, fallback to CPU torch inference");
+                    try {
+                        model_.to(torch::kCPU);
+                        use_cuda_ = false;
+                        desc = inferWithTorch(range_img);
+                        ALOG_WARN(MOD, "[OT][RECOVER] CPU retry succeeded after NVRTC arch error");
+                    } catch (const std::exception& e2) {
+                        ALOG_ERROR(MOD,
+                            "[OT][RECOVER] CPU retry failed: {} ; fallback to histogram descriptor", e2.what());
+                        desc = computeFallbackDescriptor(cloud);
+                    }
+                } else {
+                    desc = computeFallbackDescriptor(cloud);
+                }
+            }
+#else
+            desc = computeFallbackDescriptor(cloud);
+#endif
+        }
 
         auto t_infer = std::chrono::steady_clock::now();
         double infer_ms = std::chrono::duration<double, std::milli>(t_infer - t_range).count();
@@ -347,11 +464,6 @@ Eigen::VectorXf OverlapTransformerInfer::computeDescriptor(
         ALOG_INFO(MOD, "[LOOP_DESC][OT] phase=fallback_descriptor pts={} (模型未加载，使用直方图 fallback)",
                   cloud ? cloud->size() : 0u);
     }
-#else
-    desc = computeFallbackDescriptor(cloud);
-    ALOG_INFO(MOD, "[LOOP_DESC][OT] phase=fallback_descriptor pts={} (USE_TORCH=0，直方图 fallback)",
-              cloud ? cloud->size() : 0u);
-#endif
 
     // ✅ 验证 L2 归一化
     float norm = desc.norm();

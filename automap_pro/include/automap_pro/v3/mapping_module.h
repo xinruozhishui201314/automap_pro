@@ -31,6 +31,8 @@ public:
     void start() override;
     void stop() override;
     bool isIdle() const override;
+    std::vector<std::pair<std::string, size_t>> queueDepths() const override;
+    std::string idleDetail() const override;
 
 protected:
     void run() override;
@@ -142,7 +144,7 @@ private:
     size_t max_pending_semantic_events_ = 4096;
     double semantic_timestamp_match_tolerance_s_ = 1e-4;
     std::deque<SemanticLandmarkEvent> pending_semantic_landmarks_;
-    std::mutex pending_semantic_mutex_;
+    mutable std::mutex pending_semantic_mutex_;
 };
 
 } // namespace automap_pro::v3

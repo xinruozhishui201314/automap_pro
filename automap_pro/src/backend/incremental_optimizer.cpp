@@ -432,6 +432,14 @@ void IncrementalOptimizer::addOdomFactor(
 
     BACKEND_STEP("step=addOdomFactor_enter from=%d to=%d rel_norm=%.4f node_count=%zu estimate_size=%zu",
         from, to, rel.translation().norm(), node_exists_.size(), current_estimate_.size());
+    
+    // 🏛️ [架构加固] 拒绝非法里程计约束
+    if (!rel.translation().allFinite() || !rel.rotation().matrix().allFinite() || !info_matrix.allFinite()) {
+        RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+            "[IncrementalOptimizer][BACKEND][ODOM] Rejecting Odom factor from SM(%d) to SM(%d): NaN/Inf detected", from, to);
+        return;
+    }
+
     // 🔧 诊断: 记录当前状态
     RCLCPP_INFO(rclcpp::get_logger("automap_system"),
         "[IncrementalOptimizer][DIAG] addOdomFactor ENTER: from=%d to=%d "
@@ -2395,6 +2403,32 @@ OptimizationResult IncrementalOptimizer::commitAndUpdate() {
             "[CRASH_CONTEXT] step=commitAndUpdate_v5_exit_success");
         RCLCPP_INFO(rclcpp::get_logger("automap_system"),
             "[CRASH_CONTEXT] step=commitAndUpdate_exit_success");
+    } catch (const gtsam::IndeterminantLinearSystemException& e) {
+        scope.setSuccess(false);
+        RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+            "[IncrementalOptimizer][BACKEND][CRITICAL] IndeterminantLinearSystemException: %s - "
+            "This usually means a node is under-constrained (isolated). Node index: %zu",
+            e.what(), e.nearbyVariable());
+        recordOptimizationFailure(e.what());
+        
+        // 🔧 [架构修复] 尝试恢复：为异常涉及的节点添加极弱先验
+        try {
+            gtsam::Key problematic_key = e.nearbyVariable();
+            RCLCPP_WARN(rclcpp::get_logger("automap_system"),
+                "[IncrementalOptimizer][BACKEND][RECOVERY] Attempting to fix isolated node %zu by adding weak PriorFactor",
+                static_cast<size_t>(problematic_key));
+            
+            gtsam::SharedNoiseModel weak_prior = gtsam::noiseModel::Isotropic::Sigma(6, 1.0); // 1m/1rad std dev
+            if (current_estimate_.exists(problematic_key)) {
+                pending_graph_.add(gtsam::PriorFactor<gtsam::Pose3>(problematic_key, current_estimate_.at<gtsam::Pose3>(problematic_key), weak_prior));
+                RCLCPP_INFO(rclcpp::get_logger("automap_system"), "[IncrementalOptimizer][BACKEND][RECOVERY] Added weak Prior to node %zu, will retry next update", static_cast<size_t>(problematic_key));
+            }
+        } catch (...) {
+            RCLCPP_ERROR(rclcpp::get_logger("automap_system"), "[IncrementalOptimizer][BACKEND][RECOVERY] Recovery failed");
+        }
+
+        OptimizationResult fail{}; fail.success = false; return fail;
+
     } catch (const std::exception& e) {
         scope.setSuccess(false);
         BACKEND_STEP("step=commitAndUpdate_done result=fail exception=%s", e.what());
@@ -2864,6 +2898,80 @@ void IncrementalOptimizer::reset() {
     node_count_ = 0;
     factor_count_ = 0;
     has_prior_ = false;
+}
+
+void IncrementalOptimizer::transformHistoryAndRebuild(const Pose3d& T_map_odom) {
+    RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+        "[IncrementalOptimizer][BACKEND][REBUILD] transformHistoryAndRebuild ENTER: t=[%.2f, %.2f, %.2f]",
+        T_map_odom.translation().x(), T_map_odom.translation().y(), T_map_odom.translation().z());
+
+    std::vector<SubmapData> old_submaps;
+    std::vector<OdomFactorItem> old_odom;
+    std::vector<LoopFactorItem> old_loop;
+    std::vector<KeyFrameData> old_kf_data;
+    std::vector<OdomFactorItemKF> old_kf_odom;
+    std::vector<LoopFactorItemKF> old_kf_loop;
+
+    {
+        std::lock_guard<std::mutex> hlk(history_mutex_);
+        old_submaps = history_submap_data_;
+        old_odom = history_odom_factors_;
+        old_loop = history_loop_factors_;
+        old_kf_data = history_keyframe_data_;
+        old_kf_odom = history_kf_odom_factors_;
+        old_kf_loop = history_kf_loop_factors_;
+
+        // 清空历史以准备重新填充（带对齐位姿）
+        history_submap_data_.clear();
+        history_odom_factors_.clear();
+        history_loop_factors_.clear();
+        history_keyframe_data_.clear();
+        history_kf_odom_factors_.clear();
+        history_kf_loop_factors_.clear();
+    }
+
+    // 重置 iSAM2 状态
+    reset();
+
+    // 🏛️ [对齐逻辑] 对历史数据应用 T_map_odom 转换并重新入图
+    // 1. 恢复关键帧节点
+    for (auto& kf : old_kf_data) {
+        kf.pose = T_map_odom * kf.pose;
+        addKeyFrameNode(kf.id, kf.pose, kf.fixed, kf.is_first_kf_of_submap);
+    }
+
+    // 2. 恢复关键帧里程计因子
+    for (const auto& f : old_kf_odom) {
+        addOdomFactorBetweenKeyframes(f.from_id, f.to_id, f.rel_pose, f.info_matrix);
+    }
+
+    // 3. 恢复关键帧回环因子
+    for (const auto& f : old_kf_loop) {
+        addLoopFactorDeferred(f.from_id, f.to_id, f.rel_pose, f.info_matrix);
+    }
+
+    // 4. 恢复子图节点
+    for (auto& sm : old_submaps) {
+        sm.pose = T_map_odom * sm.pose;
+        addSubMapNode(sm.id, sm.pose, sm.is_fixed);
+    }
+
+    // 5. 恢复子图里程计因子
+    for (const auto& f : old_odom) {
+        addOdomFactor(f.from_id, f.to_id, f.rel_pose, f.info_matrix);
+    }
+
+    // 6. 恢复子图回环因子
+    for (const auto& f : old_loop) {
+        addLoopFactor(f.from_id, f.to_id, f.rel_pose, f.info_matrix);
+    }
+
+    // 提交所有恢复的因子
+    commitAndUpdate();
+
+    RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+        "[IncrementalOptimizer][BACKEND][REBUILD] transformHistoryAndRebuild DONE: factors=%d nodes=%d",
+        factor_count_, node_count_);
 }
 
 void IncrementalOptimizer::clearForShutdown() {

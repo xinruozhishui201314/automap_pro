@@ -117,9 +117,10 @@ RUN_AUTOMAP_UNDER_GDB=false
 RUN_FAST_LIVO_UNDER_GDB=false
 # --gdb 调试默认镜像（可用 AUTOMAP_GDB_DOCKER_IMAGE 覆盖）
 AUTOMAP_GDB_DOCKER_IMAGE="${AUTOMAP_GDB_DOCKER_IMAGE:-automap-pro:latest}"
-# 默认关闭构建/依赖安装阶段（build_inside_container），避免重复执行 build.log 中的大量操作。
-# 需要恢复时可显式设 AUTOMAP_ENABLE_BUILD_STEPS=1。
-AUTOMAP_ENABLE_BUILD_STEPS="${AUTOMAP_ENABLE_BUILD_STEPS:-0}"
+# 默认开启构建阶段（build_inside_container）以保证工程可正常编译；
+# 依赖安装是否跳过由 AUTOMAP_PREBUILT_INSTALL_DEPS 控制（如仅跳过 LibTorch/cuda-toolkit 安装）。
+# 如确需完全跳过编译/依赖安装，可显式设 AUTOMAP_ENABLE_BUILD_STEPS=0。
+AUTOMAP_ENABLE_BUILD_STEPS="${AUTOMAP_ENABLE_BUILD_STEPS:-1}"
 # 离线模式是否在启动前清空输出目录（默认 true=每次离线重新建图，避免沿用上次结果）
 CLEAN_OUTPUT_ON_OFFLINE=true
 # 宿主机日志目录：编译输出 → build.log，运行输出 → full.log
@@ -176,7 +177,7 @@ AutoMap-Pro 一键编译和运行脚本
 Docker / GPU 环境变量（可选）:
     - AUTOMAP_DOCKER_IMAGE   覆盖默认镜像（默认 NGC Isaac ROS，适配 RTX 50 等；旧环境可设为 automap-env:humble）
     - AUTOMAP_GDB_DOCKER_IMAGE  带 --gdb/--gdb-frontend 时使用的镜像（默认 automap-pro:latest）
-    - AUTOMAP_ENABLE_BUILD_STEPS  是否执行 build_inside_container 编译/依赖安装（默认 0=关闭；设 1 才执行）
+    - AUTOMAP_ENABLE_BUILD_STEPS  是否执行 build_inside_container 编译/依赖安装（默认 1=执行；设 0 可完全跳过）
     - AUTOMAP_ROS_DISTRO     容器内 ROS 发行版（默认随镜像推断：Isaac→jazzy，自建→humble）
     - AUTOMAP_IMAGE_ARCHIVE  本地 docker load 的 .tar 路径；设为空字符串可跳过 tar 仅 pull
     - AUTOMAP_PREFER_RUNTIME_SNAPSHOT  自建 humble + tar 流程默认 1（优先 load 快照）；NGC Isaac 默认镜像下默认 0（始终用 pull 的基础镜像，不写 runtime tar）
@@ -197,6 +198,7 @@ Docker / GPU 环境变量（可选）:
     - LIBTORCH_PREFER=cpu    强制下载 CPU 版 LibTorch（纯 CPU 机器）
     - ONNXRUNTIME_USE_CUDA   Isaac 镜像未设置时默认为 1（尝试 CUDA EP）；显式 0 可强制 CPU 构建 ORT（需 cuDNN 头文件才可能产出 GPU EP）
     - AUTOMAP_STRICT_BLACKWELL_STACK  默认 1：检测到 RTX 50 系时校验 CUDA≥12.8（优先 nvcc；NGC 无 nvcc 时用 nvidia-smi 的 CUDA Version）、LibTorch cu128、ONNX CUDA 时存在 cuDNN。设为 0 可跳过（不推荐）
+    - AUTOMAP_ENFORCE_CUDA_STACK_UNIFIED 默认 1：强制 libtorch / nvcc / libnvrtc 为同一 CUDA 小版本（例如都为 12.8），并在 Blackwell 上要求 libnvrtc>=12.8；不满足直接失败，避免 nvrtc -arch 运行时崩溃
 运行期（传入 run 容器，SLOAM 语义）:
     - AUTOMAP_SLOAM_ONNX_CUDA   默认为 1（尝试 ORT CUDA EP）；设为 0 强制 CPU 推理；无 libonnxruntime_providers_cuda.so 时 C++ 内仍会回退 CPU
     - AUTOMAP_ONNXRUNTIME_LIB_DIR  显式指定含 libonnxruntime*.so 的目录（可选，默认同 ONNXRUNTIME_HOME/lib）
@@ -379,11 +381,11 @@ automap_fast_livo_installed() {
     return 1
 }
 
-# 编译后复检：确保 automap_system 链接到当前 install_deps/ceres 可用 SONAME。
-# 当前工程统一目标为 libceres.so.3（Ceres 2.1.x）。
+# 编译后复检：读取 automap_system 的 NEEDED=libceres.so.X。
+# - 若 install_deps/ceres 中存在同名 SONAME，则验证 install_deps 可满足依赖（避免运行期 dlopen 崩溃）
+# - 若 install_deps/ceres 中不存在，则认为将使用镜像系统 Ceres（例如 Jazzy/noble 常为 libceres.so.4），仅告警不失败
 automap_verify_ceres_needed_postbuild() {
     local so_path="${WORKSPACE_DIR}/install/automap_pro/lib/libautomap_system_component.so"
-    local expected="libceres.so.3"
     if [ ! -f "${so_path}" ]; then
         print_error "编译后复检失败：未找到 ${so_path}"
         return 1
@@ -402,14 +404,10 @@ automap_verify_ceres_needed_postbuild() {
     [ -f "${WORKSPACE_DIR}/install_deps/ceres/lib/${needed}" ] && match="${WORKSPACE_DIR}/install_deps/ceres/lib/${needed}"
     [ -z "${match}" ] && [ -f "${WORKSPACE_DIR}/install_deps/ceres/lib64/${needed}" ] && match="${WORKSPACE_DIR}/install_deps/ceres/lib64/${needed}"
     if [ -z "${match}" ]; then
-        print_error "编译后复检失败：NEEDED=${needed}，但 install_deps/ceres 下无同名库（lib/lib64）"
-        return 1
+        print_warning "编译后复检提示：NEEDED=${needed}，install_deps/ceres 下无同名库（lib/lib64）。将按运行环境使用镜像系统 Ceres。"
+        return 0
     fi
-    if [ "${needed}" != "${expected}" ]; then
-        print_error "编译后复检失败：NEEDED=${needed}，期望 ${expected}（需重编译并确保链接到 install_deps/ceres）"
-        return 1
-    fi
-    print_success "✓ 编译后复检通过：automap_system NEEDED=${needed}，可用库=${match}"
+    print_success "✓ 编译后复检通过：automap_system NEEDED=${needed}，install_deps 可用库=${match}"
     return 0
 }
 
@@ -743,6 +741,7 @@ build_project() {
           -e AUTOMAP_SKIP_CUDA_TOOLKIT_APT="${AUTOMAP_SKIP_CUDA_TOOLKIT_APT:-0}" \
           -e ONNXRUNTIME_USE_CUDA="${_ONNXRUNTIME_USE_CUDA_VAL}" \
           -e AUTOMAP_STRICT_BLACKWELL_STACK="${AUTOMAP_STRICT_BLACKWELL_STACK:-1}" \
+          -e AUTOMAP_ENFORCE_CUDA_STACK_UNIFIED="${AUTOMAP_ENFORCE_CUDA_STACK_UNIFIED:-1}" \
           -e CUDA_HOME="${CUDA_HOME:-}" \
           -e CUDNN_HOME="${CUDNN_HOME:-}" \
           -e AUTOMAP_SETUP_LSK3DNET_VENV="${AUTOMAP_SETUP_LSK3DNET_VENV:-0}" \
@@ -844,8 +843,9 @@ run_system() {
 
     if [ "$MODE" = "offline" ]; then
         LAUNCH_FILE="automap_offline.launch.py"
-        # 使用「包名 + 文件名」从 install 加载，避免 PythonExpression/IfCondition 在 Humble 报错；请先执行一次 build 以安装修复后的 launch
-        LAUNCH_SPEC="automap_pro automap_offline.launch.py"
+        # 离线模式强制使用「源码」下的 launch 文件，确保 run-only 时也能立即生效（不依赖 install 目录是否更新）。
+        # 这样也便于将 patched config 写入 output_dir/run_*（宿主机可见），定位 system/api_version 丢失等问题。
+        LAUNCH_SPEC="/root/automap_ws/src/automap_pro/launch/automap_offline.launch.py"
         if [ -n "$BAG_FILE" ]; then
             LAUNCH_ARGS="${LAUNCH_ARGS} bag_file:=${BAG_FILE}"
             print_info "离线模式，回放: ${BAG_FILE}"
@@ -895,7 +895,7 @@ run_system() {
             fi
             FIX_SCRIPT="${SCRIPT_DIR}/scripts/fix_ros2_bag_metadata.py"
             if [ -f "$FIX_SCRIPT" ]; then
-                if ROS_DISTRO="${AUTOMAP_ROS_DISTRO}" python3 "$FIX_SCRIPT" "$BAG_DIR" --qos-style auto --ros-distro "${AUTOMAP_ROS_DISTRO}" 2>/dev/null; then
+                if ROS_DISTRO="${AUTOMAP_ROS_DISTRO}" python3 "$FIX_SCRIPT" "$BAG_DIR" --qos-style auto --ros-distro "${AUTOMAP_ROS_DISTRO}" --verify-with-ros2-info 2>/dev/null; then
                     print_info "[BAG] 已修复 metadata.yaml（避免 ros2 bag play bad conversion）"
                 else
                     FIX_ERR="$?"
@@ -924,9 +924,27 @@ except Exception as e:
     sys.exit(1)
 " "$BAG_META"; then
                 print_info "[BAG] [PRECHECK] metadata.yaml 解析通过（宿主机），若容器内仍报 bad conversion 请检查挂载与权限"
+                print_info "[BAG] [DIAG] precheck=metadata_yaml_parse result=pass bag_dir=${BAG_DIR}"
             else
                 print_warning "[BAG] [PRECHECK] metadata.yaml 解析失败（将导致 ros2 bag play 报 bad conversion，上方有解析异常详情）"
                 print_warning "[BAG] 建议宿主机执行: chmod u+w ${BAG_META} && python3 $FIX_SCRIPT $BAG_DIR"
+                print_error "[BAG] [DIAG] precheck=metadata_yaml_parse result=fail impact=bag_play_will_fail action=abort_before_launch"
+                exit 1
+            fi
+            # 高优先级预检查：若宿主机可用 ros2，直接用 ros2 bag info 验证可播放性（与 ros2 bag play 同解析链路）
+            if command -v ros2 >/dev/null 2>&1; then
+                if ros2 bag info "$BAG_DIR" >/tmp/automap_bag_info_precheck.log 2>&1; then
+                    print_info "[BAG] [PRECHECK] ros2 bag info 解析通过（与 ros2 bag play 一致）"
+                    print_info "[BAG] [DIAG] precheck=ros2_bag_info result=pass parser_chain=rosbag2_storage+yaml-cpp"
+                else
+                    print_error "[BAG] [PRECHECK] ros2 bag info 失败，关键输出：$(sed -n '1,3p' /tmp/automap_bag_info_precheck.log | tr '\n' ' ')"
+                    print_error "[BAG] metadata 仍不可被 rosbag2 解析，已中止启动；请先修复 ${BAG_META}"
+                    print_error "[BAG] [DIAG] precheck=ros2_bag_info result=fail impact=no_sensor_data action=abort_before_launch"
+                    exit 1
+                fi
+            else
+                print_warning "[BAG] [PRECHECK] 宿主机无 ros2 命令，跳过 ros2 bag info 预检查（将依赖 launch 阶段校验）"
+                print_warning "[BAG] [DIAG] precheck=ros2_bag_info result=skipped reason=no_ros2_on_host fallback=launch_runtime_guard"
             fi
         else
             print_info "[BAG] 未检测到目录或 metadata.yaml（path=${BAG_DIR}），跳过 metadata 修复与预检查"
@@ -1046,7 +1064,15 @@ except Exception as e:
     # 运行容器并启动建图系统（挂载 automap_pro 以便容器内能访问 config 等路径）
     # 若指定了 --log-dir，则 LOG_MOUNT 已包含 -v 宿主机目录:/root/run_logs，容器内 tee 写入 full.log 即保存到宿主机
     set +e
-    docker run -it "${DOCKER_RUN_EXTRA[@]}" \
+    # Some environments (CI / Cursor / non-interactive shells) don't provide a TTY.
+    # `docker run -t` will fail with "the input device is not a TTY" and exit 1.
+    DOCKER_TTY_ARGS=( )
+    if [ -t 0 ] && [ -t 1 ]; then
+        DOCKER_TTY_ARGS=( -it )
+    else
+        DOCKER_TTY_ARGS=( -i )
+    fi
+    docker run "${DOCKER_TTY_ARGS[@]}" "${DOCKER_RUN_EXTRA[@]}" \
         ${TIME_VOLUMES} \
         ${AUTOMAP_CACHE_MOUNT} \
         -v "${SCRIPT_DIR}/scripts:/root/scripts:ro" \
@@ -1170,7 +1196,7 @@ except Exception as e:
               _bagp=\"\${AUTOMAP_OFFLINE_BAG_PATH}\"
               [ -f \"\${_bagp}\" ] && _bagp=\"\$(dirname \"\${_bagp}\")\"
               if [ -d \"\${_bagp}\" ] && [ -f \"\${_bagp}/metadata.yaml\" ] && [ -f /root/automap_ws/src/automap_pro/scripts/fix_ros2_bag_metadata.py ]; then
-                ROS_DISTRO=\"${AUTOMAP_ROS_DISTRO}\" python3 /root/automap_ws/src/automap_pro/scripts/fix_ros2_bag_metadata.py \"\${_bagp}\" --qos-style auto --ros-distro \"${AUTOMAP_ROS_DISTRO}\" 1>&2 || true
+                ROS_DISTRO=\"${AUTOMAP_ROS_DISTRO}\" python3 /root/automap_ws/src/automap_pro/scripts/fix_ros2_bag_metadata.py \"\${_bagp}\" --qos-style auto --ros-distro \"${AUTOMAP_ROS_DISTRO}\" --verify-with-ros2-info 1>&2 || true
               fi
             fi
             # hba（全局优化节点）：与 GTSAM 一致，安装到 install_deps/hba
@@ -1208,9 +1234,269 @@ except Exception as e:
             if [ -x install_deps/lsk3dnet_venv/bin/python3 ]; then
               export AUTOMAP_LSK3DNET_PYTHON=\"\${AUTOMAP_LSK3DNET_PYTHON:-\$PWD/install_deps/lsk3dnet_venv/bin/python3}\"
             fi
+            # LSK3DNet hybrid: 若配置为 lsk3dnet_hybrid 且分类头 TorchScript 缺失，则自动导出（仅首次）。
+            # 这样可以确保“必须使用 hybrid”不依赖手动预处理。
+            if [ -f \"${CONTAINER_CONFIG_PATH}\" ]; then
+              _lsk_mt=\"\$(python3 - <<'PY' 2>/dev/null || true
+import yaml
+cfg = yaml.safe_load(open(\"${CONTAINER_CONFIG_PATH}\",\"r\",encoding=\"utf-8\")) or {}
+sem = cfg.get(\"semantic\") or {}
+print((sem.get(\"model_type\") or \"\").strip())
+PY
+              )\"
+              if [ \"\${_lsk_mt}\" = \"lsk3dnet_hybrid\" ]; then
+                # 计算准确性硬约束：hybrid_normal_mode=range 时必须能 import c_gen_normal_map。
+                _lsk_nm=\"\$(python3 - <<'PY' 2>/dev/null || true
+import yaml
+cfg = yaml.safe_load(open(\"${CONTAINER_CONFIG_PATH}\",\"r\",encoding=\"utf-8\")) or {}
+sem = cfg.get(\"semantic\") or {}
+lsk = sem.get(\"lsk3dnet\") or {}
+print((lsk.get(\"hybrid_normal_mode\") or \"range\").strip().lower())
+PY
+                )\"
+                if [ \"\${_lsk_nm}\" = \"range\" ]; then
+                  _py=\"\${AUTOMAP_LSK3DNET_PYTHON:-python3}\"
+                  if ! \"\${_py}\" -c \"import c_gen_normal_map\" >/dev/null 2>&1; then
+                    echo \"[FATAL] [LSK3DNET] hybrid_normal_mode=range requires python module c_gen_normal_map, but import failed.\" 1>&2
+                    echo \"[FATAL] [LSK3DNET] Fix: re-run with build steps enabled so install_deps/lsk3dnet_venv compiles c_utils, e.g.:\" 1>&2
+                    echo \"        AUTOMAP_SETUP_LSK3DNET_VENV=1 bash run_automap.sh --offline --bag-file ... --config ${CONFIG_BASENAME:-system_config_M2DGR.yaml} --clean\" 1>&2
+                    exit 1
+                  fi
+                fi
+
+                _lsk_repo=\"\$(python3 - <<'PY' 2>/dev/null || true
+import os,yaml
+cfg = yaml.safe_load(open(\"${CONTAINER_CONFIG_PATH}\",\"r\",encoding=\"utf-8\")) or {}
+sem = cfg.get(\"semantic\") or {}
+lsk = sem.get(\"lsk3dnet\") or {}
+root = \"/root/automap_ws/src/automap_pro\"
+def r(p):
+  if not p: return \"\"
+  p = p.replace(\"${CMAKE_CURRENT_SOURCE_DIR}\", root)
+  return os.path.normpath(p)
+print(r((lsk.get(\"repo_root\") or \"\").strip()))
+PY
+                )\"
+                _lsk_cfg=\"\$(python3 - <<'PY' 2>/dev/null || true
+import os,yaml
+cfg = yaml.safe_load(open(\"${CONTAINER_CONFIG_PATH}\",\"r\",encoding=\"utf-8\")) or {}
+sem = cfg.get(\"semantic\") or {}
+lsk = sem.get(\"lsk3dnet\") or {}
+print((lsk.get(\"config_yaml\") or \"\").strip())
+PY
+                )\"
+                _lsk_ckpt=\"\$(python3 - <<'PY' 2>/dev/null || true
+import os,yaml
+cfg = yaml.safe_load(open(\"${CONTAINER_CONFIG_PATH}\",\"r\",encoding=\"utf-8\")) or {}
+sem = cfg.get(\"semantic\") or {}
+lsk = sem.get(\"lsk3dnet\") or {}
+root = \"/root/automap_ws/src/automap_pro\"
+p = (lsk.get(\"checkpoint\") or \"\").strip().replace(\"${CMAKE_CURRENT_SOURCE_DIR}\", root)
+print(os.path.normpath(p))
+PY
+                )\"
+                _lsk_cls=\"\$(python3 - <<'PY' 2>/dev/null || true
+import os,yaml
+cfg = yaml.safe_load(open(\"${CONTAINER_CONFIG_PATH}\",\"r\",encoding=\"utf-8\")) or {}
+sem = cfg.get(\"semantic\") or {}
+lsk = sem.get(\"lsk3dnet\") or {}
+root = \"/root/automap_ws/src/automap_pro\"
+p = (lsk.get(\"classifier_torchscript\") or \"\").strip().replace(\"${CMAKE_CURRENT_SOURCE_DIR}\", root)
+print(os.path.normpath(p))
+PY
+                )\"
+                if [ -n \"\${_lsk_cls}\" ] && [ ! -f \"\${_lsk_cls}\" ]; then
+                  _exp_py=\"\${AUTOMAP_LSK3DNET_PYTHON:-python3}\"
+                  _exp_script=\"\${_lsk_repo}/scripts/export_lsk3dnet_classifier_torchscript.py\"
+                  if [ -f \"\${_exp_script}\" ] && [ -n \"\${_lsk_cfg}\" ] && [ -f \"\${_lsk_ckpt}\" ]; then
+                    echo \"[INFO] [LSK3DNET] classifier_torchscript missing, exporting -> \${_lsk_cls}\" 1>&2
+                    mkdir -p \"\$(dirname \"\${_lsk_cls}\")\" 2>/dev/null || true
+                    ( cd \"\${_lsk_repo}\" && \"\${_exp_py}\" \"scripts/export_lsk3dnet_classifier_torchscript.py\" \\
+                        --config \"\${_lsk_cfg}\" --checkpoint \"\${_lsk_ckpt}\" --output \"\${_lsk_cls}\" --device cpu ) 1>&2
+                    if [ -f \"/root/automap_ws/src/automap_pro/scripts/verify_lsk3dnet_hybrid_classifier.py\" ]; then
+                      \"\${_exp_py}\" /root/automap_ws/src/automap_pro/scripts/verify_lsk3dnet_hybrid_classifier.py --classifier \"\${_lsk_cls}\" 1>&2 || true
+                    fi
+                  else
+                    echo \"[WARN] [LSK3DNET] cannot export classifier: script/config/ckpt missing\" 1>&2
+                  fi
+                fi
+              fi
+            fi
             if [ \"\${AUTOMAP_USE_INSTALL_DEPS_GTSAM:-0}\" = \"1\" ] && [ -d install_deps/gtsam/lib ]; then
               export LD_LIBRARY_PATH=\"install_deps/gtsam/lib:\$LD_LIBRARY_PATH\"
               echo \"[WARN] AUTOMAP_USE_INSTALL_DEPS_GTSAM=1: forcing LD_LIBRARY_PATH prepend install_deps/gtsam/lib\" 1>&2
+            fi
+
+            # 启动前 NVRTC 架构硬校验（Blackwell 重点）：
+            # 若 libnvrtc 不支持目标架构（如 compute_120），优先自动重装/重建 GPU 栈；禁止静默切 CPU OT。
+            if [ \"\${AUTOMAP_STRICT_OT_NVRTC_PRECHECK:-1}\" = \"1\" ]; then
+              _gpu_name=\"\"
+              if command -v nvidia-smi >/dev/null 2>&1; then
+                _gpu_name=\"\$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 | tr -d '\r' || true)\"
+              fi
+              _need_check=0
+              _target_arch=\"\"
+              if echo \"\${_gpu_name}\" | grep -qE 'RTX[[:space:]]*50[0-9]{2,4}'; then
+                _need_check=1
+                _target_arch=\"compute_120\"
+              fi
+              if [ \"\${_need_check}\" = \"1\" ] && command -v python3 >/dev/null 2>&1; then
+                _nvrtc_err=\"\"
+                _nvrtc_err=\"\$(OT_NVRTC_TARGET_ARCH=\"\${_target_arch}\" python3 - <<'PY' 2>&1
+import ctypes
+import os
+import sys
+
+target_arch = (os.environ.get(\"OT_NVRTC_TARGET_ARCH\") or \"\").strip()
+if not target_arch:
+    sys.exit(0)
+
+src = b'extern \"C\" __global__ void k() {}'
+prog = ctypes.c_void_p()
+
+def _load_nvrtc():
+    for name in (\"libnvrtc.so\", \"libnvrtc.so.13\", \"libnvrtc.so.12\", \"libnvrtc.so.11\"):
+        try:
+            return ctypes.CDLL(name), name
+        except Exception:
+            continue
+    return None, None
+
+nvrtc, libname = _load_nvrtc()
+if nvrtc is None:
+    print(\"libnvrtc not found\", end=\"\")
+    sys.exit(2)
+
+nvrtc.nvrtcCreateProgram.argtypes = [
+    ctypes.POINTER(ctypes.c_void_p), ctypes.c_char_p, ctypes.c_char_p,
+    ctypes.c_int, ctypes.POINTER(ctypes.c_char_p), ctypes.POINTER(ctypes.c_char_p)
+]
+nvrtc.nvrtcCreateProgram.restype = ctypes.c_int
+nvrtc.nvrtcCompileProgram.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_char_p)]
+nvrtc.nvrtcCompileProgram.restype = ctypes.c_int
+nvrtc.nvrtcGetProgramLogSize.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t)]
+nvrtc.nvrtcGetProgramLogSize.restype = ctypes.c_int
+nvrtc.nvrtcGetProgramLog.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+nvrtc.nvrtcGetProgramLog.restype = ctypes.c_int
+nvrtc.nvrtcDestroyProgram.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
+nvrtc.nvrtcDestroyProgram.restype = ctypes.c_int
+
+rc = nvrtc.nvrtcCreateProgram(ctypes.byref(prog), src, b\"ot_nvrtc_check.cu\", 0, None, None)
+if rc != 0:
+    print(f\"nvrtcCreateProgram failed rc={rc}\", end=\"\")
+    sys.exit(3)
+
+opt = f\"--gpu-architecture={target_arch}\".encode(\"utf-8\")
+opts = (ctypes.c_char_p * 1)(opt)
+rc = nvrtc.nvrtcCompileProgram(prog, 1, opts)
+if rc != 0:
+    size = ctypes.c_size_t(0)
+    nvrtc.nvrtcGetProgramLogSize(prog, ctypes.byref(size))
+    log = b\"\"
+    if size.value > 0:
+        buf = ctypes.create_string_buffer(size.value)
+        nvrtc.nvrtcGetProgramLog(prog, buf)
+        log = buf.value
+    nvrtc.nvrtcDestroyProgram(ctypes.byref(prog))
+    msg = log.decode(\"utf-8\", errors=\"ignore\").strip() if log else f\"compile rc={rc}\"
+    print(f\"{libname} does not support {target_arch}: {msg}\", end=\"\")
+    sys.exit(4)
+
+nvrtc.nvrtcDestroyProgram(ctypes.byref(prog))
+sys.exit(0)
+PY
+)\"
+                _nvrtc_rc=$?
+                if [ \"\${_nvrtc_rc}\" -ne 0 ]; then
+                  echo -e \"\\033[1;31m[CUDA_BLOCK][OT] NVRTC arch precheck failed on GPU '\${_gpu_name}' (target=\${_target_arch})\\033[0m\" 1>&2
+                  echo -e \"\\033[1;31m[CUDA_BLOCK][OT] reason=\${_nvrtc_err:-nvrtc precheck failed}; start auto-reinstall GPU stack (CUDA/LibTorch)...\\033[0m\" 1>&2
+
+                  # 强制重装/重建依赖栈（不接受 CPU OT 降级）
+                  export AUTOMAP_PREBUILT_INSTALL_DEPS=0
+                  export LIBTORCH_SKIP_DOWNLOAD=0
+                  export AUTOMAP_SKIP_CUDA_TOOLKIT_APT=0
+                  export AUTOMAP_ENFORCE_CUDA_STACK_UNIFIED=1
+                  export AUTOMAP_STRICT_BLACKWELL_STACK=1
+
+                  # Blackwell：已存在旧版 LibTorch 时必须重下 cu128，避免继续命中 NVRTC 架构不支持
+                  if [ -d \"install_deps/libtorch\" ]; then
+                    rm -rf install_deps/libtorch
+                  fi
+
+                  if [ -x /root/scripts/build_inside_container.sh ]; then
+                    echo \"[CUDA_BLOCK][OT] Try fast repair first: CUDA/LibTorch only (no full compile).\" 1>&2
+                    AUTOMAP_REPAIR_CUDA_STACK_ONLY=1 /bin/bash /root/scripts/build_inside_container.sh 1>&2 || {
+                      echo \"[CUDA_BLOCK][OT] Fast repair failed; fallback to full rebuild.\" 1>&2
+                      AUTOMAP_REPAIR_CUDA_STACK_ONLY=0 /bin/bash /root/scripts/build_inside_container.sh 1>&2
+                    }
+                  else
+                    echo -e \"\\033[1;31m[CUDA_BLOCK][OT][FATAL] /root/scripts/build_inside_container.sh not found; cannot auto-reinstall GPU stack\\033[0m\" 1>&2
+                    exit 1
+                  fi
+
+                  # 重装后再次探测；仍失败则直接阻断启动（不切 CPU）
+                  _nvrtc_err2=\"\"
+                  _nvrtc_err2=\"\$(OT_NVRTC_TARGET_ARCH=\"\${_target_arch}\" python3 - <<'PY' 2>&1
+import ctypes
+import os
+import sys
+
+target_arch = (os.environ.get('OT_NVRTC_TARGET_ARCH') or '').strip()
+if not target_arch:
+    sys.exit(0)
+src = b'extern \"C\" __global__ void k() {}'
+prog = ctypes.c_void_p()
+for name in ('libnvrtc.so', 'libnvrtc.so.13', 'libnvrtc.so.12', 'libnvrtc.so.11'):
+    try:
+        nvrtc = ctypes.CDLL(name)
+        break
+    except Exception:
+        nvrtc = None
+if nvrtc is None:
+    print('libnvrtc not found', end='')
+    sys.exit(2)
+nvrtc.nvrtcCreateProgram.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int, ctypes.POINTER(ctypes.c_char_p), ctypes.POINTER(ctypes.c_char_p)]
+nvrtc.nvrtcCreateProgram.restype = ctypes.c_int
+nvrtc.nvrtcCompileProgram.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_char_p)]
+nvrtc.nvrtcCompileProgram.restype = ctypes.c_int
+nvrtc.nvrtcGetProgramLogSize.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t)]
+nvrtc.nvrtcGetProgramLogSize.restype = ctypes.c_int
+nvrtc.nvrtcGetProgramLog.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+nvrtc.nvrtcGetProgramLog.restype = ctypes.c_int
+nvrtc.nvrtcDestroyProgram.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
+nvrtc.nvrtcDestroyProgram.restype = ctypes.c_int
+rc = nvrtc.nvrtcCreateProgram(ctypes.byref(prog), src, b'ot_nvrtc_check_retry.cu', 0, None, None)
+if rc != 0:
+    print(f'nvrtcCreateProgram failed rc={rc}', end='')
+    sys.exit(3)
+opt = f'--gpu-architecture={target_arch}'.encode('utf-8')
+opts = (ctypes.c_char_p * 1)(opt)
+rc = nvrtc.nvrtcCompileProgram(prog, 1, opts)
+if rc != 0:
+    size = ctypes.c_size_t(0)
+    nvrtc.nvrtcGetProgramLogSize(prog, ctypes.byref(size))
+    log = b''
+    if size.value > 0:
+        buf = ctypes.create_string_buffer(size.value)
+        nvrtc.nvrtcGetProgramLog(prog, buf)
+        log = buf.value
+    nvrtc.nvrtcDestroyProgram(ctypes.byref(prog))
+    msg = log.decode('utf-8', errors='ignore').strip() if log else f'compile rc={rc}'
+    print(msg, end='')
+    sys.exit(4)
+nvrtc.nvrtcDestroyProgram(ctypes.byref(prog))
+sys.exit(0)
+PY
+)\"
+                  _nvrtc_rc2=$?
+                  if [ \"\${_nvrtc_rc2}\" -ne 0 ]; then
+                    echo -e \"\\033[1;31m[CUDA_BLOCK][OT][FATAL] NVRTC precheck still fails after auto-reinstall. reason=\${_nvrtc_err2:-unknown}\\033[0m\" 1>&2
+                    echo -e \"\\033[1;31m[CUDA_BLOCK][OT][FATAL] GPU realtime inference is required; startup aborted (no CPU fallback).\\033[0m\" 1>&2
+                    exit 1
+                  fi
+                  echo \"[CUDA_BLOCK][OT] Auto-reinstall succeeded; NVRTC arch precheck passed, keep GPU OT enabled.\" 1>&2
+                fi
+              fi
             fi
             source install/setup.bash
             ${CONTAINER_LAUNCH_CMD}
@@ -1248,6 +1534,36 @@ main() {
     parse_args "$@"
     apply_gdb_image_policy
 
+    # 若配置要求 LSK3DNet hybrid，则自动启用构建阶段创建 lsk3dnet_venv（torch+spconv+torch-scatter）。
+    # 规则：仅在用户未显式设置 AUTOMAP_SETUP_LSK3DNET_VENV 时自动开启，避免覆盖用户意图。
+    if [ -z "${AUTOMAP_SETUP_LSK3DNET_VENV+x}" ]; then
+        _CFG_PATH_FOR_LSK=""
+        if [ -n "${CONFIG_FILE:-}" ]; then
+            if [ -z "${CONFIG_FILE##*/*}" ]; then
+                _CFG_PATH_FOR_LSK="${CONFIG_FILE}"
+            else
+                _CFG_PATH_FOR_LSK="${PROJECT_DIR}/config/${CONFIG_FILE}"
+            fi
+        else
+            _CFG_PATH_FOR_LSK="${PROJECT_DIR}/config/system_config.yaml"
+        fi
+
+        if [ -f "${_CFG_PATH_FOR_LSK}" ] && AUTOMAP_CFG_PATH="${_CFG_PATH_FOR_LSK}" python3 - <<'PY' 2>/dev/null
+import os, sys, yaml
+p = os.environ.get("AUTOMAP_CFG_PATH","")
+if not p or not os.path.isfile(p):
+    raise SystemExit(1)
+cfg = yaml.safe_load(open(p, "r", encoding="utf-8")) or {}
+sem = cfg.get("semantic") or {}
+mt = (sem.get("model_type") or "").strip()
+raise SystemExit(0 if mt == "lsk3dnet_hybrid" else 1)
+PY
+        then
+            AUTOMAP_SETUP_LSK3DNET_VENV=1
+            print_info "检测到 semantic.model_type=lsk3dnet_hybrid，自动启用 AUTOMAP_SETUP_LSK3DNET_VENV=1（创建 install_deps/lsk3dnet_venv）"
+        fi
+    fi
+
     # 未指定 --log-dir 时使用带时间戳子目录，便于区分每次运行
     if [ "${LOG_DIR_USER_SET}" != "true" ] && [ "${LOG_USE_TIMESTAMP_SUBDIR}" = "true" ]; then
         LOG_DIR="${SCRIPT_DIR}/logs/run_$(date +%Y%m%d_%H%M%S)"
@@ -1258,6 +1574,18 @@ main() {
     exec > >(add_timestamp | tee "${LOG_DIR}/automap.log") 2>&1
 
     print_info "本次运行全部日志同时写入: ${LOG_DIR}/automap.log"
+
+    # 关键开关与环境变量（最终生效值），便于排查「为何执行/跳过了某阶段」
+    print_header "关键开关（最终生效值）"
+    print_info "[DIAG] AUTOMAP_ENABLE_BUILD_STEPS=${AUTOMAP_ENABLE_BUILD_STEPS:-<unset>}"
+    print_info "[DIAG] AUTOMAP_PREBUILT_INSTALL_DEPS=${AUTOMAP_PREBUILT_INSTALL_DEPS:-<unset>}"
+    print_info "[DIAG] AUTOMAP_ALWAYS_BUILD=${AUTOMAP_ALWAYS_BUILD:-0} CLEAN_BUILD=${CLEAN_BUILD} BUILD_ONLY=${BUILD_ONLY} RUN_ONLY=${RUN_ONLY}"
+    print_info "[DIAG] MODE=${MODE} BAG_FILE=${BAG_FILE:-<unset>} CONFIG_FILE=${CONFIG_FILE:-<unset>} BAG_RATE=${BAG_RATE}"
+    print_info "[DIAG] USE_RVIZ=${USE_RVIZ} USE_EXTERNAL_FRONTEND=${USE_EXTERNAL_FRONTEND} USE_EXTERNAL_OVERLAP=${USE_EXTERNAL_OVERLAP}"
+    print_info "[DIAG] AUTOMAP_ROS_DISTRO=${AUTOMAP_ROS_DISTRO:-<unset>} IMAGE_NAME=${IMAGE_NAME:-<unset>}"
+    print_info "[DIAG] ONNXRUNTIME_USE_CUDA=${ONNXRUNTIME_USE_CUDA:-<unset>} AUTOMAP_SLOAM_ONNX_CUDA=${AUTOMAP_SLOAM_ONNX_CUDA:-<unset>}"
+    print_info "[DIAG] LIBTORCH_SKIP_DOWNLOAD=${LIBTORCH_SKIP_DOWNLOAD:-<unset>} AUTOMAP_SKIP_CUDA_TOOLKIT_APT=${AUTOMAP_SKIP_CUDA_TOOLKIT_APT:-<unset>}"
+    print_info "[DIAG] AUTOMAP_STRICT_BLACKWELL_STACK=${AUTOMAP_STRICT_BLACKWELL_STACK:-1} AUTOMAP_ENFORCE_CUDA_STACK_UNIFIED=${AUTOMAP_ENFORCE_CUDA_STACK_UNIFIED:-1}"
 
     # --build-only 且未显式设置时，默认创建 LSK3DNet venv（与此前需写 AUTOMAP_SETUP_LSK3DNET_VENV=1 等价）
     if [ "$BUILD_ONLY" = true ] && [ -z "${AUTOMAP_SETUP_LSK3DNET_VENV+x}" ]; then

@@ -29,6 +29,8 @@ public:
         std::lock_guard<std::mutex> lock(queue_mutex_);
         return task_queue_.empty();
     }
+    std::vector<std::pair<std::string, size_t>> queueDepths() const override;
+    std::string idleDetail() const override;
 
 protected:
     void run() override;
@@ -41,6 +43,7 @@ private:
     void enqueueTaskLocked(const SyncedFrameEvent& ev);
     void handleGraphTaskEvent(const GraphTaskEvent& ev);
     void tryRecoverFromDegradedState(double now_s);
+    void markSemanticDegraded(const char* reason);
 
     rclcpp::Node::SharedPtr node_;
     std::vector<SemanticProcessor::Ptr> semantic_processors_;

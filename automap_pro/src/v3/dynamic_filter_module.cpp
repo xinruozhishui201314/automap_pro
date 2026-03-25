@@ -1,5 +1,6 @@
 #include "automap_pro/v3/dynamic_filter_module.h"
 #include "automap_pro/core/config_manager.h"
+#include "automap_pro/core/metrics.h"
 #include <pcl/filters/voxel_grid.h>
 #include <chrono>
 #include <cmath>
@@ -66,26 +67,47 @@ bool DynamicFilterModule::isIdle() const {
     return input_queue_.empty();
 }
 
+std::vector<std::pair<std::string, size_t>> DynamicFilterModule::queueDepths() const {
+    std::lock_guard<std::mutex> lk(queue_mutex_);
+    return {{"input_queue", input_queue_.size()}};
+}
+
+std::string DynamicFilterModule::idleDetail() const {
+    if (!enabled_) return "enabled=0";
+    if (shadow_mode_) return "shadow_mode=1";
+    return "";
+}
+
 void DynamicFilterModule::run() {
     RCLCPP_INFO(node_->get_logger(), "[V3][DynamicFilter] Started worker thread");
     while (running_) {
-        updateHeartbeat();
-        SyncedFrameEvent ev;
-        bool has_item = false;
-        {
-            std::unique_lock<std::mutex> lk(queue_mutex_);
-            cv_.wait_for(lk, std::chrono::milliseconds(100),
-                         [this]() { return !running_ || !input_queue_.empty(); });
-            if (!running_) break;
-            if (!input_queue_.empty()) {
-                ev = input_queue_.front();
-                input_queue_.pop_front();
-                has_item = true;
+        try {
+            updateHeartbeat();
+            SyncedFrameEvent ev;
+            bool has_item = false;
+            {
+                std::unique_lock<std::mutex> lk(queue_mutex_);
+                cv_.wait_for(lk, std::chrono::milliseconds(100),
+                             [this]() { return !running_ || !input_queue_.empty(); });
+                if (!running_) break;
+                if (!input_queue_.empty()) {
+                    ev = input_queue_.front();
+                    input_queue_.pop_front();
+                    has_item = true;
+                }
             }
+            if (!has_item) continue;
+            processOne(ev);
+            logKpiIfNeeded();
+        } catch (const std::exception& e) {
+            RCLCPP_ERROR(node_->get_logger(),
+                "[V3][DynamicFilter][EXCEPTION] run loop caught: %s (drop item, continue)", e.what());
+            METRICS_INCREMENT(metrics::ERRORS_TOTAL);
+        } catch (...) {
+            RCLCPP_ERROR(node_->get_logger(),
+                "[V3][DynamicFilter][EXCEPTION] run loop unknown exception (drop item, continue)");
+            METRICS_INCREMENT(metrics::ERRORS_TOTAL);
         }
-        if (!has_item) continue;
-        processOne(ev);
-        logKpiIfNeeded();
     }
 }
 

@@ -1,17 +1,24 @@
 #include "automap_pro/v3/semantic_segmentor.h"
+#include "automap_pro/core/ort_wrapper.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <filesystem>
+#include <iostream>
 #include <limits>
+#include <sstream>
 #include <stdexcept>
 #include <vector>
 
 #ifdef USE_TORCH
 #include <torch/script.h>
 #include <torch/torch.h>
+#include <torch/version.h>
 #endif
+
+#include <rclcpp/rclcpp.hpp>
 
 namespace automap_pro::v3 {
 
@@ -51,22 +58,83 @@ public:
         : cfg_(cfg),
           fov_up_rad_(static_cast<double>(cfg.fov_up) * M_PI / 180.0),
           fov_down_rad_(static_cast<double>(cfg.fov_down) * M_PI / 180.0) {
-#ifndef USE_TORCH
-        (void)cfg_;
-        throw std::runtime_error("LSK3DNet backend requires USE_TORCH=1");
-#else
         if (cfg_.lsk3dnet_model_path.empty()) {
             throw std::runtime_error("semantic.lsk3dnet.model_path is empty");
         }
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[SEMANTIC][LSK3DNET][LOAD] step=begin device_req=%s model=%s img=%dx%d fov=[%.1f,%.1f]",
+            cfg_.lsk3dnet_device.c_str(), cfg_.lsk3dnet_model_path.c_str(),
+            cfg_.img_w, cfg_.img_h, cfg_.fov_up, cfg_.fov_down);
+
+        std::filesystem::path model_path(cfg_.lsk3dnet_model_path);
+        if (model_path.extension() == ".onnx") {
+            onnx_model_ = std::make_shared<OnnxSession>();
+            bool use_cuda = (cfg_.lsk3dnet_device.rfind("cuda", 0) == 0);
+            if (onnx_model_->loadModel(cfg_.lsk3dnet_model_path, use_cuda)) {
+                RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                    "[SEMANTIC][LSK3DNET][LOAD] step=ok_onnx model=%s device=%s",
+                    cfg_.lsk3dnet_model_path.c_str(), use_cuda ? "CUDA/TensorRT" : "CPU");
+                return;
+            } else {
+                onnx_model_ = nullptr;
+                throw std::runtime_error("Failed to load ONNX model: " + cfg_.lsk3dnet_model_path);
+            }
+        }
+
+#ifndef USE_TORCH
+        throw std::runtime_error("TorchScript backend requires USE_TORCH=1 (or provide .onnx model)");
+#else
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[SEMANTIC][LSK3DNET][LOAD] torch_version=%s", TORCH_VERSION);
+        // 🛑 [FIX] 针对 RTX 5080 (Blackwell) 稳定性和性能修复
+        at::globalContext().setUserEnabledMkldnn(false);
+#if defined(TORCH_VERSION_MAJOR) && (TORCH_VERSION_MAJOR < 2)
+        torch::jit::setTensorExprFuserEnabled(false);
+#endif
+        torch::set_num_threads(1);
+
         module_ = torch::jit::load(cfg_.lsk3dnet_model_path);
         module_.eval();
 
-        if (cfg_.lsk3dnet_device.rfind("cuda", 0) == 0 && torch::cuda::is_available()) {
-            device_ = torch::Device(cfg_.lsk3dnet_device);
-        } else {
-            device_ = torch::kCPU;
+        // Hard requirement: LSK3DNet must run on CUDA. If CUDA is not active, exit fast with clear logs.
+        if (cfg_.lsk3dnet_device.rfind("cuda", 0) != 0) {
+            throw std::runtime_error(
+                "LSK3DNet requires CUDA device. Set semantic.lsk3dnet.device to 'cuda:0' (got '" + cfg_.lsk3dnet_device + "')");
         }
+        const bool cuda_ok = torch::cuda::is_available();
+        if (!cuda_ok) {
+            std::ostringstream oss;
+            oss << "[SEMANTIC][LSK3DNET][FATAL] CUDA is NOT available in LibTorch runtime.\n"
+                << "  requested_device=" << cfg_.lsk3dnet_device << "\n"
+                << "  torch_cuda_is_available=" << (cuda_ok ? "true" : "false") << "\n"
+                << "  torch_cuda_device_count=" << torch::cuda::device_count() << "\n"
+                << "  hint: ensure CUDA-capable LibTorch is installed and container has GPU access (--gpus all).";
+            std::cerr << oss.str() << std::endl;
+            throw std::runtime_error("LSK3DNet requires CUDA, but torch::cuda::is_available()==false");
+        }
+        device_ = torch::Device(cfg_.lsk3dnet_device);
         module_.to(device_);
+
+        // Warmup a tiny forward to prove CUDA path is working and measure initial latency.
+        try {
+            torch::NoGradGuard guard;
+            const int channels = std::max(4, cfg_.input_channels > 0 ? cfg_.input_channels : 4);
+            auto t0 = std::chrono::steady_clock::now();
+            auto x = torch::zeros({1, channels, cfg_.img_h, cfg_.img_w},
+                                  torch::TensorOptions().dtype(torch::kFloat32).device(device_));
+            auto out = module_.forward({x}).toTensor();
+            (void)out;
+            auto t1 = std::chrono::steady_clock::now();
+            const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                "[SEMANTIC][LSK3DNET][LOAD] step=ok device=%s cuda_available=1 warmup_ms=%.2f",
+                device_.str().c_str(), ms);
+        } catch (const std::exception& e) {
+            RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+                "[SEMANTIC][LSK3DNET][LOAD] step=warmup_failed device=%s error=%s",
+                device_.str().c_str(), e.what());
+            throw;
+        }
 #endif
     }
 
@@ -105,37 +173,96 @@ public:
         std::vector<float> input(static_cast<size_t>(channels * cfg_.img_h * cfg_.img_w), 0.0f);
         std::vector<int> hit_count(static_cast<size_t>(cfg_.img_h * cfg_.img_w), 0);
 
-        for (const auto& p : cloud->points) {
-            const auto proj = projectPoint(p, cfg_.img_w, cfg_.img_h, fov_up_rad_, fov_down_rad_);
+        const int img_h = cfg_.img_h;
+        const int img_w = cfg_.img_w;
+        const size_t img_size = static_cast<size_t>(img_h * img_w);
+
+        #pragma omp parallel for
+        for (size_t i = 0; i < cloud->points.size(); ++i) {
+            const auto& p = cloud->points[i];
+            const auto proj = projectPoint(p, img_w, img_h, fov_up_rad_, fov_down_rad_);
             if (!proj.valid) continue;
-            const int pix = proj.y * cfg_.img_w + proj.x;
-            const int cnt = ++hit_count[static_cast<size_t>(pix)];
-            auto set_channel = [&](int c, float v) {
-                if (c >= channels) return;
-                const size_t idx = static_cast<size_t>(c) * cfg_.img_h * cfg_.img_w + static_cast<size_t>(pix);
-                input[idx] += (v - meanAt(c)) / stdAt(c);
-            };
-            set_channel(0, p.x);
-            set_channel(1, p.y);
-            set_channel(2, p.z);
-            set_channel(3, p.intensity);
-            if (channels > 4) {
-                const float range = std::sqrt(p.x * p.x + p.y * p.y + p.z * p.z);
-                set_channel(4, range);
+            const int pix = proj.y * img_w + proj.x;
+            
+            #pragma omp atomic
+            ++hit_count[static_cast<size_t>(pix)];
+
+            for (int c = 0; c < channels; ++c) {
+                float val = 0.0f;
+                if (c == 0) val = p.x;
+                else if (c == 1) val = p.y;
+                else if (c == 2) val = p.z;
+                else if (c == 3) val = p.intensity;
+                else if (c == 4) val = std::sqrt(p.x * p.x + p.y * p.y + p.z * p.z);
+                
+                const size_t idx = static_cast<size_t>(c) * img_size + static_cast<size_t>(pix);
+                float norm_val = (val - meanAt(c)) / stdAt(c);
+                
+                #pragma omp atomic
+                input[idx] += norm_val;
             }
-            (void)cnt;
         }
 
-        for (int y = 0; y < cfg_.img_h; ++y) {
-            for (int x = 0; x < cfg_.img_w; ++x) {
-                const int pix = y * cfg_.img_w + x;
+        #pragma omp parallel for
+        for (int y = 0; y < img_h; ++y) {
+            for (int x = 0; x < img_w; ++x) {
+                const int pix = y * img_w + x;
                 const int cnt = hit_count[static_cast<size_t>(pix)];
                 if (cnt <= 1) continue;
                 for (int c = 0; c < channels; ++c) {
-                    const size_t idx = static_cast<size_t>(c) * cfg_.img_h * cfg_.img_w + static_cast<size_t>(pix);
+                    const size_t idx = static_cast<size_t>(c) * img_size + static_cast<size_t>(pix);
                     input[idx] /= static_cast<float>(cnt);
                 }
             }
+        }
+
+        if (onnx_model_) {
+            std::vector<int64_t> input_dims = {1, static_cast<int64_t>(channels), static_cast<int64_t>(img_h), static_cast<int64_t>(img_w)};
+            std::vector<float> input_data = input;
+            
+            Ort::Value input_tensor = onnx_model_->createTensor<float>(
+                input_data.data(), input_data.size(), input_dims);
+            
+            std::vector<Ort::Value> inputs;
+            inputs.push_back(std::move(input_tensor));
+            
+            auto outputs = onnx_model_->forward(inputs);
+            if (outputs.empty()) throw std::runtime_error("ONNX inference failed");
+            
+            float* out_ptr = outputs[0].GetTensorMutableData<float>();
+            auto out_dims = outputs[0].GetTensorTypeAndShapeInfo().GetShape();
+            
+            mask = cv::Mat(img_h, img_w, CV_8U);
+            if (out_dims.size() == 4) { // [1, C, H, W]
+                int C = static_cast<int>(out_dims[1]);
+                for (int y = 0; y < img_h; ++y) {
+                    for (int x = 0; x < img_w; ++x) {
+                        float max_val = -std::numeric_limits<float>::infinity();
+                        int max_idx = 0;
+                        for (int c = 0; c < C; ++c) {
+                            float v = out_ptr[c * img_h * img_w + y * img_w + x];
+                            if (v > max_val) {
+                                max_val = v;
+                                max_idx = c;
+                            }
+                        }
+                        mask.at<uint8_t>(y, x) = static_cast<uint8_t>(max_idx);
+                    }
+                }
+            } else if (out_dims.size() == 3) { // [1, H, W] labels
+                for (int i = 0; i < img_h * img_w; ++i) {
+                    mask.data[i] = static_cast<uint8_t>(out_ptr[i]);
+                }
+            }
+            
+            if (result != nullptr) {
+                const auto t1 = std::chrono::steady_clock::now();
+                result->success = true;
+                result->backend_name = name();
+                result->message = "ONNX/TensorRT";
+                result->inference_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            }
+            return;
         }
 
         torch::NoGradGuard no_grad;
@@ -166,6 +293,7 @@ public:
             const auto t1 = std::chrono::steady_clock::now();
             result->success = true;
             result->backend_name = name();
+            result->message = std::string("device=") + device_.str();
             result->inference_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
         }
 #endif
@@ -223,6 +351,7 @@ private:
     SegmentorConfig cfg_;
     double fov_up_rad_ = 0.0;
     double fov_down_rad_ = 0.0;
+    OnnxSession::Ptr onnx_model_ = nullptr;
 #ifdef USE_TORCH
     torch::jit::script::Module module_;
     torch::Device device_{torch::kCPU};

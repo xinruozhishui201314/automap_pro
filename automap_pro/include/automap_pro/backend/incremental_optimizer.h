@@ -162,6 +162,14 @@ public:
     /** 重置（新 session 开始） */
     void reset();
 
+    /** 🏛️ [架构加固] 修复 GPS 对齐发散：将现有历史数据转换到 MAP 坐标系并重建因子图
+     * @param T_map_odom 坐标系转换：p_map = T_map_odom * p_odom
+     */
+    void transformHistoryAndRebuild(const Pose3d& T_map_odom);
+
+    /** 获取当前因子图坐标系语义 */
+    PoseFrame getPoseFrame() const { return current_pose_frame_; }
+
     /** 获取所有子图数据（用于 GPS 对齐后重建） */
     std::vector<SubmapData> getAllSubmapData() const;
 

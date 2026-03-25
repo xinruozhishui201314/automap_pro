@@ -6,6 +6,8 @@ import os
 import sys
 import subprocess
 import traceback
+import glob
+import tempfile
 from datetime import datetime
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
@@ -89,53 +91,186 @@ def _launch_nodes_offline(context, *args, **kwargs):
             except Exception as _e_res:
                 _log_launch_exception("resolve loop_closure.overlap_transformer.model_path (offline)", _e_res)
             # 语义模型路径离线解析：避免 /tmp 补丁 YAML 导致 ${CMAKE_CURRENT_SOURCE_DIR} 失效。
-            # 同时在配置未写 semantic.model_path 时自动尝试常见路径，确保语义模块可被真正启用。
+            # 按 semantic.model_type 做分支解析，并在 LSK3DNet 资产不完整时做最小自愈。
             try:
                 _pkg_root = os.path.dirname(os.path.dirname(_orig_config_abs))
                 _sm = _cfg.get("semantic")
                 if isinstance(_sm, dict) and bool(_sm.get("enabled", True)):
-                    _raw_sem_mp = (_sm.get("model_path") or "").strip()
-                    _sem_mp = _raw_sem_mp
+                    _model_type = (_sm.get("model_type") or "sloam").strip()
                     _cmake = "${CMAKE_CURRENT_SOURCE_DIR}"
-                    if _sem_mp:
-                        if _cmake in _sem_mp:
-                            _sem_mp = _sem_mp.replace(_cmake, _pkg_root)
-                        elif not os.path.isabs(_sem_mp):
-                            _sem_mp = os.path.abspath(
-                                os.path.join(os.path.dirname(_orig_config_abs), _sem_mp)
+                    _lsk = _sm.get("lsk3dnet") if isinstance(_sm.get("lsk3dnet"), dict) else {}
+
+                    def _resolve_path(_p, _base_root=None):
+                        _p = (_p or "").strip()
+                        if not _p:
+                            return ""
+                        if _cmake in _p:
+                            _p = _p.replace(_cmake, _pkg_root)
+                        if os.path.isabs(_p):
+                            return os.path.normpath(_p)
+                        if _base_root:
+                            return os.path.normpath(os.path.join(_base_root, _p))
+                        return os.path.normpath(os.path.abspath(os.path.join(os.path.dirname(_orig_config_abs), _p)))
+
+                    def _first_existing(_cands):
+                        for _c in _cands:
+                            if _c and os.path.isfile(_c):
+                                return _c
+                        return ""
+
+                    if _model_type == "sloam":
+                        _sem_mp = _resolve_path(_sm.get("model_path"))
+                        if not _sem_mp or (not os.path.isfile(_sem_mp)):
+                            _sem_mp = _first_existing([
+                                os.path.join(_pkg_root, "models", "squeezesegV2_segmentator.onnx"),
+                                os.path.join(_pkg_root, "models", "squeezesegV2-crf_segmentator.onnx"),
+                                os.path.join(_pkg_root, "models", "squeezeseg_segmentator.onnx"),
+                                os.path.join(_pkg_root, "models", "squeezeseg-crf_segmentator.onnx"),
+                                os.path.join(_pkg_root, "models", "darknet53-1024_segmentator.onnx"),
+                                "/opt/sloam_ws/src/models/darknet53-1024_segmentator.onnx",
+                            ])
+                        if not _sem_mp:
+                            raise RuntimeError(
+                                "semantic.model_type=sloam but semantic.model_path is empty or file not found"
                             )
-                        _sem_mp = os.path.normpath(_sem_mp)
-                    if not _sem_mp or (not os.path.isfile(_sem_mp)):
-                        _candidates = [
-                            os.path.join(_pkg_root, "models", "squeezesegV2_segmentator.onnx"),
-                            os.path.join(_pkg_root, "models", "squeezesegV2-crf_segmentator.onnx"),
-                            os.path.join(_pkg_root, "models", "squeezeseg_segmentator.onnx"),
-                            os.path.join(_pkg_root, "models", "squeezeseg-crf_segmentator.onnx"),
-                            os.path.join(_pkg_root, "models", "darknet53-1024_segmentator.onnx"),
-                            "/opt/sloam_ws/src/models/darknet53-1024_segmentator.onnx",
-                        ]
-                        _found = ""
-                        for _c in _candidates:
-                            if os.path.isfile(_c):
-                                _found = _c
-                                break
-                        if _found:
-                            _sem_mp = _found
-                    if _sem_mp and os.path.isfile(_sem_mp):
                         _sm["model_path"] = _sem_mp
-                        _cfg["semantic"] = _sm
-                        sys.stderr.write(
-                            "{} [SEMANTIC] offline resolved model_path={}\n".format(_LP, _sem_mp)
-                        )
+                        sys.stderr.write("{} [SEMANTIC] offline resolved sloam model_path={}\n".format(_LP, _sem_mp))
                         sys.stderr.flush()
                     else:
-                        raise RuntimeError(
-                            "semantic.enabled=true but semantic.model_path is empty or file not found. "
-                            "Set semantic.model_path in config or provide one of the default model files."
+                        # LSK3DNet path resolution (lsk3dnet / lsk3dnet_hybrid)
+                        _repo_root = _resolve_path(_lsk.get("repo_root"))
+                        if not _repo_root:
+                            _repo_cand = os.path.join(_pkg_root, "thrid_party", "LSK3DNet-main")
+                            if os.path.isdir(_repo_cand):
+                                _repo_root = _repo_cand
+
+                        _lsk_ts = _resolve_path(_lsk.get("model_path"))
+                        _cfg_yaml = _resolve_path(_lsk.get("config_yaml"), _repo_root if _repo_root else None)
+                        _ckpt = _resolve_path(_lsk.get("checkpoint"), _repo_root if _repo_root else None)
+                        _classifier_ts = _resolve_path(_lsk.get("classifier_torchscript"), _repo_root if _repo_root else None)
+                        _worker_script = _resolve_path(_lsk.get("worker_script"), _repo_root if _repo_root else None)
+
+                        if not _cfg_yaml and _repo_root:
+                            _cfg_yaml = _first_existing([
+                                os.path.join(_repo_root, "config", "lk-semantickitti_erk_finetune.yaml"),
+                                os.path.join(_repo_root, "config", "lk-semantickitti_sub_tta.yaml"),
+                            ])
+                        if not _ckpt and _repo_root:
+                            _ckpt = _first_existing([
+                                os.path.join(_repo_root, "output_skitti", "opensource_9ks_s030_w64_0.pt"),
+                            ])
+                        if (not _ckpt) and _repo_root and os.path.isdir(_repo_root):
+                            _pt_cands = sorted(glob.glob(os.path.join(_repo_root, "**", "*.pt"), recursive=True))
+                            if _pt_cands:
+                                _ckpt = _pt_cands[0]
+                        if not _classifier_ts:
+                            _classifier_ts = _first_existing([
+                                os.path.join(_pkg_root, "models", "lsk_classifier.ts"),
+                                os.path.join(_pkg_root, "models", "lsk3dnet_classifier.ts"),
+                                os.path.join(_repo_root, "output_skitti", "lsk_classifier.ts") if _repo_root else "",
+                            ])
+                        if (not _classifier_ts) and _repo_root and os.path.isdir(_repo_root):
+                            _cls_cands = sorted(glob.glob(os.path.join(_repo_root, "**", "*classifier*.ts"), recursive=True))
+                            if _cls_cands:
+                                _classifier_ts = _cls_cands[0]
+                        if not _worker_script and _repo_root:
+                            _worker_script = os.path.join(_repo_root, "scripts", "lsk3dnet_hybrid_worker.py")
+
+                        # If lsk3dnet.ts missing but hybrid assets are present, auto switch to hybrid.
+                        _has_lsk_ts = bool(_lsk_ts and os.path.isfile(_lsk_ts))
+                        _hybrid_ready = bool(
+                            _repo_root and os.path.isdir(_repo_root) and
+                            _cfg_yaml and os.path.isfile(_cfg_yaml) and
+                            _ckpt and os.path.isfile(_ckpt) and
+                            _classifier_ts and os.path.isfile(_classifier_ts) and
+                            _worker_script and os.path.isfile(_worker_script)
                         )
+                        if _model_type == "lsk3dnet" and (not _has_lsk_ts) and _hybrid_ready:
+                            _model_type = "lsk3dnet_hybrid"
+                            sys.stderr.write("{} [SEMANTIC] lsk3dnet.ts missing, auto-switch model_type -> lsk3dnet_hybrid\n".format(_LP))
+                            sys.stderr.flush()
+
+                        if _model_type == "lsk3dnet":
+                            if not _has_lsk_ts:
+                                raise RuntimeError(
+                                    "semantic.model_type=lsk3dnet but semantic.lsk3dnet.model_path not found: {}".format(_lsk_ts)
+                                )
+                        elif _model_type == "lsk3dnet_hybrid":
+                            _missing = []
+                            if not (_repo_root and os.path.isdir(_repo_root)):
+                                _missing.append("repo_root")
+                            if not (_cfg_yaml and os.path.isfile(_cfg_yaml)):
+                                _missing.append("config_yaml")
+                            if not (_ckpt and os.path.isfile(_ckpt)):
+                                _missing.append("checkpoint(.pt)")
+                            if not (_classifier_ts and os.path.isfile(_classifier_ts)):
+                                _missing.append("classifier_torchscript(.ts)")
+                            if not (_worker_script and os.path.isfile(_worker_script)):
+                                _missing.append("worker_script")
+                            if _missing:
+                                raise RuntimeError(
+                                    "semantic.model_type=lsk3dnet_hybrid missing assets: {}".format(", ".join(_missing))
+                                )
+                        else:
+                            raise RuntimeError("unsupported semantic.model_type: {}".format(_model_type))
+
+                        _sm["model_type"] = _model_type
+                        if _repo_root:
+                            _lsk["repo_root"] = _repo_root
+                        if _lsk_ts:
+                            _lsk["model_path"] = _lsk_ts
+                        if _cfg_yaml:
+                            _lsk["config_yaml"] = _cfg_yaml
+                        if _ckpt:
+                            _lsk["checkpoint"] = _ckpt
+                        if _classifier_ts:
+                            _lsk["classifier_torchscript"] = _classifier_ts
+                        if _worker_script:
+                            _lsk["worker_script"] = _worker_script
+                        _sm["lsk3dnet"] = _lsk
+                        sys.stderr.write(
+                            "{} [SEMANTIC] offline resolved {} assets: ts={} ckpt={} cls_ts={} repo={}\n".format(
+                                _LP, _model_type, _lsk.get("model_path", ""), _lsk.get("checkpoint", ""),
+                                _lsk.get("classifier_torchscript", ""), _lsk.get("repo_root", ""))
+                        )
+                        sys.stderr.flush()
+
+                    _cfg["semantic"] = _sm
             except Exception as _e_sem:
+                # 语义资产缺失时不应中断离线会话补丁写入；降级后继续启动主流程。
                 _log_launch_exception("resolve semantic.model_path (offline)", _e_sem)
-                raise
+                try:
+                    _sm = _cfg.get("semantic") if isinstance(_cfg.get("semantic"), dict) else {}
+                    _pkg_root = os.path.dirname(os.path.dirname(_orig_config_abs))
+                    _fallback_sloam = _first_existing([
+                        os.path.join(_pkg_root, "models", "squeezesegV2_segmentator.onnx"),
+                        os.path.join(_pkg_root, "models", "squeezesegV2-crf_segmentator.onnx"),
+                        os.path.join(_pkg_root, "models", "squeezeseg_segmentator.onnx"),
+                        os.path.join(_pkg_root, "models", "squeezeseg-crf_segmentator.onnx"),
+                        os.path.join(_pkg_root, "models", "darknet53-1024_segmentator.onnx"),
+                        "/opt/sloam_ws/src/models/darknet53-1024_segmentator.onnx",
+                    ])
+                    if _fallback_sloam:
+                        _sm["enabled"] = True
+                        _sm["model_type"] = "sloam"
+                        _sm["model_path"] = os.path.normpath(_fallback_sloam)
+                        _cfg["semantic"] = _sm
+                        sys.stderr.write(
+                            "{} [SEMANTIC][FALLBACK] resolve failed, downgrade to sloam model_path={}\n".format(
+                                _LP, _sm["model_path"])
+                        )
+                    else:
+                        _sm["enabled"] = False
+                        _cfg["semantic"] = _sm
+                        sys.stderr.write(
+                            "{} [SEMANTIC][FALLBACK] resolve failed and no sloam model found, disable semantic for this run\n".format(
+                                _LP)
+                        )
+                    sys.stderr.flush()
+                except Exception as _e_sem_fb:
+                    _log_launch_exception("semantic fallback (offline)", _e_sem_fb)
+            # Normalize section types before patching: YAML can contain `system: null`,
+            # and dict.setdefault() will NOT override an existing None value.
             _system = _cfg.get("system") if isinstance(_cfg.get("system"), dict) else {}
             _base_out = (_system.get("output_dir") or "").strip() or "/data/automap_output"
             _base_out = os.path.abspath(_base_out.rstrip("/"))
@@ -146,14 +281,126 @@ def _launch_nodes_offline(context, *args, **kwargs):
             os.makedirs(session_out, exist_ok=True)
             os.environ["AUTOMAP_SESSION_OUTPUT_DIR"] = session_out
 
-            _cfg.setdefault("system", {})
+            # Contract flags are needed for config patching/hardening.
+            _contract = _cfg.get("contract") if isinstance(_cfg.get("contract"), dict) else {}
+            _strict_mode = str(_contract.get("strict_mode", False)).strip().lower() in ("1", "true", "yes", "on")
+
+            # Hardening: ensure `system` is a dict (YAML may contain `system: null`).
+            # If it's not a dict, attempt to recover it from the original config before falling back to {}.
+            if not isinstance(_cfg.get("system"), dict):
+                try:
+                    with open(_orig_config_abs, "r", encoding="utf-8") as _f_orig:
+                        _orig_cfg_reload = _yaml.safe_load(_f_orig) or {}
+                    if isinstance(_orig_cfg_reload, dict) and isinstance(_orig_cfg_reload.get("system"), dict):
+                        _cfg["system"] = dict(_orig_cfg_reload.get("system") or {})
+                    else:
+                        _cfg["system"] = {}
+                except Exception:
+                    _cfg["system"] = {}
+
+            # Ensure the protocol-required key is present when strict_mode is enabled.
+            # (The C++ side enforces this in strict_mode; keep launch behavior consistent.)
+            if _strict_mode and not str(_cfg.get("system", {}).get("api_version", "")).strip():
+                # Default to the current Automap-Pro protocol version used in shipped configs.
+                _cfg["system"]["api_version"] = "3.1"
+                sys.stderr.write(
+                    "{} [CONFIG][WARN] strict_mode=true but system.api_version missing; defaulting to '3.1' for offline patched config\n".format(_LP)
+                )
+                sys.stderr.flush()
+
             _cfg["system"]["output_dir"] = session_out
-            _cfg.setdefault("map", {})
+            if not isinstance(_cfg.get("map"), dict):
+                _cfg["map"] = {}
             _cfg["map"]["frame_config_path"] = os.path.join(session_out, "map_frame.cfg")
 
-            _patched_config = "/tmp/automap_offline_system_config_{}.yaml".format(os.getpid())
-            with open(_patched_config, "w", encoding="utf-8") as _f:
-                _yaml.safe_dump(_cfg, _f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+            # Runtime hard guard (from run_automap precheck):
+            # If NVRTC arch support is insufficient, force OT to CPU to avoid process aborts.
+            _force_ot_cpu = str(os.environ.get("AUTOMAP_FORCE_OT_CPU", "")).strip().lower() in ("1", "true", "yes", "on")
+            if _force_ot_cpu:
+                _reason = str(os.environ.get("AUTOMAP_FORCE_OT_CPU_REASON", "")).strip()
+                if not isinstance(_cfg.get("loop_closure"), dict):
+                    _cfg["loop_closure"] = {}
+                if not isinstance(_cfg["loop_closure"].get("overlap_transformer"), dict):
+                    _cfg["loop_closure"]["overlap_transformer"] = {}
+                _cfg["loop_closure"]["overlap_transformer"]["use_cuda"] = False
+                _red = "\033[1;31m"
+                _rst = "\033[0m"
+                sys.stderr.write(
+                    "{} {}[CUDA_BLOCK][OT] NVRTC arch precheck failed -> force CPU OT (loop_closure.overlap_transformer.use_cuda=false){} reason={}\n".format(
+                        _LP, _red, _rst, _reason if _reason else "<unspecified>"
+                    )
+                )
+                sys.stderr.flush()
+
+            # Preflight protocol contract: strict_mode requires system.api_version.
+            _api_version = str(_cfg.get("system", {}).get("api_version", "")).strip() if isinstance(_cfg.get("system"), dict) else ""
+            if _strict_mode and not _api_version:
+                raise RuntimeError(
+                    "offline patched config invalid: contract.strict_mode=true but missing required key system.api_version "
+                    "(source_config={})".format(_orig_config_abs)
+                )
+
+            # Write patched config into the session output dir (mounted to host in offline mode),
+            # so we can always inspect it after a crash (container /tmp is ephemeral and not visible on host).
+            _patched_config = os.path.join(session_out, "system_config_offline_patched.yaml")
+            # Atomic write: avoid readers observing partial YAML (bind-mounts/overlay can expose torn writes).
+            _tmp_fd = None
+            _tmp_path = None
+            try:
+                _tmp_fd, _tmp_path = tempfile.mkstemp(
+                    prefix="system_config_offline_patched.",
+                    suffix=".yaml.tmp",
+                    dir=session_out,
+                )
+                with os.fdopen(_tmp_fd, "w", encoding="utf-8") as _f:
+                    _yaml.safe_dump(_cfg, _f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+                    _f.flush()
+                    os.fsync(_f.fileno())
+                _tmp_fd = None
+                os.replace(_tmp_path, _patched_config)
+                _tmp_path = None
+                # Ensure host user can inspect the file (mkstemp defaults to 0600).
+                try:
+                    os.chmod(_patched_config, 0o644)
+                except Exception:
+                    pass
+            finally:
+                try:
+                    if _tmp_fd is not None:
+                        os.close(_tmp_fd)
+                except Exception:
+                    pass
+                try:
+                    if _tmp_path and os.path.exists(_tmp_path):
+                        os.unlink(_tmp_path)
+                except Exception:
+                    pass
+
+            # Post-write verification: re-load from disk to ensure YAML serialization didn't drop keys.
+            _verify_cfg = {}
+            try:
+                with open(_patched_config, "r", encoding="utf-8") as _f:
+                    _verify_cfg = _yaml.safe_load(_f) or {}
+            except Exception as _e_verify:
+                raise RuntimeError("failed to re-load patched config from disk: {}".format(_patched_config)) from _e_verify
+
+            _verify_contract = _verify_cfg.get("contract") if isinstance(_verify_cfg.get("contract"), dict) else {}
+            _verify_strict = str(_verify_contract.get("strict_mode", False)).strip().lower() in ("1", "true", "yes", "on")
+            _verify_api = ""
+            if isinstance(_verify_cfg.get("system"), dict):
+                _verify_api = str(_verify_cfg.get("system", {}).get("api_version", "")).strip()
+            if _verify_strict and not _verify_api:
+                # Print a short preview for debugging before failing fast.
+                try:
+                    _raw = _yaml.safe_dump(_verify_cfg, default_flow_style=False, allow_unicode=True, sort_keys=False)
+                    _lines = _raw.splitlines()
+                    _preview = "\n".join(_lines[:60]) + ("\n... (truncated)" if len(_lines) > 60 else "")
+                    sys.stderr.write("{} [CONFIG][FATAL] patched YAML missing system.api_version after write. Preview:\n{}\n".format(_LP, _preview))
+                    sys.stderr.flush()
+                except Exception:
+                    pass
+                raise RuntimeError("offline patched config invalid after write: strict_mode=true but missing system.api_version (file={})".format(_patched_config))
+
             config_path = _patched_config
             sys.stderr.write("{} [OUTPUT] AUTOMAP_SESSION_OUTPUT_DIR={}\n".format(_LP, session_out))
             sys.stderr.write("{} [CONFIG] offline patched config: {}\n".format(_LP, config_path))
@@ -306,6 +553,13 @@ def _launch_nodes_offline(context, *args, **kwargs):
     if not config_path_str:
         sys.stderr.write("{} [WARN] config_path 为空，automap_system 将使用默认配置\n".format(_LP))
         sys.stderr.flush()
+    else:
+        try:
+            _rp = os.path.realpath(config_path_str)
+        except Exception:
+            _rp = config_path_str
+        sys.stderr.write("{} [CONFIG] automap_system config_file(raw)={} realpath={}\n".format(_LP, config_path_str, _rp))
+        sys.stderr.flush()
     run_automap_under_gdb = LaunchConfiguration("run_automap_under_gdb", default="false").perform(context).lower() == "true"
     # 可选：预加载 libgtsam 以尝试规避 lago 静态初始化 double free（见 docs/FIX_GTSAM_LAGO_STATIC_INIT_DOUBLE_FREE.md）
     gtsam_preload_path = LaunchConfiguration("gtsam_preload_path", default="").perform(context).strip()
@@ -396,6 +650,9 @@ def _launch_nodes_offline(context, *args, **kwargs):
 def _log_bag_topics(bag_file):
     """调用 ros2 bag info 或读取 metadata.yaml 获取 bag 内发布的话题名称。"""
     topics = []
+    ros2_info_failed = False
+    ros2_info_stderr = ""
+    metadata_fallback_error = ""
 
     def parse_ros2_bag_info_stdout(stdout):
         """解析 ros2 bag info 输出：支持 'Topics:' 与 'Topic information:' 两种节标题及多种行格式。"""
@@ -433,6 +690,9 @@ def _log_bag_topics(bag_file):
         )
         if result.returncode == 0 and result.stdout:
             topics = parse_ros2_bag_info_stdout(result.stdout)
+        elif result.returncode != 0:
+            ros2_info_failed = True
+            ros2_info_stderr = (result.stderr or "").strip()
     except FileNotFoundError:
         pass  # 下方用 metadata 回退
     except subprocess.TimeoutExpired:
@@ -453,9 +713,10 @@ def _log_bag_topics(bag_file):
                     name = (t.get("topic_metadata") or {}).get("name")
                     if name and name not in topics:
                         topics.append(name)
-        except Exception:
-            pass
-    return topics
+        except Exception as e:
+            metadata_fallback_error = str(e)
+            sys.stderr.write("{} [BAG] [WARN] metadata fallback parse failed: {}\n".format(_LP, metadata_fallback_error))
+    return topics, ros2_info_failed, ros2_info_stderr, metadata_fallback_error
 
 
 def _log_bag_path(context, *args, **kwargs):
@@ -463,29 +724,84 @@ def _log_bag_path(context, *args, **kwargs):
     bag_file = LaunchConfiguration("bag_file").perform(context)
     sys.stderr.write("{} [BAG] 离线回放 bag_file={}\n".format(_LP, bag_file))
 
-    topics = _log_bag_topics(bag_file)
+    topics, ros2_info_failed, ros2_info_stderr, metadata_fallback_error = _log_bag_topics(bag_file)
     if topics:
         sys.stderr.write("{} [BAG] rosbag2 将发布的话题 ({} 个): {}\n".format(
             _LP, len(topics), ", ".join(topics)))
     else:
         sys.stderr.write("{} [BAG] 无法获取 bag 话题列表（请确认 bag 路径正确且为 ROS2 格式）\n".format(_LP))
+    if ros2_info_failed:
+        msg = "{} [BAG] [FATAL] ros2 bag info 失败，启动中止；通常是 metadata.yaml 非法，ros2 bag play 也会失败。stderr={} metadata_fallback_error={}".format(
+            _LP, ros2_info_stderr if ros2_info_stderr else "(empty)",
+            metadata_fallback_error if metadata_fallback_error else "(none)")
+        sys.stderr.write(msg + "\n")
+        sys.stderr.write(
+            "{} [BAG] [ACTION] 请先修复 metadata.yaml，再重试：python3 scripts/fix_ros2_bag_metadata.py <bag_dir>\n".format(
+                _LP
+            )
+        )
+        sys.stderr.flush()
+        raise RuntimeError(msg)
 
     sys.stderr.write("{} [BAG] 若 ros2 bag play 报 Exception on parsing info file / bad conversion，将无数据；odom 来自 fast_livo，请确保 config 中 lid_topic/imu_topic 与 bag 一致\n".format(_LP))
     sys.stderr.write("{} [BAG] 离线模式默认不启动 standalone HBA 节点(use_hba=false)，后端优化由 automap_system 内 HBAOptimizer 负责\n".format(_LP))
     sys.stderr.flush()
 
 
+def _handle_bag_play_exit(context, *args, **kwargs):
+    """仅在 bag 正常结束时触发 finish_mapping，避免空数据被误保存为成功运行。"""
+    event = kwargs.get("event")
+    return_code = getattr(event, "returncode", None)
+    if return_code == 0:
+        sys.stderr.write("{} [BAG] bag play exited with code 0; trigger finish_mapping\n".format(_LP))
+        sys.stderr.flush()
+        return [ExecuteProcess(
+            cmd=["bash", "-c", "sleep 5 && ros2 service call /automap/finish_mapping std_srvs/srv/Trigger '{}'"],
+            output="screen",
+        )]
+
+    sys.stderr.write(
+        "{} [BAG] [FATAL] bag play exited abnormally (code={}); skip finish_mapping to avoid empty map artifacts.\n".format(
+            _LP, return_code
+        )
+    )
+    sys.stderr.write(
+        "{} [BAG] [DIAG] root_cause=bag_play_failed effect=no_sensor_data action=shutdown_without_finish_mapping\n".format(
+            _LP
+        )
+    )
+    sys.stderr.flush()
+    return [EmitEvent(event=Shutdown(reason="bag play failed, abort offline pipeline"))]
+
+
 def generate_launch_description():
     pkg_share = get_package_share_directory("automap_pro")
     config_default = os.path.join(pkg_share, "config", "system_config.yaml")
-    # bag 播完后调用 finish_mapping，执行最终 HBA + 保存 + shutdown（离线“播完再结束”）
+    # bag 正常播完后调用 finish_mapping，执行最终 HBA + 保存 + shutdown（离线“播完再结束”）
     bag_play_action = ExecuteProcess(
-        cmd=["ros2", "bag", "play", LaunchConfiguration("bag_file"), "--rate", LaunchConfiguration("rate"), "--clock"],
+        cmd=["bash", "-c",
+             "set -e; "
+             "echo '[automap_offline] [BAG] waiting /automap/ready ...' 1>&2; "
+             "for i in $(seq 1 120); do "
+             "  if ros2 topic list 2>/dev/null | grep -Fx '/automap/ready' >/dev/null; then break; fi; "
+             "  sleep 0.5; "
+             "done; "
+             "if ! ros2 topic list 2>/dev/null | grep -Fx '/automap/ready' >/dev/null; then "
+             "  echo '[automap_offline] [BAG] [FATAL] timeout waiting topic /automap/ready to appear' 1>&2; "
+             "  exit 1; "
+             "fi; "
+             "if ! ros2 topic echo /automap/ready std_msgs/msg/Bool --qos-durability transient_local --once --timeout 10 >/dev/null; then "
+             "  echo '[automap_offline] [BAG] [FATAL] failed to receive /automap/ready message' 1>&2; "
+             "  exit 1; "
+             "fi; "
+             "echo '[automap_offline] [BAG] /automap/ready received, starting ros2 bag play' 1>&2; "
+             "exec ros2 bag play \"${BAG_FILE}\" --rate \"${BAG_RATE}\" --clock"
+             ],
         output="screen",
-    )
-    finish_after_bag_action = ExecuteProcess(
-        cmd=["bash", "-c", "sleep 5 && ros2 service call /automap/finish_mapping std_srvs/srv/Trigger '{}'"],
-        output="screen",
+        additional_env={
+            "BAG_FILE": LaunchConfiguration("bag_file"),
+            "BAG_RATE": LaunchConfiguration("rate"),
+        },
     )
     return LaunchDescription([
         DeclareLaunchArgument("config", default_value=config_default, description="Path to system_config.yaml"),
@@ -504,12 +820,12 @@ def generate_launch_description():
         DeclareLaunchArgument("gtsam_preload_path", default_value="", description="If set to path of libgtsam.so.4, set LD_PRELOAD to try avoiding lago static-init double free (see docs/FIX_GTSAM_LAGO_STATIC_INIT_DOUBLE_FREE.md)"),
         DeclareLaunchArgument("run_fast_livo_under_gdb", default_value="false", description="Run fastlivo_mapping under GDB; use when frontend SIGSEGV to get backtrace (e.g. frame=10 crash)"),
         OpaqueFunction(function=_log_bag_path),
-        bag_play_action,
         OpaqueFunction(function=_launch_nodes_offline),
+        bag_play_action,
         RegisterEventHandler(
             event_handler=OnProcessExit(
                 target_action=bag_play_action,
-                on_exit=[finish_after_bag_action],
+                on_exit=[OpaqueFunction(function=_handle_bag_play_exit)],
             )
         ),
     ])

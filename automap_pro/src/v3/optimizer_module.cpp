@@ -65,6 +65,7 @@ OptimizerModule::OptimizerModule(EventBus::Ptr event_bus, MapRegistry::Ptr map_r
     : ModuleBase("OptimizerModule", event_bus, map_registry), node_(node) {
 
     optimizer_.registerPoseUpdateCallback([this](const OptimizationResult& res) {
+        try {
         if (!running_.load()) {
             RCLCPP_WARN(node_->get_logger(), "[V3][CONTRACT] Reject optimizer callback: module is stopping/stopped");
             return;
@@ -79,7 +80,13 @@ OptimizerModule::OptimizerModule(EventBus::Ptr event_bus, MapRegistry::Ptr map_r
             METRICS_INCREMENT(metrics::FRAME_MISMATCH_TOTAL);
             return;
         }
-        if (ConfigManager::instance().contractFramePolicy() == "strict_map_only" && res.pose_frame != PoseFrame::MAP) {
+        if (ConfigManager::instance().contractFramePolicy() == "strict_map_only" &&
+            res.pose_frame != PoseFrame::MAP &&
+            !map_registry_->isGPSAligned()) {
+            RCLCPP_WARN(node_->get_logger(),
+                "[V3][CONTRACT] strict_map_only bypassed before GPS alignment: accepting non-MAP optimizer result");
+        } else if (ConfigManager::instance().contractFramePolicy() == "strict_map_only" &&
+                   res.pose_frame != PoseFrame::MAP) {
             RCLCPP_ERROR(node_->get_logger(), "[V3][CONTRACT] strict_map_only rejects non-MAP optimizer result");
             METRICS_INCREMENT(metrics::FRAME_MISMATCH_TOTAL);
             return;
@@ -157,6 +164,16 @@ OptimizerModule::OptimizerModule(EventBus::Ptr event_bus, MapRegistry::Ptr map_r
         RCLCPP_DEBUG(node_->get_logger(),
             "[V3][DIAG] step=Optimizer_poseCallback_done version=%lu (grep V3 DIAG)",
             static_cast<unsigned long>(version));
+        } catch (const std::exception& e) {
+            RCLCPP_ERROR(node_->get_logger(),
+                "[V3][OptimizerModule][EXCEPTION] pose update callback failed: %s (drop this update, keep process alive)",
+                e.what());
+            METRICS_INCREMENT(metrics::ERRORS_TOTAL);
+        } catch (...) {
+            RCLCPP_ERROR(node_->get_logger(),
+                "[V3][OptimizerModule][EXCEPTION] pose update callback unknown exception (drop this update, keep process alive)");
+            METRICS_INCREMENT(metrics::ERRORS_TOTAL);
+        }
     });
 
     onEvent<LoopConstraintEvent>([this](const LoopConstraintEvent& ev) {
@@ -188,52 +205,69 @@ bool OptimizerModule::isIdle() const {
     return task_queue_.empty();
 }
 
+std::vector<std::pair<std::string, size_t>> OptimizerModule::queueDepths() const {
+    std::lock_guard<std::mutex> lock(task_mutex_);
+    return {{"task_queue", task_queue_.size()}};
+}
+
+std::string OptimizerModule::idleDetail() const {
+    return "";
+}
+
 void OptimizerModule::run() {
     RCLCPP_INFO(node_->get_logger(), "[V3][OptimizerModule] Started worker thread");
     
     while (running_) {
-        updateHeartbeat();
-        std::deque<OptTaskItem> tasks;
-        {
-            std::unique_lock<std::mutex> lock(task_mutex_);
-            cv_.wait_for(lock, std::chrono::milliseconds(100), 
-                [this] { return !running_ || !task_queue_.empty(); });
-            
-            if (!running_) break;
-            if (task_queue_.empty()) continue;
-            
-            // 🏛️ [P0 性能优化] 任务合并 (Task Coalescing)
-            // 一次性取出当前队列中所有任务进行批量处理，显著减少 iSAM2::update() 的调用频率
-            // 对于高频关键帧流，这能极大降低 GTSAM 重线性化带来的 CPU 抖动
-            tasks = std::move(task_queue_);
-            task_queue_.clear();
-        }
-
-        // 处理一批优化任务
-        bool needs_update = false;
-        bool has_reset = false;
-
-        for (const auto& task : tasks) {
-            if (task.type == OptTaskItem::Type::RESET) {
-                optimizer_.reset();
-                has_reset = true;
-                needs_update = false; // reset 后不需要立即 update
-                continue;
+        try {
+            updateHeartbeat();
+            std::deque<OptTaskItem> tasks;
+            {
+                std::unique_lock<std::mutex> lock(task_mutex_);
+                cv_.wait_for(lock, std::chrono::milliseconds(100), 
+                    [this] { return !running_ || !task_queue_.empty(); });
+                
+                if (!running_) break;
+                if (task_queue_.empty()) continue;
+                
+                // 🏛️ [P0 性能优化] 任务合并 (Task Coalescing)
+                // 一次性取出当前队列中所有任务进行批量处理，显著减少 iSAM2::update() 的调用频率
+                // 对于高频关键帧流，这能极大降低 GTSAM 重线性化带来的 CPU 抖动
+                tasks = std::move(task_queue_);
+                task_queue_.clear();
             }
-            
-            if (task.type == OptTaskItem::Type::FORCE_UPDATE) {
+
+            // 处理一批优化任务
+            bool needs_update = false;
+
+            for (const auto& task : tasks) {
+                if (task.type == OptTaskItem::Type::RESET) {
+                    optimizer_.reset();
+                    needs_update = false; // reset 后不需要立即 update
+                    continue;
+                }
+                
+                if (task.type == OptTaskItem::Type::FORCE_UPDATE) {
+                    needs_update = true;
+                }
+
+                // 如果已经 reset，后续非关键任务在同一批次中可能不再有意义，但为了逻辑简单继续处理
+                processTaskInternal(task);
+                
+                // 保证版本推进：任何非 RESET 批次都至少触发一次优化提交
                 needs_update = true;
             }
 
-            // 如果已经 reset，后续非关键任务在同一批次中可能不再有意义，但为了逻辑简单继续处理
-            processTaskInternal(task);
-            
-            // 保证版本推进：任何非 RESET 批次都至少触发一次优化提交
-            needs_update = true;
-        }
-
-        if (needs_update && running_) {
-            optimizer_.forceUpdate();
+            if (needs_update && running_) {
+                optimizer_.forceUpdate();
+            }
+        } catch (const std::exception& e) {
+            RCLCPP_ERROR(node_->get_logger(),
+                "[V3][OptimizerModule][EXCEPTION] run loop caught: %s (isolate+continue)", e.what());
+            METRICS_INCREMENT(metrics::ERRORS_TOTAL);
+        } catch (...) {
+            RCLCPP_ERROR(node_->get_logger(),
+                "[V3][OptimizerModule][EXCEPTION] run loop unknown exception (isolate+continue)");
+            METRICS_INCREMENT(metrics::ERRORS_TOTAL);
         }
     }
 }
@@ -317,6 +351,17 @@ void OptimizerModule::processGPSBatchKF(const OptTaskItem& task) {
     size_t reject_quality = 0;
     const auto& cfg = ConfigManager::instance();
     const double gps_max_dt = cfg.gpsKeyframeMatchWindowS();
+
+    // 🏛️ [对齐逻辑] 若当前处于 ODOM 系，注入批量 GPS 因子前必须先进行坐标系转换与重建
+    if (optimizer_.getPoseFrame() == PoseFrame::ODOM) {
+        Pose3d T_map_odom = Pose3d::Identity();
+        T_map_odom.linear() = R;
+        T_map_odom.translation() = t;
+        optimizer_.transformHistoryAndRebuild(T_map_odom);
+        RCLCPP_INFO(node_->get_logger(),
+            "[V3][POSE_DIAG] step=processGPSBatchKF: Triggered IncrementalOptimizer REBUILD from ODOM to MAP");
+    }
+
     for (const auto& kf : all_kfs) {
         if (!kf) continue;
         const double gps_dt = std::abs(kf->timestamp - kf->gps.timestamp);

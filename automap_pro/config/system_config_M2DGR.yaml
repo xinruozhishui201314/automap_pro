@@ -26,6 +26,7 @@
 # └─────────────────────────────────────────────────────────────────────────────
 system:
   name: "AutoMap-Pro"
+  api_version: "3.1"
   output_dir: "/data/automap_output"
   num_threads: 20             # 高资源可设 16~20；8 核及以下用 8
   log_level: "DEBUG"          # DEBUG | INFO | WARN | ERROR
@@ -45,6 +46,10 @@ system:
   backpressure_max_waits: 3
   # HBA 完成后是否自动启动 VTK 轨迹查看器（两条曲线+偏差）；launch 可覆盖：vtk_viewer_after_hba:=false
   vtk_viewer_after_hba: true
+
+contract:
+  strict_mode: true
+  frame_policy: "strict_map_only"
 
 # 运行模式与传感器空闲超时（EARLY_SHUTDOWN_QUICK_FIX：离线用 7200s 避免 bag 未播完就结束）
 mode:
@@ -103,40 +108,42 @@ frontend:
 semantic:
   enabled: true
   # 可选后端：sloam | lsk3dnet（纯 TorchScript 距离图）| lsk3dnet_hybrid（Python spconv 骨干 + LibTorch 分类头）
-  model_type: "sloam"
+  # 使用 LSK3DNet hybrid：Python 子进程跑 spconv 骨干，C++ LibTorch 跑分类头 TorchScript。
+  model_type: "lsk3dnet_hybrid"
   # 离线 launch 会将 ${CMAKE_CURRENT_SOURCE_DIR} 解析为仓库绝对路径并写入 /tmp 补丁配置。
   # 若该路径不存在，离线 launch 会自动尝试仓库 models 下其它 segmentator onnx 候选。
   model_path: "${CMAKE_CURRENT_SOURCE_DIR}/models/squeezesegV2_segmentator.onnx"
   lsk3dnet:
     # model_type=lsk3dnet 时使用的 TorchScript 路径
     model_path: "${CMAKE_CURRENT_SOURCE_DIR}/models/lsk3dnet.ts"
-    # cpu | cuda:0 | cuda:1（默认 sloam 时本段不生效；切到 lsk3dnet 时 RTX 50 等建议 cuda:0）
+    # cpu | cuda:0 | cuda:1（当前默认 model_type=lsk3dnet，RTX 50 等建议 cuda:0）
     device: "cuda:0"
     # ── lsk3dnet_hybrid 专用（需 USE_TORCH 编译 + 本机 Python 含 torch/spconv 与权重一致）──
     # repo_root: LSK3DNet-main 根目录（含 network/、scripts/lsk3dnet_hybrid_worker.py）
     # config_yaml / checkpoint / classifier_torchscript：可为绝对路径，或相对 repo_root
     # classifier：用 LSK3DNet-main/scripts/export_lsk3dnet_classifier_torchscript.py 从同一 checkpoint 导出
-    # repo_root: ""
-    # config_yaml: "config/lk-semantickitti_erk_finetune.yaml"
-    # checkpoint: "output_skitti/your.pt"
-    # classifier_torchscript: "${CMAKE_CURRENT_SOURCE_DIR}/models/lsk_classifier.ts"
+    repo_root: "${CMAKE_CURRENT_SOURCE_DIR}/thrid_party/LSK3DNet-main"
+    config_yaml: "config/lk-semantickitti_erk_finetune.yaml"
+    checkpoint: "${CMAKE_CURRENT_SOURCE_DIR}/models/LSK3DNET/opensource_9ks_s030_w64_0.pt"
+    classifier_torchscript: "${CMAKE_CURRENT_SOURCE_DIR}/models/LSK3DNET/lsk_classifier.ts"
     # python: "python3"   # hybrid 推荐: /root/automap_ws/install_deps/lsk3dnet_venv/bin/python3（AUTOMAP_SETUP_LSK3DNET_VENV=1 编译后）
     # 或设环境变量 AUTOMAP_LSK3DNET_PYTHON（优先于本字段）
-    # worker_script: ""   # 留空则优先 share/automap_pro/lsk3dnet_scripts/（安装后），否则 repo_root/scripts/
+    worker_script: "scripts/lsk3dnet_hybrid_worker.py"
     # 生产闭环（推荐）:
     # 1) 用 export_lsk3dnet_classifier_torchscript.py 导出 .pt，会生成同名的 .meta.json（SHA256 + feat_dim）
     # 2) hybrid_normal_mode=range 需 LSK 的 c_gen_normal_map；无扩展时用 zeros 仅调试
     # 3) normal_fov_* / normal_proj_* 应与训练时 dataset 距离图参数一致（默认 3,-25,64,900）
-    # hybrid_normal_mode: "range"
-    # normal_fov_up_deg: 3.0
-    # normal_fov_down_deg: -25.0
-    # normal_proj_h: 64
-    # normal_proj_w: 900
+    # 🏛️ [Fix] Align Normal estimation FOV with Lidar's actual physical FOV (from system config)
+    # This prevents 'black holes' in features at the FOV edges.
+    normal_fov_up_deg: 22.5
+    normal_fov_down_deg: -22.5
+    normal_proj_h: 64
+    normal_proj_w: 2048
   # 模型自描述驱动:
   # 0 = 自动从 ONNX 输入/输出维度读取（推荐，换模型无需改代码）
   input_channels: 0
   num_classes: 0
-  # -1 = 自动回退（num_classes>2 时默认 2，否则 1）
+  # -1 = 自动回退（sloam->255；lsk3dnet/lsk3dnet_hybrid->16(trunk)）
   tree_class_id: -1
   # 可选：与 ONNX 输入通道数一致时的 per-channel 归一化 (x-mean)/std；不填则用默认 range=12.97/12.35 其余 mean=0 std=1
   # SqueezeSeg 风格 5 通道示例（需与训练一致）:
@@ -144,8 +151,9 @@ semantic:
   # input_std: [12.32, 11.47, 6.91, 0.86, 0.16]
   fov_up: 22.5
   fov_down: -22.5
-  img_w: 2048
-  img_h: 64
+  img_w: 4096
+  img_h: 128
+  batch_size: 1
   do_destagger: true
   # 实例聚类参数（默认沿用历史值）
   # 验证档（仅配置）: 放宽聚类门限，适配关键帧稀疏点云
@@ -181,7 +189,7 @@ semantic:
     dump_points_per_class_limit: -1
     # 最小回退补丁：恢复默认，不覆盖 tree_label（避免与 255 掩码语义冲突）
     # -2: 不覆盖（默认）；-1: 自动；>=0: 强制 maskCloud 使用指定类 id
-    override_tree_class_id: 19
+    override_tree_class_id: -2
     # default | relaxed（relaxed 用于快速验证“聚类阈值过严”）
     cluster_profile: "relaxed"
     # 诊断验证补丁：切到 dense_for_clustering，对齐 sloam_rec 原始链路输入形态。
@@ -265,7 +273,7 @@ fast_livo:
     lidar_type:       2         # 2=Velodyne
     scan_line:        32
     point_filter_num: 1
-    filter_size_surf: 0.1      # 验证档（仅配置）: 减小下采样，提升语义输入密度
+    filter_size_surf: 0.25      # 验证档（仅配置）: 减小下采样，提升语义输入密度
     blind:            1.0       # 最小量程约 1.0 m
 
   vio:                                     # VIO（仅 img_en=1 生效）
@@ -295,7 +303,7 @@ fast_livo:
     dept_err:        0.02
     beam_err:        0.05
     min_eigen_value: 0.0025
-    voxel_size:      0.2
+    voxel_size:      0.4
     max_layer:       2
     max_points_num:  500
     sigma_num:       3.0

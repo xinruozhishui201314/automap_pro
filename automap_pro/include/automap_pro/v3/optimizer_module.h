@@ -36,6 +36,8 @@ public:
     IncrementalOptimizer& getOptimizer() { return optimizer_; }
 
     bool isIdle() const override;
+    std::vector<std::pair<std::string, size_t>> queueDepths() const override;
+    std::string idleDetail() const override;
 
 protected:
     void run() override;

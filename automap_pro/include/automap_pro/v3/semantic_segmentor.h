@@ -8,7 +8,7 @@
 namespace automap_pro::v3 {
 
 struct SegmentorConfig {
-    std::string model_type = "sloam";
+    std::string model_type = "lsk3dnet";
     std::string model_path;
     std::string lsk3dnet_model_path;
     std::string lsk3dnet_device = "cpu";
@@ -35,6 +35,7 @@ struct SegmentorConfig {
     std::vector<float> input_mean;
     std::vector<float> input_std;
     bool do_destagger = true;
+    int batch_size = 1;
 };
 
 struct SemanticSegResult {

@@ -23,7 +23,7 @@ public:
     using Ptr = std::shared_ptr<SemanticProcessor>;
 
     struct Config {
-        std::string model_type = "sloam";  // sloam | lsk3dnet | lsk3dnet_hybrid
+        std::string model_type = "lsk3dnet";  // sloam | lsk3dnet | lsk3dnet_hybrid
         std::string model_path;
         std::string lsk3dnet_model_path;
         std::string lsk3dnet_device = "cpu";

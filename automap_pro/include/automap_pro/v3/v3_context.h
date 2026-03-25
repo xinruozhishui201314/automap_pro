@@ -10,8 +10,18 @@
 #include <memory>
 #include <vector>
 #include <mutex>
+#include <chrono>
 
 namespace automap_pro::v3 {
+
+struct ModuleIdleStatus {
+    std::string name;
+    bool        is_idle{true};
+    bool        is_quiescing{false};
+    double      heartbeat_age_s{0.0};
+    std::vector<std::pair<std::string, size_t>> queue_depths;
+    std::string idle_detail;
+};
 
 /**
  * @brief V3 架构上下文 (Architecture Context)
@@ -87,6 +97,29 @@ public:
             if (!mod->isIdle()) return false;
         }
         return true;
+    }
+
+    /**
+     * @brief 导出模块 idle/quiesce/heartbeat 快照（用于 finish_mapping 排空阶段诊断）
+     */
+    std::vector<ModuleIdleStatus> getIdleStatusSnapshot() const {
+        std::vector<ModuleIdleStatus> out;
+        std::lock_guard<std::mutex> lock(module_mutex_);
+        out.reserve(modules_.size());
+        auto now = std::chrono::steady_clock::now();
+        const double now_s = std::chrono::duration<double>(now.time_since_epoch()).count();
+        for (const auto& mod : modules_) {
+            ModuleIdleStatus s;
+            s.name = mod->getName();
+            s.is_idle = mod->isIdle();
+            s.is_quiescing = mod->isQuiescing();
+            const double hb = mod->getLastHeartbeat();
+            s.heartbeat_age_s = (hb > 0.0) ? (now_s - hb) : 1e9;
+            s.queue_depths = mod->queueDepths();
+            s.idle_detail = mod->idleDetail();
+            out.push_back(std::move(s));
+        }
+        return out;
     }
 
     /**

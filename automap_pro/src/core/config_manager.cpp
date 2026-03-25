@@ -86,16 +86,68 @@ void ConfigManager::load(const std::string& yaml_path) {
         }
         test_file.close();
 
-        cfg_ = YAML::LoadFile(yaml_path);
+        // 先打印真实路径，避免容器 bind-mount / overlay 导致“看起来同路径但内容不同”
+        try {
+            std::string rp = yaml_path;
+            if (std::filesystem::exists(yaml_path)) {
+                rp = std::filesystem::weakly_canonical(std::filesystem::path(yaml_path)).string();
+            }
+            RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                "[ConfigManager][PATH] yaml_path(raw)=%s yaml_path(realpath)=%s",
+                yaml_path.c_str(), rp.c_str());
+        } catch (...) {}
+
+        // Read the file once and parse from the in-memory buffer.
+        // This avoids TOCTOU and "torn read" issues if the file is being replaced while loading
+        // (common with bind-mounts / overlayfs when writers do non-atomic writes).
+        std::string raw_bytes;
+        {
+            std::ifstream f(yaml_path, std::ios::in | std::ios::binary);
+            if (!f.good()) {
+                throw std::runtime_error("Config file not readable: " + yaml_path);
+            }
+            raw_bytes.assign((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        }
+        cfg_ = YAML::Load(raw_bytes);
         
         if (cfg_.IsNull()) {
             throw std::runtime_error("Config file loaded as null: " + yaml_path);
         }
+
+        // Early diagnostic: ensure cfg_ is the full root map before any get()/contract reads.
+        try {
+            int nkeys = 0;
+            if (cfg_.IsMap()) {
+                for (auto it = cfg_.begin(); it != cfg_.end() && nkeys < 1000; ++it) nkeys++;
+            }
+            const YAML::Node _sys0 = cfg_["system"];
+            const YAML::Node _api0 = (_sys0.IsDefined() && !_sys0.IsNull() && _sys0.IsMap()) ? _sys0["api_version"] : YAML::Node();
+            RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                "[ConfigManager][DIAG][PRE] root.IsMap=%d keys=%d system.defined=%d system.null=%d api_version.defined=%d api_version.null=%d",
+                cfg_.IsMap() ? 1 : 0, nkeys,
+                _sys0.IsDefined() ? 1 : 0, _sys0.IsNull() ? 1 : 0,
+                _api0.IsDefined() ? 1 : 0, _api0.IsNull() ? 1 : 0);
+        } catch (...) {}
         
         ALOG_INFO("ConfigManager", "Successfully loaded config from: {}", yaml_path);
 
         contract_strict_mode_ = get<bool>("contract.strict_mode", false);
         contract_frame_policy_ = get<std::string>("contract.frame_policy", "compat");
+        // Post-contract diagnostic: detect accidental root mutation.
+        try {
+            int nkeys = 0;
+            if (cfg_.IsMap()) {
+                for (auto it = cfg_.begin(); it != cfg_.end() && nkeys < 1000; ++it) nkeys++;
+            }
+            const YAML::Node _sys1 = cfg_["system"];
+            const YAML::Node _api1 = (_sys1.IsDefined() && !_sys1.IsNull() && _sys1.IsMap()) ? _sys1["api_version"] : YAML::Node();
+            RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                "[ConfigManager][DIAG][POST] root.IsMap=%d keys=%d system.defined=%d system.null=%d api_version.defined=%d api_version.null=%d strict_mode=%d frame_policy=%s",
+                cfg_.IsMap() ? 1 : 0, nkeys,
+                _sys1.IsDefined() ? 1 : 0, _sys1.IsNull() ? 1 : 0,
+                _api1.IsDefined() ? 1 : 0, _api1.IsNull() ? 1 : 0,
+                contract_strict_mode_ ? 1 : 0, contract_frame_policy_.c_str());
+        } catch (...) {}
         if (contract_frame_policy_ != "compat" && contract_frame_policy_ != "strict_map_only") {
             std::string err = "Invalid contract.frame_policy='" + contract_frame_policy_ +
                 "'. Allowed: compat | strict_map_only";
@@ -105,8 +157,13 @@ void ConfigManager::load(const std::string& yaml_path) {
 
         // 🏛️ [架构契约] Fail-Fast 协议一致性校验
         // 产品化要求：如果配置中显式声明了 API 版本，则必须与二进制文件内核版本兼容
-        if (cfg_["system"] && cfg_["system"]["api_version"]) {
-            std::string cfg_version = cfg_["system"]["api_version"].as<std::string>();
+        const YAML::Node sys_node = cfg_["system"];
+        const bool sys_ok = sys_node.IsDefined() && !sys_node.IsNull() && sys_node.IsMap();
+        const YAML::Node api_node = sys_ok ? sys_node["api_version"] : YAML::Node();
+        const bool api_ok = api_node.IsDefined() && !api_node.IsNull() && api_node.IsScalar();
+
+        if (sys_ok && api_ok) {
+            std::string cfg_version = api_node.as<std::string>();
             int major = 0, minor = 0;
             if (sscanf(cfg_version.c_str(), "%d.%d", &major, &minor) >= 2) {
                 if (!protocol::isCompatible(major, minor)) {
@@ -130,6 +187,101 @@ void ConfigManager::load(const std::string& yaml_path) {
         } else {
             if (contract_strict_mode_) {
                 std::string err = "[PROTOCOL_FATAL] strict_mode=true but missing required key: system.api_version";
+                // strict_mode 下也要把“读到的 system 段内容”吐出来，避免只看到一句 fatal 无法定位内容差异
+                try {
+                    // ---- Diagnostic: What did yaml-cpp parse? What does the file look like? ----
+                    RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+                        "[ConfigManager][DIAG] yaml-cpp root: IsDefined=%d IsNull=%d IsMap=%d IsSeq=%d IsScalar=%d Type=%d",
+                        cfg_.IsDefined() ? 1 : 0, cfg_.IsNull() ? 1 : 0, cfg_.IsMap() ? 1 : 0, cfg_.IsSequence() ? 1 : 0,
+                        cfg_.IsScalar() ? 1 : 0, static_cast<int>(cfg_.Type()));
+
+                    RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+                        "[ConfigManager][DIAG] system node: defined=%d null=%d map=%d ; api_version node: defined=%d null=%d scalar=%d",
+                        sys_node.IsDefined() ? 1 : 0, sys_node.IsNull() ? 1 : 0, sys_node.IsMap() ? 1 : 0,
+                        api_node.IsDefined() ? 1 : 0, api_node.IsNull() ? 1 : 0, api_node.IsScalar() ? 1 : 0);
+
+                    // Print top-level keys (if map) to catch hidden-char keys or unexpected structure.
+                    if (cfg_.IsMap()) {
+                        std::string keys;
+                        int n = 0;
+                        for (auto it = cfg_.begin(); it != cfg_.end() && n < 50; ++it, ++n) {
+                            try {
+                                std::string k = it->first.as<std::string>();
+                                if (!keys.empty()) keys += ", ";
+                                keys += "'" + k + "'";
+                            } catch (...) {
+                                if (!keys.empty()) keys += ", ";
+                                keys += "<non-string-key>";
+                            }
+                        }
+                        if (n >= 50) keys += ", ...";
+                        RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+                            "[ConfigManager][DIAG] top-level keys (up to 50): %s", keys.c_str());
+                    }
+
+                    // Raw file snippet (text) and first bytes (hex) from the same buffer we parsed.
+                    {
+                        const std::string& bytes = raw_bytes;
+                        if (!bytes.empty()) {
+                            const size_t hex_n = std::min<size_t>(256, bytes.size());
+                            static const char* hex = "0123456789ABCDEF";
+                            std::string hexs;
+                            hexs.reserve(hex_n * 3);
+                            for (size_t i = 0; i < hex_n; ++i) {
+                                unsigned char c = static_cast<unsigned char>(bytes[i]);
+                                hexs.push_back(hex[(c >> 4) & 0xF]);
+                                hexs.push_back(hex[c & 0xF]);
+                                hexs.push_back(' ');
+                            }
+                            RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+                                "[ConfigManager][DIAG] file first %zu bytes (hex): %s", hex_n, hexs.c_str());
+
+                            // First lines (printable) to confirm the mounted file content in-container.
+                            std::istringstream ss(bytes);
+                            std::string line;
+                            std::string block;
+                            int ln = 0;
+                            while (ln < 60 && std::getline(ss, line)) {
+                                block += line + "\n";
+                                ln++;
+                                if (block.size() > 3500) {
+                                    RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+                                        "[ConfigManager][DIAG] file head (partial):\n%s", block.c_str());
+                                    block.clear();
+                                }
+                            }
+                            if (!block.empty()) {
+                                RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+                                    "[ConfigManager][DIAG] file head:\n%s", block.c_str());
+                            }
+                        } else {
+                            RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+                                "[ConfigManager][DIAG] raw_bytes empty (file may be empty/unreadable): %s", yaml_path.c_str());
+                        }
+                    }
+
+                    std::vector<std::string> lines;
+                    dumpYamlSection("system", cfg_["system"], lines, 60);
+                    if (!lines.empty()) {
+                        RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+                            "[ConfigManager][DIAG] 'system' section dump (up to 60 lines):");
+                        std::string block;
+                        for (const auto& l : lines) {
+                            block += l + "\n";
+                            if (block.size() > 3500) {
+                                RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+                                    "[ConfigManager][DIAG] %s", block.c_str());
+                                block.clear();
+                            }
+                        }
+                        if (!block.empty())
+                            RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+                                "[ConfigManager][DIAG] %s", block.c_str());
+                    } else {
+                        RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+                            "[ConfigManager][DIAG] 'system' section is missing/null or failed to dump.");
+                    }
+                } catch (...) {}
                 RCLCPP_FATAL(rclcpp::get_logger("automap_system"), "%s", err.c_str());
                 throw std::runtime_error(err);
             }

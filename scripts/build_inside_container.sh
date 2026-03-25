@@ -16,6 +16,16 @@ fi
 source "${ROS_SETUP}"
 cd /root/automap_ws
 
+# CMake (>=3.18) initializes CMAKE_CUDA_ARCHITECTURES from env `CUDAARCHS`.
+# If `CUDAARCHS` is defined but empty, CMake errors out ("must be non-empty if set").
+# Hardening: clear empty vars to keep CPU-only builds working in generic containers.
+if [ "${CUDAARCHS+x}" = "x" ] && [ -z "${CUDAARCHS}" ]; then
+  unset CUDAARCHS
+fi
+if [ "${CMAKE_CUDA_ARCHITECTURES+x}" = "x" ] && [ -z "${CMAKE_CUDA_ARCHITECTURES}" ]; then
+  unset CMAKE_CUDA_ARCHITECTURES
+fi
+
 # 须在首次 apt-get 之前：pip/LibTorch/git/apt 缓存目录（宿主机 thrid_party/automap_cache → /root/automap_download_cache）
 if [ -f /root/scripts/automap_download_defaults.sh ]; then
   # shellcheck source=scripts/automap_download_defaults.sh
@@ -400,7 +410,7 @@ automap_log_progress "容器内编译流程开始：apt → ROS/系统包 → �
 # libgeographiclib-dev：Ubuntu 24.04+ 包名（GeographicLib）；旧名 libgeographic-dev 在 noble 无候选
 # CMakeLists find_package(GeographicLib)（/usr/share/cmake/geographiclib）
 # unzip：LibTorch 等为 zip 预编译包，最小容器常未预装
-if command -v apt-get >/dev/null 2>&1; then
+if command -v apt-get >/dev/null 2>&1 && [ "${AUTOMAP_PREBUILT_INSTALL_DEPS:-0}" != "1" ]; then
   # 镜像常已含 deb822 的 ros2 源；若上次运行留下 ros2-packages-org.list，会与内联 Signed-By 冲突导致 apt 无法 update
   if _automap_ros2_repo_declared; then
     rm -f /etc/apt/sources.list.d/ros2-packages-org.list
@@ -424,6 +434,8 @@ if command -v apt-get >/dev/null 2>&1; then
   export CMAKE_PREFIX_PATH="/opt/ros/${ROS_DISTRO_NAME}:${CMAKE_PREFIX_PATH}"
   automap_ensure_cv_bridge_headers
   automap_log_progress "apt 依赖已安装，进入编译阶段"
+elif [ "${AUTOMAP_PREBUILT_INSTALL_DEPS:-0}" = "1" ]; then
+  echo "[INFO] AUTOMAP_PREBUILT_INSTALL_DEPS=1：跳过 apt 安装 ROS/系统依赖（沿用 install_deps 与镜像现有环境）"
 fi
 
 # 防止 colcon 将 ONNX 源码树当作包扫描（setup.py 会触发 python_setup_py 且污染日志）
@@ -449,6 +461,12 @@ fi
 # 第三方库（GTSAM/TEASER++/vikit）安装到 install_deps，--clean 时不删除，编译一次后续跳过
 INSTALL_DEPS="/root/automap_ws/install_deps"
 mkdir -p "${INSTALL_DEPS}"
+# 防止 colcon 递归扫描 install_deps（其中可能含 Python venv/site-packages，会触发 python_setup_py 识别异常并污染日志）
+: > "${INSTALL_DEPS}/COLCON_IGNORE"
+# LSK3DNet venv（若启用）同样不应被当作 workspace 包扫描
+if [ -d "${INSTALL_DEPS}/lsk3dnet_venv" ]; then
+  : > "${INSTALL_DEPS}/lsk3dnet_venv/COLCON_IGNORE"
+fi
 # 宿主机已预置 install_deps（含 libtorch/onnxruntime 等）时：不下载 LibTorch、不 apt 装 nvidia-cuda-toolkit；可单独覆盖 LIBTORCH_SKIP_DOWNLOAD / AUTOMAP_SKIP_CUDA_TOOLKIT_APT
 if [ "${AUTOMAP_PREBUILT_INSTALL_DEPS:-0}" = "1" ]; then
   : "${LIBTORCH_SKIP_DOWNLOAD:=1}"
@@ -911,6 +929,123 @@ automap_verify_blackwell_accel_stack() {
   return 0
 }
 
+# 统一 CUDA 栈：要求 libtorch / nvcc / libnvrtc 版本对齐，避免运行期 NVRTC 架构不支持导致崩溃
+# 可通过 AUTOMAP_ENFORCE_CUDA_STACK_UNIFIED=0 临时关闭（不推荐）
+automap_verify_cuda_stack_unified() {
+  [ "${AUTOMAP_ENFORCE_CUDA_STACK_UNIFIED:-1}" = "0" ] && return 0
+
+  local lt_tag=""
+  local lt_mm=""
+  local nvcc_mm=""
+  local nvrtc_mm=""
+  local gpu_name=""
+
+  # 1) 解析 LibTorch CUDA 变体：优先 URL，其次 TorchConfig/libtorch.so
+  if [ -n "${LIBTORCH_URL:-}" ]; then
+    lt_tag=$(printf '%s' "${LIBTORCH_URL}" | sed -n 's/.*\(cu[0-9][0-9][0-9]\).*/\1/p' | head -n1)
+  fi
+  if [ -z "${lt_tag}" ] && [ -f "${LIBTORCH_INSTALL_DIR}/share/cmake/Torch/TorchConfig.cmake" ]; then
+    lt_tag=$(grep -oE 'cu[0-9]{3}' "${LIBTORCH_INSTALL_DIR}/share/cmake/Torch/TorchConfig.cmake" | head -n1 || true)
+  fi
+  if [ -z "${lt_tag}" ] && [ -f "${LIBTORCH_INSTALL_DIR}/lib/libtorch.so" ] && command -v strings >/dev/null 2>&1; then
+    lt_tag=$(strings "${LIBTORCH_INSTALL_DIR}/lib/libtorch.so" 2>/dev/null | grep -oE 'cu[0-9]{3}' | head -n1 || true)
+  fi
+
+  # CPU LibTorch 不参与 CUDA 栈一致性检查
+  if [ -z "${lt_tag}" ]; then
+    echo "[INFO] CUDA 栈一致性检查：当前 LibTorch 未识别到 cuXXX（可能为 CPU 版），跳过 nvcc/libnvrtc 对齐校验"
+    return 0
+  fi
+
+  case "${lt_tag}" in
+    cu121) lt_mm="12.1" ;;
+    cu124) lt_mm="12.4" ;;
+    cu126) lt_mm="12.6" ;;
+    cu128) lt_mm="12.8" ;;
+    *)
+      echo "[WARN] CUDA 栈一致性检查：无法识别 LibTorch CUDA 变体 ${lt_tag}，跳过强一致校验"
+      return 0
+      ;;
+  esac
+
+  # 2) nvcc 版本
+  local nvcc_bin=""
+  if command -v nvcc >/dev/null 2>&1; then
+    nvcc_bin=$(command -v nvcc)
+  elif [ -n "${CUDA_HOME:-}" ] && [ -x "${CUDA_HOME}/bin/nvcc" ]; then
+    nvcc_bin="${CUDA_HOME}/bin/nvcc"
+  fi
+  if [ -n "${nvcc_bin}" ]; then
+    nvcc_mm=$("${nvcc_bin}" --version 2>/dev/null | sed -n 's/.*release \([0-9]*\.[0-9]*\).*/\1/p' | head -n1)
+  fi
+
+  # 3) libnvrtc 版本（通过官方 NVRTC API nvrtcVersion 读取，避免仅看文件名）
+  if command -v python3 >/dev/null 2>&1; then
+    nvrtc_mm=$(python3 - <<'PY'
+import ctypes
+import sys
+
+libs = ("libnvrtc.so", "libnvrtc.so.13", "libnvrtc.so.12", "libnvrtc.so.11")
+for name in libs:
+    try:
+        lib = ctypes.CDLL(name)
+        major = ctypes.c_int()
+        minor = ctypes.c_int()
+        fn = lib.nvrtcVersion
+        fn.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int)]
+        fn.restype = ctypes.c_int
+        rc = fn(ctypes.byref(major), ctypes.byref(minor))
+        if rc == 0:
+            print(f"{major.value}.{minor.value}")
+            raise SystemExit(0)
+    except Exception:
+        continue
+sys.exit(1)
+PY
+) || true
+  fi
+
+  if [ -z "${nvcc_mm}" ]; then
+    echo "[ERROR] CUDA 栈一致性检查失败：未找到 nvcc，无法确认与 LibTorch(${lt_tag}) 的工具链版本一致性。" >&2
+    echo "[ERROR] 请安装与 LibTorch 对齐的 CUDA toolkit（期望 ${lt_mm}），或切换为 CPU LibTorch。" >&2
+    return 1
+  fi
+  if [ -z "${nvrtc_mm}" ]; then
+    echo "[ERROR] CUDA 栈一致性检查失败：未找到可用 libnvrtc（nvrtcVersion 读取失败）。" >&2
+    echo "[ERROR] 请确保 LD_LIBRARY_PATH/系统库中存在与 LibTorch(${lt_tag}) 对齐的 libnvrtc（期望 ${lt_mm}）。" >&2
+    return 1
+  fi
+
+  if [ "${nvcc_mm}" != "${lt_mm}" ]; then
+    echo "[ERROR] CUDA 栈版本不一致：LibTorch=${lt_tag}(${lt_mm})，nvcc=${nvcc_mm}。" >&2
+    echo "[ERROR] 必须统一为同一 CUDA 小版本，避免 JIT/NVRTC 运行期崩溃。" >&2
+    return 1
+  fi
+  if [ "${nvrtc_mm}" != "${lt_mm}" ]; then
+    echo "[ERROR] CUDA 栈版本不一致：LibTorch=${lt_tag}(${lt_mm})，libnvrtc=${nvrtc_mm}。" >&2
+    echo "[ERROR] 必须统一为同一 CUDA 小版本，避免 nvrtc: invalid --gpu-architecture。" >&2
+    return 1
+  fi
+
+  # 4) Blackwell 额外门控：libnvrtc 必须至少 12.8（支持 sm_120 目标架构）
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    gpu_name=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 | tr -d '\r' || true)
+    if echo "${gpu_name}" | grep -qE 'RTX[[:space:]]*50[0-9]{2,4}'; then
+      case "${nvrtc_mm}" in
+        12.8|12.9|13.*) ;;
+        *)
+          echo "[ERROR] Blackwell GPU（${gpu_name}）要求 libnvrtc >= 12.8；当前 libnvrtc=${nvrtc_mm}。" >&2
+          echo "[ERROR] 请升级 CUDA 运行时并与 LibTorch/nvcc 保持同版。" >&2
+          return 1
+          ;;
+      esac
+    fi
+  fi
+
+  echo "[INFO] CUDA 栈一致性校验通过：LibTorch=${lt_tag} nvcc=${nvcc_mm} libnvrtc=${nvrtc_mm}"
+  return 0
+}
+
 # LibTorch（OverlapTransformer 推理）：与 GTSAM 一致，安装到 install_deps，仅下载解压一次，不随工程重复编译
 LIBTORCH_INSTALL_DIR="${INSTALL_DEPS}/libtorch"
 NEED_LIBTORCH_DOWNLOAD=false
@@ -922,7 +1057,8 @@ if [ "${LIBTORCH_SKIP_DOWNLOAD:-0}" = "1" ]; then
   echo "[INFO] LIBTORCH_SKIP_DOWNLOAD=1，跳过 LibTorch 下载（请确保已手动放置到 ${LIBTORCH_INSTALL_DIR}）"
 fi
 # Blackwell + 已存在的非 cu128 LibTorch（曾由 apt nvcc 12.0 误选 cu121）：删除并强制重下 cu128
-if [ "${LIBTORCH_SKIP_DOWNLOAD:-0}" != "1" ] && \
+if [ "${AUTOMAP_PREBUILT_INSTALL_DEPS:-0}" != "1" ] && \
+   [ "${LIBTORCH_SKIP_DOWNLOAD:-0}" != "1" ] && \
    { [ -f "${LIBTORCH_INSTALL_DIR}/share/cmake/Torch/TorchConfig.cmake" ] || [ -f "${LIBTORCH_INSTALL_DIR}/lib/libtorch.so" ]; }; then
   if command -v nvidia-smi >/dev/null 2>&1; then
     _lt_bw_gpu=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 | tr -d '\r' || true)
@@ -1039,6 +1175,14 @@ fi
 automap_ensure_cuda_toolkit_for_libtorch_cmake
 
 automap_verify_blackwell_accel_stack || exit 1
+automap_verify_cuda_stack_unified || exit 1
+
+# 快速修复模式：仅修 CUDA/LibTorch 栈并做一致性校验，不进入 ONNX/colcon 全量编译。
+# 用途：run_automap 运行前 NVRTC 预检失败时，先快速恢复 GPU 推理能力，减少恢复时间。
+if [ "${AUTOMAP_REPAIR_CUDA_STACK_ONLY:-0}" = "1" ]; then
+  echo "[INFO] AUTOMAP_REPAIR_CUDA_STACK_ONLY=1：CUDA/LibTorch 快速修复完成，跳过 ONNX 与全量编译。"
+  exit 0
+fi
 
 # ONNX Runtime（SLOAM 语义分割）：与 GTSAM 一致，安装到 install_deps，首次编译后后续跳过
 ONNXRUNTIME_INSTALL_DIR="${INSTALL_DEPS}/onnxruntime"
@@ -1466,7 +1610,17 @@ fi
 set +e
 (
   set -o pipefail
-  colcon build ${COLCON_PARALLEL} --event-handlers status+ console_direct+ --packages-select automap_pro --cmake-force-configure --cmake-args ${NINJA_CMAKE_ARG} -DCMAKE_BUILD_TYPE=Release -DNLOHMANN_JSON_LOCAL=/root/automap_ws/src/thrid_party/nlohmann-json3 -DSCANCONTEXT_ROOT=/root/automap_ws/automap_pro_thrid_party_scancontext ${_CERES_CMAKE_DIR:+-DCeres_DIR=${_CERES_CMAKE_DIR}} 2>&1 | tee /tmp/automap_build.log
+  colcon build \
+    ${COLCON_PARALLEL} \
+    --event-handlers status+ console_direct+ \
+    --packages-select automap_pro \
+    --cmake-force-configure \
+    --cmake-args ${NINJA_CMAKE_ARG} \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DNLOHMANN_JSON_LOCAL=/root/automap_ws/src/thrid_party/nlohmann-json3 \
+      -DSCANCONTEXT_ROOT=/root/automap_ws/automap_pro_thrid_party_scancontext \
+      ${_CERES_CMAKE_DIR:+-DCeres_DIR=${_CERES_CMAKE_DIR}} \
+    2>&1 | tee /tmp/automap_build.log
 )
 BUILD_EXIT_CODE=$?
 set -e
@@ -1474,6 +1628,44 @@ echo ""
 echo "[INFO] 编译命令退出码: ${BUILD_EXIT_CODE}"
 
 if [ "${BUILD_EXIT_CODE}" -ne 0 ]; then
+    # If the build directory was deleted while a compiler job had it as CWD,
+    # we may see "getcwd() failed" and many cascading "No such file" errors.
+    # This is non-deterministic and typically fixed by cleaning the package build dir and retrying once
+    # with reduced parallelism to lower filesystem pressure.
+    if grep -q "getcwd() failed: No such file or directory" /tmp/automap_build.log 2>/dev/null; then
+        echo ""
+        echo "========================================"
+        echo "[WARN] 检测到 getcwd() failed（疑似 build 目录在并行构建中被清理/失效），将清理 build/automap_pro 并降并行重试一次"
+        echo "========================================"
+        echo ""
+        rm -rf build/automap_pro
+        _RETRY_JOBS="${AUTOMAP_AUTOMAP_PRO_RETRY_JOBS:-8}"
+        if [ "${_RETRY_JOBS}" -lt 1 ]; then _RETRY_JOBS=1; fi
+        echo "[INFO] retry: CMAKE_BUILD_PARALLEL_LEVEL=${_RETRY_JOBS} (original=${PARALLEL_JOBS})"
+        set +e
+        (
+          set -o pipefail
+          export CMAKE_BUILD_PARALLEL_LEVEL="${_RETRY_JOBS}"
+          colcon build \
+            --parallel-workers 1 \
+            ${COLCON_EVENT_HANDLERS} \
+            --packages-select automap_pro \
+            --cmake-force-configure \
+            --cmake-args ${NINJA_CMAKE_ARG} \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DNLOHMANN_JSON_LOCAL=/root/automap_ws/src/thrid_party/nlohmann-json3 \
+              -DSCANCONTEXT_ROOT=/root/automap_ws/automap_pro_thrid_party_scancontext \
+              ${_CERES_CMAKE_DIR:+-DCeres_DIR=${_CERES_CMAKE_DIR}} \
+            2>&1 | tee /tmp/automap_build_retry.log
+        )
+        BUILD_EXIT_CODE=$?
+        set -e
+        echo ""
+        echo "[INFO] retry 编译命令退出码: ${BUILD_EXIT_CODE}"
+        # Merge retry log into main log path expected by run_automap.sh
+        cat /tmp/automap_build_retry.log >> /tmp/automap_build.log 2>/dev/null || true
+    fi
+
     echo ""
     echo "========================================"
     echo "编译失败，分析错误原因"

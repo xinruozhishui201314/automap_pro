@@ -41,6 +41,20 @@ std::filesystem::path resolveSemanticPath(const std::string& root, const std::st
     return std::filesystem::path(root) / ph;
 }
 
+std::string findFirstByExtensionRecursively(const std::string& root, const std::string& ext) {
+    if (root.empty() || !std::filesystem::is_directory(root)) return {};
+    try {
+        for (const auto& entry : std::filesystem::recursive_directory_iterator(root)) {
+            if (!entry.is_regular_file()) continue;
+            if (entry.path().extension() == ext) {
+                return entry.path().string();
+            }
+        }
+    } catch (const std::exception&) {
+    }
+    return {};
+}
+
 }  // namespace
 
 void SemanticModule::enqueueTaskLocked(const SyncedFrameEvent& ev) {
@@ -102,8 +116,29 @@ SemanticModule::SemanticModule(EventBus::Ptr event_bus, MapRegistry::Ptr map_reg
     semantic_cfg_.diag_cluster_input_mode = cfg.semanticDiagClusterInputMode();
     semantic_cfg_.diag_trellis_min_cluster_points = cfg.semanticDiagTrellisMinClusterPoints();
     semantic_cfg_.diag_trellis_min_tree_vertices = cfg.semanticDiagTrellisMinTreeVertices();
+    auto infer_pkg_root_from_model_path = [this]() -> std::string {
+        if (semantic_cfg_.model_path.empty()) return {};
+        std::filesystem::path p(semantic_cfg_.model_path);
+        if (!p.is_absolute()) return {};
+        auto parent = p.parent_path();
+        if (parent.filename() == "models") {
+            return parent.parent_path().string();
+        }
+        return {};
+    };
+    auto maybe_repo_root = cfg.semanticLsk3dnetRepoRoot();
+    if (maybe_repo_root.empty()) {
+        const auto pkg_root = infer_pkg_root_from_model_path();
+        if (!pkg_root.empty()) {
+            const auto rr = (std::filesystem::path(pkg_root) / "thrid_party" / "LSK3DNet-main").string();
+            if (std::filesystem::is_directory(rr)) {
+                maybe_repo_root = rr;
+            }
+        }
+    }
+    semantic_cfg_.lsk3dnet_repo_root = maybe_repo_root;
     if (semantic_cfg_.model_type == "lsk3dnet_hybrid") {
-        const std::string rr = cfg.semanticLsk3dnetRepoRoot();
+        const std::string rr = semantic_cfg_.lsk3dnet_repo_root;
         semantic_cfg_.lsk3dnet_repo_root = rr;
         semantic_cfg_.lsk3dnet_config_yaml = resolveSemanticPath(rr, cfg.semanticLsk3dnetConfigYaml()).string();
         semantic_cfg_.lsk3dnet_checkpoint = resolveSemanticPath(rr, cfg.semanticLsk3dnetCheckpoint()).string();
@@ -133,6 +168,82 @@ SemanticModule::SemanticModule(EventBus::Ptr event_bus, MapRegistry::Ptr map_reg
             semantic_cfg_.lsk3dnet_worker_script = resolveSemanticPath(rr, ws_cfg).string();
         }
         semantic_cfg_.lsk3dnet_python_exe = cfg.semanticLsk3dnetPython();
+    }
+
+    // Complete config log for semantic pipeline (paths + device + dimensions).
+    RCLCPP_INFO(node_->get_logger(),
+        "[SEMANTIC][Module][CONFIG] enabled=%d model_type=%s device=%s sloam_onnx=%s lsk_ts=%s img=%dx%d fov=[%.1f,%.1f] do_destagger=%d",
+        semantic_enabled ? 1 : 0,
+        semantic_cfg_.model_type.c_str(),
+        semantic_cfg_.lsk3dnet_device.c_str(),
+        semantic_cfg_.model_path.c_str(),
+        semantic_cfg_.lsk3dnet_model_path.c_str(),
+        semantic_cfg_.img_w, semantic_cfg_.img_h,
+        semantic_cfg_.fov_up, semantic_cfg_.fov_down,
+        semantic_cfg_.do_destagger ? 1 : 0);
+    if (semantic_cfg_.model_type == "lsk3dnet_hybrid") {
+        RCLCPP_INFO(node_->get_logger(),
+            "[SEMANTIC][Module][CONFIG_LSK_HYBRID] repo_root=%s cfg_yaml=%s ckpt=%s cls_ts=%s py=%s worker=%s normal(mode=%s fov=[%.1f,%.1f] proj=%dx%d)",
+            semantic_cfg_.lsk3dnet_repo_root.c_str(),
+            semantic_cfg_.lsk3dnet_config_yaml.c_str(),
+            semantic_cfg_.lsk3dnet_checkpoint.c_str(),
+            semantic_cfg_.lsk3dnet_classifier_torchscript.c_str(),
+            semantic_cfg_.lsk3dnet_python_exe.c_str(),
+            semantic_cfg_.lsk3dnet_worker_script.c_str(),
+            semantic_cfg_.lsk3dnet_hybrid_normal_mode.c_str(),
+            semantic_cfg_.lsk3dnet_normal_fov_up_deg, semantic_cfg_.lsk3dnet_normal_fov_down_deg,
+            semantic_cfg_.lsk3dnet_normal_proj_w, semantic_cfg_.lsk3dnet_normal_proj_h);
+    }
+    // Runtime-safe fallback: when default lsk3dnet.ts is missing but hybrid assets are complete, switch to hybrid.
+    if (semantic_cfg_.model_type == "lsk3dnet" &&
+        (semantic_cfg_.lsk3dnet_model_path.empty() || !std::filesystem::exists(semantic_cfg_.lsk3dnet_model_path))) {
+        const std::string rr = semantic_cfg_.lsk3dnet_repo_root;
+        const std::string hy_cfg = resolveSemanticPath(rr, cfg.semanticLsk3dnetConfigYaml()).string();
+        std::string hy_ckpt = resolveSemanticPath(rr, cfg.semanticLsk3dnetCheckpoint()).string();
+        std::string hy_cls = resolveSemanticPath(rr, cfg.semanticLsk3dnetClassifierTorchscript()).string();
+        std::string hy_ws = resolveSemanticPath(rr, cfg.semanticLsk3dnetWorkerScript()).string();
+        if ((hy_ckpt.empty() || !std::filesystem::exists(hy_ckpt)) && std::filesystem::is_directory(rr)) {
+            hy_ckpt = findFirstByExtensionRecursively(rr, ".pt");
+        }
+        if ((hy_cls.empty() || !std::filesystem::exists(hy_cls)) && std::filesystem::is_directory(rr)) {
+            try {
+                for (const auto& entry : std::filesystem::recursive_directory_iterator(rr)) {
+                    if (!entry.is_regular_file()) continue;
+                    if (entry.path().extension() != ".ts") continue;
+                    const auto name = entry.path().filename().string();
+                    if (name.find("classifier") != std::string::npos) {
+                        hy_cls = entry.path().string();
+                        break;
+                    }
+                }
+            } catch (const std::exception&) {
+            }
+        }
+        if (hy_ws.empty() && !rr.empty()) {
+            hy_ws = (std::filesystem::path(rr) / "scripts" / "lsk3dnet_hybrid_worker.py").string();
+        }
+        const bool hybrid_ready =
+            std::filesystem::is_directory(rr) &&
+            std::filesystem::exists(hy_cfg) &&
+            std::filesystem::exists(hy_ckpt) &&
+            std::filesystem::exists(hy_cls) &&
+            std::filesystem::exists(hy_ws);
+        if (hybrid_ready) {
+            semantic_cfg_.model_type = "lsk3dnet_hybrid";
+            semantic_cfg_.lsk3dnet_config_yaml = hy_cfg;
+            semantic_cfg_.lsk3dnet_checkpoint = hy_ckpt;
+            semantic_cfg_.lsk3dnet_classifier_torchscript = hy_cls;
+            semantic_cfg_.lsk3dnet_worker_script = hy_ws;
+            semantic_cfg_.lsk3dnet_hybrid_normal_mode = cfg.semanticLsk3dnetHybridNormalMode();
+            semantic_cfg_.lsk3dnet_normal_fov_up_deg = cfg.semanticLsk3dnetNormalFovUpDeg();
+            semantic_cfg_.lsk3dnet_normal_fov_down_deg = cfg.semanticLsk3dnetNormalFovDownDeg();
+            semantic_cfg_.lsk3dnet_normal_proj_h = std::max(8, std::min(4096, cfg.semanticLsk3dnetNormalProjH()));
+            semantic_cfg_.lsk3dnet_normal_proj_w = std::max(8, std::min(8192, cfg.semanticLsk3dnetNormalProjW()));
+            semantic_cfg_.lsk3dnet_python_exe = cfg.semanticLsk3dnetPython();
+            RCLCPP_WARN(node_->get_logger(),
+                "[SEMANTIC][Module][INIT] lsk3dnet.ts not found, auto-switch to lsk3dnet_hybrid checkpoint=%s classifier=%s",
+                semantic_cfg_.lsk3dnet_checkpoint.c_str(), semantic_cfg_.lsk3dnet_classifier_torchscript.c_str());
+        }
     }
     const int system_threads = std::max(1, cfg.numThreads());
     const int configured_workers = cfg.semanticWorkerThreads();
@@ -198,6 +309,17 @@ SemanticModule::SemanticModule(EventBus::Ptr event_bus, MapRegistry::Ptr map_reg
         }
     }
 
+    // Hard requirement for LSK3DNet: must be CUDA-accelerated. If runtime is unavailable, abort startup.
+    if (semantic_enabled &&
+        (semantic_cfg_.model_type == "lsk3dnet" || semantic_cfg_.model_type == "lsk3dnet_hybrid") &&
+        !semantic_runtime_ready_.load(std::memory_order_relaxed)) {
+        RCLCPP_FATAL(node_->get_logger(),
+            "[SEMANTIC][FATAL] model_type=%s requires CUDA acceleration, but runtime is NOT ready. "
+            "This is configured as a hard requirement; exiting to avoid running without GPU inference.",
+            semantic_cfg_.model_type.c_str());
+        throw std::runtime_error("LSK3DNet semantic runtime not ready (CUDA required)");
+    }
+
     // 订阅 Mapping 创建的关键帧事件：语义主入口应与真实 KeyFrame 对齐
     onEvent<GraphTaskEvent>([this](const GraphTaskEvent& ev) {
         handleGraphTaskEvent(ev);
@@ -240,6 +362,25 @@ SemanticModule::SemanticModule(EventBus::Ptr event_bus, MapRegistry::Ptr map_reg
             semantic_cfg_.diag_dump_points_per_class_limit,
             semantic_cfg_.diag_override_tree_class_id);
     }
+}
+
+std::vector<std::pair<std::string, size_t>> SemanticModule::queueDepths() const {
+    std::lock_guard<std::mutex> lock(queue_mutex_);
+    return {
+        {"task_queue", task_queue_.size()},
+        {"workers_active", active_worker_count_.load(std::memory_order_relaxed)},
+        {"workers_total", worker_thread_count_},
+    };
+}
+
+std::string SemanticModule::idleDetail() const {
+    if (semantic_degraded_.load(std::memory_order_relaxed)) {
+        return "semantic_degraded=1";
+    }
+    if (!semantic_runtime_ready_.load(std::memory_order_relaxed)) {
+        return "semantic_runtime_ready=0";
+    }
+    return "";
 }
 
 void SemanticModule::start() {
@@ -341,46 +482,74 @@ void SemanticModule::run() {
 void SemanticModule::workerLoop(size_t worker_idx) {
     RCLCPP_INFO(node_->get_logger(), "[V3][SemanticModule] Started worker thread idx=%zu", worker_idx);
     while (running_) {
-        if (worker_idx == 0) {
-            updateHeartbeat();
-        }
-        tryRecoverFromDegradedState(node_->now().seconds());
-        SyncedFrameEvent event;
-        {
-            std::unique_lock<std::mutex> lock(queue_mutex_);
+        try {
             if (worker_idx == 0) {
-                maybeAdjustActiveWorkersLocked(node_->now().seconds());
+                updateHeartbeat();
             }
-            const size_t active_workers = active_worker_count_.load(std::memory_order_relaxed);
-            if (worker_idx >= active_workers) {
-                cv_.wait_for(lock, std::chrono::milliseconds(100), [this, worker_idx] {
-                    return !running_ || worker_idx < active_worker_count_.load(std::memory_order_relaxed);
+            tryRecoverFromDegradedState(node_->now().seconds());
+            SyncedFrameEvent event;
+            {
+                std::unique_lock<std::mutex> lock(queue_mutex_);
+                if (worker_idx == 0) {
+                    maybeAdjustActiveWorkersLocked(node_->now().seconds());
+                }
+                const size_t active_workers = active_worker_count_.load(std::memory_order_relaxed);
+                if (worker_idx >= active_workers) {
+                    cv_.wait_for(lock, std::chrono::milliseconds(100), [this, worker_idx] {
+                        return !running_ || worker_idx < active_worker_count_.load(std::memory_order_relaxed);
+                    });
+                    continue;
+                }
+                cv_.wait_for(lock, std::chrono::milliseconds(100), [this] { 
+                    return !running_ || !task_queue_.empty(); 
                 });
-                continue;
-            }
-            cv_.wait_for(lock, std::chrono::milliseconds(100), [this] { 
-                return !running_ || !task_queue_.empty(); 
-            });
-            if (!running_) break;
-            if (task_queue_.empty()) {
-                continue;
+                if (!running_) break;
+                if (task_queue_.empty()) {
+                    continue;
+                }
+
+                event = task_queue_.front();
+                task_queue_.pop_front();
+                if ((processed_tasks_.load(std::memory_order_relaxed) < 20) ||
+                    ((processed_tasks_.load(std::memory_order_relaxed) % 50) == 0)) {
+                    RCLCPP_INFO(node_->get_logger(),
+                        "[SEMANTIC][Module][DEQUEUE] worker=%zu ts=%.3f cloud_pts=%zu queue_left=%zu active_workers=%zu",
+                        worker_idx,
+                        event.timestamp,
+                        event.cloud ? event.cloud->size() : 0,
+                        task_queue_.size(),
+                        active_worker_count_.load(std::memory_order_relaxed));
+                }
             }
 
-            event = task_queue_.front();
-            task_queue_.pop_front();
-            if ((processed_tasks_.load(std::memory_order_relaxed) < 20) ||
-                ((processed_tasks_.load(std::memory_order_relaxed) % 50) == 0)) {
-                RCLCPP_INFO(node_->get_logger(),
-                    "[SEMANTIC][Module][DEQUEUE] worker=%zu ts=%.3f cloud_pts=%zu queue_left=%zu active_workers=%zu",
-                    worker_idx,
-                    event.timestamp,
-                    event.cloud ? event.cloud->size() : 0,
-                    task_queue_.size(),
-                    active_worker_count_.load(std::memory_order_relaxed));
-            }
+            processTask(event, worker_idx);
+        } catch (const std::exception& e) {
+            RCLCPP_ERROR(node_->get_logger(),
+                "[SEMANTIC][Module][EXCEPTION] worker=%zu caught=%s (degrade+continue)",
+                worker_idx, e.what());
+            METRICS_INCREMENT(metrics::ERRORS_TOTAL);
+            markSemanticDegraded("worker_exception");
+        } catch (...) {
+            RCLCPP_ERROR(node_->get_logger(),
+                "[SEMANTIC][Module][EXCEPTION] worker=%zu unknown exception (degrade+continue)",
+                worker_idx);
+            METRICS_INCREMENT(metrics::ERRORS_TOTAL);
+            markSemanticDegraded("worker_exception_unknown");
         }
+    }
+}
 
-        processTask(event, worker_idx);
+void SemanticModule::markSemanticDegraded(const char* reason) {
+    const int err_count = ++consecutive_errors_;
+    if (err_count >= kMaxConsecutiveErrors) {
+        semantic_runtime_ready_.store(false, std::memory_order_relaxed);
+        semantic_degraded_.store(true, std::memory_order_relaxed);
+        next_recovery_retry_s_.store(node_->now().seconds() + kRecoveryCooldownSec, std::memory_order_relaxed);
+        recovery_attempts_.store(0, std::memory_order_relaxed);
+        recovery_exhausted_reported_.store(false, std::memory_order_relaxed);
+        RCLCPP_FATAL(node_->get_logger(),
+            "[SEMANTIC][Module][RUN] step=degraded reason=%s threshold=%d → SemanticModule disabled to protect system stability",
+            reason ? reason : "unknown", kMaxConsecutiveErrors);
     }
 }
 

@@ -58,9 +58,17 @@ int main(int argc, char **argv)
   auto nh = std::make_shared<rclcpp::Node>("laserMapping", options);
   image_transport::ImageTransport it_(nh);
   
-  LIVMapper mapper(nh, "laserMapping", options);
-  mapper.initializeSubscribersAndPublishers(nh, it_);
-  mapper.run(nh);
+  try {
+    LIVMapper mapper(nh, "laserMapping", options);
+    mapper.initializeSubscribersAndPublishers(nh, it_);
+    mapper.run(nh);
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "[fast_livo][FATAL_GUARD] unhandled exception in main pipeline: %s\n", e.what());
+    std::fflush(stderr);
+  } catch (...) {
+    std::fprintf(stderr, "[fast_livo][FATAL_GUARD] unknown unhandled exception in main pipeline\n");
+    std::fflush(stderr);
+  }
   
   // 🏛️ [安全策略] 显式重置以确保在 rclcpp::shutdown() 前清理所有资源，避免 static destruction 顺序导致的崩溃
   nh.reset();

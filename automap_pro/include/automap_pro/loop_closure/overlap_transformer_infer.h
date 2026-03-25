@@ -1,6 +1,7 @@
 #pragma once
 
 #include "automap_pro/core/data_types.h"
+#include "automap_pro/core/ort_wrapper.h"
 #include <string>
 #include <mutex>
 
@@ -95,8 +96,9 @@ private:
 #ifdef USE_TORCH
     mutable torch::jit::script::Module model_;
 #endif
+    OnnxSession::Ptr onnx_model_ = nullptr;
     bool model_loaded_ = false;
-    bool use_cuda_     = false;
+    mutable bool use_cuda_ = false;
 
     // ── Range Image 参数 ──────────────────────────────────────────────────
     int   proj_H_    = 64;
@@ -123,6 +125,9 @@ private:
     /** LibTorch 推理（Level 1） */
     Eigen::VectorXf inferWithTorch(const std::vector<float>& range_img) const;
 #endif
+
+    /** ONNX/TensorRT 推理 */
+    Eigen::VectorXf inferWithOnnx(const std::vector<float>& range_img) const;
 
     /** FPFH 直方图 fallback 描述子（Level 3） */
     Eigen::VectorXf computeFallbackDescriptor(const CloudXYZIPtr& cloud) const;

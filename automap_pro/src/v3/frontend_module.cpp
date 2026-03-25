@@ -2,6 +2,7 @@
 #include "automap_pro/backend/gps_constraint_policy.h"
 #include "automap_pro/core/config_manager.h"
 #include "automap_pro/core/logger.h"
+#include "automap_pro/core/metrics.h"
 #include "automap_pro/core/utils.h"
 #include <pcl_conversions/pcl_conversions.h>
 #include <algorithm>
@@ -152,40 +153,40 @@ void FrontEndModule::run() {
     RCLCPP_INFO(node_->get_logger(), "[V3][FrontEndModule] Started sync thread");
     
     while (running_) {
-        updateHeartbeat();
+        try {
+            updateHeartbeat();
 
-        // 🏛️ [架构契约] 背压限流应用
-        if (throttle_active_.load()) {
-            const double now = node_->now().seconds();
-            if (now < throttle_until_.load()) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                continue;
-            } else {
-                throttle_active_.store(false);
+            // 🏛️ [架构契约] 背压限流应用
+            if (throttle_active_.load()) {
+                const double now = node_->now().seconds();
+                if (now < throttle_until_.load()) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                    continue;
+                } else {
+                    throttle_active_.store(false);
+                }
             }
-        }
+            FrameToProcess f;
+            bool woke_by_data = frame_processor_.tryPopFrame(100, f);
+            if (!running_) break;
+            if (!woke_by_data) continue;
 
-        FrameToProcess f;
-        bool woke_by_data = frame_processor_.tryPopFrame(100, f);
-        if (!running_) break;
-        if (!woke_by_data) continue;
+            Pose3d pose = Pose3d::Identity();
+            Mat66d cov = Mat66d::Identity() * 1e-4;
+            const char* pose_source = "cache_interp";
 
-        Pose3d pose = Pose3d::Identity();
-        Mat66d cov = Mat66d::Identity() * 1e-4;
-        const char* pose_source = "cache_interp";
-
-        if (!odomCacheGet(f.ts, pose, cov)) {
-            // 插值失败时（多线程调度 / 短时滞后 / 历史边界）用最近一次里程计，与 LivoBridge「cloud 配 last odom」一致；过大时间差仍丢弃，避免错配
-            std::lock_guard<std::mutex> lk(data_mutex_);
-            constexpr double kMaxCloudOdomSkewS = 1.5;
-            if (last_odom_ts_ >= 0.0 && std::abs(f.ts - last_odom_ts_) <= kMaxCloudOdomSkewS) {
-                pose = last_odom_pose_;
-                cov = last_cov_;
-                pose_source = "last_odom_fallback";
-            } else {
-                continue;
+            if (!odomCacheGet(f.ts, pose, cov)) {
+                // 插值失败时（多线程调度 / 短时滞后 / 历史边界）用最近一次里程计，与 LivoBridge「cloud 配 last odom」一致；过大时间差仍丢弃，避免错配
+                std::lock_guard<std::mutex> lk(data_mutex_);
+                constexpr double kMaxCloudOdomSkewS = 1.5;
+                if (last_odom_ts_ >= 0.0 && std::abs(f.ts - last_odom_ts_) <= kMaxCloudOdomSkewS) {
+                    pose = last_odom_pose_;
+                    cov = last_cov_;
+                    pose_source = "last_odom_fallback";
+                } else {
+                    continue;
+                }
             }
-        }
 
         LivoKeyFrameInfo kfinfo_copy;
         bool kfinfo_from_cache = kfinfoCacheGet(f.ts, kfinfo_copy);
@@ -266,7 +267,7 @@ void FrontEndModule::run() {
         event.meta.route_tag = "legacy";
         event.processing_state = throttle_active_.load() ? ProcessingState::DEGRADED : ProcessingState::NORMAL;
 
-        if (event.isValid()) {
+            if (event.isValid()) {
             event_bus_->publish(event);
             const auto published = synced_publish_total_.fetch_add(1, std::memory_order_relaxed) + 1;
             RCLCPP_INFO_THROTTLE(node_->get_logger(), *node_->get_clock(), 2000,
@@ -283,10 +284,21 @@ void FrontEndModule::run() {
             RCLCPP_DEBUG_THROTTLE(node_->get_logger(), *node_->get_clock(), 2000,
                 "[SEMANTIC][FrontEnd][run] step=publish SyncedFrameEvent ts=%.3f pts=%zu ref_version=%lu",
                 event.timestamp, event.cloud ? event.cloud->size() : 0, event.ref_map_version);
-        } else {
+            } else {
             RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000,
                 "[V3][CONTRACT] Dropping invalid SyncedFrameEvent (NaN/null/invalid cloud_frame=%s)",
                 event.cloud_frame.c_str());
+            }
+        } catch (const std::exception& e) {
+            RCLCPP_ERROR(node_->get_logger(),
+                "[V3][FrontEndModule][EXCEPTION] run loop caught: %s (drop current frame, continue)", e.what());
+            METRICS_INCREMENT(metrics::ERRORS_TOTAL);
+            continue;
+        } catch (...) {
+            RCLCPP_ERROR(node_->get_logger(),
+                "[V3][FrontEndModule][EXCEPTION] run loop unknown exception (drop current frame, continue)");
+            METRICS_INCREMENT(metrics::ERRORS_TOTAL);
+            continue;
         }
     }
 }

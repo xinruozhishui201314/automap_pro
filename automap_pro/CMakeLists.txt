@@ -622,6 +622,7 @@ set(AUTOMAP_INCLUDE_DIRS
   ${EIGEN3_INCLUDE_DIRS}
   ${OpenCV_INCLUDE_DIRS}
   ${GTSAM_INCLUDE_DIR}
+  ${_onnx_include}
 )
 if(Torch_FOUND)
   list(APPEND AUTOMAP_INCLUDE_DIRS ${TORCH_INCLUDE_DIRS})
@@ -649,6 +650,7 @@ set(AUTOMAP_LIBS
   nlohmann_json::nlohmann_json
   GeographicLib::GeographicLib
   ${TEASER_TARGET}
+  ${_onnx_lib}
 )
 if(Torch_FOUND)
   list(APPEND AUTOMAP_LIBS ${TORCH_LIBRARIES})
@@ -673,6 +675,7 @@ add_library(automap_core SHARED
   src/core/error_monitor.cpp
   src/core/health_monitor_impl.cpp
   src/core/crash_report.cpp
+  src/core/ort_wrapper.cpp
   src/config/thread_config.cpp
 )
 target_include_directories(automap_core PUBLIC ${AUTOMAP_INCLUDE_DIRS})

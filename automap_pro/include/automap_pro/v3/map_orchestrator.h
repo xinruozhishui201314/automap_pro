@@ -14,6 +14,8 @@ public:
     MapOrchestrator(EventBus::Ptr event_bus, MapRegistry::Ptr map_registry, rclcpp::Node::SharedPtr node);
 
     bool isIdle() const override;
+    std::vector<std::pair<std::string, size_t>> queueDepths() const override;
+    std::string idleDetail() const override;
 
 protected:
     void run() override;

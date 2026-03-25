@@ -121,6 +121,42 @@ automap_log_progress "pip：安装 easydict / PyYAML / numpy…"
 echo "[INFO] 安装 LSK worker 轻量依赖..."
 pip install easydict PyYAML numpy ${PIP_INDEX:-}
 
+automap_log_progress "pip：安装 pybind11/cmake（用于编译 c_gen_normal_map）…"
+echo "[INFO] 安装 pybind11/cmake..."
+pip install pybind11 cmake ${PIP_INDEX:-}
+
+automap_log_progress "编译 LSK c_utils: c_gen_normal_map（range 法线，训练一致）…"
+LSK_REPO_ROOT="${LSK_REPO_ROOT:-/root/automap_ws/src/automap_pro/thrid_party/LSK3DNet-main}"
+if [[ -d "${LSK_REPO_ROOT}/c_utils" ]]; then
+  if python3 -c "import c_gen_normal_map" >/dev/null 2>&1; then
+    echo "[INFO] c_gen_normal_map 已可 import，跳过编译"
+  else
+    _PYBIND_CMAKE_DIR="$("${VENV_DIR}/bin/python3" -m pybind11 --cmakedir 2>/dev/null || true)"
+    if [[ -z "${_PYBIND_CMAKE_DIR}" ]]; then
+      echo "[ERROR] 无法获取 pybind11 cmake dir（python -m pybind11 --cmakedir 失败）" >&2
+      exit 1
+    fi
+    # Out-of-source build: LSK repo is often mounted read-only (e.g. /root/mapping or /root/automap_ws/src/automap_pro),
+    # so never write build artifacts under ${LSK_REPO_ROOT}.
+    _LSK_CUTILS_SRC="${LSK_REPO_ROOT}/c_utils"
+    _LSK_CUTILS_BUILD="${VENV_DIR}/.build_lsk3dnet_c_utils"
+    rm -rf "${_LSK_CUTILS_BUILD}" 2>/dev/null || true
+    mkdir -p "${_LSK_CUTILS_BUILD}"
+    cmake -S "${_LSK_CUTILS_SRC}" -B "${_LSK_CUTILS_BUILD}" -Dpybind11_DIR="${_PYBIND_CMAKE_DIR}" -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+    cmake --build "${_LSK_CUTILS_BUILD}" -j"$(nproc)"
+    _SO="$(ls -1 "${_LSK_CUTILS_BUILD}"/c_gen_normal_map*.so 2>/dev/null | head -n1 || true)"
+    if [[ -z "${_SO}" ]]; then
+      echo "[ERROR] 未生成 c_gen_normal_map*.so（编译失败或输出路径变化）" >&2
+      exit 1
+    fi
+    _SITE="$("${VENV_DIR}/bin/python3" -c "import site; print(site.getsitepackages()[0])")"
+    cp -f "${_SO}" "${_SITE}/"
+    python3 -c "import c_gen_normal_map; print('[OK] import c_gen_normal_map')"
+  fi
+else
+  echo "[WARN] 未找到 LSK3DNet c_utils 目录: ${LSK_REPO_ROOT}/c_utils（将无法使用 normal_mode=range）" >&2
+fi
+
 automap_log_progress "校验 torch / spconv / torch_scatter import…"
 echo "[INFO] 校验 import（CUDA 可用性取决于镜像与 --gpus）..."
 python3 - <<'PY'

@@ -15,6 +15,7 @@
 # └─────────────────────────────────────────────────────────────────────────────
 system:
   name: "AutoMap-Pro"
+  api_version: "3.1"
   output_dir: "/data/automap_output"
   num_threads: 8
   log_level: "INFO"          # DEBUG | INFO | WARN | ERROR
@@ -300,8 +301,8 @@ loop_closure:
   overlap_transformer:
     # 空则 launch 自动解析为仓库内 pretrained_overlap_transformer.pth.tar（回环粗匹配必须使用该模型）
     model_path:     ""
-    proj_H:         64
-    proj_W:         900
+    proj_H:         128
+    proj_W:         1800
     fov_up:         3.0        # KITTI 标准参数，与模型训练一致
     fov_down:      -25.0       # KITTI 标准参数，与模型训练一致（总视野28°）
     max_range:      80.0       # ⚠️ 改为80m（模型训练值），确保远距离回环不被丢弃

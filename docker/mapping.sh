@@ -214,9 +214,16 @@ run_mapping() {
     # 创建输出目录
     mkdir -p "$OUTPUT_DIR"
     
-    # 运行建图
+    # 运行建图（强制使用源码版 launch，避免 install 中旧版 launch 导致 patched config / strict_mode 契约失效）
     cd /workspace
-    ros2 launch automap_pro automap_offline.launch.py \
+    LAUNCH_SRC="/workspace/automap_pro/launch/automap_offline.launch.py"
+    if [ -f "$LAUNCH_SRC" ]; then
+      LAUNCH_SPEC="$LAUNCH_SRC"
+    else
+      LAUNCH_SPEC="automap_pro automap_offline.launch.py"
+      log_error "未找到源码 launch: $LAUNCH_SRC，将回退到 install 版（可能导致旧逻辑生效）"
+    fi
+    ros2 launch ${LAUNCH_SPEC} \
         config:="$CONFIG" \
         bag_file:="$BAG_FILE_FINAL" \
         rate:=1.0 \

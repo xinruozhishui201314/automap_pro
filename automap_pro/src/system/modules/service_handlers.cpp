@@ -152,7 +152,31 @@ void AutoMapSystem::handleFinishMapping(
         int wait_count = 0;
         while (!v3_context_->isAllIdle() && wait_count < 600) { // 最多等 10 分钟 (600 * 1s)
             if (wait_count % 10 == 0) {
-                RCLCPP_INFO(get_logger(), "[AutoMapSystem] Backend still busy (draining queues), waiting... (%ds)", wait_count);
+                auto snap = v3_context_->getIdleStatusSnapshot();
+                std::string busy;
+                for (const auto& s : snap) {
+                    if (s.is_idle) continue;
+                    if (!busy.empty()) busy += " | ";
+                    busy += s.name + "(quiesce=" + (s.is_quiescing ? "1" : "0") +
+                            ",hb_age_s=" + std::to_string(s.heartbeat_age_s).substr(0, 6);
+                    if (!s.queue_depths.empty()) {
+                        busy += ",queues=";
+                        bool first_q = true;
+                        for (const auto& q : s.queue_depths) {
+                            if (!first_q) busy += ",";
+                            first_q = false;
+                            busy += q.first + ":" + std::to_string(q.second);
+                        }
+                    }
+                    if (!s.idle_detail.empty()) {
+                        busy += ",detail=" + s.idle_detail;
+                    }
+                    busy += ")";
+                }
+                if (busy.empty()) busy = "<none>";
+                RCLCPP_INFO(get_logger(),
+                            "[AutoMapSystem] Backend still busy (draining queues), waiting... (%ds) non_idle=%s",
+                            wait_count, busy.c_str());
             }
             std::this_thread::sleep_for(std::chrono::seconds(1));
             wait_count++;

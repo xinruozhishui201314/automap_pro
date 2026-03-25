@@ -146,9 +146,17 @@ def compute_normals_like_training(
     proj_range, proj_vertex, _, _, from_proj_x, from_proj_y = range_projection(
         feat_np, fov_up=fov_up_deg, fov_down=fov_down_deg, proj_H=proj_h, proj_W=proj_w
     )
+    # 🏛️ [Ideal State Fix] Check for invalid projections before normal generation
+    # Points falling outside the specified normal_fov will have proj_range == -1
     proj_range = depth_map_utils.fill_in_fast(proj_range, extrapolate=True, blur_type="gaussian")
     normal_data = gen_normal_map(proj_range, proj_vertex, proj_h, proj_w)
-    return normal_data[from_proj_y, from_proj_x]
+    
+    # 🏛️ [Robustness Fix] Mask out points that are far outside the normal estimation window
+    # to prevent backbone from receiving 'garbage' normal features.
+    mask_invalid = (from_proj_y < 0) | (from_proj_y >= proj_h) | (from_proj_x < 0) | (from_proj_x >= proj_w)
+    normals = normal_data[np.clip(from_proj_y, 0, proj_h-1), np.clip(from_proj_x, 0, proj_w-1)]
+    normals[mask_invalid] = 0
+    return normals
 
 
 def forward_point_features(model, device, points: "torch.Tensor", normals: "torch.Tensor"):

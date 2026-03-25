@@ -224,12 +224,20 @@ void AutoMapSystem::deferredSetupModules() {
     state_ = SystemState::MAPPING;
     RCLCPP_INFO(get_logger(), "[PIPELINE][SYS] step=09 state=MAPPING === AutoMapSystem V3 Architecture Ready === (grep PIPELINE)");
     ALOG_INFO("Pipeline", "[PIPELINE][SYS] step=09 all V3 modules registered; system ready for mapping");
+    if (ready_pub_) {
+        std_msgs::msg::Bool msg;
+        msg.data = true;
+        ready_pub_->publish(msg);
+        RCLCPP_INFO(get_logger(), "[PIPELINE][SYS] step=09b published /automap/ready=true (latched)");
+    }
 }
 
 void AutoMapSystem::setupPublishers() {
     status_pub_ = create_publisher<automap_pro::msg::MappingStatusMsg>("/automap/status", 10);
     global_map_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(protocol::topics::GLOBAL_MAP, 1);
-    RCLCPP_INFO(get_logger(), "[PIPELINE][SYS] step=05 publishers: /automap/status %s", protocol::topics::GLOBAL_MAP);
+    ready_pub_ = create_publisher<std_msgs::msg::Bool>(
+        "/automap/ready", rclcpp::QoS(1).transient_local().reliable());
+    RCLCPP_INFO(get_logger(), "[PIPELINE][SYS] step=05 publishers: /automap/status /automap/ready %s", protocol::topics::GLOBAL_MAP);
 }
 
 void AutoMapSystem::setupServices() {

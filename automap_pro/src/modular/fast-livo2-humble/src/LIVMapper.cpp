@@ -13,10 +13,14 @@ which is included as part of this source code package.
 #include "LIVMapper.h"
 #include <vikit/camera_loader.h>
 #include <rclcpp/exceptions.hpp>
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <chrono>
 #include <ctime>
 #include <filesystem>
+#include <limits>
+#include <vector>
 
 using namespace Sophus;
 
@@ -34,6 +38,136 @@ inline std::string hostTimeString() {
                 ptm->tm_year + 1900, ptm->tm_mon + 1, ptm->tm_mday,
                 ptm->tm_hour, ptm->tm_min, ptm->tm_sec, static_cast<long>(ms.count()));
   return std::string("[host: ") + s + "]";
+}
+
+// 分块 + 体素降采样（RGB）：避免单次 VoxelGrid 在大范围地图上出现 "Integer indices would overflow"。
+inline pcl::PointCloud<pcl::PointXYZRGB>::Ptr downsampleRgbChunkedSafe(
+    const pcl::PointCloud<pcl::PointXYZRGB>::Ptr& cloud, float leaf_size) {
+  if (!cloud || cloud->empty()) return cloud;
+
+  const float leaf = std::max(leaf_size, 0.2f);
+  constexpr float kMaxVoxelAxisIndex = 1290.0f;  // cbrt(INT_MAX) 的保守上限
+
+  float min_x = std::numeric_limits<float>::max();
+  float min_y = std::numeric_limits<float>::max();
+  float min_z = std::numeric_limits<float>::max();
+  float max_x = std::numeric_limits<float>::lowest();
+  float max_y = std::numeric_limits<float>::lowest();
+  float max_z = std::numeric_limits<float>::lowest();
+
+  for (const auto& p : cloud->points) {
+    if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) continue;
+    min_x = std::min(min_x, p.x); max_x = std::max(max_x, p.x);
+    min_y = std::min(min_y, p.y); max_y = std::max(max_y, p.y);
+    min_z = std::min(min_z, p.z); max_z = std::max(max_z, p.z);
+  }
+
+  auto would_overflow = [&](float l) -> bool {
+    const float dx = (max_x - min_x) / l;
+    const float dy = (max_y - min_y) / l;
+    const float dz = (max_z - min_z) / l;
+    return !std::isfinite(dx) || !std::isfinite(dy) || !std::isfinite(dz) ||
+           dx > kMaxVoxelAxisIndex || dy > kMaxVoxelAxisIndex || dz > kMaxVoxelAxisIndex;
+  };
+
+  const float mdx = (mm_max_x - mm_min_x) / leaf;
+  const float mdy = (mm_max_y - mm_min_y) / leaf;
+  const float mdz = (mm_max_z - mm_min_z) / leaf;
+  const bool merged_overflow =
+      !std::isfinite(mdx) || !std::isfinite(mdy) || !std::isfinite(mdz) ||
+      mdx > kMaxVoxelAxisIndex || mdy > kMaxVoxelAxisIndex || mdz > kMaxVoxelAxisIndex;
+
+  if (!merged_overflow) {
+    auto out = std::make_shared<pcl::PointCloud<pcl::PointXYZRGB>>();
+    pcl::VoxelGrid<pcl::PointXYZRGB> vg;
+    vg.setInputCloud(cloud);
+    vg.setLeafSize(leaf, leaf, leaf);
+    vg.filter(*out);
+    return out;
+  }
+
+  // 复用工程内已验证的“安全分块”思路：按 leaf 自动计算块尺寸（带余量）。
+  float chunk_size_m = std::max(leaf * 2.0f, std::min(leaf * (kMaxVoxelAxisIndex * 0.5f), 200.0f));
+  const float span_x = std::max(0.0f, max_x - min_x);
+  const float span_y = std::max(0.0f, max_y - min_y);
+  const float span_z = std::max(0.0f, max_z - min_z);
+  const int nx = std::max(1, static_cast<int>(std::ceil(span_x / chunk_size_m)));
+  const int ny = std::max(1, static_cast<int>(std::ceil(span_y / chunk_size_m)));
+  const int nz = std::max(1, static_cast<int>(std::ceil(span_z / chunk_size_m)));
+  const int total_chunks = nx * ny * nz;
+
+  std::vector<std::vector<size_t>> chunk_indices(static_cast<size_t>(total_chunks));
+  chunk_indices.reserve(static_cast<size_t>(total_chunks));
+
+  for (size_t i = 0; i < cloud->points.size(); ++i) {
+    const auto& p = cloud->points[i];
+    if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) continue;
+    const int ix = std::clamp(static_cast<int>((p.x - min_x) / chunk_size_m), 0, nx - 1);
+    const int iy = std::clamp(static_cast<int>((p.y - min_y) / chunk_size_m), 0, ny - 1);
+    const int iz = std::clamp(static_cast<int>((p.z - min_z) / chunk_size_m), 0, nz - 1);
+    const int idx = ix * (ny * nz) + iy * nz + iz;
+    chunk_indices[static_cast<size_t>(idx)].push_back(i);
+  }
+
+  auto merged = std::make_shared<pcl::PointCloud<pcl::PointXYZRGB>>();
+  merged->reserve(cloud->size() / 4);
+
+  for (int idx = 0; idx < total_chunks; ++idx) {
+    const auto& indices = chunk_indices[static_cast<size_t>(idx)];
+    if (indices.empty()) continue;
+
+    auto chunk = std::make_shared<pcl::PointCloud<pcl::PointXYZRGB>>();
+    chunk->points.reserve(indices.size());
+    for (const size_t pt_idx : indices) {
+      chunk->points.push_back(cloud->points[pt_idx]);
+    }
+
+    pcl::VoxelGrid<pcl::PointXYZRGB> vg;
+    vg.setInputCloud(chunk);
+    vg.setLeafSize(leaf, leaf, leaf);
+    pcl::PointCloud<pcl::PointXYZRGB> ds;
+    vg.filter(ds);
+    if (!ds.empty()) {
+      merged->points.insert(merged->points.end(), ds.points.begin(), ds.points.end());
+    }
+  }
+
+  if (merged->empty()) return cloud;
+
+  // 分块结果在块边界可能存在少量重复点；若全局范围已安全，则做一次最终体素去重。
+  float mm_min_x = std::numeric_limits<float>::max();
+  float mm_min_y = std::numeric_limits<float>::max();
+  float mm_min_z = std::numeric_limits<float>::max();
+  float mm_max_x = std::numeric_limits<float>::lowest();
+  float mm_max_y = std::numeric_limits<float>::lowest();
+  float mm_max_z = std::numeric_limits<float>::lowest();
+  for (const auto& p : merged->points) {
+    if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) continue;
+    mm_min_x = std::min(mm_min_x, p.x); mm_max_x = std::max(mm_max_x, p.x);
+    mm_min_y = std::min(mm_min_y, p.y); mm_max_y = std::max(mm_max_y, p.y);
+    mm_min_z = std::min(mm_min_z, p.z); mm_max_z = std::max(mm_max_z, p.z);
+  }
+  if (!would_overflow(leaf)) {
+    pcl::VoxelGrid<pcl::PointXYZRGB> vg_final;
+    vg_final.setInputCloud(merged);
+    vg_final.setLeafSize(leaf, leaf, leaf);
+    auto final_cloud = std::make_shared<pcl::PointCloud<pcl::PointXYZRGB>>();
+    vg_final.filter(*final_cloud);
+    if (!final_cloud->empty()) {
+      final_cloud->header = cloud->header;
+      final_cloud->width = static_cast<uint32_t>(final_cloud->points.size());
+      final_cloud->height = 1;
+      final_cloud->is_dense = false;
+      return final_cloud;
+    }
+  }
+
+  // 无论是否做最终去重，最终都返回“单帧合并点云”。
+  merged->header = cloud->header;
+  merged->width = static_cast<uint32_t>(merged->points.size());
+  merged->height = 1;
+  merged->is_dense = false;
+  return merged;
 }
 }
 LIVMapper::LIVMapper(rclcpp::Node::SharedPtr &node, std::string node_name, const rclcpp::NodeOptions & options)
@@ -742,11 +876,8 @@ void LIVMapper::savePCD()
 
     if (img_en)
     {
-      pcl::PointCloud<pcl::PointXYZRGB>::Ptr downsampled_cloud(new pcl::PointCloud<pcl::PointXYZRGB>);
-      pcl::VoxelGrid<pcl::PointXYZRGB> voxel_filter;
-      voxel_filter.setInputCloud(pcl_wait_save);
-      voxel_filter.setLeafSize(filter_size_pcd, filter_size_pcd, filter_size_pcd);
-      voxel_filter.filter(*downsampled_cloud);
+      pcl::PointCloud<pcl::PointXYZRGB>::Ptr downsampled_cloud =
+          downsampleRgbChunkedSafe(pcl_wait_save, static_cast<float>(filter_size_pcd));
   
       pcd_writer.writeBinary(raw_points_dir, *pcl_wait_save); // Save the raw point cloud data
       std::cout << GREEN << "Raw point cloud data saved to: " << raw_points_dir 
@@ -787,10 +918,37 @@ void LIVMapper::run(rclcpp::Node::SharedPtr &node)
   rclcpp::Rate rate(5000);
   while (rclcpp::ok()) 
   {
-    rclcpp::spin_some(this->node);
+    try {
+      rclcpp::spin_some(this->node);
+    } catch (const std::exception& e) {
+      RCLCPP_WARN(
+        this->node->get_logger(),
+        "[fast_livo][SHUTDOWN_GUARD] spin_some exception during shutdown: %s; exit run loop.",
+        e.what());
+      break;
+    } catch (...) {
+      RCLCPP_WARN(
+        this->node->get_logger(),
+        "[fast_livo][SHUTDOWN_GUARD] spin_some unknown exception during shutdown; exit run loop.");
+      break;
+    }
     if (!sync_packages(LidarMeasures)) 
     {
-      rate.sleep();
+      try {
+        if (!rclcpp::ok()) { break; }
+        rate.sleep();
+      } catch (const std::exception& e) {
+        RCLCPP_WARN(
+          this->node->get_logger(),
+          "[fast_livo][SHUTDOWN_GUARD] rate.sleep exception (likely invalid context): %s; exit run loop.",
+          e.what());
+        break;
+      } catch (...) {
+        RCLCPP_WARN(
+          this->node->get_logger(),
+          "[fast_livo][SHUTDOWN_GUARD] rate.sleep unknown exception; exit run loop.");
+        break;
+      }
       continue;
     }
     try {

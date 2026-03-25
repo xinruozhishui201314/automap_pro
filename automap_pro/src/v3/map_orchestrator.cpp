@@ -40,37 +40,54 @@ bool MapOrchestrator::isIdle() const {
     return queue_.empty();
 }
 
+std::vector<std::pair<std::string, size_t>> MapOrchestrator::queueDepths() const {
+    std::lock_guard<std::mutex> lk(queue_mutex_);
+    return {{"queue", queue_.size()}};
+}
+
+std::string MapOrchestrator::idleDetail() const {
+    return takeover_enabled_ ? "takeover_enabled=1" : "";
+}
+
 void MapOrchestrator::run() {
     while (running_) {
-        updateHeartbeat();
-        Item item;
-        {
-            std::unique_lock<std::mutex> lk(queue_mutex_);
-            cv_.wait_for(lk, std::chrono::milliseconds(100), [this] { return !running_ || !queue_.empty(); });
-            if (!running_) break;
-            if (queue_.empty()) continue;
-            item = queue_.front();
-            queue_.pop_front();
-        }
+        try {
+            updateHeartbeat();
+            Item item;
+            {
+                std::unique_lock<std::mutex> lk(queue_mutex_);
+                cv_.wait_for(lk, std::chrono::milliseconds(100), [this] { return !running_ || !queue_.empty(); });
+                if (!running_) break;
+                if (queue_.empty()) continue;
+                item = queue_.front();
+                queue_.pop_front();
+            }
 
-        const char* name = "unknown";
-        if (item.type == ItemType::SYNCED) name = "SyncedFrameEvent";
-        else if (item.type == ItemType::OPT) name = "OptimizationResultEvent";
-        else if (item.type == ItemType::GPS_ALIGN) name = "GPSAlignedEvent";
-        else if (item.type == ItemType::SEMANTIC) name = "SemanticLandmarkEvent";
-        observeMeta(name, item.meta);
-        size_t q_size = 0;
-        {
-            std::lock_guard<std::mutex> lk(queue_mutex_);
-            q_size = queue_.size();
+            const char* name = "unknown";
+            if (item.type == ItemType::SYNCED) name = "SyncedFrameEvent";
+            else if (item.type == ItemType::OPT) name = "OptimizationResultEvent";
+            else if (item.type == ItemType::GPS_ALIGN) name = "GPSAlignedEvent";
+            else if (item.type == ItemType::SEMANTIC) name = "SemanticLandmarkEvent";
+            observeMeta(name, item.meta);
+            size_t q_size = 0;
+            {
+                std::lock_guard<std::mutex> lk(queue_mutex_);
+                q_size = queue_.size();
+            }
+            RCLCPP_INFO_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000,
+                "[ORCH][KPI] observed=%lu out_of_order=%lu stale=%lu queue=%zu takeover=%d",
+                static_cast<unsigned long>(observed_total_.load(std::memory_order_relaxed)),
+                static_cast<unsigned long>(out_of_order_total_.load(std::memory_order_relaxed)),
+                static_cast<unsigned long>(stale_total_.load(std::memory_order_relaxed)),
+                q_size,
+                takeover_enabled_ ? 1 : 0);
+        } catch (const std::exception& e) {
+            RCLCPP_ERROR(node_->get_logger(),
+                "[ORCH][EXCEPTION] run loop caught: %s (isolate+continue)", e.what());
+        } catch (...) {
+            RCLCPP_ERROR(node_->get_logger(),
+                "[ORCH][EXCEPTION] run loop unknown exception (isolate+continue)");
         }
-        RCLCPP_INFO_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000,
-            "[ORCH][KPI] observed=%lu out_of_order=%lu stale=%lu queue=%zu takeover=%d",
-            static_cast<unsigned long>(observed_total_.load(std::memory_order_relaxed)),
-            static_cast<unsigned long>(out_of_order_total_.load(std::memory_order_relaxed)),
-            static_cast<unsigned long>(stale_total_.load(std::memory_order_relaxed)),
-            q_size,
-            takeover_enabled_ ? 1 : 0);
     }
 }
 

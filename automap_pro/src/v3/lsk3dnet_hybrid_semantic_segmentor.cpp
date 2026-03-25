@@ -6,10 +6,13 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <iostream>
 #include <limits>
 #include <mutex>
+#include <sstream>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <fcntl.h>
@@ -26,7 +29,10 @@
 #ifdef USE_TORCH
 #include <torch/script.h>
 #include <torch/torch.h>
+#include <torch/version.h>
 #endif
+
+#include <rclcpp/rclcpp.hpp>
 
 namespace automap_pro::v3 {
 
@@ -356,6 +362,19 @@ void hybridEnsureInit(const SegmentorConfig& cfg) {
     }
     st.frozen_cfg = cfg;
     const ClassifierMetaFile meta = loadClassifierMeta(cfg.lsk3dnet_classifier_torchscript);
+    RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+        "[SEMANTIC][LSK3DNET_HYBRID][LOAD] step=begin ts=%s py=%s worker=%s repo_root=%s cfg=%s ckpt=%s cls_ts=%s dev_req=%s normal(mode=%s fov=[%.1f,%.1f] proj=%dx%d)",
+        TORCH_VERSION,
+        cfg.lsk3dnet_python_exe.c_str(),
+        cfg.lsk3dnet_worker_script.c_str(),
+        cfg.lsk3dnet_repo_root.c_str(),
+        cfg.lsk3dnet_config_yaml.c_str(),
+        cfg.lsk3dnet_checkpoint.c_str(),
+        cfg.lsk3dnet_classifier_torchscript.c_str(),
+        cfg.lsk3dnet_device.c_str(),
+        cfg.lsk3dnet_hybrid_normal_mode.c_str(),
+        cfg.lsk3dnet_normal_fov_up_deg, cfg.lsk3dnet_normal_fov_down_deg,
+        cfg.lsk3dnet_normal_proj_w, cfg.lsk3dnet_normal_proj_h);
     st.worker = std::make_unique<HybridPythonWorker>(cfg, meta.checkpoint_sha256_hex);
     if (meta.present) {
         if (meta.feat_dim != static_cast<uint32_t>(st.worker->feat_dim())) {
@@ -368,16 +387,43 @@ void hybridEnsureInit(const SegmentorConfig& cfg) {
     st.validated_feat_dim = static_cast<uint32_t>(st.worker->feat_dim());
     st.validated_num_classes = static_cast<uint32_t>(st.worker->num_classes());
     st.init_checkpoint = cfg.lsk3dnet_checkpoint;
+
+    // 🛑 [FIX] 针对 RTX 5080 (Blackwell) 稳定性和性能修复
+    at::globalContext().setUserEnabledMkldnn(false);
+#if defined(TORCH_VERSION_MAJOR) && (TORCH_VERSION_MAJOR < 2)
+    torch::jit::setTensorExprFuserEnabled(false);
+#endif
+    torch::set_num_threads(1);
+
     st.classifier = torch::jit::load(cfg.lsk3dnet_classifier_torchscript);
     st.classifier.eval();
-    if (cfg.lsk3dnet_device.rfind("cuda", 0) == 0 && torch::cuda::is_available()) {
-        st.device = torch::Device(cfg.lsk3dnet_device);
-    } else {
-        st.device = torch::kCPU;
+    // Hard requirement: hybrid classifier must run on CUDA; if not, fail fast.
+    if (cfg.lsk3dnet_device.rfind("cuda", 0) != 0) {
+        throw std::runtime_error(
+            "lsk3dnet_hybrid requires CUDA device. Set semantic.lsk3dnet.device to 'cuda:0' (got '" + cfg.lsk3dnet_device + "')");
     }
+    const bool cuda_ok = torch::cuda::is_available();
+    if (!cuda_ok) {
+        std::ostringstream oss;
+        oss << "[SEMANTIC][LSK3DNET_HYBRID][FATAL] CUDA is NOT available in LibTorch runtime.\n"
+            << "  requested_device=" << cfg.lsk3dnet_device << "\n"
+            << "  torch_cuda_is_available=" << (cuda_ok ? "true" : "false") << "\n"
+            << "  torch_cuda_device_count=" << torch::cuda::device_count() << "\n"
+            << "  hint: ensure CUDA-capable LibTorch is installed and container has GPU access (--gpus all).";
+        std::cerr << oss.str() << std::endl;
+        throw std::runtime_error("lsk3dnet_hybrid requires CUDA, but torch::cuda::is_available()==false");
+    }
+    st.device = torch::Device(cfg.lsk3dnet_device);
     st.classifier.to(st.device);
     validateTorchscriptClassifier(st.classifier, st.device, static_cast<int>(st.validated_feat_dim),
                                   static_cast<int>(st.validated_num_classes));
+    RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+        "[SEMANTIC][LSK3DNET_HYBRID][LOAD] step=ok infer_dims=%d feat_dim=%u num_classes=%u device=%s meta_present=%d expected_ckpt_sha256=%s",
+        st.worker->input_dims(),
+        st.validated_feat_dim, st.validated_num_classes,
+        st.device.str().c_str(),
+        meta.present ? 1 : 0,
+        meta.checkpoint_sha256_hex.empty() ? "(none)" : meta.checkpoint_sha256_hex.c_str());
 }
 
 void inferFeaturesWithRecover(const std::vector<float>& pts, std::vector<float>* feat, torch::Device* out_dev) {
@@ -440,37 +486,142 @@ public:
             return;
         }
         const auto t0 = std::chrono::steady_clock::now();
+        if (cloud->empty()) {
+            mask = cv::Mat(cfg_.img_h, cfg_.img_w, CV_8U, cv::Scalar(0));
+            if (result) { result->success = true; result->message = "Empty cloud"; }
+            return;
+        }
 
-        const int c = input_dims_;
+    const int c = input_dims_;
         std::vector<float> pts(static_cast<size_t>(cloud->size()) * static_cast<size_t>(c), 0.0f);
         for (size_t i = 0; i < cloud->size(); ++i) {
             const auto& p = cloud->points[i];
             const size_t base = i * static_cast<size_t>(c);
-            pts[base + 0] = p.x;
-            pts[base + 1] = p.y;
-            pts[base + 2] = p.z;
-            if (c > 3) pts[base + 3] = p.intensity;
+            // 🏛️ [架构加固] 拒绝 NaN 点进入神经网络特征提取
+            if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) {
+                pts[base + 0] = 0.0f; pts[base + 1] = 0.0f; pts[base + 2] = 0.0f;
+            } else {
+                pts[base + 0] = p.x;
+                pts[base + 1] = p.y;
+                pts[base + 2] = p.z;
+            }
+            if (c > 3) pts[base + 3] = std::isfinite(p.intensity) ? p.intensity : 0.0f;
         }
 
         std::vector<float> feat;
         torch::Device infer_device{torch::kCPU};
-        detail_hybrid::inferFeaturesWithRecover(pts, &feat, &infer_device);
+        try {
+            detail_hybrid::inferFeaturesWithRecover(pts, &feat, &infer_device);
+        } catch (const std::exception& e) {
+            RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+                "[SEMANTIC][Hybrid] Feature extraction failed: %s", e.what());
+            if (result != nullptr) {
+                result->success = false;
+                result->message = std::string("Feature extraction error: ") + e.what();
+            }
+            return;
+        }
 
         torch::NoGradGuard no_grad;
-        auto tfeat = torch::from_blob(feat.data(), {static_cast<long>(cloud->size()), static_cast<long>(feat_dim_)}, torch::kFloat32)
-                         .clone()
-                         .to(infer_device);
         torch::Tensor logits;
-        {
+        try {
+            auto tfeat = torch::from_blob(feat.data(), {static_cast<long>(cloud->size()), static_cast<long>(feat_dim_)}, torch::kFloat32)
+                             .clone()
+                             .to(infer_device);
             detail_hybrid::HybridSharedState& st = detail_hybrid::hybridState();
             std::lock_guard<std::mutex> lock(st.mu);
+            if (!st.worker || st.validated_num_classes == 0 || st.validated_feat_dim == 0) {
+                throw std::runtime_error("Classifier state not initialized");
+            }
             logits = st.classifier.forward({tfeat}).toTensor().to(torch::kCPU);
+        } catch (const std::exception& e) {
+            RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+                "[SEMANTIC][Hybrid] Classifier inference failed: %s", e.what());
+            if (result != nullptr) {
+                result->success = false;
+                result->message = std::string("Inference error: ") + e.what();
+            }
+            return;
         }
         auto pred = logits.argmax(1).contiguous();
         if (static_cast<size_t>(pred.numel()) != cloud->size()) {
             throw std::runtime_error("lsk3dnet_hybrid: pred size mismatch");
         }
-        const int64_t* plab = pred.data_ptr<int64_t>();
+        
+        // --- [Ideal State Fix] 3D Label Consistency Filtering ---
+        // 1. Point-level raw labels
+        std::vector<int64_t> raw_labels(cloud->size());
+        const int64_t* pred_ptr = pred.data_ptr<int64_t>();
+        std::copy(pred_ptr, pred_ptr + cloud->size(), raw_labels.begin());
+
+        // 2. Spatial smoothing (Radius-based voting in a sparse grid)
+        // This eliminates salt-and-pepper noise from point-level classification.
+        std::vector<int64_t> smoothed_labels = raw_labels;
+        if (cloud->size() > 0) {
+            const float filter_radius = 0.5f; // meter
+            const int min_neighbors = 3;
+            
+            // Build a quick lookup grid for spatial consensus
+            struct VoxelKey {
+                int x, y, z;
+                bool operator==(const VoxelKey& o) const { return x == o.x && y == o.y && z == o.z; }
+            };
+            auto hash_fn = [](const VoxelKey& k) {
+                return std::hash<int>()(k.x) ^ (std::hash<int>()(k.y) << 1) ^ (std::hash<int>()(k.z) << 2);
+            };
+            std::unordered_map<VoxelKey, std::vector<size_t>, decltype(hash_fn)> grid(cloud->size() / 2, hash_fn);
+            
+            float inv_res = 1.0f / filter_radius;
+            for (size_t i = 0; i < cloud->size(); ++i) {
+                const auto& p = cloud->points[i];
+                VoxelKey key{static_cast<int>(std::floor(p.x * inv_res)),
+                             static_cast<int>(std::floor(p.y * inv_res)),
+                             static_cast<int>(std::floor(p.z * inv_res))};
+                grid[key].push_back(i);
+            }
+
+            #pragma omp parallel for
+            for (size_t i = 0; i < cloud->size(); ++i) {
+                const auto& p = cloud->points[i];
+                const int64_t my_label = raw_labels[i];
+                if (my_label == 0) continue; // Skip background/outliers if already 0
+
+                const VoxelKey key{static_cast<int>(std::floor(p.x * inv_res)),
+                                   static_cast<int>(std::floor(p.y * inv_res)),
+                                   static_cast<int>(std::floor(p.z * inv_res))};
+                
+                int same_label_count = 0;
+                int total_neighbors = 0;
+                
+                // Check current and 26 neighbor voxels
+                for (int dx = -1; dx <= 1; ++dx) {
+                    for (int dy = -1; dy <= 1; ++dy) {
+                        for (int dz = -1; dz <= 1; ++dz) {
+                            const VoxelKey search_key{key.x + dx, key.y + dy, key.z + dz};
+                            auto it = grid.find(search_key);
+                            if (it != grid.end()) {
+                                for (size_t neighbor_idx : it->second) {
+                                    const auto& np = cloud->points[neighbor_idx];
+                                    const float d2 = (p.x-np.x)*(p.x-np.x) + (p.y-np.y)*(p.y-np.y) + (p.z-np.z)*(p.z-np.z);
+                                    if (d2 < filter_radius * filter_radius) {
+                                        total_neighbors++;
+                                        if (raw_labels[neighbor_idx] == my_label) {
+                                            same_label_count++;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                // If the label is isolated (less than 30% consensus in 3D vicinity), suppress it
+                if (same_label_count < min_neighbors || static_cast<float>(same_label_count) / std::max(1, total_neighbors) < 0.3f) {
+                    smoothed_labels[i] = 0; 
+                }
+            }
+        }
+        const int64_t* plab = smoothed_labels.data();
 
         mask = cv::Mat(cfg_.img_h, cfg_.img_w, CV_8U, cv::Scalar(0));
         for (size_t i = 0; i < cloud->size(); ++i) {
@@ -486,7 +637,7 @@ public:
             const auto t1 = std::chrono::steady_clock::now();
             result->success = true;
             result->backend_name = name();
-            result->message = "ok";
+            result->message = std::string("device=") + infer_device.str();
             result->inference_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
         }
     }

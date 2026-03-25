@@ -221,11 +221,13 @@ void LoopDetector::init(rclcpp::Node::SharedPtr node) {
         "[OT] overlap_transformer.model_path (resolved)=%s (empty=use ScanContext only; grep [OT] for load/inference state)",
         model_path.empty() ? "(empty)" : model_path.c_str());
     if (!model_path.empty()) {
-        bool loaded = overlap_infer_.loadModel(model_path, true);
+        const bool ot_use_cuda = cfg.overlapUseCuda();
+        bool loaded = overlap_infer_.loadModel(model_path, ot_use_cuda);
         RCLCPP_INFO(node->get_logger(),
-            "[OT] load result: %s (from %s); loop closure descriptor=%s",
+            "[OT] load result: %s (from %s, use_cuda=%d); loop closure descriptor=%s",
             loaded ? "OK" : "FAIL_or_SKIP",
             model_path.c_str(),
+            ot_use_cuda ? 1 : 0,
             loaded ? "LibTorch (overlapTransformer.pt)" : (use_scancontext_ ? "ScanContext" : "fallback"));
         if (!loaded && !use_scancontext_ && cfg.loopAutoEnableScancontextOnOtFailure()) {
             use_scancontext_ = true;
@@ -428,7 +430,25 @@ void LoopDetector::descWorkerLoop() {
                     submap->id, queue_remaining, use_scancontext_ ? 1 : 0);
     }
 
-    computeDescriptorAsync(submap);
+    try {
+        computeDescriptorAsync(submap);
+    } catch (const std::exception& e) {
+        ALOG_ERROR(MOD, "[LOOP_DESC][EXCEPTION] desc_worker submap_id={} what={} (degrade: skip this submap descriptor)",
+                  submap->id, e.what());
+        if (node()) {
+            RCLCPP_ERROR(node()->get_logger(),
+                "[LOOP_DESC][EXCEPTION] desc_worker submap_id=%d what=%s (skip descriptor to keep process alive)",
+                submap->id, e.what());
+        }
+    } catch (...) {
+        ALOG_ERROR(MOD, "[LOOP_DESC][EXCEPTION] desc_worker submap_id={} unknown exception (degrade: skip this submap descriptor)",
+                  submap->id);
+        if (node()) {
+            RCLCPP_ERROR(node()->get_logger(),
+                "[LOOP_DESC][EXCEPTION] desc_worker submap_id=%d unknown exception (skip descriptor to keep process alive)",
+                submap->id);
+        }
+    }
     }
 }
 

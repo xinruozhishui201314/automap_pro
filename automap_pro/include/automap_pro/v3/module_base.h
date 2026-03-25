@@ -10,6 +10,8 @@
 #include <mutex>
 #include <condition_variable>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace automap_pro::v3 {
 
@@ -99,6 +101,16 @@ public:
      * @brief 检查模块是否空闲（队列为空）
      */
     virtual bool isIdle() const { return true; }
+
+    /**
+     * @brief 导出队列深度（用于 finish_mapping 卡滞诊断）
+     */
+    virtual std::vector<std::pair<std::string, size_t>> queueDepths() const { return {}; }
+
+    /**
+     * @brief 导出模块忙原因（用于 finish_mapping 卡滞诊断）
+     */
+    virtual std::string idleDetail() const { return ""; }
 
 protected:
     /**
