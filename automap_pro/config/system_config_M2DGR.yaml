@@ -123,7 +123,7 @@ semantic:
     # config_yaml / checkpoint / classifier_torchscript：可为绝对路径，或相对 repo_root
     # classifier：用 LSK3DNet-main/scripts/export_lsk3dnet_classifier_torchscript.py 从同一 checkpoint 导出
     repo_root: "${CMAKE_CURRENT_SOURCE_DIR}/thrid_party/LSK3DNet-main"
-    config_yaml: "config/lk-semantickitti_erk_finetune.yaml"
+    config_yaml: "config/lk-nuscenes_erk.yaml"
     checkpoint: "${CMAKE_CURRENT_SOURCE_DIR}/models/LSK3DNET/opensource_9ks_s030_w64_0.pt"
     classifier_torchscript: "${CMAKE_CURRENT_SOURCE_DIR}/models/LSK3DNET/lsk_classifier.ts"
     # python: "python3"   # hybrid 推荐: /root/automap_ws/install_deps/lsk3dnet_venv/bin/python3（AUTOMAP_SETUP_LSK3DNET_VENV=1 编译后）

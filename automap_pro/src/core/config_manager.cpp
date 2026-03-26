@@ -2,6 +2,7 @@
 #include "automap_pro/core/logger.h"
 #include "automap_pro/core/error_code.h"
 #include "automap_pro/core/error_monitor.h"
+#include "automap_pro/core/path_resolver.h"
 #include <rclcpp/rclcpp.hpp>
 #include <fstream>
 #include <sstream>
@@ -887,7 +888,7 @@ std::string ConfigManager::gpsTopic() const {
 
 std::string ConfigManager::overlapModelPath() const {
     if (!overlap_model_path_expanded_.empty()) return overlap_model_path_expanded_;
-    // 与 sensor 话题一致：get() 可能因路径解析返回默认值，优先从 flat 缓存取原始值再展开
+    
     std::string path;
     auto it = flat_params_cache_.find("loop_closure.overlap_transformer.model_path");
     if (it != flat_params_cache_.end() && !it->second.empty()) {
@@ -896,21 +897,8 @@ std::string ConfigManager::overlapModelPath() const {
         path = get<std::string>("loop_closure.overlap_transformer.model_path",
                                 "${CMAKE_CURRENT_SOURCE_DIR}/models/overlapTransformer.pt");
     }
-    if (path.empty()) return path;
-    const std::string var = "${CMAKE_CURRENT_SOURCE_DIR}";
-    size_t pos = path.find(var);
-    if (pos != std::string::npos) {
-        std::string cfg_dir = config_file_path_.empty() ? "." : config_file_path_;
-        if (!config_file_path_.empty()) {
-            for (int i = 0; i < 2 && !cfg_dir.empty(); ++i) {
-                size_t s = cfg_dir.find_last_of("/\\");
-                if (s == std::string::npos) break;
-                cfg_dir.resize(s);
-            }
-        }
-        path.replace(pos, var.size(), cfg_dir.empty() ? "." : cfg_dir);
-    }
-    return path;
+    
+    return PathResolver::resolve(path);
 }
 
 Eigen::Vector3d ConfigManager::gpsCovExcellent() const {

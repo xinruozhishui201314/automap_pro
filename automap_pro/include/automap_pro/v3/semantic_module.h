@@ -36,6 +36,12 @@ protected:
     void run() override;
 
 private:
+    [[noreturn]] void terminateSystemOnInferenceFailure(
+        const char* reason,
+        size_t worker_idx,
+        double ts,
+        uint64_t trace_id,
+        const std::string& detail = "");
     void processTask(const SyncedFrameEvent& event);
     void processTask(const SyncedFrameEvent& event, size_t worker_idx);
     void workerLoop(size_t worker_idx);

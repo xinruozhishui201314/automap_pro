@@ -26,6 +26,7 @@ which is included as part of this source code package.
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <nav_msgs/msg/path.hpp>
 #include <vikit/camera_loader.h>
+#include <automap_pro/msg/key_frame_info_msg.hpp>
 
 class LIVMapper
 {
@@ -36,6 +37,7 @@ public:
   void initializeComponents(rclcpp::Node::SharedPtr &node);
   void initializeFiles();
   void run(rclcpp::Node::SharedPtr &node);
+  void mapping_thread_fn();
   void gravityAlignment();
   void handleFirstFrame();
   void stateEstimationAndMapping();
@@ -58,9 +60,10 @@ public:
   void publish_frame_world(const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr &pubLaserCloudFullRes, VIOManagerPtr vio_manager);
   void publish_visual_sub_map(const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr &pubSubVisualMap);
   void publish_effect_world(const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr &pubLaserCloudEffect, const std::vector<PointToPlane> &ptpl_list);
-  void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr &pmavros_pose_publisherubOdomAftMapped);
+  void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr &pubOdomAftMapped);
   void publish_mavros(const rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr &mavros_pose_publisher);
   void publish_path(const rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr &pubPath);
+  void publish_keyframe_info(const rclcpp::Publisher<automap_pro::msg::KeyFrameInfoMsg>::SharedPtr &pubKFInfo, double timestamp);
   void readParameters(rclcpp::Node::SharedPtr &node);
   template <typename T> void set_posestamp(T &out);
   template <typename T> void pointBodyToWorld(const Eigen::Matrix<T, 3, 1> &pi, Eigen::Matrix<T, 3, 1> &po);
@@ -68,6 +71,9 @@ public:
   cv::Mat getImageFromMsg(const sensor_msgs::msg::Image::ConstSharedPtr &img_msg);
 
   std::mutex mtx_buffer, mtx_buffer_imu_prop;
+  std::mutex mtx_lidar;  // Fine-grained lock for LiDAR buffer
+  std::mutex mtx_imu;    // Fine-grained lock for IMU buffer
+  std::mutex mtx_img;    // Fine-grained lock for Image buffer
   std::condition_variable sig_buffer;
 
   SLAM_MODE slam_mode_;
@@ -181,6 +187,7 @@ public:
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudEffect;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudMap;
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped;
+  rclcpp::Publisher<automap_pro::msg::KeyFrameInfoMsg>::SharedPtr pubKFInfo;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudDyn;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudDynRmed;
@@ -189,6 +196,9 @@ public:
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr mavros_pose_publisher;
   // IMU 传播已改为数据触发（imu_cbk 内调用 imu_prop_callback），不再使用定时器
   rclcpp::Node::SharedPtr node;
+  rclcpp::CallbackGroup::SharedPtr callback_group_reentrant_;
+  std::thread mapping_thread_;
+  std::atomic<bool> mapping_thread_running_{false};
 
   int frame_num = 0;
   double aver_time_consu = 0;

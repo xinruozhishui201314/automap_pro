@@ -648,6 +648,7 @@ public:
     // ── 语义处理 ──────────────────────────────────────────
     // 语义模块强制默认开启：即使配置未提供该项也按开启处理
     bool        semanticEnabled()    const { return get<bool>("semantic.enabled", true); }
+    bool        semanticStrictMode() const { return get<bool>("semantic.strict_mode", false); }
     std::string semanticModelType()  const { return get<std::string>("semantic.model_type", "lsk3dnet"); }
     std::string semanticModelPath()  const { return get<std::string>("semantic.model_path", ""); }
     std::string semanticLsk3dnetModelPath() const { return get<std::string>("semantic.lsk3dnet.model_path", ""); }

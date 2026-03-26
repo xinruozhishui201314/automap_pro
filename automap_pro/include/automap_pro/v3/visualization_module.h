@@ -147,6 +147,9 @@ private:
         // 发布所有关键帧位姿
         rviz_publisher_.publishKeyframePoses(all_kf, snapshot);
 
+        // 发布语义地标（如树木圆柱体）
+        rviz_publisher_.publishSemanticLandmarks(all_sm);
+
         RCLCPP_INFO_THROTTLE(node_->get_logger(), *node_->get_clock(), 10000,
             "[V3][POSE_DIAG] Visualization published Everything: version=%lu sm=%zu kf=%zu aligned=%d",
             snapshot->version, all_sm.size(), all_kf.size(), snapshot->gps_aligned ? 1 : 0);

@@ -36,6 +36,7 @@
   <build_depend>Sophus</build_depend>
   <build_depend>eigen</build_depend>
   <build_depend>fmt</build_depend>
+  <build_depend>automap_pro</build_depend>
 
   <exec_depend>rclcpp</exec_depend>
   <exec_depend>rclpy</exec_depend>

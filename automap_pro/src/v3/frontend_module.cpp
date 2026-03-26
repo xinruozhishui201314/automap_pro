@@ -563,21 +563,36 @@ bool FrontEndModule::kfinfoCacheGet(double ts, LivoKeyFrameInfo& out_info) {
             ts);
         return false;
     }
+    
+    // 🏛️ [策略优化] 优先寻找 it->ts <= ts 的最新记录（满足因果性）
     const KFinfoCacheEntry* best = nullptr;
     for (auto it = kfinfo_cache_.rbegin(); it != kfinfo_cache_.rend(); ++it) {
         if (it->ts <= ts) { best = &(*it); break; }
     }
-    if (!best) {
-        kf_info_cache_no_leq_total_.fetch_add(1, std::memory_order_relaxed);
-        const double oldest = kfinfo_cache_.front().ts;
-        const double newest = kfinfo_cache_.back().ts;
-        RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 2000,
-            "[SEMANTIC][FrontEnd][KFINFO_CACHE] miss reason=no_leq ts_req=%.3f window=[%.3f,%.3f] size=%zu",
-            ts, oldest, newest, kfinfo_cache_.size());
-        return false;
+    
+    if (best) {
+        out_info = best->info;
+        return true;
     }
-    out_info = best->info;
-    return true;
+
+    // 🏛️ [策略优化] 如果请求时间比缓存中最老的还早，但在容忍范围内，使用最老的（系统启动初期）
+    const double oldest_ts = kfinfo_cache_.front().ts;
+    if (ts < oldest_ts) {
+        constexpr double kMaxStartTimeTolerance = 0.5;
+        if (oldest_ts - ts <= kMaxStartTimeTolerance) {
+            out_info = kfinfo_cache_.front().info;
+            RCLCPP_DEBUG_THROTTLE(node_->get_logger(), *node_->get_clock(), 2000,
+                "[SEMANTIC][FrontEnd][KFINFO_CACHE] using oldest for early ts=%.3f oldest=%.3f", ts, oldest_ts);
+            return true;
+        }
+    }
+
+    kf_info_cache_no_leq_total_.fetch_add(1, std::memory_order_relaxed);
+    const double newest = kfinfo_cache_.back().ts;
+    RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 2000,
+        "[SEMANTIC][FrontEnd][KFINFO_CACHE] miss reason=no_leq ts_req=%.3f window=[%.3f,%.3f] size=%zu",
+        ts, oldest_ts, newest, kfinfo_cache_.size());
+    return false;
 }
 
 } // namespace automap_pro::v3

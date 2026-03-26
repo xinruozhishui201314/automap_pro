@@ -61,6 +61,7 @@ void RvizPublisher::init(rclcpp::Node::SharedPtr node) {
     hba_result_pub_       = node->create_publisher<visualization_msgs::msg::MarkerArray>("/automap/hba_result", reliable_qos);
     convergence_pub_      = node->create_publisher<visualization_msgs::msg::MarkerArray>("/automap/convergence", reliable_qos);
     convergence_residual_pub_ = node->create_publisher<std_msgs::msg::Float64MultiArray>("/automap/convergence_residual", reliable_qos);
+    semantic_landmark_pub_ = node->create_publisher<visualization_msgs::msg::MarkerArray>("/automap/semantic_landmarks", reliable_qos);
 
     // Path（optimized_path / gps_keyframe_path 使用 TransientLocal，供 HBA 后自动启动的 VTK 查看器收最后一次发布）
     auto path_qos_latched = rclcpp::QoS(rclcpp::KeepLast(100)).reliable()
@@ -82,7 +83,7 @@ void RvizPublisher::init(rclcpp::Node::SharedPtr node) {
         "/automap/submap_bboxes, /automap/submap_graph, /automap/covariance_ellipses, /automap/factor_graph, /automap/gps_quality, /automap/gps_positions_map, "
         "/automap/module_status, /automap/coordinate_frames, /automap/active_region, /automap/degeneration_regions, /automap/hba_result, "
         "/automap/convergence, /automap/convergence_residual, /automap/odom_path, /automap/optimized_path, /automap/gps_raw_path, "
-        "/automap/gps_aligned_path, /automap/gps_keyframe_path, /automap/hba_gps_deviation, /automap/hba_trajectory_points, /automap/gps_trajectory_points, /automap/keyframe_poses");
+        "/automap/gps_aligned_path, /automap/gps_keyframe_path, /automap/hba_gps_deviation, /automap/hba_trajectory_points, /automap/gps_trajectory_points, /automap/keyframe_poses, /automap/semantic_landmarks");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -951,6 +952,74 @@ void RvizPublisher::publishDegenerationRegions(const std::vector<std::pair<doubl
         markers.markers.push_back(m);
     }
     degen_region_pub_->publish(markers);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 8. 语义信息可视化
+// ─────────────────────────────────────────────────────────────────────────────
+
+void RvizPublisher::publishSemanticLandmarks(const std::vector<SubMap::Ptr>& submaps) {
+    if (!node() || !semantic_landmark_pub_) return;
+
+    visualization_msgs::msg::MarkerArray markers;
+    // 首先删除所有旧的地标 Marker，防止残留
+    markers.markers.push_back(makeDeleteAllMarkers("semantic_landmarks").markers.front());
+    markers.markers.push_back(makeDeleteAllMarkers("semantic_labels").markers.front());
+
+    int marker_id = 0;
+    int label_id = 0;
+    for (const auto& sm : submaps) {
+        if (!sm) continue;
+        
+        // 每个子图都有自己的 landmarks (相对于子图锚点系)
+        for (const auto& lm : sm->landmarks) {
+            if (!lm || !lm->isValid()) continue;
+
+            // 将地标 root 变换到 map 系
+            Eigen::Vector3d root_map = sm->pose_map_anchor_optimized * lm->root;
+            Eigen::Vector3d ray_map = sm->pose_map_anchor_optimized.rotation() * lm->ray;
+
+            // 创建圆柱体 Marker (CYLINDER 类型)
+            visualization_msgs::msg::Marker cylinder;
+            cylinder.header.frame_id = frame_id_;
+            cylinder.header.stamp = node()->now();
+            cylinder.ns = "semantic_landmarks";
+            cylinder.id = marker_id++;
+            cylinder.type = visualization_msgs::msg::Marker::CYLINDER;
+            cylinder.action = visualization_msgs::msg::Marker::ADD;
+
+            // 设置圆柱体位姿（中心点位置）
+            // 注意：Marker::CYLINDER 的中心点在圆柱体几何中心。lm->root 通常是底部中心。
+            // 假设圆柱体高度为 5.0m (可视需求调整)
+            const double cylinder_height = 5.0;
+            Eigen::Vector3d center_map = root_map + ray_map * (cylinder_height * 0.5);
+            cylinder.pose.position.x = center_map.x();
+            cylinder.pose.position.y = center_map.y();
+            cylinder.pose.position.z = center_map.z();
+
+            // 设置方向（朝向 ray_map）
+            // 默认 CYLINDER 沿 Z 轴。我们需要旋转到 ray_map 方向。
+            Eigen::Quaterniond q = Eigen::Quaterniond::FromTwoVectors(Eigen::Vector3d::UnitZ(), ray_map);
+            cylinder.pose.orientation.x = q.x();
+            cylinder.pose.orientation.y = q.y();
+            cylinder.pose.orientation.z = q.z();
+            cylinder.pose.orientation.w = q.w();
+
+            // 设置尺寸
+            cylinder.scale.x = lm->radius * 2.0; // 直径
+            cylinder.scale.y = lm->radius * 2.0; // 直径
+            cylinder.scale.z = cylinder_height;   // 高度
+            
+            // 设置颜色（棕色/木头色）
+            cylinder.color = makeColor(0.54f, 0.27f, 0.07f, 0.8f);
+            markers.markers.push_back(cylinder);
+
+            // 添加置信度标签 (可选)
+            std::string label_text = "Tree_" + std::to_string(lm->id) + " (conf:" + std::to_string(static_cast<int>(lm->confidence * 100)) + "%)";
+            markers.markers.push_back(makeTextMarker("semantic_labels", label_id++, root_map + Eigen::Vector3d(0, 0, 2.0), label_text, 0.8));
+        }
+    }
+    semantic_landmark_pub_->publish(markers);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

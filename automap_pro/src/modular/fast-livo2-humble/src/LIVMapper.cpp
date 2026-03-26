@@ -40,6 +40,16 @@ inline std::string hostTimeString() {
   return std::string("[host: ") + s + "]";
 }
 
+inline bool rosContextAlive(const rclcpp::Node::SharedPtr& node) {
+  if (!node || !rclcpp::ok()) return false;
+  try {
+    auto ctx = node->get_node_base_interface()->get_context();
+    return ctx && ctx->is_valid();
+  } catch (...) {
+    return false;
+  }
+}
+
 // 分块 + 体素降采样（RGB）：避免单次 VoxelGrid 在大范围地图上出现 "Integer indices would overflow"。
 inline pcl::PointCloud<pcl::PointXYZRGB>::Ptr downsampleRgbChunkedSafe(
     const pcl::PointCloud<pcl::PointXYZRGB>::Ptr& cloud, float leaf_size) {
@@ -70,12 +80,7 @@ inline pcl::PointCloud<pcl::PointXYZRGB>::Ptr downsampleRgbChunkedSafe(
            dx > kMaxVoxelAxisIndex || dy > kMaxVoxelAxisIndex || dz > kMaxVoxelAxisIndex;
   };
 
-  const float mdx = (mm_max_x - mm_min_x) / leaf;
-  const float mdy = (mm_max_y - mm_min_y) / leaf;
-  const float mdz = (mm_max_z - mm_min_z) / leaf;
-  const bool merged_overflow =
-      !std::isfinite(mdx) || !std::isfinite(mdy) || !std::isfinite(mdz) ||
-      mdx > kMaxVoxelAxisIndex || mdy > kMaxVoxelAxisIndex || mdz > kMaxVoxelAxisIndex;
+  const bool merged_overflow = would_overflow(leaf);
 
   if (!merged_overflow) {
     auto out = std::make_shared<pcl::PointCloud<pcl::PointXYZRGB>>();
@@ -147,7 +152,14 @@ inline pcl::PointCloud<pcl::PointXYZRGB>::Ptr downsampleRgbChunkedSafe(
     mm_min_y = std::min(mm_min_y, p.y); mm_max_y = std::max(mm_max_y, p.y);
     mm_min_z = std::min(mm_min_z, p.z); mm_max_z = std::max(mm_max_z, p.z);
   }
-  if (!would_overflow(leaf)) {
+  const float fmdx = (mm_max_x - mm_min_x) / leaf;
+  const float fmdy = (mm_max_y - mm_min_y) / leaf;
+  const float fmdz = (mm_max_z - mm_min_z) / leaf;
+  const bool final_overflow =
+      !std::isfinite(fmdx) || !std::isfinite(fmdy) || !std::isfinite(fmdz) ||
+      fmdx > kMaxVoxelAxisIndex || fmdy > kMaxVoxelAxisIndex || fmdz > kMaxVoxelAxisIndex;
+
+  if (!final_overflow) {
     pcl::VoxelGrid<pcl::PointXYZRGB> vg_final;
     vg_final.setInputCloud(merged);
     vg_final.setLeafSize(leaf, leaf, leaf);
@@ -180,6 +192,7 @@ LIVMapper::LIVMapper(rclcpp::Node::SharedPtr &node, std::string node_name, const
     node = std::make_shared<rclcpp::Node>(node_name, options);
   }
   this->node = node;
+  callback_group_reentrant_ = this->node->create_callback_group(rclcpp::CallbackGroupType::Reentrant);
 
   extrinT.assign(3, 0.0);
   extrinR.assign(9, 0.0);
@@ -221,6 +234,10 @@ LIVMapper::LIVMapper(rclcpp::Node::SharedPtr &node, std::string node_name, const
 }
 
 LIVMapper::~LIVMapper() {
+  mapping_thread_running_ = false;
+  if (mapping_thread_.joinable()) {
+    mapping_thread_.join();
+  }
   savePCD();
 }
 
@@ -518,9 +535,13 @@ void LIVMapper::initializeFiles()
 void LIVMapper::initializeSubscribersAndPublishers(rclcpp::Node::SharedPtr &node, image_transport::ImageTransport &it_)
 {
   image_transport::ImageTransport it(this->node);
-  sub_pcl = this->node->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, 200000, std::bind(&LIVMapper::standard_pcl_cbk, this, std::placeholders::_1));
-  sub_imu = this->node->create_subscription<sensor_msgs::msg::Imu>(imu_topic, 200000, std::bind(&LIVMapper::imu_cbk, this, std::placeholders::_1));
-  sub_img = this->node->create_subscription<sensor_msgs::msg::Image>(img_topic, 200000, std::bind(&LIVMapper::img_cbk, this, std::placeholders::_1));
+  
+  auto sub_opt = rclcpp::SubscriptionOptions();
+  sub_opt.callback_group = callback_group_reentrant_;
+
+  sub_pcl = this->node->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, 200000, std::bind(&LIVMapper::standard_pcl_cbk, this, std::placeholders::_1), sub_opt);
+  sub_imu = this->node->create_subscription<sensor_msgs::msg::Imu>(imu_topic, 200000, std::bind(&LIVMapper::imu_cbk, this, std::placeholders::_1), sub_opt);
+  sub_img = this->node->create_subscription<sensor_msgs::msg::Image>(img_topic, 200000, std::bind(&LIVMapper::img_cbk, this, std::placeholders::_1), sub_opt);
   
   pubLaserCloudFullRes = this->node->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 100);
   pubNormal = this->node->create_publisher<visualization_msgs::msg::MarkerArray>("/visualization_marker", 100);
@@ -528,6 +549,7 @@ void LIVMapper::initializeSubscribersAndPublishers(rclcpp::Node::SharedPtr &node
   pubLaserCloudEffect = this->node->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_effected", 100);
   pubLaserCloudMap = this->node->create_publisher<sensor_msgs::msg::PointCloud2>("/Laser_map", 100);
   pubOdomAftMapped = this->node->create_publisher<nav_msgs::msg::Odometry>("/aft_mapped_to_init", 10);
+  pubKFInfo = this->node->create_publisher<automap_pro::msg::KeyFrameInfoMsg>("/fast_livo/keyframe_info", 10);
   pubPath = this->node->create_publisher<nav_msgs::msg::Path>("/path", 10);
   plane_pub = this->node->create_publisher<visualization_msgs::msg::Marker>("/planner_normal", 1);
   voxel_pub = this->node->create_publisher<visualization_msgs::msg::MarkerArray>("/voxels", 1);
@@ -545,7 +567,7 @@ void LIVMapper::initializeSubscribersAndPublishers(rclcpp::Node::SharedPtr &node
       lid_topic.c_str(), imu_topic.c_str(), img_topic.c_str());
   RCLCPP_INFO(this->node->get_logger(),
       "[fast_livo][TOPIC] publish: /cloud_registered, /visualization_marker, /cloud_visual_sub_map_before, /cloud_effected, "
-      "/Laser_map, /aft_mapped_to_init, /path, /planner_normal, /voxels, /dyn_obj, /dyn_obj_removed, /dyn_obj_dbg_hist, "
+      "/Laser_map, /aft_mapped_to_init, /fast_livo/keyframe_info, /path, /planner_normal, /voxels, /dyn_obj, /dyn_obj_removed, /dyn_obj_dbg_hist, "
       "/mavros/vision_pose/pose, /rgb_img, /LIVO2/imu_propagate, /planes");
 }
 
@@ -599,6 +621,11 @@ void LIVMapper::processImu()
 
 void LIVMapper::stateEstimationAndMapping() 
 {
+  if (!rosContextAlive(this->node)) {
+    RCLCPP_WARN(this->node->get_logger(),
+      "[fast_livo][SHUTDOWN_GUARD] skip stateEstimationAndMapping: ROS context already invalid");
+    return;
+  }
   switch (LidarMeasures.lio_vio_flg) 
   {
     case VIO:
@@ -664,6 +691,7 @@ void LIVMapper::handleVIO()
 
   publish_frame_world(pubLaserCloudFullRes, vio_manager);
   publish_img_rgb(pubImage, vio_manager);
+  publish_keyframe_info(pubKFInfo, LidarMeasures.last_lio_update_time);
 
   euler_cur = RotMtoEuler(_state.rot_end);
   if(mat_out_en && fout_out.is_open()) {
@@ -763,6 +791,7 @@ void LIVMapper::handleLIO()
   euler_cur = RotMtoEuler(_state.rot_end);
   geoQuat = tf::createQuaternionMsgFromRollPitchYaw(euler_cur(0), euler_cur(1), euler_cur(2));
   publish_odometry(pubOdomAftMapped);
+  publish_keyframe_info(pubKFInfo, LidarMeasures.last_lio_update_time);
 
   // 地图更新，计算点的协方差并更新体素地图。
   auto t3_wall = WallClock::now();
@@ -915,52 +944,67 @@ void LIVMapper::savePCD()
 
 void LIVMapper::run(rclcpp::Node::SharedPtr &node) 
 {
-  rclcpp::Rate rate(5000);
-  while (rclcpp::ok()) 
+  mapping_thread_running_ = true;
+  mapping_thread_ = std::thread(&LIVMapper::mapping_thread_fn, this);
+
+  // 使用多线程执行器来并行处理回调（话题接收、传播等）
+  // 线程数可根据需要调整，0 表示根据系统核心数自动分配
+  rclcpp::executors::MultiThreadedExecutor executor(rclcpp::ExecutorOptions(), 0);
+  executor.add_node(this->node);
+  executor.spin();
+
+  mapping_thread_running_ = false;
+  if (mapping_thread_.joinable()) {
+    mapping_thread_.join();
+  }
+}
+
+void LIVMapper::mapping_thread_fn()
+{
+  RCLCPP_INFO(this->node->get_logger(), "[fast_livo] mapping_thread started.");
+  
+  while (rclcpp::ok() && mapping_thread_running_) 
   {
-    try {
-      rclcpp::spin_some(this->node);
-    } catch (const std::exception& e) {
-      RCLCPP_WARN(
-        this->node->get_logger(),
-        "[fast_livo][SHUTDOWN_GUARD] spin_some exception during shutdown: %s; exit run loop.",
-        e.what());
-      break;
-    } catch (...) {
-      RCLCPP_WARN(
-        this->node->get_logger(),
-        "[fast_livo][SHUTDOWN_GUARD] spin_some unknown exception during shutdown; exit run loop.");
+    // 使用条件变量等待数据，替代 5000Hz 轮询，大幅降低 CPU 开销并提高响应速度
+    std::unique_lock<std::mutex> lock(mtx_buffer);
+    sig_buffer.wait_for(lock, std::chrono::milliseconds(20), [this] {
+      return !mapping_thread_running_ || 
+             (!lid_raw_data_buffer.empty() && !imu_buffer.empty() && (!img_en || !img_buffer.empty()));
+    });
+    lock.unlock();
+
+    if (!mapping_thread_running_) break;
+    if (!rosContextAlive(this->node)) {
+      RCLCPP_WARN(this->node->get_logger(),
+        "[fast_livo][SHUTDOWN_GUARD] mapping thread exits before processing: ROS context invalid");
       break;
     }
+
     if (!sync_packages(LidarMeasures)) 
     {
-      try {
-        if (!rclcpp::ok()) { break; }
-        rate.sleep();
-      } catch (const std::exception& e) {
-        RCLCPP_WARN(
-          this->node->get_logger(),
-          "[fast_livo][SHUTDOWN_GUARD] rate.sleep exception (likely invalid context): %s; exit run loop.",
-          e.what());
-        break;
-      } catch (...) {
-        RCLCPP_WARN(
-          this->node->get_logger(),
-          "[fast_livo][SHUTDOWN_GUARD] rate.sleep unknown exception; exit run loop.");
-        break;
-      }
+      // sync_packages 内部会处理更复杂的同步逻辑，如果同步失败则稍后重试
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
       continue;
     }
+
     try {
       handleFirstFrame();
       processImu();
       stateEstimationAndMapping();
     } catch (const std::exception& e) {
-      RCLCPP_ERROR(this->node->get_logger(), "[fast_livo][EXCEPTION] run loop: %s (continuing)", e.what());
+      const std::string err = e.what();
+      if (err.find("context is invalid") != std::string::npos) {
+        RCLCPP_WARN(this->node->get_logger(),
+          "[fast_livo][SHUTDOWN_GUARD] mapping thread got context invalid, stop immediately: %s", err.c_str());
+        mapping_thread_running_ = false;
+        break;
+      }
+      RCLCPP_ERROR(this->node->get_logger(), "[fast_livo][EXCEPTION] mapping thread: %s (continuing)", err.c_str());
     } catch (...) {
-      RCLCPP_ERROR(this->node->get_logger(), "[fast_livo][EXCEPTION] run loop: unknown exception (continuing)");
+      RCLCPP_ERROR(this->node->get_logger(), "[fast_livo][EXCEPTION] mapping thread: unknown exception (continuing)");
     }
   }
+  RCLCPP_INFO(this->node->get_logger(), "[fast_livo] mapping_thread exiting.");
   savePCD();
 }
 
@@ -1124,25 +1168,28 @@ void LIVMapper::RGBpointBodyLidarToIMU(PointType const *const pi, PointType *con
 
 void LIVMapper::standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &msg)
 {
-  // RCLCPP_INFO(this->node->get_logger(), "get point cloud at time: %.6f %s", stamp2Sec(msg->header.stamp), hostTimeString().c_str());
   if (!lidar_en) return;
-  mtx_buffer.lock();
 
   double cur_head_time = stamp2Sec(msg->header.stamp) + lidar_time_offset;
-  // RCLCPP_INFO(this->node->get_logger(), "get lidar at time: %.6f", cur_head_time);
-  // cout<<"got feature"<<endl;
-  if (cur_head_time < last_timestamp_lidar)
-  {
-    RCLCPP_ERROR(this->node->get_logger(),"lidar loop back, clear buffer");
-    lid_raw_data_buffer.clear();
-  }
+
+  // 1. 在锁外执行耗时的点云预处理，显著降低回调阻塞风险
   PointCloudXYZI::Ptr ptr(new PointCloudXYZI());
   p_pre->process(msg, ptr);
-  lid_raw_data_buffer.push_back(ptr);
-  lid_header_time_buffer.push_back(cur_head_time);
-  last_timestamp_lidar = cur_head_time;
 
-  mtx_buffer.unlock();
+  // 2. 使用细粒度锁仅保护 buffer 入队操作
+  {
+    std::lock_guard<std::mutex> lock(mtx_lidar);
+    if (cur_head_time < last_timestamp_lidar)
+    {
+      RCLCPP_ERROR(this->node->get_logger(),"lidar loop back, clear buffer");
+      lid_raw_data_buffer.clear();
+      lid_header_time_buffer.clear();
+    }
+    lid_raw_data_buffer.push_back(ptr);
+    lid_header_time_buffer.push_back(cur_head_time);
+    last_timestamp_lidar = cur_head_time;
+  }
+
   sig_buffer.notify_all();
 }
 
@@ -1171,41 +1218,38 @@ void LIVMapper::imu_cbk(const sensor_msgs::msg::Imu::ConstSharedPtr &msg_in)
   if (ros_driver_fix_en) timestamp += std::round(last_timestamp_lidar - timestamp);
   msg->header.stamp = sec2Stamp(timestamp);
 
-  mtx_buffer.lock();
-
-  if (last_timestamp_imu > 0.0 && timestamp < last_timestamp_imu)
   {
-    mtx_buffer.unlock();
-    sig_buffer.notify_all();
-    RCLCPP_ERROR(this->node->get_logger(), "imu loop back, offset: %lf %s", last_timestamp_imu - timestamp, hostTimeString().c_str());
-    return;
+    std::lock_guard<std::mutex> lock(mtx_imu);
+
+    if (last_timestamp_imu > 0.0 && timestamp < last_timestamp_imu)
+    {
+      RCLCPP_ERROR(this->node->get_logger(), "imu loop back, offset: %lf %s", last_timestamp_imu - timestamp, hostTimeString().c_str());
+      return;
+    }
+
+    if (last_timestamp_imu > 0.0 && timestamp > last_timestamp_imu + 1.0)
+    {
+      RCLCPP_WARN(this->node->get_logger(), "imu time stamp Jumps %0.4lf seconds %s. Re-syncing last_timestamp_imu.", timestamp - last_timestamp_imu, hostTimeString().c_str());
+    }
+
+    last_timestamp_imu = timestamp;
+    imu_buffer.push_back(msg);
   }
 
-  if (last_timestamp_imu > 0.0 && timestamp > last_timestamp_imu + 0.2)
-  {
-    RCLCPP_WARN(this->node->get_logger(), "imu time stamp Jumps %0.4lf seconds %s", timestamp - last_timestamp_imu, hostTimeString().c_str());
-    mtx_buffer.unlock();
-    sig_buffer.notify_all();
-    return;
-  }
-
-  last_timestamp_imu = timestamp;
-
-  imu_buffer.push_back(msg);
-  if (should_log) {
-    // RCLCPP_INFO(this->node->get_logger(), "get imu at time: %.6f, imu size %zu %s", t, imu_buffer.size(), hostTimeString().c_str());
-  }
-  mtx_buffer.unlock();
   if (imu_prop_enable)
   {
-    mtx_buffer_imu_prop.lock();
-    if (imu_prop_enable && !p_imu->imu_need_init) { prop_imu_buffer.push_back(*msg); }
+    std::lock_guard<std::mutex> lock_prop(mtx_buffer_imu_prop);
+    if (!p_imu->imu_need_init) { prop_imu_buffer.push_back(*msg); }
     newest_imu = *msg;
     new_imu = true;
-    mtx_buffer_imu_prop.unlock();
-    // 数据触发：收到 IMU 即执行一次传播，不依赖定时器
+    // Note: imu_prop_callback() is called after releasing the lock
+  }
+  
+  if (imu_prop_enable)
+  {
     imu_prop_callback();
   }
+
   sig_buffer.notify_all();
 }
 
@@ -1247,29 +1291,23 @@ void LIVMapper::img_cbk(const sensor_msgs::msg::Image::ConstSharedPtr &msg_in)
     return;
   }
 
-  mtx_buffer.lock();
-
-  double img_time_correct = msg_header_time; // last_timestamp_lidar + 0.105;
-
-  if (img_time_correct - last_timestamp_img < 0.02)
   {
-    RCLCPP_WARN(this->node->get_logger(), "Image need Jumps: %.6f", img_time_correct);
-    mtx_buffer.unlock();
-    sig_buffer.notify_all();
-    return;
+    std::lock_guard<std::mutex> lock(mtx_img);
+
+    double img_time_correct = msg_header_time; // last_timestamp_lidar + 0.105;
+
+    if (img_time_correct - last_timestamp_img < 0.02)
+    {
+      RCLCPP_WARN(this->node->get_logger(), "Image need Jumps: %.6f", img_time_correct);
+      return;
+    }
+
+    cv::Mat img_cur = getImageFromMsg(msg);
+    img_buffer.push_back(img_cur);
+    img_time_buffer.push_back(img_time_correct);
+
+    last_timestamp_img = img_time_correct;
   }
-
-  cv::Mat img_cur = getImageFromMsg(msg);
-  img_buffer.push_back(img_cur);
-  img_time_buffer.push_back(img_time_correct);
-
-  // ROS_INFO("Correct Image time: %.6f", img_time_correct);
-
-  last_timestamp_img = img_time_correct;
-  // cv::imshow("img", img);
-  // cv::waitKey(1);
-  // cout<<"last_timestamp_img:::"<<last_timestamp_img<<endl;
-  mtx_buffer.unlock();
   sig_buffer.notify_all();
 }
 
@@ -1290,6 +1328,9 @@ void LIVMapper::img_cbk(const sensor_msgs::msg::Image::ConstSharedPtr &msg_in)
 // 在进行VIO过程中，last_lio_update_time就是此次要使用的相机时间戳，此时last_lio_update_time = lio_time = vio_time
 bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
 {
+  // 使用 scoped_lock 同时锁定所有传感器 buffer，确保同步逻辑在一致的快照下运行，同时避免死锁
+  std::scoped_lock lock(mtx_lidar, mtx_imu, mtx_img);
+
   if (lid_raw_data_buffer.empty() && lidar_en) return false;
   if (img_buffer.empty() && img_en) return false;
   if (imu_buffer.empty() && imu_en) return false;
@@ -1328,7 +1369,6 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
 
     m.imu.clear();
     m.lio_time = meas.lidar_frame_end_time;
-    mtx_buffer.lock();
     while (!imu_buffer.empty())
     {
       if (stamp2Sec(imu_buffer.front()->header.stamp) > meas.lidar_frame_end_time) break;
@@ -1337,7 +1377,6 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
     }
     lid_raw_data_buffer.pop_front();
     lid_header_time_buffer.pop_front();
-    mtx_buffer.unlock();
     sig_buffer.notify_all();
 
     meas.lio_vio_flg = LIO; // process lidar topic, so timestamp should be lidar scan end.
@@ -1394,7 +1433,6 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
       m.imu.clear();
       // lio_time是相机时间戳
       m.lio_time = img_capture_time;
-      mtx_buffer.lock();
       // 只要上次雷达更新之后，到这次image图像之间的imu数据。
       while (!imu_buffer.empty())
       {
@@ -1404,7 +1442,6 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
 
         imu_buffer.pop_front();
       }
-      mtx_buffer.unlock();
       sig_buffer.notify_all();
       // 将上次切割剩下一半的点云转移到当前的队列
       *(meas.pcl_proc_cur) = *(meas.pcl_proc_next);
@@ -1466,11 +1503,9 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
       m.vio_time = img_capture_time;
       m.lio_time = meas.last_lio_update_time;
       m.img = img_buffer.front();
-      mtx_buffer.lock();
 
       img_buffer.pop_front();
       img_time_buffer.pop_front();
-      mtx_buffer.unlock();
       sig_buffer.notify_all();
       meas.measures.push_back(m);
       lidar_pushed = false; // after VIO update, the _lidar_frame_end_time will be refresh.
@@ -1501,10 +1536,8 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
     }
     struct MeasureGroup m; // standard method to keep imu message.
     m.lio_time = meas.lidar_frame_end_time;
-    mtx_buffer.lock();
     lid_raw_data_buffer.pop_front();
     lid_header_time_buffer.pop_front();
-    mtx_buffer.unlock();
     sig_buffer.notify_all();
     lidar_pushed = false; // sync one whole lidar scan.
     meas.lio_vio_flg = LO; // process lidar topic, so timestamp should be lidar scan end.
@@ -1520,10 +1553,12 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
   }
   }
   RCLCPP_ERROR(this->node->get_logger(), "out sync");
+  return false;
 }
 
 void LIVMapper::publish_img_rgb(const image_transport::Publisher &pubImage, VIOManagerPtr vio_manager)
 {
+  if (!rosContextAlive(this->node)) return;
   cv::Mat img_rgb = vio_manager->img_cp;
   cv_bridge::CvImage out_msg;
   out_msg.header.stamp = this->node->get_clock()->now();
@@ -1827,4 +1862,21 @@ void LIVMapper::publish_path(const rclcpp::Publisher<nav_msgs::msg::Path>::Share
   msg_body_pose.header.frame_id = "camera_init";
   path.poses.push_back(msg_body_pose);
   pubPath->publish(path);
+}
+
+void LIVMapper::publish_keyframe_info(const rclcpp::Publisher<automap_pro::msg::KeyFrameInfoMsg>::SharedPtr &pubKFInfo, double timestamp)
+{
+  automap_pro::msg::KeyFrameInfoMsg kf_info;
+  kf_info.timestamp = timestamp;
+  kf_info.esikf_covariance_norm = _state.cov.norm();
+  kf_info.is_degenerate = false; // FIXME: check if we can detect degeneracy in fast_livo
+  kf_info.cloud_point_count = feats_down_size;
+  kf_info.cloud_valid = true;
+  kf_info.gyro_bias[0] = _state.bias_g[0];
+  kf_info.gyro_bias[1] = _state.bias_g[1];
+  kf_info.gyro_bias[2] = _state.bias_g[2];
+  kf_info.accel_bias[0] = _state.bias_a[0];
+  kf_info.accel_bias[1] = _state.bias_a[1];
+  kf_info.accel_bias[2] = _state.bias_a[2];
+  pubKFInfo->publish(kf_info);
 }

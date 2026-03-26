@@ -119,9 +119,17 @@ SemanticProcessor::SemanticProcessor(const Config& config) : config_(config) {
         instance_detector_->set_params(params);
         
         RCLCPP_INFO(rclcpp::get_logger("automap_system"), 
-            "[SEMANTIC][Processor][INIT] step=ok backend=%s model_path=%s fov=[%.1f,%.1f] img=%dx%d input_channels=%d num_classes=%d tree_class_id=%d",
-            segmentor_->name(), config.model_path.c_str(), config.fov_up, config.fov_down, config.img_w, config.img_h,
+            "[SEMANTIC][Processor][INIT] step=ok backend=%s model_type=%s fov=[%.1f,%.1f] img=%dx%d input_channels=%d num_classes=%d tree_class_id=%d",
+            segmentor_->name(), config.model_type.c_str(), config.fov_up, config.fov_down, config.img_w, config.img_h,
             config.input_channels, config.num_classes, config.tree_class_id);
+        
+        if (config.model_type == "lsk3dnet_hybrid") {
+            RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                "[SEMANTIC][Processor][INIT_HYBRID] checkpoint=%s classifier=%s python=%s worker=%s",
+                config.lsk3dnet_checkpoint.c_str(), config.lsk3dnet_classifier_torchscript.c_str(),
+                config.lsk3dnet_python_exe.c_str(), config.lsk3dnet_worker_script.c_str());
+        }
+
         RCLCPP_INFO(rclcpp::get_logger("automap_system"),
             "[SEMANTIC][Processor][INIT_DIAG] cluster(thr=%.3f max_dist=%.3f min_vertex=%d min_landmark_size=%d min_height=%.2f profile=%s input_mode=%s) trellis(min_cluster_points=%d min_tree_vertices=%d) diag(detailed=%d class_hist=%d topk=%d interval=%d override_tree_class_id=%d)",
             config_.beam_cluster_threshold, config_.max_dist_to_centroid, config_.min_vertex_size,
@@ -132,8 +140,8 @@ SemanticProcessor::SemanticProcessor(const Config& config) : config_(config) {
             config_.diag_class_hist_top_k, config_.diag_class_hist_interval_frames, config_.diag_override_tree_class_id);
     } catch (const std::exception& e) {
         RCLCPP_ERROR(rclcpp::get_logger("automap_system"), 
-            "[SEMANTIC][Processor][INIT] step=FAILED model_path=%s error=%s → abort startup",
-            config.model_path.c_str(), e.what());
+            "[SEMANTIC][Processor][INIT] step=FAILED model_type=%s error=%s → abort startup",
+            config.model_type.c_str(), e.what());
         throw std::runtime_error(std::string("SemanticProcessor init failed: ") + e.what());
     }
 }
@@ -162,10 +170,16 @@ std::vector<CylinderLandmark::Ptr> SemanticProcessor::process(const CloudXYZICon
 
     try {
         const auto t0 = std::chrono::steady_clock::now();
-        RCLCPP_DEBUG(rclcpp::get_logger("automap_system"),
-            "[SEMANTIC][Processor][process] step=input_snapshot cloud_size=%zu cloud_wh=%ux%u expected_mask_wh=%dx%d",
-            cloud->size(), cloud->width, cloud->height, config_.img_w, config_.img_h);
-        if (config_.diag_enable_detailed_stats) {
+        const auto processed_idx = processed_frames_.load(std::memory_order_relaxed);
+        
+        if (processed_idx <= 5 || (processed_idx % 100 == 0)) {
+            RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                "[SEMANTIC][Processor][process] step=input_start frame=%lu cloud_size=%zu cloud_wh=%ux%u expected_mask_wh=%dx%d",
+                static_cast<unsigned long>(processed_idx),
+                cloud->size(), cloud->width, cloud->height, config_.img_w, config_.img_h);
+        }
+
+        if (config_.diag_enable_detailed_stats || processed_idx <= 2) {
             double x_min = std::numeric_limits<double>::infinity();
             double x_max = -std::numeric_limits<double>::infinity();
             double y_min = std::numeric_limits<double>::infinity();
@@ -248,6 +262,20 @@ std::vector<CylinderLandmark::Ptr> SemanticProcessor::process(const CloudXYZICon
                 seg_result.message.empty() ? "(none)" : seg_result.message.c_str(),
                 mask.cols, mask.rows,
                 flipped_cloud->size());
+        }
+        if (!seg_result.success) {
+            std::ostringstream os;
+            os << "segmentation_inference_failed"
+               << " frame=" << static_cast<unsigned long>(processed)
+               << " backend=" << (seg_result.backend_name.empty() ? "(unknown)" : seg_result.backend_name)
+               << " infer_ms=" << std::fixed << std::setprecision(2) << seg_result.inference_ms
+               << " msg=" << (seg_result.message.empty() ? "(none)" : seg_result.message)
+               << " cloud_pts=" << flipped_cloud->size()
+               << " mask_wh=" << mask.cols << "x" << mask.rows;
+            RCLCPP_FATAL(rclcpp::get_logger("automap_system"),
+                "[SEMANTIC][Processor][INFER_CHAIN_ERROR] %s",
+                os.str().c_str());
+            throw std::runtime_error(os.str());
         }
 
         const bool log_class_hist = config_.diag_log_class_histogram;
@@ -417,6 +445,90 @@ std::vector<CylinderLandmark::Ptr> SemanticProcessor::process(const CloudXYZICon
         segmentor_->maskCloud(flipped_cloud, mask, tree_cloud, tree_label, dense_for_clustering);
         const auto t3 = std::chrono::steady_clock::now();
         ++processed_frames_;
+        // Inference explainability log: class -> point count and sampled points.
+        // This helps diagnose "segmentation has classes but downstream has no landmarks".
+        if (config_.diag_enable_detailed_stats &&
+            (processed_frames_.load(std::memory_order_relaxed) <= 10 ||
+             (processed_frames_.load(std::memory_order_relaxed) % static_cast<uint64_t>(config_.diag_class_hist_interval_frames) == 0))) {
+            const double fov_up_rad = static_cast<double>(config_.fov_up) * M_PI / 180.0;
+            const double fov_down_rad = static_cast<double>(config_.fov_down) * M_PI / 180.0;
+            const double fov_rad = std::abs(fov_up_rad) + std::abs(fov_down_rad);
+            const int configured_sample_limit = config_.diag_dump_points_per_class_limit;
+            const int sample_limit = (configured_sample_limit < 0)
+                ? 8  // guardrail: avoid huge per-frame logs when configured as dump-all
+                : std::max(0, std::min(configured_sample_limit, 16));
+
+            struct PerClassStats {
+                uint64_t point_count{0};
+                std::vector<pcl::PointXYZI> samples;
+            };
+            std::unordered_map<int, PerClassStats> class_stats;
+            class_stats.reserve(32);
+
+            for (const auto& p : flipped_cloud->points) {
+                if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) continue;
+                const double range = std::sqrt(static_cast<double>(p.x) * p.x +
+                                               static_cast<double>(p.y) * p.y +
+                                               static_cast<double>(p.z) * p.z);
+                if (!(range > 1e-6)) continue;
+
+                const double yaw = -std::atan2(static_cast<double>(p.y), static_cast<double>(p.x));
+                const double sin_pitch = std::clamp(static_cast<double>(p.z) / range, -1.0, 1.0);
+                const double pitch = std::asin(sin_pitch);
+
+                int proj_x = static_cast<int>(std::floor(0.5 * (yaw / M_PI + 1.0) * static_cast<double>(config_.img_w)));
+                int proj_y = static_cast<int>(std::floor((1.0 - (pitch + std::abs(fov_down_rad)) / std::max(1e-6, fov_rad)) *
+                                                         static_cast<double>(config_.img_h)));
+                proj_x = std::clamp(proj_x, 0, config_.img_w - 1);
+                proj_y = std::clamp(proj_y, 0, config_.img_h - 1);
+
+                const int cls = static_cast<int>(mask.at<uint8_t>(proj_y, proj_x));
+                auto& st = class_stats[cls];
+                ++st.point_count;
+                if (sample_limit > 0 && static_cast<int>(st.samples.size()) < sample_limit) {
+                    st.samples.push_back(p);
+                }
+            }
+
+            std::vector<std::pair<int, PerClassStats>> sorted_stats;
+            sorted_stats.reserve(class_stats.size());
+            for (const auto& kv : class_stats) sorted_stats.push_back(kv);
+            std::sort(sorted_stats.begin(), sorted_stats.end(),
+                      [](const auto& a, const auto& b) { return a.second.point_count > b.second.point_count; });
+
+            std::ostringstream class_count_os;
+            const size_t max_classes_to_log = std::min<size_t>(sorted_stats.size(), 12);
+            for (size_t i = 0; i < max_classes_to_log; ++i) {
+                if (i > 0) class_count_os << ", ";
+                class_count_os << sorted_stats[i].first << ":" << sorted_stats[i].second.point_count;
+            }
+            RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                "[SEMANTIC][Processor][INFER_RESULT] frame=%lu classes=%zu top_class_points=[%s] tree_label=%d sample_limit=%d",
+                static_cast<unsigned long>(processed_frames_.load(std::memory_order_relaxed)),
+                sorted_stats.size(),
+                class_count_os.str().c_str(),
+                tree_label,
+                sample_limit);
+
+            for (size_t i = 0; i < max_classes_to_log; ++i) {
+                const int cls = sorted_stats[i].first;
+                const auto& st = sorted_stats[i].second;
+                std::ostringstream pts_os;
+                for (size_t j = 0; j < st.samples.size(); ++j) {
+                    if (j > 0) pts_os << " ";
+                    const auto& sp = st.samples[j];
+                    pts_os << "(" << std::fixed << std::setprecision(2)
+                           << sp.x << "," << sp.y << "," << sp.z << ",i=" << sp.intensity << ")";
+                }
+                RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                    "[SEMANTIC][Processor][CLASS_POINTS_SAMPLED] frame=%lu class=%d point_count=%lu samples=%zu pts=%s",
+                    static_cast<unsigned long>(processed_frames_.load(std::memory_order_relaxed)),
+                    cls,
+                    static_cast<unsigned long>(st.point_count),
+                    st.samples.size(),
+                    st.samples.empty() ? "(none)" : pts_os.str().c_str());
+            }
+        }
         if (config_.diag_enable_detailed_stats || dense_for_clustering) {
             const bool organized = (tree_cloud->height > 1 && tree_cloud->width > 1 &&
                                     tree_cloud->size() == static_cast<size_t>(tree_cloud->height) * static_cast<size_t>(tree_cloud->width));
@@ -595,6 +707,60 @@ std::vector<CylinderLandmark::Ptr> SemanticProcessor::process(const CloudXYZICon
                 static_cast<unsigned long>(empty_fit), empty_fit_ratio,
                 tree_cloud->size(), tree_clusters.size(), landmarks.size(),
                 input_filter_ms, seg_ms, mask_ms, cluster_ms, fit_ms);
+            // Root-cause oriented anomaly summary for full semantic chain.
+            if (processed_total >= 20 &&
+                (empty_fit_ratio >= 90.0 || empty_cluster_ratio >= 70.0 || empty_tree_ratio >= 70.0)) {
+                const char* dominant_reason = "fit_failed";
+                double dominant_ratio = empty_fit_ratio;
+                if (empty_cluster_ratio > dominant_ratio) {
+                    dominant_reason = "cluster_empty";
+                    dominant_ratio = empty_cluster_ratio;
+                }
+                if (empty_tree_ratio > dominant_ratio) {
+                    dominant_reason = "tree_points_empty";
+                    dominant_ratio = empty_tree_ratio;
+                }
+
+                const double total_ms = input_filter_ms + seg_ms + mask_ms + cluster_ms + fit_ms;
+                const char* bottleneck_stage = "seg";
+                double bottleneck_ms = seg_ms;
+                if (cluster_ms > bottleneck_ms) {
+                    bottleneck_stage = "cluster";
+                    bottleneck_ms = cluster_ms;
+                }
+                if (fit_ms > bottleneck_ms) {
+                    bottleneck_stage = "fit";
+                    bottleneck_ms = fit_ms;
+                }
+                if (mask_ms > bottleneck_ms) {
+                    bottleneck_stage = "mask";
+                    bottleneck_ms = mask_ms;
+                }
+                if (input_filter_ms > bottleneck_ms) {
+                    bottleneck_stage = "filter";
+                    bottleneck_ms = input_filter_ms;
+                }
+
+                RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+                    "[SEMANTIC][Processor][CHAIN_ANOMALY] processed=%lu dominant_reason=%s ratio=%.1f%% "
+                    "ratios(empty_tree=%.1f%% empty_cluster=%.1f%% empty_fit=%.1f%%) "
+                    "latest(tree_pts=%zu clusters=%zu fitted=%zu tree_label=%d) "
+                    "bottleneck=%s(%.1fms/%.1fms total) "
+                    "reason_code=E_SEMANTIC_CHAIN_ANOMALY",
+                    static_cast<unsigned long>(processed_total),
+                    dominant_reason,
+                    dominant_ratio,
+                    empty_tree_ratio,
+                    empty_cluster_ratio,
+                    empty_fit_ratio,
+                    tree_cloud->size(),
+                    tree_clusters.size(),
+                    landmarks.size(),
+                    tree_label,
+                    bottleneck_stage,
+                    bottleneck_ms,
+                    total_ms);
+            }
             if (config_.diag_enable_detailed_stats) {
                 const double total_ms = input_filter_ms + seg_ms + mask_ms + cluster_ms + fit_ms;
                 RCLCPP_INFO(rclcpp::get_logger("automap_system"),
@@ -610,16 +776,13 @@ std::vector<CylinderLandmark::Ptr> SemanticProcessor::process(const CloudXYZICon
         consecutive_failures_.store(0, std::memory_order_relaxed);
     } catch (const std::exception& e) {
         const size_t failures = consecutive_failures_.fetch_add(1, std::memory_order_relaxed) + 1;
-        RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
-            "[SEMANTIC][Processor][process] step=EXCEPTION error=%s cloud_size=%zu cloud_wh=%ux%u cfg(mask_wh=%dx%d input_ch=%d classes=%d tree_class=%d) consecutive_failures=%zu",
+        RCLCPP_FATAL(rclcpp::get_logger("automap_system"),
+            "[SEMANTIC][Processor][process] FATAL EXCEPTION error=%s cloud_size=%zu cloud_wh=%ux%u cfg(mask_wh=%dx%d input_ch=%d classes=%d tree_class=%d) consecutive_failures=%zu",
             e.what(), cloud ? cloud->size() : 0, cloud ? cloud->width : 0, cloud ? cloud->height : 0,
             config_.img_w, config_.img_h, config_.input_channels, config_.num_classes, config_.tree_class_id, failures);
-        if (failures >= kMaxConsecutiveFailures) {
-            runtime_disabled_.store(true, std::memory_order_relaxed);
-            RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
-                "[SEMANTIC][Processor][process] step=DISABLED reason=too_many_exceptions threshold=%zu",
-                kMaxConsecutiveFailures);
-        }
+        
+        // 🏛️ [架构加固] 满足用户契约：重新抛出异常，让上层 SemanticModule 触发进程退出
+        throw;
     }
 
     return landmarks;

@@ -14,6 +14,16 @@ else()
 endif()
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -Wno-unused-parameter -Wno-deprecated-declarations")
 
+# Fix for Ubuntu 24.04 (Noble) + CUDA: _Float128 not declared in system headers when using nvcc
+if(EXISTS "/etc/os-release")
+  file(READ "/etc/os-release" OS_RELEASE)
+  if(OS_RELEASE MATCHES "noble")
+    message(STATUS "[automap_pro] Ubuntu Noble detected: applying _Float128 workaround for CUDA")
+    add_definitions(-D_Float128=__float128)
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -D_Float128=__float128")
+  endif()
+endif()
+
 # ──────────────────────────────────────────────────────────
 # ROS2 基础依赖
 # ──────────────────────────────────────────────────────────
@@ -633,6 +643,7 @@ endif()
 # ──────────────────────────────────────────────────────────
 set(AUTOMAP_AMENT_DEPS
   rclcpp rclcpp_components rclcpp_action
+  ament_index_cpp
   std_msgs std_srvs sensor_msgs geometry_msgs nav_msgs visualization_msgs
   tf2 tf2_ros tf2_eigen
   pcl_ros pcl_conversions cv_bridge image_transport message_filters

@@ -37,8 +37,11 @@ fi
 
 MARKER="${VENV_DIR}/.lsk3dnet_venv_ok"
 if [[ "${LSK_SKIP_IF_OK:-0}" = "1" ]] && [[ -f "${MARKER}" ]] && [[ -x "${VENV_DIR}/bin/python3" ]]; then
-  echo "[INFO] LSK3DNet venv 已就绪（${MARKER}），跳过 setup"
-  exit 0
+  if "${VENV_DIR}/bin/python3" -c "import torch, spconv.pytorch, torch_scatter, cv2" >/dev/null 2>&1; then
+    echo "[INFO] LSK3DNet venv 已就绪（${MARKER}），跳过 setup"
+    exit 0
+  fi
+  echo "[WARN] LSK3DNet venv marker 存在但关键依赖缺失（含 cv2），将执行修复安装"
 fi
 
 BASE_PY="${LSK_VENV_BASE_PYTHON:-python3}"
@@ -69,21 +72,43 @@ resolve_cuda_tag() {
   case "${ver}" in
     11.*) echo "cu118" ;;
     12.0|12.1|12.2|12.3) echo "cu121" ;;
+    12.8*) echo "cu128" ;;
     *) echo "cu124" ;;
   esac
 }
 
 CUDA_TAG="$(resolve_cuda_tag)"
-TORCH_VER="${LSK_TORCH_VER:-2.5.1}"
+# Blackwell (sm_120) requires PyTorch 2.6+ (or 2.7+ for cu128 wheels)
+DEFAULT_TORCH_VER="2.5.1"
+if [[ "${CUDA_TAG}" == "cu128" ]]; then
+  DEFAULT_TORCH_VER="2.7.0"
+fi
+TORCH_VER="${LSK_TORCH_VER:-${DEFAULT_TORCH_VER}}"
+
+# Blackwell Fix: spconv does not have cu128 binary wheels yet.
+# Use cu126 (latest available) which is compatible with 12.8 drivers.
+SPCONV_PKG="spconv-${CUDA_TAG}"
+if [[ "${CUDA_TAG}" == "cu128" ]]; then
+  SPCONV_PKG="spconv-cu126" # Latest stable for 12.x
+fi
+
 if [[ -n "${LSK_PYTORCH_WHL_INDEX:-}" ]]; then
   PYTORCH_WHL_INDEX="${LSK_PYTORCH_WHL_INDEX}"
 else
   _PT_BASE="${LSK_PYTORCH_WHL_INDEX_DEFAULT_BASE:-https://mirror.sjtu.edu.cn/pytorch-wheels}"
   PYTORCH_WHL_INDEX="${_PT_BASE}/${CUDA_TAG}"
 fi
-SPCONV_PKG="spconv-${CUDA_TAG}"
 _PYG_BASE="${AUTOMAP_PYG_WHEEL_BASE:-https://data.pyg.org/whl}"
 PYG_INDEX="${_PYG_BASE}/torch-${TORCH_VER}+${CUDA_TAG}.html"
+
+# Version sanity check: if the venv exists but version differs, clean it
+if [[ -x "${VENV_DIR}/bin/python3" ]]; then
+  EXISTING_VER=$("${VENV_DIR}/bin/python3" -c "import torch; print(torch.__version__)" 2>/dev/null || echo "none")
+  if [[ "${EXISTING_VER}" != "${TORCH_VER}"* ]] && [[ "${EXISTING_VER}" != "none" ]]; then
+    echo "[WARN] Existing venv version (${EXISTING_VER}) does not match target (${TORCH_VER}). Cleaning..."
+    rm -rf "${VENV_DIR}"
+  fi
+fi
 
 echo "[INFO] LSK3DNet venv → ${VENV_DIR}"
 echo "[INFO] 使用 CUDA 标签: ${CUDA_TAG}（torch==${TORCH_VER}，${SPCONV_PKG}，PyG: ${PYG_INDEX}）"
@@ -99,15 +124,16 @@ pip install -U pip wheel setuptools ${PIP_INDEX:-}
 
 automap_log_progress "pip：安装 PyTorch ${TORCH_VER}（可能数分钟）…"
 echo "[INFO] 安装 PyTorch (${PYTORCH_WHL_INDEX})..."
-pip install "torch==${TORCH_VER}" torchvision ${PIP_INDEX:-} --index-url "${PYTORCH_WHL_INDEX}"
+pip install --upgrade "torch==${TORCH_VER}" torchvision ${PIP_INDEX:-} --index-url "${PYTORCH_WHL_INDEX}"
 
 automap_log_progress "pip：安装 ${SPCONV_PKG}…"
 echo "[INFO] 安装 ${SPCONV_PKG}..."
-pip install "${SPCONV_PKG}" ${PIP_INDEX:-}
+pip install --upgrade "${SPCONV_PKG}" ${PIP_INDEX:-}
 
 automap_log_progress "pip：安装 torch-scatter（PyG）…"
 echo "[INFO] 安装 torch-scatter（PyG 扩展索引）..."
-if ! pip install "torch-scatter" -f "${PYG_INDEX}" ${PIP_INDEX:-}; then
+# [ABI Fix] Force reinstall to avoid "undefined symbol" errors after torch upgrade
+if ! pip install --upgrade --force-reinstall --no-cache-dir "torch-scatter" -f "${PYG_INDEX}" ${PIP_INDEX:-}; then
   _MAJMIN="${TORCH_VER%.*}"
   echo "[WARN] torch-scatter 首选索引失败，尝试 torch-${_MAJMIN}+${CUDA_TAG}..."
   ALT_INDEX="${_PYG_BASE}/torch-${_MAJMIN}+${CUDA_TAG}.html"
@@ -120,6 +146,10 @@ fi
 automap_log_progress "pip：安装 easydict / PyYAML / numpy…"
 echo "[INFO] 安装 LSK worker 轻量依赖..."
 pip install easydict PyYAML numpy ${PIP_INDEX:-}
+
+automap_log_progress "pip：安装 OpenCV（cv2）…"
+echo "[INFO] 安装 opencv-python-headless（提供 cv2 模块）..."
+pip install --upgrade opencv-python-headless ${PIP_INDEX:-}
 
 automap_log_progress "pip：安装 pybind11/cmake（用于编译 c_gen_normal_map）…"
 echo "[INFO] 安装 pybind11/cmake..."
@@ -163,7 +193,8 @@ python3 - <<'PY'
 import torch
 import spconv.pytorch  # noqa: F401
 import torch_scatter  # noqa: F401
-print("[OK] torch", torch.__version__, "cuda_available=", torch.cuda.is_available())
+import cv2  # noqa: F401
+print("[OK] torch", torch.__version__, "cuda_available=", torch.cuda.is_available(), "cv2=", cv2.__version__)
 PY
 
 touch "${MARKER}"

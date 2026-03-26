@@ -340,6 +340,17 @@ private:
 
     std::vector<PoseUpdateCallback> pose_update_cbs_;
 
+    // ── 🏛️ [架构加固] 事务性图插入 (Transactional Graph Insertion) ──
+    // 解决异步数据流导致的“孤立节点”引发 IndeterminantLinearSystemException 崩溃。
+    // 新增节点与因子首先进入 Staging 区，只有当节点满足 grounding 条件（有 Prior 或链接到已入图节点）
+    // 才原子化地移入 pending_values_ / pending_graph_。
+    gtsam::Values               staged_values_;
+    gtsam::NonlinearFactorGraph staged_factors_;
+    /** 检查并尝试将满足条件的 Staging 数据移入 Pending */
+    void tryMoveStagedToPendingInternal();
+    /** 判断 Key 是否已经“着陆”（在 isam2 内部或已在 pending 中） */
+    bool isGroundedInternal(gtsam::Key key) const;
+
     // ── P0 异步优化队列与工作线程 ─────────────────────────────────────────
     // 🔧 V2 修复：删除内部 opt_thread_，GTSAM 写入由外部 opt_worker_thread_ 独占
     /*

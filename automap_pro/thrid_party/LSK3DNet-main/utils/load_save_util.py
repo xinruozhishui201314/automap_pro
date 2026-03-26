@@ -7,7 +7,7 @@ import torch
 
 def load_checkpoint(model_load_path, model):
     my_model_dict = model.state_dict()
-    pre_weight = torch.load(model_load_path)
+    pre_weight = torch.load(model_load_path, weights_only=False)
 
     part_load = {}
     match_size = 0
@@ -19,8 +19,8 @@ def load_checkpoint(model_load_path, model):
             match_size += 1
             part_load[k] = value
         else:
-            print(k in my_model_dict)
-            print(my_model_dict[k].shape, value.shape)
+            # print(k in my_model_dict)
+            # print(my_model_dict[k].shape, value.shape)
             assert len(value.shape) == 1 or len(value.shape) == 5
             if len(value.shape) == 1:
                 c = value.shape[0]
@@ -50,7 +50,7 @@ def load_checkpoint(model_load_path, model):
             assert my_model_dict[k].shape == value.shape
             #print("model shape:{}, pre shape:{}".format(str(my_model_dict[k].shape), str(value.shape)))
 
-    print("matched parameter sets: {}, and no matched: {}".format(match_size, nomatch_size))
+    # print("matched parameter sets: {}, and no matched: {}".format(match_size, nomatch_size))
 
     my_model_dict.update(part_load)
     model.load_state_dict(my_model_dict)
@@ -59,7 +59,7 @@ def load_checkpoint(model_load_path, model):
 
 def load_checkpoint_old(model_load_path, model):
     my_model_dict = model.state_dict()
-    pre_weight = torch.load(model_load_path)['checkpoint']
+    pre_weight = torch.load(model_load_path, weights_only=False)['checkpoint']
 
     part_load = {}
     match_size = 0
@@ -75,7 +75,7 @@ def load_checkpoint_old(model_load_path, model):
             # pdb.set_trace()
             nomatch_size += 1
 
-    print("matched parameter sets: {}, and no matched: {}".format(match_size, nomatch_size))
+    # print("matched parameter sets: {}, and no matched: {}".format(match_size, nomatch_size))
 
     my_model_dict.update(part_load)
     model.load_state_dict(my_model_dict)
@@ -84,7 +84,7 @@ def load_checkpoint_old(model_load_path, model):
 
 def load_checkpoint_model_mask(model_load_path, model, device):
     my_model_dict = model.state_dict()
-    pre_weight = torch.load(model_load_path,map_location=device)
+    pre_weight = torch.load(model_load_path, map_location=device, weights_only=False)
     model_weight = pre_weight['checkpoint']
     part_load = {}
     match_size = 0
@@ -101,7 +101,7 @@ def load_checkpoint_model_mask(model_load_path, model, device):
             print("not matched key", k)
             nomatch_size += 1
 
-    print("matched parameter sets: {}, and no matched: {}".format(match_size, nomatch_size))
+    # print("matched parameter sets: {}, and no matched: {}".format(match_size, nomatch_size))
 
     my_model_dict.update(part_load)
     model.load_state_dict(my_model_dict)
@@ -109,7 +109,7 @@ def load_checkpoint_model_mask(model_load_path, model, device):
 
 def load_checkpoint_1b1(model_load_path, model):
     my_model_dict = model.state_dict()
-    pre_weight = torch.load(model_load_path)
+    pre_weight = torch.load(model_load_path, weights_only=False)
 
     part_load = {}
     match_size = 0
@@ -131,7 +131,7 @@ def load_checkpoint_1b1(model_load_path, model):
             print(key_2)
             nomatch_size += 1
 
-    print("matched parameter sets: {}, and no matched: {}".format(match_size, nomatch_size))
+    # print("matched parameter sets: {}, and no matched: {}".format(match_size, nomatch_size))
 
     my_model_dict.update(part_load)
     model.load_state_dict(my_model_dict)

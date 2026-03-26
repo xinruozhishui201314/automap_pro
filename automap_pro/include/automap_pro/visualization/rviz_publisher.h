@@ -210,11 +210,18 @@ public:
     /** 发布当前子图活跃区域 */
     void publishActiveRegion(const SubMap::Ptr& active_submap);
 
-    /** 发布ESIKF退化区域标注 */
+    /** 发布 ES-IKF 退化区域标注 */
     void publishDegenerationRegions(const std::vector<std::pair<double, Pose3d>>& degraded_poses);
 
     // ═══════════════════════════════════════════════════════════════════════
-    // 8. 工具函数
+    // 8. 语义信息可视化
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /** 发布语义地标（如树木圆柱体） */
+    void publishSemanticLandmarks(const std::vector<SubMap::Ptr>& submaps);
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // 9. 工具函数
     // ═══════════════════════════════════════════════════════════════════════
 
     /** 清除所有Marker */
@@ -259,6 +266,7 @@ private:
     rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr degen_region_pub_;
     rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr hba_result_pub_;
     rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr convergence_pub_;
+    rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr semantic_landmark_pub_;
 
     /** 收敛曲线数据（供 PlotJuggler 等绘制迭代-残差） */
     rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr convergence_residual_pub_;

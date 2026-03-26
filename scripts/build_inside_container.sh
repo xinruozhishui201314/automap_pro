@@ -1,6 +1,37 @@
 #!/bin/bash
 set -e
 
+# [CRITICAL] 必须在执行任何逻辑或加载预检查脚本前进入工作区根目录
+# 确保 $(pwd) 在所有后续脚本（如 preflight.sh）中指向正确的 /root/automap_ws
+cd /root/automap_ws
+
+automap_apply_cn_mirror_defaults() {
+  [ "${AUTOMAP_USE_CN_MIRROR:-0}" = "0" ] && return 0
+  
+  # SJTU (上海交通大学) 镜像
+  export AUTOMAP_LIBTORCH_DOWNLOAD_BASE="${AUTOMAP_LIBTORCH_DOWNLOAD_BASE:-https://mirror.sjtu.edu.cn/pytorch/libtorch}"
+  export AUTOMAP_ROS2_POOL_BASE="${AUTOMAP_ROS2_POOL_BASE:-https://mirror.sjtu.edu.cn/ros2/ubuntu}"
+  
+  # Github 镜像 (针对 ONNX Runtime 等 git 克隆)
+  export AUTOMAP_ONNXRUNTIME_GIT_URL="${AUTOMAP_ONNXRUNTIME_GIT_URL:-https://ghp.ci/https://github.com/microsoft/onnxruntime.git}"
+  
+  echo "[INFO] AUTOMAP_USE_CN_MIRROR=1：已启用国内加速镜像 (SJTU/ghp.ci)"
+}
+
+automap_apply_cn_mirror_defaults
+
+# 在编译前强制执行环境预检查 (Pre-flight Check)
+if [ -f /root/scripts/container_runtime_preflight.sh ]; then
+  export AUTOMAP_PREFLIGHT_BUILD_TOOLS=1
+  export AUTOMAP_SKIP_PREFLIGHT_BAG_CHECK=1
+  # 编译时如果 NVRTC 检查失败，我们可以尝试继续（因为编译本身可能就是为了修复它）
+  # 但如果是在修复模式下，我们可能需要更严格的检查。
+  # 默认在编译阶段不因 NVRTC 失败而中止，除非是 Blackwell 且明确要求严格。
+  export AUTOMAP_STRICT_OT_NVRTC_PRECHECK=0 
+  
+  source /root/scripts/container_runtime_preflight.sh
+fi
+
 # automap_download_defaults 未挂载时的兜底（与其中 automap_log_progress 行为一致）
 automap_log_progress() { echo "[PROGRESS] $*"; }
 # 误写或旧片段若调用 _log_progress，仍可用（须委托给 automap_log_progress，见下方 source 后再绑一次）
@@ -15,6 +46,39 @@ fi
 # shellcheck source=/dev/null
 source "${ROS_SETUP}"
 cd /root/automap_ws
+
+echo "[INFO] ROS Distro: ${ROS_DISTRO_NAME}"
+echo "[INFO] Workspace: $(pwd)"
+
+# System dependency check summary
+echo "------------------------------------------------------------"
+echo "System Dependency Status:"
+for _p in "ros-${ROS_DISTRO_NAME}-cv-bridge" "ros-${ROS_DISTRO_NAME}-pcl-ros" "libgeographiclib-dev"; do
+  if dpkg -s "${_p}" >/dev/null 2>&1; then
+    echo " [✓] ${_p}"
+  else
+    echo " [ ] ${_p} (will be installed)"
+  fi
+done
+
+# install_deps summary
+echo "------------------------------------------------------------"
+echo "Third-party Dependency Status (install_deps/):"
+_id_deps=("gtsam" "teaserpp" "ceres" "vikit" "hba" "libtorch" "onnxruntime")
+for _d in "${_id_deps[@]}"; do
+  if [ -d "install_deps/${_d}" ]; then
+    echo " [✓] ${_d}"
+  else
+    echo " [ ] ${_d} (will be built/installed)"
+  fi
+done
+echo "------------------------------------------------------------"
+echo ""
+
+echo "============================================================"
+echo "         AutoMap-Pro Build Environment Check Completed      "
+echo "============================================================"
+echo ""
 
 # CMake (>=3.18) initializes CMAKE_CUDA_ARCHITECTURES from env `CUDAARCHS`.
 # If `CUDAARCHS` is defined but empty, CMake errors out ("must be non-empty if set").
@@ -345,6 +409,13 @@ automap_resolve_ort_cuda_cudnn_paths() {
 # CUDA 版 LibTorch：CMake find_package(Torch) 会拉 Caffe2Config，要求本机存在 CUDA 工具链（nvcc、cudart 头文件等）。
 # NGC/最小镜像常仅有驱动 + 预编译 cu LibTorch，无 nvcc → Caffe2Config.cmake 直接 FATAL_ERROR。
 automap_export_cuda_home_for_cmake() {
+  # 如果已有 CUDA_HOME 且有效，优先保留（尤其是 12.8 版本）
+  if [ -n "${CUDA_HOME:-}" ] && [ -x "${CUDA_HOME}/bin/nvcc" ]; then
+    export PATH="${CUDA_HOME}/bin:${PATH}"
+    echo "[INFO] 使用已有 CUDA_HOME=${CUDA_HOME}"
+    return 0
+  fi
+
   if ! command -v nvcc >/dev/null 2>&1; then
     if [ -n "${CUDA_HOME:-}" ] && [ -x "${CUDA_HOME}/bin/nvcc" ]; then
       export PATH="${CUDA_HOME}/bin:${PATH}"
@@ -352,7 +423,9 @@ automap_export_cuda_home_for_cmake() {
       return 1
     fi
   fi
-  if [ -f /usr/lib/cuda/include/cuda.h ]; then
+  if [ -f /usr/local/cuda-12.8/include/cuda.h ]; then
+    export CUDA_HOME=/usr/local/cuda-12.8
+  elif [ -f /usr/lib/cuda/include/cuda.h ]; then
     export CUDA_HOME=/usr/lib/cuda
   elif [ -f /usr/local/cuda/include/cuda.h ]; then
     export CUDA_HOME=/usr/local/cuda
@@ -588,10 +661,15 @@ if [ -d src/hba ]; then
   mkdir -p /root/automap_ws/install
   ln -sfn /root/automap_ws/install_deps/gtsam /root/automap_ws/install/gtsam
 
-  # hba：已安装则跳过（colcon 产出 setup.bash，--clean 不删 install_deps）
+  # hba：自动检测代码是否更新 (in-tree hba @ src/hba)
   NEED_HBA_BUILD=true
-  if [ -f "${HBA_INSTALL_DIR}/setup.bash" ] || [ -f "${HBA_INSTALL_DIR}/lib/libhba_core.so" ] || [ -d "${HBA_INSTALL_DIR}/lib" ]; then
-    NEED_HBA_BUILD=false
+  if [ -f "${HBA_INSTALL_DIR}/setup.bash" ] && [ "${AUTOMAP_REBUILD_MODULAR:-0}" != "1" ]; then
+    if [ -d src/hba ] && [ -n "$(find src/hba -type f -newer "${HBA_INSTALL_DIR}/setup.bash" -not -path '*/.*' | head -n 1)" ]; then
+      echo "[INFO] 检测到 hba (src/hba) 代码有更新，将重新编译 hba"
+      NEED_HBA_BUILD=true
+    else
+      NEED_HBA_BUILD=false
+    fi
   fi
   if [ "$NEED_HBA_BUILD" = true ]; then
     echo '========================================'
@@ -702,10 +780,16 @@ VIKIT_SRC=""
 [ -z "${VIKIT_SRC}" ] && [ -d src/automap_pro/thrid_party/rpg_vikit_ros2 ] && VIKIT_SRC="src/automap_pro/thrid_party/rpg_vikit_ros2"
 if [ -n "${VIKIT_SRC}" ]; then
   NEED_VIKIT_BUILD=true
-  # 已安装则跳过（colcon 产出 setup.bash，--clean 不删 install_deps）
-  if [ -f "${VIKIT_INSTALL_DIR}/setup.bash" ] || [ -f "${VIKIT_INSTALL_DIR}/lib/libvikit_common.so" ] || [ -d "${VIKIT_INSTALL_DIR}/lib" ]; then
-    NEED_VIKIT_BUILD=false
-  elif [ -f "${INSTALL_DEPS}/lib/libvikit_common.so" ]; then
+  # 已安装则跳过（除非源码有更新，见下）
+  if [ -f "${VIKIT_INSTALL_DIR}/setup.bash" ] && [ "${AUTOMAP_REBUILD_MODULAR:-0}" != "1" ]; then
+    if [ -n "${VIKIT_SRC}" ] && [ -d "${VIKIT_SRC}" ] && \
+       [ -n "$(find "${VIKIT_SRC}" -type f -newer "${VIKIT_INSTALL_DIR}/setup.bash" -not -path '*/.*' | head -n 1)" ]; then
+      echo "[INFO] 检测到 vikit (${VIKIT_SRC}) 代码有更新，将重新编译 vikit"
+      NEED_VIKIT_BUILD=true
+    else
+      NEED_VIKIT_BUILD=false
+    fi
+  elif [ -f "${INSTALL_DEPS}/lib/libvikit_common.so" ] && [ "${AUTOMAP_REBUILD_MODULAR:-0}" != "1" ]; then
     NEED_VIKIT_BUILD=false
     VIKIT_INSTALL_DIR="${INSTALL_DEPS}"
   fi
@@ -736,6 +820,208 @@ fi
 # 可选: AUTOMAP_LIBTORCH_DOWNLOAD_BASE=与官方同路径的镜像根；AUTOMAP_USE_OFFICIAL_LIBTORCH=1 强制不用镜像重写
 # 镜像下载失败时自动再试官方同路径（禁回退: AUTOMAP_LIBTORCH_NO_OFFICIAL_FALLBACK=1）
 # 纯 CPU 环境可设: LIBTORCH_PREFER=cpu 或显式 LIBTORCH_URL=...cpu...
+automap_apt_recover_stale_locks() {
+  [ "${AUTOMAP_SKIP_APT_LOCK_RECOVERY:-0}" = "1" ] && return 0
+  local _lock_files=(
+    "/var/lib/apt/lists/lock"
+    "/var/cache/apt/archives/lock"
+    "/var/lib/dpkg/lock"
+    "/var/lib/dpkg/lock-frontend"
+  )
+  local _l
+  for _l in "${_lock_files[@]}"; do
+    if [ -f "$_l" ]; then
+      if command -v fuser >/dev/null 2>&1; then
+        if ! fuser "$_l" >/dev/null 2>&1; then
+          echo "[INFO] 清理未使用的 APT/dpkg 锁文件: $_l"
+          rm -f "$_l"
+        fi
+      else
+        echo "[INFO] 清理发现的 APT/dpkg 锁文件: $_l (无 fuser，强制清理)"
+        rm -f "$_l"
+      fi
+    fi
+  done
+}
+
+# 幂等路径前置工具 (防止重复执行导致环境变量爆炸)
+automap_prepend_path() {
+  local _val="$1"
+  local _var_name="$2"
+  local _current_val
+  eval "_current_val=\"\${$_var_name:-}\""
+  if [[ ":$_current_val:" != *":$_val:"* ]]; then
+    export "$_var_name"="$_val${_current_val:+:$_current_val}"
+  fi
+}
+
+automap_apt_quiet_retry() {
+  local max_retries=3
+  local count=0
+  local wait_sec=5
+  until DEBIAN_FRONTEND=noninteractive apt-get "$@" -y -qq -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" -o Acquire::Retries=3 -o Acquire::http::Timeout=60 2>/dev/null; do
+    count=$((count + 1))
+    if [ $count -ge $max_retries ]; then
+      echo "[ERROR] apt-get $* 失败，已重试 ${max_retries} 次。" >&2
+      return 1
+    fi
+    echo "[WARN] apt-get $* 失败，${wait_sec} 秒后进行第 ${count}/${max_retries} 次重试..."
+    automap_apt_recover_stale_locks
+    sleep ${wait_sec}
+  done
+  return 0
+}
+
+automap_try_install_cuda_12_8_for_blackwell() {
+  [ "${AUTOMAP_SKIP_CUDA_TOOLKIT_APT:-0}" = "1" ] && return 0
+
+  local gpu_name=""
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    gpu_name=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 | tr -d '\r' || true)
+  fi
+  [ -z "${gpu_name}" ] && return 0
+  
+  # 仅针对 Blackwell (RTX 50) 自动升级到 12.8
+  if ! echo "${gpu_name}" | grep -qE 'RTX[[:space:]]*50[0-9]{2,4}'; then
+    return 0
+  fi
+
+  local nvcc_mm=""
+  if command -v nvcc >/dev/null 2>&1; then
+    nvcc_mm=$(nvcc --version 2>/dev/null | sed -n 's/.*release \([0-9]*\.[0-9]*\).*/\1/p' | head -n1)
+  fi
+
+  if [ "${nvcc_mm}" = "12.8" ]; then
+    return 0
+  fi
+
+  echo "[INFO] 检测到 Blackwell GPU (${gpu_name}) 但 nvcc=${nvcc_mm:-none}，正在自动安装 CUDA 12.8 Toolkit..."
+  
+  automap_apt_recover_stale_locks
+  
+  # 如果没有 cuda-keyring，先安装
+  if ! dpkg -l | grep -q "cuda-keyring"; then
+    local _repo_base="${AUTOMAP_CUDA_APT_REPO_BASE:-https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64}"
+    local _keyring_url="${_repo_base}/cuda-keyring_1.1-1_all.deb"
+    local _tmp_deb="/tmp/cuda-keyring.deb"
+    if automap_download_to_file "${_keyring_url}" "${_tmp_deb}"; then
+      dpkg -i "${_tmp_deb}" || true
+      rm -f "${_tmp_deb}"
+    fi
+  fi
+  
+  automap_apt_quiet_retry update
+  automap_apt_quiet_retry install cuda-toolkit-12-8
+  
+  # 安装后更新路径
+  if [ -x "/usr/local/cuda-12.8/bin/nvcc" ]; then
+    export CUDA_HOME="/usr/local/cuda-12.8"
+    automap_prepend_path "${CUDA_HOME}/bin" "PATH"
+    automap_prepend_path "${CUDA_HOME}/lib64" "LD_LIBRARY_PATH"
+    automap_prepend_path "${CUDA_HOME}/targets/x86_64-linux/lib" "LD_LIBRARY_PATH"
+    echo "[INFO] CUDA 12.8 安装成功，已更新环境变量 (幂等方式)。"
+  fi
+}
+
+automap_libtorch_tag_from_cuda_mm() {
+  case "$1" in
+    11.*) echo "cu118" ;;
+    12.0|12.1|12.2|12.3) echo "cu121" ;;
+    12.4|12.5|12.6|12.7) echo "cu124" ;;
+    12.8|12.9|13.*) echo "cu128" ;;
+    *) echo "cu128" ;;
+  esac
+}
+
+automap_libtorch_url_from_tag() {
+  local tag="$1"
+  local ver="2.5.1"
+  [ "${tag}" = "cu128" ] && ver="2.7.0"
+  [ "${tag}" = "cu118" ] && ver="2.1.2"
+
+  local _off="https://download.pytorch.org/libtorch"
+  local _mir="${AUTOMAP_LIBTORCH_DOWNLOAD_BASE:-${_off}}"
+  local url="${_off}/${tag}/libtorch-cxx11-abi-shared-with-deps-${ver}%2B${tag}.zip"
+  if [ "${AUTOMAP_USE_OFFICIAL_LIBTORCH:-0}" != "1" ]; then
+    url="${url/${_off}/${_mir}}"
+  fi
+  echo "${url}"
+}
+
+automap_align_libtorch_target_to_highest_cuda_triplet() {
+  [ "${AUTOMAP_AUTO_ALIGN_CUDA_TRIPLET:-1}" = "0" ] && return 0
+  [ "${LIBTORCH_PREFER:-}" = "cpu" ] && return 0
+
+  local lt_tag="" lt_mm="" nvcc_mm="" nvrtc_mm="" gpu_name="" max_mm="" target_tag="" target_url=""
+
+  # 1. 检测当前 LibTorch (如果已安装)
+  if [ -n "${LIBTORCH_URL:-}" ]; then
+    lt_tag=$(printf '%s' "${LIBTORCH_URL}" | sed -n 's/.*\(cu[0-9][0-9][0-9]\).*/\1/p' | head -n1)
+  fi
+  if [ -z "${lt_tag}" ] && [ -f "${LIBTORCH_INSTALL_DIR}/share/cmake/Torch/TorchConfig.cmake" ]; then
+    lt_tag=$(grep -oE 'cu[0-9]{3}' "${LIBTORCH_INSTALL_DIR}/share/cmake/Torch/TorchConfig.cmake" | head -n1 || true)
+  fi
+  case "${lt_tag}" in
+    cu121) lt_mm="12.1" ;;
+    cu124) lt_mm="12.4" ;;
+    cu126) lt_mm="12.6" ;;
+    cu128) lt_mm="12.8" ;;
+  esac
+
+  # 2. 检测 nvcc
+  if command -v nvcc >/dev/null 2>&1; then
+    nvcc_mm=$(nvcc --version 2>/dev/null | sed -n 's/.*release \([0-9]*\.[0-9]*\).*/\1/p' | head -n1)
+  fi
+
+  # 3. 检测 libnvrtc
+  if command -v python3 >/dev/null 2>&1; then
+    nvrtc_mm=$(python3 - <<'PY'
+import ctypes, sys
+for name in ("libnvrtc.so", "libnvrtc.so.13", "libnvrtc.so.12", "libnvrtc.so.11"):
+    try:
+        lib = ctypes.CDLL(name)
+        major, minor = ctypes.c_int(), ctypes.c_int()
+        if lib.nvrtcVersion(ctypes.byref(major), ctypes.byref(minor)) == 0:
+            print(f"{major.value}.{minor.value}"); sys.exit(0)
+    except: continue
+sys.exit(1)
+PY
+) || true
+  fi
+
+  # 4. 确定目标
+  max_mm="$(printf '%s\n%s\n%s\n' "${lt_mm}" "${nvcc_mm}" "${nvrtc_mm}" | awk 'NF' | sort -V | tail -1)"
+  target_tag="$(automap_libtorch_tag_from_cuda_mm "${max_mm:-12.8}")"
+  
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    gpu_name=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 | tr -d '\r' || true)
+    if echo "${gpu_name}" | grep -qE 'RTX[[:space:]]*50[0-9]{2,4}'; then
+      target_tag="cu128"
+    fi
+  fi
+  
+  local target_mm=""
+  case "${target_tag}" in
+    cu121) target_mm="12.1" ;;
+    cu124) target_mm="12.4" ;;
+    cu126) target_mm="12.6" ;;
+    cu128) target_mm="12.8" ;;
+  esac
+
+  # 5. 检查是否完全对齐 (且文件存在)
+  if [ -n "${lt_mm}" ] && [ "${lt_mm}" = "${target_mm}" ] && [ "${nvcc_mm}" = "${target_mm}" ] && [ "${nvrtc_mm}" = "${target_mm}" ]; then
+     if [ -f "${LIBTORCH_INSTALL_DIR}/share/cmake/Torch/TorchConfig.cmake" ] || [ -f "${LIBTORCH_INSTALL_DIR}/lib/libtorch.so" ]; then
+       echo "[INFO] CUDA 三元组已完全对齐且本地 LibTorch 已就绪: LibTorch=${lt_tag} nvcc=${nvcc_mm} libnvrtc=${nvrtc_mm}"
+       return 0
+     fi
+  fi
+
+  echo "[INFO] CUDA 三元组需要对齐：LibTorch=${lt_mm:-unknown} nvcc=${nvcc_mm:-unknown} libnvrtc=${nvrtc_mm:-unknown} -> 目标最高版本 ${max_mm:-12.8} / ${target_tag}${gpu_name:+ (GPU=${gpu_name})}"
+  LIBTORCH_URL="$(automap_libtorch_url_from_tag "${target_tag}")"
+  export LIBTORCH_URL
+  return 1
+}
+
 automap_resolve_libtorch_url() {
   local _off="https://download.pytorch.org/libtorch"
   local _mir="${AUTOMAP_LIBTORCH_DOWNLOAD_BASE:-${_off}}"
@@ -970,6 +1256,10 @@ automap_verify_cuda_stack_unified() {
   fi
   if [ -z "${lt_tag}" ] && [ -f "${LIBTORCH_INSTALL_DIR}/share/cmake/Torch/TorchConfig.cmake" ]; then
     lt_tag=$(grep -oE 'cu[0-9]{3}' "${LIBTORCH_INSTALL_DIR}/share/cmake/Torch/TorchConfig.cmake" | head -n1 || true)
+    # 额外兼容 TorchConfig.cmake 中不含 cuXXX 但含有版本号的情况 (2.7.0 -> cu128)
+    if [ -z "${lt_tag}" ] && grep -q '2\.7\.0' "${LIBTORCH_INSTALL_DIR}/share/cmake/Torch/TorchConfig.cmake" 2>/dev/null; then
+      lt_tag="cu128"
+    fi
   fi
   if [ -z "${lt_tag}" ] && [ -f "${LIBTORCH_INSTALL_DIR}/lib/libtorch.so" ] && command -v strings >/dev/null 2>&1; then
     lt_tag=$(strings "${LIBTORCH_INSTALL_DIR}/lib/libtorch.so" 2>/dev/null | grep -oE 'cu[0-9]{3}' | head -n1 || true)
@@ -1129,6 +1419,12 @@ automap_try_align_cuda_toolchain_with_libtorch() {
 
 # LibTorch（OverlapTransformer 推理）：与 GTSAM 一致，安装到 install_deps，仅下载解压一次，不随工程重复编译
 LIBTORCH_INSTALL_DIR="${INSTALL_DEPS}/libtorch"
+
+automap_try_install_cuda_12_8_for_blackwell
+if automap_align_libtorch_target_to_highest_cuda_triplet; then
+  # 如果已经完全对齐（版本一致且文件已在本地），则强制跳过后续下载与清理逻辑
+  LIBTORCH_SKIP_DOWNLOAD=1
+fi
 LIBTORCH_URL_RECORD_FILE="${INSTALL_DEPS}/.libtorch_source_url"
 NEED_LIBTORCH_DOWNLOAD=false
 if [ ! -f "${LIBTORCH_INSTALL_DIR}/share/cmake/Torch/TorchConfig.cmake" ] && [ ! -f "${LIBTORCH_INSTALL_DIR}/lib/libtorch.so" ]; then
@@ -1276,8 +1572,8 @@ if [ "${AUTOMAP_PREBUILT_INSTALL_DEPS:-0}" = "1" ]; then
 fi
 if [ -d "${LIBTORCH_INSTALL_DIR}/lib" ]; then
   export LIBTORCH_HOME="${LIBTORCH_INSTALL_DIR}"
-  export CMAKE_PREFIX_PATH="${LIBTORCH_INSTALL_DIR}:${CMAKE_PREFIX_PATH}"
-  export LD_LIBRARY_PATH="${LIBTORCH_INSTALL_DIR}/lib:${LD_LIBRARY_PATH}"
+  automap_prepend_path "${LIBTORCH_INSTALL_DIR}" "CMAKE_PREFIX_PATH"
+  automap_prepend_path "${LIBTORCH_INSTALL_DIR}/lib" "LD_LIBRARY_PATH"
 fi
 
 automap_ensure_cuda_toolkit_for_libtorch_cmake
@@ -1501,62 +1797,6 @@ if [ -n "${_CERES_PREFIX}" ]; then
   [ -d "${_CERES_PREFIX}/lib" ] && export LD_LIBRARY_PATH="${_CERES_PREFIX}/lib:${LD_LIBRARY_PATH}"
 fi
 
-# fast_livo：与 GTSAM/vikit/hba 一致，安装到 install_deps/fast_livo，已安装则跳过
-FAST_LIVO_INSTALL_DIR="${INSTALL_DEPS}/fast_livo"
-FAST_LIVO_PATH=""
-[ -d src/automap_pro/src/modular/fast-livo2-humble ] && FAST_LIVO_PATH="src/automap_pro/src/modular/fast-livo2-humble"
-[ -z "${FAST_LIVO_PATH}" ] && [ -d src/fast_livo ] && FAST_LIVO_PATH="src/fast_livo"
-echo "[INFO] fast_livo 源码检查: in-tree=$([ -d src/automap_pro/src/modular/fast-livo2-humble ] && echo 存在 || echo 不存在), src/fast_livo=$([ -d src/fast_livo ] && echo 存在 || echo 不存在) → FAST_LIVO_PATH=${FAST_LIVO_PATH:-未设置}"
-if [ -n "${FAST_LIVO_PATH}" ]; then
-  NEED_FAST_LIVO_BUILD=true
-  # 已安装则跳过（colcon 产出 setup.bash，--clean 不删 install_deps）
-  if [ -f "${FAST_LIVO_INSTALL_DIR}/setup.bash" ] || [ -d "${FAST_LIVO_INSTALL_DIR}/fast_livo" ] || [ -d "${FAST_LIVO_INSTALL_DIR}/lib" ] || [ -d "${FAST_LIVO_INSTALL_DIR}/share" ]; then
-    NEED_FAST_LIVO_BUILD=false
-  fi
-  if [ "$NEED_FAST_LIVO_BUILD" = true ]; then
-    echo '========================================'
-    echo '编译 fast_livo（安装到 install_deps/fast_livo）'
-    echo '========================================'
-    automap_log_progress "colcon：fast_livo（耗时可能较长）"
-    echo "[INFO] 使用路径: ${FAST_LIVO_PATH}（避免 symlink 导致 colcon 0 packages）"
-    mkdir -p "${FAST_LIVO_INSTALL_DIR}"
-    # find_package(vikit_common) 走 ament：仅 CMAKE_PREFIX_PATH 往往不够，需 source setup 以设置 AMENT_PREFIX_PATH
-    _VIKIT_SETUP=""
-    if [ -f "${INSTALL_DEPS}/vikit/setup.bash" ]; then
-      _VIKIT_SETUP="${INSTALL_DEPS}/vikit/setup.bash"
-    elif [ -n "${VIKIT_INSTALL_DIR:-}" ] && [ -f "${VIKIT_INSTALL_DIR}/setup.bash" ]; then
-      _VIKIT_SETUP="${VIKIT_INSTALL_DIR}/setup.bash"
-    fi
-    if [ -n "${_VIKIT_SETUP}" ]; then
-      echo "[INFO] source ${_VIKIT_SETUP}（供 fast_livo 解析 vikit_common / vikit_ros）"
-      # shellcheck source=/dev/null
-      source "${_VIKIT_SETUP}"
-    else
-      echo "[WARN] 未找到 vikit 的 setup.bash（期望 ${INSTALL_DEPS}/vikit/setup.bash），fast_livo 可能 CMake 找不到 vikit_common" >&2
-    fi
-    colcon build ${COLCON_PARALLEL} ${COLCON_EVENT_HANDLERS} --install-base "${FAST_LIVO_INSTALL_DIR}" --paths "${FAST_LIVO_PATH}" --cmake-args ${NINJA_CMAKE_ARG} -DCMAKE_BUILD_TYPE=Release
-    _fl_ok=false
-    [ -f "${FAST_LIVO_INSTALL_DIR}/setup.bash" ] && _fl_ok=true
-    [ -f "${FAST_LIVO_INSTALL_DIR}/share/fast_livo/package.xml" ] && _fl_ok=true
-    [ -d "${FAST_LIVO_INSTALL_DIR}/lib" ] && _fl_ok=true
-    [ -d "${FAST_LIVO_INSTALL_DIR}/share" ] && _fl_ok=true
-    [ -d "${FAST_LIVO_INSTALL_DIR}/fast_livo" ] && _fl_ok=true
-    if [ "$_fl_ok" = false ]; then
-      echo "[WARN] fast_livo 编译完成但未在预期路径找到产物，检查: ${FAST_LIVO_INSTALL_DIR}"
-      ls -la "${FAST_LIVO_INSTALL_DIR}" 2>/dev/null || true
-    fi
-    echo "[INFO] fast_livo 已安装于 install_deps/fast_livo"
-  else
-    echo "[INFO] fast_livo 已安装于 install_deps，跳过"
-  fi
-  [ -d "${FAST_LIVO_INSTALL_DIR}/lib" ] && export CMAKE_PREFIX_PATH="${FAST_LIVO_INSTALL_DIR}:${CMAKE_PREFIX_PATH}"
-  [ -d "${FAST_LIVO_INSTALL_DIR}/lib" ] && export LD_LIBRARY_PATH="${FAST_LIVO_INSTALL_DIR}/lib:${LD_LIBRARY_PATH}"
-  mkdir -p /root/automap_ws/install
-  ln -sfn "${FAST_LIVO_INSTALL_DIR}" /root/automap_ws/install/fast_livo 2>/dev/null || true
-else
-  echo '[WARN] 未找到 fast_livo 源码（src/automap_pro/src/modular/fast-livo2-humble 或 src/fast_livo），跳过；运行时会报 package fast_livo not found'
-fi
-
 # automap_pro
 
 # ============================================================
@@ -1715,21 +1955,34 @@ if [ -n "${_CERES_CMAKE_DIR}" ]; then
   echo "[INFO] automap_pro Ceres_DIR 强制为: ${_CERES_CMAKE_DIR}"
 fi
 
+# 强制统一 CUDA：确保 CMake 使用环境变量设置的 nvcc，避免使用系统老版本或空壳
+_CUDA_NVCC=""
+if [ -n "${CUDA_HOME:-}" ] && [ -x "${CUDA_HOME}/bin/nvcc" ]; then
+  _CUDA_NVCC="${CUDA_HOME}/bin/nvcc"
+elif command -v nvcc >/dev/null 2>&1; then
+  _CUDA_NVCC=$(command -v nvcc)
+fi
+if [ -n "${_CUDA_NVCC}" ]; then
+  echo "[INFO] automap_pro CMAKE_CUDA_COMPILER 强制为: ${_CUDA_NVCC}"
+fi
+
 # 无 pipefail 时 colcon|tee 的管道退出码为 tee(0)，set -e 不会失败退出；子 shell + pipefail 保证 colcon 非零即失败
 set +e
 (
   set -o pipefail
-  colcon build \
-    ${COLCON_PARALLEL} \
-    --event-handlers status+ console_direct+ \
-    --packages-select automap_pro \
-    --cmake-force-configure \
-    --cmake-args ${NINJA_CMAKE_ARG} \
-      -DCMAKE_BUILD_TYPE=Release \
-      -DNLOHMANN_JSON_LOCAL=/root/automap_ws/src/thrid_party/nlohmann-json3 \
-      -DSCANCONTEXT_ROOT=/root/automap_ws/automap_pro_thrid_party_scancontext \
-      ${_CERES_CMAKE_DIR:+-DCeres_DIR=${_CERES_CMAKE_DIR}} \
-    2>&1 | tee /tmp/automap_build.log
+          colcon build \
+            ${COLCON_PARALLEL} \
+            --event-handlers status+ console_direct+ \
+            --packages-select automap_pro \
+            --cmake-force-configure \
+            --cmake-args ${NINJA_CMAKE_ARG} \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DNLOHMANN_JSON_LOCAL=/root/automap_ws/src/thrid_party/nlohmann-json3 \
+              -DSCANCONTEXT_ROOT=/root/automap_ws/automap_pro_thrid_party_scancontext \
+              -DCMAKE_CUDA_FLAGS="-D_Float128=__float128" \
+              ${_CUDA_NVCC:+-DCMAKE_CUDA_COMPILER=${_CUDA_NVCC}} \
+              ${_CERES_CMAKE_DIR:+-DCeres_DIR=${_CERES_CMAKE_DIR}} \
+            2>&1 | tee /tmp/automap_build.log
 )
 BUILD_EXIT_CODE=$?
 set -e
@@ -1764,6 +2017,8 @@ if [ "${BUILD_EXIT_CODE}" -ne 0 ]; then
               -DCMAKE_BUILD_TYPE=Release \
               -DNLOHMANN_JSON_LOCAL=/root/automap_ws/src/thrid_party/nlohmann-json3 \
               -DSCANCONTEXT_ROOT=/root/automap_ws/automap_pro_thrid_party_scancontext \
+              -DCMAKE_CUDA_FLAGS="-D_Float128=__float128" \
+              ${_CUDA_NVCC:+-DCMAKE_CUDA_COMPILER=${_CUDA_NVCC}} \
               ${_CERES_CMAKE_DIR:+-DCeres_DIR=${_CERES_CMAKE_DIR}} \
             2>&1 | tee /tmp/automap_build_retry.log
         )
@@ -1804,3 +2059,74 @@ if [ ! -f install/automap_pro/share/automap_pro/package.xml ]; then
   exit 1
 fi
 echo '✓ automap_pro 已安装'
+
+# fast_livo：与 GTSAM/vikit/hba 一致，安装到 install_deps/fast_livo，已安装则跳过
+FAST_LIVO_INSTALL_DIR="${INSTALL_DEPS}/fast_livo"
+FAST_LIVO_PATH=""
+[ -d src/automap_pro/src/modular/fast-livo2-humble ] && FAST_LIVO_PATH="src/automap_pro/src/modular/fast-livo2-humble"
+[ -z "${FAST_LIVO_PATH}" ] && [ -d src/fast_livo ] && FAST_LIVO_PATH="src/fast_livo"
+echo "[INFO] fast_livo 源码检查: in-tree=$([ -d src/automap_pro/src/modular/fast-livo2-humble ] && echo 存在 || echo 不存在), src/fast_livo=$([ -d src/fast_livo ] && echo 存在 || echo 不存在) → FAST_LIVO_PATH=${FAST_LIVO_PATH:-未设置}"
+if [ -n "${FAST_LIVO_PATH}" ]; then
+  # [AUTOMAP-PRO] 自动检查代码是否更新：如果源码比 install 中的 setup.bash 更亲，则强制重编
+  NEED_FAST_LIVO_BUILD=true
+  if [ -f "${FAST_LIVO_INSTALL_DIR}/setup.bash" ] && [ "${AUTOMAP_REBUILD_MODULAR:-0}" != "1" ]; then
+    if [ -n "${FAST_LIVO_PATH}" ] && [ -d "${FAST_LIVO_PATH}" ] && \
+       [ -n "$(find "${FAST_LIVO_PATH}" -type f -newer "${FAST_LIVO_INSTALL_DIR}/setup.bash" -not -path '*/.*' | head -n 1)" ]; then
+      echo "[INFO] 检测到 ${FAST_LIVO_PATH} 代码有更新，将重新编译 fast_livo"
+      NEED_FAST_LIVO_BUILD=true
+    else
+      NEED_FAST_LIVO_BUILD=false
+    fi
+  fi
+  if [ "$NEED_FAST_LIVO_BUILD" = true ]; then
+    echo '========================================'
+    echo '编译 fast_livo（安装到 install_deps/fast_livo）'
+    echo '========================================'
+    automap_log_progress "colcon：fast_livo（耗时可能较长）"
+    echo "[INFO] 使用路径: ${FAST_LIVO_PATH}（避免 symlink 导致 colcon 0 packages）"
+    mkdir -p "${FAST_LIVO_INSTALL_DIR}"
+    # find_package(vikit_common) 走 ament：仅 CMAKE_PREFIX_PATH 往往不够，需 source setup 以设置 AMENT_PREFIX_PATH
+    _VIKIT_SETUP=""
+    if [ -f "${INSTALL_DEPS}/vikit/setup.bash" ]; then
+      _VIKIT_SETUP="${INSTALL_DEPS}/vikit/setup.bash"
+    elif [ -n "${VIKIT_INSTALL_DIR:-}" ] && [ -f "${VIKIT_INSTALL_DIR}/setup.bash" ]; then
+      _VIKIT_SETUP="${VIKIT_INSTALL_DIR}/setup.bash"
+    fi
+    if [ -n "${_VIKIT_SETUP}" ]; then
+      echo "[INFO] source ${_VIKIT_SETUP}（供 fast_livo 解析 vikit_common / vikit_ros）"
+      # shellcheck source=/dev/null
+      source "${_VIKIT_SETUP}"
+    else
+      echo "[WARN] 未找到 vikit 的 setup.bash（期望 ${INSTALL_DEPS}/vikit/setup.bash），fast_livo 可能 CMake 找不到 vikit_common" >&2
+    fi
+    # fast_livo 依赖 automap_pro::KeyFrameInfoMsg；install_deps 独立 colcon 须先完成主 workspace 的 automap_pro 安装
+    if [ -f /root/automap_ws/install/setup.bash ]; then
+      echo "[INFO] source /root/automap_ws/install/setup.bash（供 fast_livo 解析 automap_pro）"
+      # shellcheck source=/dev/null
+      source /root/automap_ws/install/setup.bash
+    else
+      echo "[ERROR] 未找到 /root/automap_ws/install/setup.bash（请先成功编译 automap_pro）" >&2
+      exit 1
+    fi
+    colcon build ${COLCON_PARALLEL} ${COLCON_EVENT_HANDLERS} --install-base "${FAST_LIVO_INSTALL_DIR}" --paths "${FAST_LIVO_PATH}" --cmake-args ${NINJA_CMAKE_ARG} -DCMAKE_BUILD_TYPE=Release
+    _fl_ok=false
+    [ -f "${FAST_LIVO_INSTALL_DIR}/setup.bash" ] && _fl_ok=true
+    [ -f "${FAST_LIVO_INSTALL_DIR}/share/fast_livo/package.xml" ] && _fl_ok=true
+    [ -d "${FAST_LIVO_INSTALL_DIR}/lib" ] && _fl_ok=true
+    [ -d "${FAST_LIVO_INSTALL_DIR}/share" ] && _fl_ok=true
+    [ -d "${FAST_LIVO_INSTALL_DIR}/fast_livo" ] && _fl_ok=true
+    if [ "$_fl_ok" = false ]; then
+      echo "[WARN] fast_livo 编译完成但未在预期路径找到产物，检查: ${FAST_LIVO_INSTALL_DIR}"
+      ls -la "${FAST_LIVO_INSTALL_DIR}" 2>/dev/null || true
+    fi
+    echo "[INFO] fast_livo 已安装于 install_deps/fast_livo"
+  else
+    echo "[INFO] fast_livo 已安装于 install_deps，跳过"
+  fi
+  [ -d "${FAST_LIVO_INSTALL_DIR}/lib" ] && export CMAKE_PREFIX_PATH="${FAST_LIVO_INSTALL_DIR}:${CMAKE_PREFIX_PATH}"
+  [ -d "${FAST_LIVO_INSTALL_DIR}/lib" ] && export LD_LIBRARY_PATH="${FAST_LIVO_INSTALL_DIR}/lib:${LD_LIBRARY_PATH}"
+  mkdir -p /root/automap_ws/install
+  ln -sfn "${FAST_LIVO_INSTALL_DIR}" /root/automap_ws/install/fast_livo 2>/dev/null || true
+else
+  echo '[WARN] 未找到 fast_livo 源码（src/automap_pro/src/modular/fast-livo2-humble 或 src/fast_livo），跳过；运行时会报 package fast_livo not found'
+fi

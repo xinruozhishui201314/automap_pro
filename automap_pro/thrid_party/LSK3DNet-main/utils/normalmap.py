@@ -12,8 +12,9 @@ import utils.depth_map_utils as depth_map_utils
 try:
   from c_gen_normal_map import gen_normal_map
 except:
-  print("You are currently using python library, which could be slow.")
-  print("If you want to use fast C library, please Export PYTHONPATH=<path-to-range-image-library>")
+  # print("You are currently using python library, which could be slow.")
+  # print("If you want to use fast C library, please Export PYTHONPATH=<path-to-range-image-library>")
+  pass
 
 
 def range_projection(current_vertex, fov_up=3.0, fov_down=-25.0, proj_H=64, proj_W=900, max_range=50):

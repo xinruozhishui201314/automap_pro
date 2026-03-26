@@ -53,7 +53,7 @@ def load_config(path: str):
 
 
 def load_weights(model, ckpt_path: str, device: torch.device):
-    raw = torch.load(ckpt_path, map_location=device)
+    raw = torch.load(ckpt_path, map_location=device, weights_only=False)
     if isinstance(raw, dict) and "checkpoint" in raw:
         from utils.load_save_util import load_checkpoint_old
 

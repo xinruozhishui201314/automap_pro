@@ -195,6 +195,16 @@ Visualization Manager:
         Value: /automap/gps_positions_map
       Use Fixed Frame: true
 
+    # 语义地标 (Tree Trunks)
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: semantic_landmarks
+      Topic:
+        Depth: 10
+        Reliability Policy: Reliable
+        Value: /automap/semantic_landmarks
+      Use Fixed Frame: true
+
     # 子图
     - Class: rviz_default_plugins/MarkerArray
       Enabled: true

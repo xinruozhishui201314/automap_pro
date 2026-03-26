@@ -1,7 +1,7 @@
 import collections
 
-import cv2
 import numpy as np
+import cv2
 
 # Full kernels
 FULL_KERNEL_3 = np.ones((3, 3), np.uint8)

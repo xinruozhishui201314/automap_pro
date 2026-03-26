@@ -141,15 +141,18 @@ public:
                 status.last_heartbeat = mod->getLastHeartbeat();
                 status.age_s = ev.timestamp - status.last_heartbeat;
 
-                // 🏛️ 健康阈值：如果模块超过 10s 没有心跳，标记为异常 (Zombie detect)
-                status.ok = (status.age_s < 10.0);
+                // Semantic inference may run much longer than realtime modules under heavy GPU/worker load.
+                // Use a dedicated threshold to avoid false "hung" alarms while keeping strict limits for others.
+                const double heartbeat_timeout_s =
+                    (status.name == "SemanticModule") ? 30.0 : 10.0;
+                status.ok = (status.age_s < heartbeat_timeout_s);
                 if (!status.ok) ev.overall_ok = false;
                 ev.modules.push_back(status);
 
                 if (!status.ok) {
                     RCLCPP_ERROR_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000,
-                        "[CRITICAL_V3] Module '%s' seems to be HUNG! (age=%.1fs) (grep V3 ZOMBIE)",
-                        status.name.c_str(), status.age_s);
+                        "[CRITICAL_V3] Module '%s' seems to be HUNG! (age=%.1fs, threshold=%.1fs) (grep V3 ZOMBIE)",
+                        status.name.c_str(), status.age_s, heartbeat_timeout_s);
                 }
             }
         }

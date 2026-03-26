@@ -108,16 +108,35 @@ void AutoMapSystem::loadConfigAndInit() {
         RCLCPP_INFO(get_logger(), "[PIPELINE][SYS] step=04 ConfigManager::load OK");
         try {
             const auto& cfg = ConfigManager::instance();
+            const std::string semantic_model_type = cfg.semanticModelType();
             const std::string semantic_model = cfg.semanticModelPath();
             const bool semantic_enabled = cfg.semanticEnabled();
-            const bool semantic_model_exists = (!semantic_model.empty() && std::filesystem::exists(semantic_model));
+            bool semantic_model_exists = false;
+            std::string semantic_model_hint;
+            if (semantic_model_type == "lsk3dnet_hybrid") {
+                const std::string ckpt = cfg.semanticLsk3dnetCheckpoint();
+                const std::string cls = cfg.semanticLsk3dnetClassifierTorchscript();
+                const std::string yaml = cfg.semanticLsk3dnetConfigYaml();
+                const bool ckpt_ok = (!ckpt.empty() && std::filesystem::exists(ckpt));
+                const bool cls_ok = (!cls.empty() && std::filesystem::exists(cls));
+                const bool yaml_ok = (!yaml.empty() && std::filesystem::exists(yaml));
+                semantic_model_exists = ckpt_ok && cls_ok && yaml_ok;
+                semantic_model_hint = "hybrid(ckpt=" + ckpt + ", classifier=" + cls + ", yaml=" + yaml + ")";
+            } else if (semantic_model_type == "lsk3dnet") {
+                const std::string ts_model = cfg.semanticLsk3dnetModelPath();
+                semantic_model_exists = (!ts_model.empty() && std::filesystem::exists(ts_model));
+                semantic_model_hint = ts_model;
+            } else {
+                semantic_model_exists = (!semantic_model.empty() && std::filesystem::exists(semantic_model));
+                semantic_model_hint = semantic_model;
+            }
             const std::string ot_model = cfg.overlapModelPath();
             const bool ot_model_exists = (!ot_model.empty() && std::filesystem::exists(ot_model));
             RCLCPP_INFO(
                 get_logger(),
-                "[DIAG][BOOT][CONFIG] semantic.enabled=%d semantic.model_path=%s semantic.model_exists=%d "
+                "[DIAG][BOOT][CONFIG] semantic.enabled=%d semantic.model_type=%s semantic.model_path=%s semantic.model_exists=%d "
                 "loop.overlap_model_path=%s loop.overlap_model_exists=%d gps.enabled=%d gps.topic=%s gps.min_quality=%d gps.match_window_s=%.2f",
-                semantic_enabled ? 1 : 0, semantic_model.c_str(), semantic_model_exists ? 1 : 0,
+                semantic_enabled ? 1 : 0, semantic_model_type.c_str(), semantic_model_hint.c_str(), semantic_model_exists ? 1 : 0,
                 ot_model.c_str(), ot_model_exists ? 1 : 0,
                 cfg.gpsEnabled() ? 1 : 0, cfg.gpsTopic().c_str(),
                 cfg.gpsMinAcceptedQualityLevel(), cfg.gpsKeyframeMatchWindowS());
@@ -125,8 +144,8 @@ void AutoMapSystem::loadConfigAndInit() {
                 RCLCPP_ERROR(
                     get_logger(),
                     "[DIAG][BOOT][E_SEMANTIC_MODEL] semantic enabled but model missing/invalid. "
-                    "path=%s exists=%d (fix semantic.model_path or provide model file)",
-                    semantic_model.c_str(), semantic_model_exists ? 1 : 0);
+                    "type=%s path=%s exists=%d (fix semantic model assets for selected backend)",
+                    semantic_model_type.c_str(), semantic_model_hint.c_str(), semantic_model_exists ? 1 : 0);
             }
             if (!cfg.gpsEnabled()) {
                 RCLCPP_WARN(

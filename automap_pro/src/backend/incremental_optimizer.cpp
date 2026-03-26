@@ -294,13 +294,14 @@ void IncrementalOptimizer::addSubMapNode(int sm_id, const Pose3d& init_pose, boo
     }
 
     node_exists_[sm_id] = true;
-    pending_values_.insert(SM(sm_id), toPose3(init_pose));
+    // 🏛️ [架构加固] 事务性插入：先进入 staging，待满足接地 (Grounded) 条件后再进入 pending
+    staged_values_.insert(SM(sm_id), toPose3(init_pose));
     node_count_++;
 
     if (fixed || !has_prior_) {
         gtsam::noiseModel::Diagonal::shared_ptr noise =
             gtsam::noiseModel::Diagonal::Variances(prior_var6_);
-        pending_graph_.add(gtsam::PriorFactor<gtsam::Pose3>(
+        staged_factors_.add(gtsam::PriorFactor<gtsam::Pose3>(
             SM(sm_id), toPose3(init_pose), noise));
         has_prior_ = true;
         factor_count_++;
@@ -312,13 +313,16 @@ void IncrementalOptimizer::addSubMapNode(int sm_id, const Pose3d& init_pose, boo
     int anchor_kf_id = sm_id * MAX_KF_PER_SUBMAP;
     if (keyframe_node_exists_.count(anchor_kf_id)) {
         auto anchor_noise = gtsam::noiseModel::Diagonal::Variances(prior_var6_);
-        pending_graph_.add(gtsam::BetweenFactor<gtsam::Pose3>(
+        staged_factors_.add(gtsam::BetweenFactor<gtsam::Pose3>(
             SM(sm_id), KF(anchor_kf_id), gtsam::Pose3::Identity(), anchor_noise));
         factor_count_++;
         RCLCPP_INFO(rclcpp::get_logger("automap_system"),
             "[IncrementalOptimizer][BACKEND][LINK] addSubMapNode: Linked SM(%d) to existing anchor KF(%d)",
             sm_id, anchor_kf_id);
     }
+
+    // 🏛️ [架构加固] 触发事务提交检查
+    tryMoveStagedToPendingInternal();
 
     // 子图节点加入后尝试刷入此前因缺节点被 defer 的子图里程计因子，避免孤立 s 节点
     if (!pending_odom_factors_submap_.empty()) {
@@ -330,7 +334,8 @@ void IncrementalOptimizer::addSubMapNode(int sm_id, const Pose3d& init_pose, boo
                 continue;
             }
             auto noise = infoToNoiseDiagonal(f.info_matrix);
-            pending_graph_.add(gtsam::BetweenFactor<gtsam::Pose3>(
+            // 移入 staging
+            staged_factors_.add(gtsam::BetweenFactor<gtsam::Pose3>(
                 SM(f.from_id), SM(f.to_id), toPose3(f.rel_pose), noise));
             factor_count_++;
             flushed++;
@@ -343,6 +348,7 @@ void IncrementalOptimizer::addSubMapNode(int sm_id, const Pose3d& init_pose, boo
             RCLCPP_INFO(rclcpp::get_logger("automap_system"),
                 "[IncrementalOptimizer][BACKEND][ODOM] addSubMapNode: flushed %d deferred submap odom factors (remain=%zu)",
                 flushed, pending_odom_factors_submap_.size());
+            tryMoveStagedToPendingInternal();
         }
     }
 
@@ -496,9 +502,12 @@ void IncrementalOptimizer::addOdomFactor(
 
     // 使用 Diagonal 噪声避免 Gaussian::Covariance 在 linearize 路径触发 double free（即使 TBB 已关）
     auto noise = infoToNoiseDiagonal(info_matrix);
-    pending_graph_.add(gtsam::BetweenFactor<gtsam::Pose3>(
+    staged_factors_.add(gtsam::BetweenFactor<gtsam::Pose3>(
         SM(from), SM(to), toPose3(rel), noise));
     factor_count_++;
+
+    // 🏛️ [架构加固] 触发事务提交检查
+    tryMoveStagedToPendingInternal();
 
     BACKEND_STEP("step=addOdomFactor_added from=%d to=%d pending_factors=%zu result=ok", from, to, pending_graph_.size());
     CONSTRAINT_LOG("step=odom from=%d to=%d result=ok factor_count=%d (子图间里程计约束)", from, to, factor_count_);
@@ -608,7 +617,7 @@ OptimizationResult IncrementalOptimizer::addLoopFactor(
             gtsam::noiseModel::mEstimator::Huber::Create(1.345),
             base_noise);
 
-        pending_graph_.add(gtsam::BetweenFactor<gtsam::Pose3>(
+        staged_factors_.add(gtsam::BetweenFactor<gtsam::Pose3>(
             SM(from), SM(to), toPose3(rel), robust_noise));
         factor_count_++;
         const uint64_t added = g_loop_added_total.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -701,7 +710,7 @@ OptimizationResult IncrementalOptimizer::addLoopFactorBetweenKeyframes(int kf_id
     auto robust_noise = gtsam::noiseModel::Robust::Create(
         gtsam::noiseModel::mEstimator::Huber::Create(1.345), base_noise);
 
-    pending_graph_.add(gtsam::BetweenFactor<gtsam::Pose3>(
+    staged_factors_.add(gtsam::BetweenFactor<gtsam::Pose3>(
         KF(kf_id_i), KF(kf_id_j), toPose3(rel), robust_noise));
     factor_count_++;
 
@@ -780,9 +789,9 @@ void IncrementalOptimizer::addLoopFactorDeferred(int from, int to,
         gtsam::noiseModel::Base::shared_ptr robust_noise = gtsam::noiseModel::Robust::Create(
             gtsam::noiseModel::mEstimator::Huber::Create(1.345), base_noise);
         if (use_kf_path) {
-            pending_graph_.add(gtsam::BetweenFactor<gtsam::Pose3>(KF(from), KF(to), toPose3(rel), robust_noise));
+            staged_factors_.add(gtsam::BetweenFactor<gtsam::Pose3>(KF(from), KF(to), toPose3(rel), robust_noise));
         } else {
-            pending_graph_.add(gtsam::BetweenFactor<gtsam::Pose3>(SM(from), SM(to), toPose3(rel), robust_noise));
+            staged_factors_.add(gtsam::BetweenFactor<gtsam::Pose3>(SM(from), SM(to), toPose3(rel), robust_noise));
         }
         factor_count_++;
         BACKEND_STEP("step=addLoopFactorDeferred_added from=%d to=%d pending_factors=%zu result=ok", from, to, pending_graph_.size());
@@ -939,10 +948,13 @@ void IncrementalOptimizer::addGPSFactor(
                 std::max(1e-6, final_cov(1, 1)),
                 std::max(1e-6, final_cov(2, 2));
         auto noise = gtsam::noiseModel::Diagonal::Variances(vars);
-        pending_graph_.add(gtsam::GPSFactor(SM(sm_id), gps_point, noise));
+        staged_factors_.add(gtsam::GPSFactor(SM(sm_id), gps_point, noise));
         factor_count_++;
 
-        BACKEND_STEP("step=addGPSFactor_added sm_id=%d pending_factors=%zu result=ok", sm_id, pending_graph_.size());
+        // 🏛️ [架构加固] 触发事务提交检查
+    tryMoveStagedToPendingInternal();
+
+    BACKEND_STEP("step=addGPSFactor_added sm_id=%d pending_factors=%zu result=ok", sm_id, pending_graph_.size());
         CONSTRAINT_LOG("step=gps_submap sm_id=%d result=ok factor_count=%d (子图级 GPS 约束)", sm_id, factor_count_);
         RCLCPP_INFO(rclcpp::get_logger("automap_system"),
             "[IncrementalOptimizer][BACKEND][GPS] GPS factor added to graph sm_id=%d (grep for verification)",
@@ -997,7 +1009,7 @@ void IncrementalOptimizer::addGPSFactorsBatch(const std::vector<GPSFactorItem>& 
                         std::max(1e-6, f.cov(1, 1)),
                         std::max(1e-6, f.cov(2, 2));
                 auto noise = gtsam::noiseModel::Diagonal::Variances(vars);
-                pending_graph_.add(gtsam::GPSFactor(SM(f.sm_id), gps_point, noise));
+                staged_factors_.add(gtsam::GPSFactor(SM(f.sm_id), gps_point, noise));
                 factor_count_++;
                 added++;
             } catch (const std::exception& e) {
@@ -1006,6 +1018,9 @@ void IncrementalOptimizer::addGPSFactorsBatch(const std::vector<GPSFactorItem>& 
                     f.sm_id, e.what());
             }
         }
+
+        // 🏛️ [架构加固] 触发事务提交检查
+        tryMoveStagedToPendingInternal();
 
         if (!pending_graph_.empty() || !pending_values_.empty()) {
             // ✅ 修复：单独处理 update 异常，防止单次 update 失败导致整个 batch 失败
@@ -1071,7 +1086,7 @@ int IncrementalOptimizer::flushPendingGPSFactorsInternal() {
                 std::max(1e-6, f.cov(1, 1)),
                 std::max(1e-6, f.cov(2, 2));
         auto noise = gtsam::noiseModel::Diagonal::Variances(vars);
-        pending_graph_.add(gtsam::GPSFactor(SM(f.sm_id), gps_point, noise));
+        staged_factors_.add(gtsam::GPSFactor(SM(f.sm_id), gps_point, noise));
         factor_count_++;
         added++;
         RCLCPP_INFO(rclcpp::get_logger("automap_system"),
@@ -1080,6 +1095,9 @@ int IncrementalOptimizer::flushPendingGPSFactorsInternal() {
     }
     pending_gps_factors_ = std::move(still_pending);
     if (added > 0) {
+        // 🏛️ [架构加固] 触发事务提交检查
+        tryMoveStagedToPendingInternal();
+
         RCLCPP_INFO(rclcpp::get_logger("automap_system"),
             "[IncrementalOptimizer][BACKEND][GPS] flushPendingGPSFactors: added %d deferred GPS factors",
             added);
@@ -1170,7 +1188,8 @@ void IncrementalOptimizer::addKeyFrameNode(int kf_id, const Pose3d& init_pose, b
 
     keyframe_node_exists_[kf_id] = true;
     keyframe_count_++;
-    pending_values_.insert(KF(kf_id), toPose3(init_pose));
+    // 🏛️ [架构加固] 事务性插入：先进入 staging
+    staged_values_.insert(KF(kf_id), toPose3(init_pose));
     BACKEND_TRACE("addKeyFrameNode VALUE_INSERT kf_id=%d keyframe_count=%d pending_values=%zu",
         kf_id, keyframe_count_, pending_values_.size());
 
@@ -1210,7 +1229,7 @@ void IncrementalOptimizer::addKeyFrameNode(int kf_id, const Pose3d& init_pose, b
     if (is_first_kf_of_submap && node_exists_.count(sm_id)) {
         gtsam::noiseModel::Diagonal::shared_ptr anchor_noise = 
             gtsam::noiseModel::Diagonal::Variances(prior_var6_);
-        pending_graph_.add(gtsam::BetweenFactor<gtsam::Pose3>(
+        staged_factors_.add(gtsam::BetweenFactor<gtsam::Pose3>(
             SM(sm_id), KF(kf_id), gtsam::Pose3::Identity(), anchor_noise));
         factor_count_++;
         RCLCPP_INFO(rclcpp::get_logger("automap_system"),
@@ -1229,7 +1248,7 @@ void IncrementalOptimizer::addKeyFrameNode(int kf_id, const Pose3d& init_pose, b
         } else {
             gtsam::noiseModel::Diagonal::shared_ptr noise =
                 gtsam::noiseModel::Diagonal::Variances(prior_var6_);
-            pending_graph_.add(gtsam::PriorFactor<gtsam::Pose3>(
+            staged_factors_.add(gtsam::PriorFactor<gtsam::Pose3>(
                 KF(kf_id), toPose3(init_pose), noise));
             has_prior_ = true;
             factor_count_++;
@@ -1258,7 +1277,7 @@ void IncrementalOptimizer::addKeyFrameNode(int kf_id, const Pose3d& init_pose, b
             gtsam::Vector6 var6;
             var6 << 1e-4, 1e-4, 1e-4, 1e-4, 1e-4, 1e-4;  // 平移/旋转方差，约 1cm / ~0.01rad
             auto noise = gtsam::noiseModel::Diagonal::Variances(var6);
-            pending_graph_.add(gtsam::BetweenFactor<gtsam::Pose3>(
+            staged_factors_.add(gtsam::BetweenFactor<gtsam::Pose3>(
                 KF(last_keyframe_id_), KF(kf_id), toPose3(rel), noise));
             factor_count_++;
             added_between_factor = true;
@@ -1279,6 +1298,9 @@ void IncrementalOptimizer::addKeyFrameNode(int kf_id, const Pose3d& init_pose, b
     }
     last_keyframe_id_ = kf_id;
     last_keyframe_pose_ = init_pose;
+
+    // 🏛️ [架构加固] 触发事务提交检查
+    tryMoveStagedToPendingInternal();
 
     RCLCPP_INFO(rclcpp::get_logger("automap_system"),
         "[ISAM2_PRE] addKeyFrameNode kf_id=%d added_prior=%d added_between=%d prev_last_kf=%d has_prior_=%d "
@@ -1426,8 +1448,13 @@ void IncrementalOptimizer::addGPSFactorForKeyFrame(int kf_id, const Eigen::Vecto
             std::max(1e-6, cov3x3(1, 1)),
             std::max(1e-6, cov3x3(2, 2));
     auto noise = gtsam::noiseModel::Diagonal::Variances(vars);
-    pending_graph_.add(gtsam::GPSFactor(KF(kf_id), gps_point, noise));
+    // 🏛️ [架构加固] 事务性插入：GPS 因子进入 staging
+    staged_factors_.add(gtsam::GPSFactor(KF(kf_id), gps_point, noise));
     factor_count_++;
+    
+    // 🏛️ [架构加固] 触发事务提交检查
+    tryMoveStagedToPendingInternal();
+
     BACKEND_TRACE("addGPSFactorForKeyFrame ADD kf_id=%d factor_count=%d", kf_id, factor_count_);
     BACKEND_STEP("step=addGPSFactorForKeyFrame_added kf_id=%d pending_factors=%zu result=ok", kf_id, pending_graph_.size());
     CONSTRAINT_LOG("step=gps_kf kf_id=%d result=ok factor_count=%d (关键帧级 GPS 约束)", kf_id, factor_count_);
@@ -1480,11 +1507,14 @@ void IncrementalOptimizer::addCylinderFactorForKeyFrame(int kf_id, const Cylinde
     gtsam::Unit3 ray_submap(factor.ray_submap.x(), factor.ray_submap.y(), factor.ray_submap.z());
 
     // 添加二元因子：KF 节点与 SM 锚点节点
-    pending_graph_.add(boost::make_shared<CylinderFactor>(
+    staged_factors_.add(boost::make_shared<CylinderFactor>(
         KF(kf_id), SM(static_cast<int>(factor.sm_id)),
         point_body, root_submap, ray_submap, factor.radius, noise));
 
     factor_count_++;
+
+    // 🏛️ [架构加固] 触发事务提交检查
+    tryMoveStagedToPendingInternal();
 
     RCLCPP_INFO(rclcpp::get_logger("automap_system"),
         "[SEMANTIC][Backend][addCylinderFactor] step=ok kf_id=%d sm_id=%lu radius=%.3f weight=%.2f factor_count=%d",
@@ -1551,10 +1581,13 @@ void IncrementalOptimizer::addGPSFactorsForKeyFramesBatch(const std::vector<GPSF
                     std::max(1e-6, f.cov(1, 1)),
                     std::max(1e-6, f.cov(2, 2));
             auto noise = gtsam::noiseModel::Diagonal::Variances(vars);
-            pending_graph_.add(gtsam::GPSFactor(KF(f.kf_id), gps_point, noise));
+            staged_factors_.add(gtsam::GPSFactor(KF(f.kf_id), gps_point, noise));
             factor_count_++;
             added++;
         }
+
+        // 🏛️ [架构加固] 触发事务提交检查
+        tryMoveStagedToPendingInternal();
 
         if (added > 0) {
             OptimizationResult res = commitAndUpdate();
@@ -1608,11 +1641,14 @@ int IncrementalOptimizer::flushPendingGPSFactorsForKeyFramesInternal() {
                 std::max(1e-6, f.cov(1, 1)),
                 std::max(1e-6, f.cov(2, 2));
         auto noise = gtsam::noiseModel::Diagonal::Variances(vars);
-        pending_graph_.add(gtsam::GPSFactor(KF(f.kf_id), gps_point, noise));
+        staged_factors_.add(gtsam::GPSFactor(KF(f.kf_id), gps_point, noise));
         factor_count_++;
         added++;
     }
     if (added > 0) {
+        // 🏛️ [架构加固] 触发事务提交检查
+        tryMoveStagedToPendingInternal();
+
         pending_gps_factors_kf_ = std::move(still_pending);
         MetricsRegistry::instance().setGauge(metrics::ISAM2_PENDING_GPS_KF, static_cast<double>(pending_gps_factors_kf_.size()));
         RCLCPP_INFO(rclcpp::get_logger("automap_system"),
@@ -1826,8 +1862,10 @@ void IncrementalOptimizer::addOdomFactorBetweenKeyframes(int from, int to, const
     }
 
     auto noise = infoToNoiseDiagonal(info_matrix);
-    pending_graph_.add(gtsam::BetweenFactor<gtsam::Pose3>(KF(from), KF(to), toPose3(rel), noise));
+    staged_factors_.add(gtsam::BetweenFactor<gtsam::Pose3>(KF(from), KF(to), toPose3(rel), noise));
     factor_count_++;
+    // 🏛️ [架构加固] 触发事务提交检查
+    tryMoveStagedToPendingInternal();
     BACKEND_TRACE("addOdomFactorBetweenKeyframes ADD from=%d to=%d factor_count=%d", from, to, factor_count_);
 
     {
@@ -1845,6 +1883,9 @@ void IncrementalOptimizer::addOdomFactorBetweenKeyframes(int from, int to, const
 }
 
 OptimizationResult IncrementalOptimizer::commitAndUpdate() {
+    // 🏛️ [架构加固] 触发事务提交检查，确保在优化前尽量多的数据已经从 staging 转移到 pending
+    tryMoveStagedToPendingInternal();
+
     // 注意：调用时已持有写锁
     if (pending_graph_.empty() && pending_values_.empty()) {
         BACKEND_STEP("step=commitAndUpdate_skip reason=no_pending");
@@ -2420,8 +2461,10 @@ OptimizationResult IncrementalOptimizer::commitAndUpdate() {
             
             gtsam::SharedNoiseModel weak_prior = gtsam::noiseModel::Isotropic::Sigma(6, 1.0); // 1m/1rad std dev
             if (current_estimate_.exists(problematic_key)) {
-                pending_graph_.add(gtsam::PriorFactor<gtsam::Pose3>(problematic_key, current_estimate_.at<gtsam::Pose3>(problematic_key), weak_prior));
-                RCLCPP_INFO(rclcpp::get_logger("automap_system"), "[IncrementalOptimizer][BACKEND][RECOVERY] Added weak Prior to node %zu, will retry next update", static_cast<size_t>(problematic_key));
+                // 🏛️ [架构加固] 恢复因子也进入 staging
+                staged_factors_.add(gtsam::PriorFactor<gtsam::Pose3>(problematic_key, current_estimate_.at<gtsam::Pose3>(problematic_key), weak_prior));
+                tryMoveStagedToPendingInternal();
+                RCLCPP_INFO(rclcpp::get_logger("automap_system"), "[IncrementalOptimizer][BACKEND][RECOVERY] Added weak Prior to node %zu to staging, will retry next update", static_cast<size_t>(problematic_key));
             }
         } catch (...) {
             RCLCPP_ERROR(rclcpp::get_logger("automap_system"), "[IncrementalOptimizer][BACKEND][RECOVERY] Recovery failed");
@@ -2771,12 +2814,13 @@ void IncrementalOptimizer::rebuildAfterGPSAlign(const std::vector<SubmapData>& s
     // 1. 恢复子图节点
     for (const auto& d : submap_data) {
         node_exists_[d.id] = true;
-        pending_values_.insert(SM(d.id), toPose3(d.pose));
+        // 🏛️ [架构加固] 事务性插入：先进入 staging
+        staged_values_.insert(SM(d.id), toPose3(d.pose));
         node_count_++;
         
         if (d.is_fixed || !has_prior_) {
             auto noise = gtsam::noiseModel::Diagonal::Variances(prior_var6_);
-            pending_graph_.add(gtsam::PriorFactor<gtsam::Pose3>(SM(d.id), toPose3(d.pose), noise));
+            staged_factors_.add(gtsam::PriorFactor<gtsam::Pose3>(SM(d.id), toPose3(d.pose), noise));
             has_prior_ = true;
             factor_count_++;
         }
@@ -2785,12 +2829,13 @@ void IncrementalOptimizer::rebuildAfterGPSAlign(const std::vector<SubmapData>& s
     // 2. 恢复关键帧节点
     for (const auto& d : keyframe_data) {
         keyframe_node_exists_[d.id] = true;
-        pending_values_.insert(KF(d.id), toPose3(d.pose));
+        // 🏛️ [架构加固] 事务性插入：先进入 staging
+        staged_values_.insert(KF(d.id), toPose3(d.pose));
         keyframe_count_++;
         
         if (d.fixed || !has_prior_) {
             auto noise = gtsam::noiseModel::Diagonal::Variances(prior_var6_);
-            pending_graph_.add(gtsam::PriorFactor<gtsam::Pose3>(KF(d.id), toPose3(d.pose), noise));
+            staged_factors_.add(gtsam::PriorFactor<gtsam::Pose3>(KF(d.id), toPose3(d.pose), noise));
             has_prior_ = true;
             factor_count_++;
         }
@@ -2799,7 +2844,7 @@ void IncrementalOptimizer::rebuildAfterGPSAlign(const std::vector<SubmapData>& s
         int sm_id = d.id / MAX_KF_PER_SUBMAP;
         if (d.is_first_kf_of_submap && node_exists_.count(sm_id)) {
             auto anchor_noise = gtsam::noiseModel::Diagonal::Variances(prior_var6_);
-            pending_graph_.add(gtsam::BetweenFactor<gtsam::Pose3>(
+            staged_factors_.add(gtsam::BetweenFactor<gtsam::Pose3>(
                 SM(sm_id), KF(d.id), gtsam::Pose3::Identity(), anchor_noise));
             factor_count_++;
         }
@@ -2808,22 +2853,22 @@ void IncrementalOptimizer::rebuildAfterGPSAlign(const std::vector<SubmapData>& s
     // 3. 恢复因子
     for (const auto& f : odom_factors) {
         auto noise = infoToNoiseDiagonal(f.info_matrix);
-        pending_graph_.add(gtsam::BetweenFactor<gtsam::Pose3>(SM(f.from_id), SM(f.to_id), toPose3(f.rel_pose), noise));
+        staged_factors_.add(gtsam::BetweenFactor<gtsam::Pose3>(SM(f.from_id), SM(f.to_id), toPose3(f.rel_pose), noise));
         factor_count_++;
     }
     for (const auto& f : loop_factors) {
         auto noise = infoToNoiseDiagonal(f.info_matrix);
-        pending_graph_.add(gtsam::BetweenFactor<gtsam::Pose3>(SM(f.from_id), SM(f.to_id), toPose3(f.rel_pose), noise));
+        staged_factors_.add(gtsam::BetweenFactor<gtsam::Pose3>(SM(f.from_id), SM(f.to_id), toPose3(f.rel_pose), noise));
         factor_count_++;
     }
     for (const auto& f : kf_odom_factors) {
         auto noise = infoToNoiseDiagonal(f.info_matrix);
-        pending_graph_.add(gtsam::BetweenFactor<gtsam::Pose3>(KF(f.from_id), KF(f.to_id), toPose3(f.rel_pose), noise));
+        staged_factors_.add(gtsam::BetweenFactor<gtsam::Pose3>(KF(f.from_id), KF(f.to_id), toPose3(f.rel_pose), noise));
         factor_count_++;
     }
     for (const auto& f : kf_loop_factors) {
         auto noise = infoToNoiseDiagonal(f.info_matrix);
-        pending_graph_.add(gtsam::BetweenFactor<gtsam::Pose3>(KF(f.from_id), KF(f.to_id), toPose3(f.rel_pose), noise));
+        staged_factors_.add(gtsam::BetweenFactor<gtsam::Pose3>(KF(f.from_id), KF(f.to_id), toPose3(f.rel_pose), noise));
         factor_count_++;
     }
 
@@ -2836,6 +2881,10 @@ void IncrementalOptimizer::rebuildAfterGPSAlign(const std::vector<SubmapData>& s
         history_kf_odom_factors_ = kf_odom_factors;
         history_kf_loop_factors_ = kf_loop_factors;
     }
+
+    // 🏛️ [架构加固] 触发事务提交检查
+    tryMoveStagedToPendingInternal();
+
     try {
         isam2_.update(pending_graph_, pending_values_);
         current_estimate_ = isam2_.calculateEstimate();
@@ -3235,6 +3284,8 @@ void IncrementalOptimizer::resetForRecovery() {
     // 清空因子图但保留节点映射（避免重建）
     pending_graph_.resize(0);
     pending_values_.clear();
+    staged_factors_.resize(0);
+    staged_values_.clear();
     current_estimate_.clear();
     pending_odom_factors_submap_.clear();
 
@@ -3266,6 +3317,85 @@ void IncrementalOptimizer::resetForRecovery() {
     ALOG_INFO(MOD, "[Health] iSAM2 reset complete for recovery");
     RCLCPP_INFO(rclcpp::get_logger("automap_system"),
         "[IncrementalOptimizer][Health] iSAM2 reset complete for recovery");
+}
+
+void IncrementalOptimizer::tryMoveStagedToPendingInternal() {
+    bool progress = true;
+    int move_count = 0;
+    while (progress) {
+        progress = false;
+        
+        // 1. 识别已 grounded 的 staged values
+        gtsam::KeyVector grounded_now;
+        for (const auto& kv : staged_values_) {
+            gtsam::Key k = kv.key;
+            if (isGroundedInternal(k)) {
+                grounded_now.push_back(k);
+            }
+        }
+        
+        if (!grounded_now.empty()) progress = true;
+        
+        // 2. 移动到 pending_values_
+        for (gtsam::Key k : grounded_now) {
+            pending_values_.insert(k, staged_values_.at<gtsam::Pose3>(k));
+            staged_values_.erase(k);
+            move_count++;
+        }
+        
+        // 3. 识别并移动 grounded factors
+        gtsam::NonlinearFactorGraph still_staged;
+        for (const auto& f : staged_factors_) {
+            if (!f) continue;
+            bool all_grounded = true;
+            for (gtsam::Key k : f->keys()) {
+                if (!isGroundedInternal(k)) {
+                    all_grounded = false;
+                    break;
+                }
+            }
+            if (all_grounded) {
+                pending_graph_.add(f);
+                progress = true;
+            } else {
+                still_staged.add(f);
+            }
+        }
+        staged_factors_ = still_staged;
+    }
+    
+    if (move_count > 0) {
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[IncrementalOptimizer][BACKEND][TRANSACTION] Moved %d nodes and associated factors from STAGED to PENDING",
+            move_count);
+    }
+}
+
+bool IncrementalOptimizer::isGroundedInternal(gtsam::Key key) const {
+    // 已经在图中（isam2 内部或 pending 中）
+    if (current_estimate_.exists(key) || pending_values_.exists(key)) return true;
+    
+    // 检查 staged_factors 中是否有直接 Prior
+    for (const auto& f : staged_factors_) {
+        if (!f) continue;
+        if (dynamic_cast<const gtsam::PriorFactor<gtsam::Pose3>*>(f.get())) {
+            if (f->keys().size() == 1 && f->keys()[0] == key) return true;
+        }
+    }
+    
+    // 检查是否有链接到 grounded 节点的 BetweenFactor (这里只看一层，while 循环会处理多层)
+    for (const auto& f : staged_factors_) {
+        if (!f) continue;
+        auto b = dynamic_cast<const gtsam::BetweenFactor<gtsam::Pose3>*>(f.get());
+        if (b) {
+            gtsam::Key k1 = b->key1();
+            gtsam::Key k2 = b->key2();
+            if (k1 == key && (current_estimate_.exists(k2) || pending_values_.exists(k2))) return true;
+            if (k2 == key && (current_estimate_.exists(k1) || pending_values_.exists(k1))) return true;
+        }
+    }
+    
+    return false;
 }
 
 } // namespace automap_pro

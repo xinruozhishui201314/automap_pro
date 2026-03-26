@@ -19,6 +19,11 @@ import struct
 import sys
 import traceback
 
+# 🏛️ [架构加固] 立即重定向标准输出到标准错误，防止后续所有 import 或 print 污染二进制协议通道
+# 必须在任何三方库（如 torch, spconv）加载之前执行
+_real_stdout_buffer = sys.stdout.buffer
+sys.stdout = sys.stderr
+
 MAGIC = b"LSK1"
 VERSION = 1
 CMD_INIT = 1
@@ -93,12 +98,14 @@ def load_model_bundle(config_yaml: str, checkpoint: str, device_s: str):
     from utils.load_util import load_yaml
     from utils.load_save_util import load_checkpoint_old
 
+    print(f"[lsk3dnet_hybrid_worker] loading config from {config_yaml}", file=sys.stderr)
     cfg = EasyDict(load_yaml(config_yaml))
     model = get_model_class(cfg.model_params.model_architecture)(cfg)
     dev = torch.device(device_s)
     model.to(dev)
     if checkpoint and os.path.isfile(checkpoint):
-        raw = torch.load(checkpoint, map_location=dev)
+        print(f"[lsk3dnet_hybrid_worker] loading checkpoint from {checkpoint} to {dev}", file=sys.stderr)
+        raw = torch.load(checkpoint, map_location=dev, weights_only=False)
         if isinstance(raw, dict) and "checkpoint" in raw:
             load_checkpoint_old(checkpoint, model)
         elif isinstance(raw, dict):
@@ -110,11 +117,28 @@ def load_model_bundle(config_yaml: str, checkpoint: str, device_s: str):
             )
         else:
             raise ValueError("unsupported checkpoint type")
+    else:
+        print(f"[lsk3dnet_hybrid_worker] WARNING: checkpoint not found or not specified: {checkpoint}", file=sys.stderr)
+    
     model.eval()
     feat_dim = int(model.hiden_size * model.num_scales)
-    input_dims = int(model.input_dims)
+    packed_input_dims = int(model.input_dims)
+    # voxel_3d_generator.prepare_input() always builds:
+    #   cat(point, nor_pc(3), center_to_point(3), normal(3))
+    # so the protocol must carry RAW point dims = packed_input_dims - 9.
+    if packed_input_dims <= 9:
+        raise ValueError(
+            f"invalid model.input_dims={packed_input_dims}; expected packed dims > 9 "
+            f"(point + nor_pc + center + normal)"
+        )
+    raw_input_dims = packed_input_dims - 9
     num_classes = int(model.num_classes)
-    return model, dev, feat_dim, input_dims, num_classes
+    print(
+        f"[lsk3dnet_hybrid_worker] model initialized: feat_dim={feat_dim} "
+        f"packed_input_dims={packed_input_dims} raw_input_dims={raw_input_dims} num_classes={num_classes}",
+        file=sys.stderr,
+    )
+    return model, dev, feat_dim, raw_input_dims, num_classes
 
 
 def compute_normals_like_training(
@@ -189,8 +213,25 @@ def main_stdio():
     import numpy as np
     import torch
 
+    # 🏛️ [协议通道解耦] 优先尝试使用专门的文件描述符 3 进行二进制通信
+    # 如果 FD 3 不可用（如旧版或手动启动），回退到原始 stdout 缓冲
+    try:
+        # 检查 FD 3 是否有效且可写
+        os.fstat(3)
+        proto_out = os.fdopen(3, "wb", buffering=0)
+        print("[lsk3dnet_hybrid_worker] Using FD 3 for binary protocol", file=sys.stderr)
+    except (OSError, ValueError):
+        # 🏛️ [架构加固] 极端情况下 FD 3 不可用，回退到原始 stdout 缓冲（此时 FD 1 应已被 C++ 父进程重定向到 stderr）
+        # 除非明确传参要求 stdio 模式，否则 FD 3 不可用应该是致命错误以防止隐式故障。
+        if "--stdio" in sys.argv:
+            proto_out = _real_stdout_buffer
+            print("[lsk3dnet_hybrid_worker] FD 3 not available, falling back to real stdout buffer", file=sys.stderr)
+        else:
+            print("[lsk3dnet_hybrid_worker] CRITICAL: FD 3 not available and --stdio not specified. ABORT.", file=sys.stderr)
+            sys.exit(124)
+
     fin = sys.stdin.buffer
-    fout = sys.stdout.buffer
+    fout = proto_out
     model = None
     device = None
     feat_dim = 0
@@ -252,6 +293,11 @@ def main_stdio():
                 if c != input_dims:
                     write_error(fout, f"channel mismatch: got {c} want {input_dims}")
                     continue
+                
+                # Periodic logging for inference
+                if n > 0:
+                    print(f"[lsk3dnet_hybrid_worker] inferring {n} points...", file=sys.stderr)
+
                 arr = np.frombuffer(payload, dtype=np.float32, offset=12, count=n * c).reshape(n, c)
                 points = torch.from_numpy(arr.copy())
                 nor_np = compute_normals_like_training(

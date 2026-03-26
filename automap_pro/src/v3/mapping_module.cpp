@@ -1297,16 +1297,26 @@ void MappingModule::handleSaveMap(const SaveMapRequestEvent& ev) {
 
 void MappingModule::handleGlobalMapBuild(const GlobalMapBuildRequestEvent& ev) {
     try {
-        CloudXYZIPtr global;
         if (ev.async) {
-            global = sm_manager_.buildGlobalMapAsync(ev.voxel_size).get();
+            // 🏛️ [稳定性修复] 使用异步构建且不再通过 .get() 阻塞 MappingModule 线程 (解决 HUNG/ZOMBIE 问题)
+            // 获取 future 后通过单独的辅助线程处理结果并发布事件，确保 MappingModule 心跳不中断
+            auto future = sm_manager_.buildGlobalMapAsync(ev.voxel_size);
+            std::thread([this, f = std::move(future)]() mutable {
+                try {
+                    auto global = f.get();
+                    GlobalMapBuildResultEvent res;
+                    res.global_map = global;
+                    event_bus_->publish(res);
+                } catch (const std::exception& e) {
+                    RCLCPP_ERROR(node_->get_logger(), "[V3][MappingModule][ASYNC_BUILD] Build failed: %s", e.what());
+                }
+            }).detach();
         } else {
-            global = sm_manager_.buildGlobalMap(ev.voxel_size);
+            CloudXYZIPtr global = sm_manager_.buildGlobalMap(ev.voxel_size);
+            GlobalMapBuildResultEvent res;
+            res.global_map = global;
+            event_bus_->publish(res);
         }
-
-        GlobalMapBuildResultEvent res;
-        res.global_map = global;
-        event_bus_->publish(res);
     } catch (const std::exception& e) {
         RCLCPP_ERROR(node_->get_logger(), "[V3][MappingModule] Global map build failed: %s", e.what());
     }

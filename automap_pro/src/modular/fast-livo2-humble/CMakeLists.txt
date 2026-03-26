@@ -104,6 +104,7 @@ find_package(OpenCV REQUIRED)
 find_package(Sophus REQUIRED)
 find_package(Boost REQUIRED COMPONENTS thread)
 find_package(fmt REQUIRED)
+find_package(automap_pro REQUIRED)
 
 # ROS 2 Jazzy 等：SophusConfig 常只导出 Sophus::Sophus，Sophus_INCLUDE_DIRS 可能为空；须链接目标以传递 sophus 头文件路径
 if(TARGET Sophus::Sophus)
@@ -139,6 +140,7 @@ set(dependencies
   pcl_ros
   pcl_conversions
   tf2_ros
+  automap_pro
 )
 
 set(COMMON_DEPENDENCIES OpenMP::OpenMP_CXX fmt::fmt)
