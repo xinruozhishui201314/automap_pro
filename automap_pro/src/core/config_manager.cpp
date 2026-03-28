@@ -989,4 +989,32 @@ std::vector<float> ConfigManager::semanticInputStd() const {
     return readSemanticFloatSequence(cfg_, "input_std");
 }
 
+std::vector<int> ConfigManager::loopSemanticIcpDynamicClassIds() const {
+    static const std::vector<int> kDefault = {10, 11, 15, 16, 18};
+    try {
+        YAML::Node n = cfg_["loop_closure"]["semantic_icp"]["dynamic_class_ids"];
+        if (n && n.IsSequence() && n.size() > 0) {
+            std::vector<int> out;
+            out.reserve(n.size());
+            for (size_t i = 0; i < n.size(); ++i) {
+                if (n[i].IsScalar()) out.push_back(n[i].as<int>());
+            }
+            if (!out.empty()) return out;
+        }
+    } catch (...) {}
+    std::string csv = get<std::string>("loop_closure.semantic_icp.dynamic_class_ids_csv", "");
+    if (csv.empty()) return kDefault;
+    std::vector<int> out;
+    std::stringstream ss(csv);
+    std::string item;
+    while (std::getline(ss, item, ',')) {
+        try {
+            while (!item.empty() && (item.front() == ' ' || item.front() == '\t')) item.erase(0, 1);
+            while (!item.empty() && (item.back() == ' ' || item.back() == '\t')) item.pop_back();
+            if (!item.empty()) out.push_back(std::stoi(item));
+        } catch (...) {}
+    }
+    return out.empty() ? kDefault : out;
+}
+
 } // namespace automap_pro

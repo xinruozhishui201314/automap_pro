@@ -595,6 +595,16 @@ if(overlap_transformer_msgs_FOUND)
   add_definitions(-DUSE_OVERLAP_TRANSFORMER_MSGS)
 endif()
 
+# Patchwork++
+set(PATCHWORK_PP_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/thrid_party/patchwork-plusplus")
+if(EXISTS "${PATCHWORK_PP_SOURCE}/CMakeLists.txt")
+  message(STATUS "[automap_pro] Patchwork++ source at ${PATCHWORK_PP_SOURCE} – inline build")
+  add_subdirectory(${PATCHWORK_PP_SOURCE} ${CMAKE_CURRENT_BINARY_DIR}/patchworkpp EXCLUDE_FROM_ALL)
+  set(PATCHWORK_PP_TARGET patchworkpp)
+else()
+  message(WARNING "[automap_pro] Patchwork++ not found – semantic geometric fusion may be limited")
+endif()
+
 # ──────────────────────────────────────────────────────────
 # ROS2 消息/服务/Action 生成
 # ──────────────────────────────────────────────────────────
@@ -633,6 +643,7 @@ set(AUTOMAP_INCLUDE_DIRS
   ${OpenCV_INCLUDE_DIRS}
   ${GTSAM_INCLUDE_DIR}
   ${_onnx_include}
+  ${PATCHWORK_PP_SOURCE}/include
 )
 if(Torch_FOUND)
   list(APPEND AUTOMAP_INCLUDE_DIRS ${TORCH_INCLUDE_DIRS})
@@ -662,6 +673,7 @@ set(AUTOMAP_LIBS
   GeographicLib::GeographicLib
   ${TEASER_TARGET}
   ${_onnx_lib}
+  ${PATCHWORK_PP_TARGET}
 )
 if(Torch_FOUND)
   list(APPEND AUTOMAP_LIBS ${TORCH_LIBRARIES})
@@ -678,6 +690,7 @@ endif()
 # ──────────────────────────────────────────────────────────
 add_library(automap_core SHARED
   src/core/config_manager.cpp
+  src/core/landmark_id.cpp
   src/core/map_frame_config.cpp
   src/core/logger.cpp
   src/core/load_trace.cpp
@@ -857,9 +870,11 @@ add_library(automap_system_component SHARED
   src/system/modules/tasks_and_utils.cpp
   src/v3/map_registry.cpp
   src/v3/semantic_segmentor_factory.cpp
+  src/v3/noop_semantic_segmentor.cpp
   src/v3/sloam_semantic_segmentor.cpp
   src/v3/lsk3dnet_semantic_segmentor.cpp
   src/v3/lsk3dnet_hybrid_semantic_segmentor.cpp
+  src/v3/geometric_processor.cpp
   src/v3/semantic_processor.cpp
   src/v3/semantic_module.cpp
   src/v3/frontend_module.cpp

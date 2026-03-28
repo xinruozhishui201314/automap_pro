@@ -48,6 +48,7 @@ public:
         const auto t0 = std::chrono::steady_clock::now();
         segmentator_->run(sloamInputCloudPtr(cloud), mask);
         if (result != nullptr) {
+            result->per_point_labels.clear();
             const auto t1 = std::chrono::steady_clock::now();
             result->success = true;
             result->backend_name = name();

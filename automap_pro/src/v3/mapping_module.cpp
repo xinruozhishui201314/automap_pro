@@ -4,10 +4,14 @@
 #include "automap_pro/core/metrics.h"
 #include "automap_pro/core/opt_task_types.h"
 #include "automap_pro/v3/map_registry.h"
+#include "automap_pro/v3/semantic_backend_gates.h"
 #include "automap_pro/core/data_types.h"
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <limits>
 #include <vector>
+#include <unordered_set>
 #include <filesystem>
 #include <chrono>
 #include <future>
@@ -64,6 +68,12 @@ uint64_t semanticTraceId(uint64_t kf_id, double ts) {
 uint64_t makeEventId(double ts, uint64_t seq) {
     const uint64_t ts_us = std::isfinite(ts) ? static_cast<uint64_t>(std::max(0.0, ts) * 1e6) : 0ull;
     return (seq << 20) ^ ts_us;
+}
+
+/** 后端噪声与 DCS 缩放用：检测置信度 × 子图内地标可观测性（多帧几何一致） */
+double semanticBackendFactorWeight(double detection_confidence, double submap_observability) {
+    const double obs = std::clamp(submap_observability, 0.05, 1.0);
+    return std::max(1e-3, detection_confidence * obs);
 }
 } // namespace
 
@@ -352,8 +362,56 @@ MappingModule::MappingModule(EventBus::Ptr event_bus, MapRegistry::Ptr map_regis
         cv_.notify_one();
     });
 
+    // 语义点云（intensity=类别 id）挂到关键帧，供回环 ICP 加权（与 SemanticLandmarkEvent 独立到达）
+    onEvent<SemanticCloudEvent>([this](const SemanticCloudEvent& ev) {
+        if (!running_.load()) return;
+        if (!ev.labeled_cloud || ev.labeled_cloud->empty()) return;
+        const auto& cfg = ConfigManager::instance();
+        const double tol = cfg.semanticTimestampMatchToleranceS();
+        KeyFrame::Ptr kf = map_registry_->getKeyFrameByTimestamp(ev.timestamp, tol);
+        if (!kf && std::isfinite(ev.timestamp) && ev.timestamp > 0.0) {
+            kf = map_registry_->getKeyFrameByTimestamp(ev.timestamp, std::min(0.5, tol * 2.0));
+        }
+        if (!kf) {
+            RCLCPP_DEBUG_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000,
+                "[SEMANTIC][MAP] SemanticCloudEvent: no keyframe for ts=%.3f", ev.timestamp);
+            return;
+        }
+        if (!kf->cloud_body || kf->cloud_body->empty()) return;
+        if (ev.labeled_cloud->size() != kf->cloud_body->size()) {
+            RCLCPP_DEBUG_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000,
+                "[SEMANTIC][MAP] labeled_cloud pts=%zu != cloud_body %zu kf_id=%lu skip",
+                ev.labeled_cloud->size(), kf->cloud_body->size(),
+                static_cast<unsigned long>(kf->id));
+            return;
+        }
+        const double min_agree = cfg.semanticCloudAttachMinPointAgreement();
+        if (min_agree > 0.0 && kf->cloud_semantic_labeled_body &&
+            kf->cloud_semantic_labeled_body->size() == ev.labeled_cloud->size()) {
+            size_t same = 0;
+            const size_t n = ev.labeled_cloud->size();
+            for (size_t pi = 0; pi < n; ++pi) {
+                const int a = static_cast<int>(std::lround(kf->cloud_semantic_labeled_body->points[pi].intensity));
+                const int b = static_cast<int>(std::lround(ev.labeled_cloud->points[pi].intensity));
+                if (a == b) ++same;
+            }
+            const double ratio = static_cast<double>(same) / static_cast<double>(n > 0 ? n : 1);
+            if (ratio < min_agree) {
+                RCLCPP_DEBUG_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000,
+                    "[SEMANTIC][MAP] semantic flicker reject kf_id=%lu point_agreement=%.2f < min=%.2f (keep previous labels)",
+                    static_cast<unsigned long>(kf->id), ratio, min_agree);
+                return;
+            }
+        }
+        kf->cloud_semantic_labeled_body = std::make_shared<CloudXYZI>();
+        *kf->cloud_semantic_labeled_body = *ev.labeled_cloud;
+        RCLCPP_DEBUG(node_->get_logger(),
+            "[SEMANTIC][MAP] attached semantic labels on kf_id=%lu pts=%zu",
+            static_cast<unsigned long>(kf->id), kf->cloud_semantic_labeled_body->size());
+    });
+
     RCLCPP_INFO(node_->get_logger(),
-                "[PIPELINE][MAP] ctor OK events=FilteredFrame+GPSAligned+OptResult+Loop+SaveMap+GlobalMap+HBA+Semantic");
+                "[PIPELINE][MAP] ctor OK events=FilteredFrame+GPSAligned+OptResult+Loop+SaveMap+GlobalMap+HBA+Semantic+SemanticCloud");
     RCLCPP_INFO(node_->get_logger(),
                 "[V3][SELF_CHECK][CONTRACT] module=Mapping prequeue_valid_guard=on process_entry_guard=on safe_cloud_ds_fallback=on required_ds_subscription=on");
 }
@@ -629,8 +687,64 @@ void MappingModule::processFrame(const FilteredFrameEventRequiredDs& event) {
         CloudXYZIPtr body_cloud_ds(new CloudXYZI());
         pcl::transformPointCloud(*safe_cloud_ds, *body_cloud_ds, event.T_odom_b.inverse().cast<float>());
         cloud_ds = body_cloud_ds;
-        
-        RCLCPP_DEBUG(node_->get_logger(), 
+
+        // grep GEO_PIPELINE：世界系关键帧入库前 span 对比，区分「未转换」与「转换后正常车体系尺度」
+        static std::atomic<uint32_t> geo_pipeline_world_kf{0};
+        const uint32_t wk = geo_pipeline_world_kf.fetch_add(1, std::memory_order_relaxed) + 1;
+        const bool log_geo = (wk <= 25u || (wk % 200u) == 0u);
+        if (log_geo && event.cloud && cloud) {
+            auto bboxStats = [](const CloudXYZIPtr& pc) {
+                struct {
+                    double xy_span = -1.0;
+                    double z_span = -1.0;
+                } out;
+                if (!pc || pc->empty()) {
+                    return out;
+                }
+                double x_min = std::numeric_limits<double>::infinity();
+                double x_max = -std::numeric_limits<double>::infinity();
+                double y_min = std::numeric_limits<double>::infinity();
+                double y_max = -std::numeric_limits<double>::infinity();
+                double z_min = std::numeric_limits<double>::infinity();
+                double z_max = -std::numeric_limits<double>::infinity();
+                for (const auto& p : pc->points) {
+                    if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) {
+                        continue;
+                    }
+                    x_min = std::min(x_min, static_cast<double>(p.x));
+                    x_max = std::max(x_max, static_cast<double>(p.x));
+                    y_min = std::min(y_min, static_cast<double>(p.y));
+                    y_max = std::max(y_max, static_cast<double>(p.y));
+                    z_min = std::min(z_min, static_cast<double>(p.z));
+                    z_max = std::max(z_max, static_cast<double>(p.z));
+                }
+                if (std::isfinite(x_min) && std::isfinite(z_min)) {
+                    out.xy_span = std::max(x_max - x_min, y_max - y_min);
+                    out.z_span = z_max - z_min;
+                }
+                return out;
+            };
+            const auto sw = bboxStats(event.cloud);
+            const auto sb = bboxStats(cloud);
+            const Eigen::Vector3d tw = event.T_odom_b.translation();
+            RCLCPP_INFO(
+                node_->get_logger(),
+                "[GEO_PIPELINE][MAP_COORD] world_kf_seq=%u ts=%.3f pts_w=%zu span_xy_w=%.2f dz_w=%.2f "
+                "pts_b=%zu span_xy_b=%.2f dz_b=%.2f T_odom_b_t=[%.2f,%.2f,%.2f] | cloud_frame=world->body",
+                wk,
+                event.timestamp,
+                event.cloud->size(),
+                sw.xy_span,
+                sw.z_span,
+                cloud->size(),
+                sb.xy_span,
+                sb.z_span,
+                tw.x(),
+                tw.y(),
+                tw.z());
+        }
+
+        RCLCPP_DEBUG(node_->get_logger(),
             "[V3][CONTRACT] cloud_frame=world converted to body (ts=%.3f pose_frame=%d)",
             event.timestamp, static_cast<int>(event.pose_frame));
     }
@@ -688,18 +802,41 @@ void MappingModule::processFrame(const FilteredFrameEventRequiredDs& event) {
     bool has_prev_kf = (prev_kf != nullptr);
     int prev_kf_id = has_prev_kf ? static_cast<int>(prev_kf->id) : -1;
 
-    // 发布任务
-    GraphTaskEvent task_ev;
-    task_ev.task.type = OptTaskItem::Type::KEYFRAME_CREATE;
-    task_ev.task.keyframe = kf;
-    task_ev.task.has_prev_kf = has_prev_kf;
-    task_ev.task.prev_kf_id = prev_kf_id;
-    task_ev.task.prev_keyframe = prev_kf;
-    task_ev.task.gps_aligned = aligned;
-    task_ev.task.gps_transform_R = R_snapshot;
-    task_ev.task.gps_transform_t = t_snapshot;
-    
-    publishGraphTaskEvent(task_ev, kf->timestamp);
+    // 发布任务（灰度迁移：GraphTaskEvent <-> SemanticInputEvent 可双路）
+    const auto& cfg = ConfigManager::instance();
+    const bool use_independent_semantic_input = cfg.semanticInputUseIndependentEvent();
+    const bool dual_write_graph_task = cfg.semanticInputDualWriteGraphTask();
+    if (!use_independent_semantic_input || dual_write_graph_task) {
+        GraphTaskEvent task_ev;
+        task_ev.task.type = OptTaskItem::Type::KEYFRAME_CREATE;
+        task_ev.task.keyframe = kf;
+        task_ev.task.has_prev_kf = has_prev_kf;
+        task_ev.task.prev_kf_id = prev_kf_id;
+        task_ev.task.prev_keyframe = prev_kf;
+        task_ev.task.gps_aligned = aligned;
+        task_ev.task.gps_transform_R = R_snapshot;
+        task_ev.task.gps_transform_t = t_snapshot;
+        publishGraphTaskEvent(task_ev, kf->timestamp);
+    }
+
+    if (use_independent_semantic_input) {
+        SemanticInputEvent sem_in_ev;
+        sem_in_ev.timestamp = kf->timestamp;
+        sem_in_ev.keyframe = kf;
+        const uint64_t seq = graph_event_seq_.fetch_add(1, std::memory_order_relaxed) + 1;
+        const double now_ts = node_->now().seconds();
+        sem_in_ev.meta.event_id = makeEventId(kf->timestamp, seq);
+        sem_in_ev.meta.idempotency_key = sem_in_ev.meta.event_id;
+        sem_in_ev.meta.producer_seq = seq;
+        sem_in_ev.meta.ref_version = map_registry_->getVersion();
+        sem_in_ev.meta.ref_epoch = map_registry_->getAlignmentEpoch();
+        sem_in_ev.meta.source_ts = kf->timestamp;
+        sem_in_ev.meta.publish_ts = now_ts;
+        sem_in_ev.meta.producer = "MappingModule";
+        sem_in_ev.meta.route_tag = route_takeover_enabled_.load(std::memory_order_relaxed) ? "orchestrated" : "legacy";
+        sem_in_ev.processing_state = quiescing_.load() ? ProcessingState::DEGRADED : ProcessingState::NORMAL;
+        event_bus_->publish(sem_in_ev);
+    }
     const uint64_t trace_id = semanticTraceId(kf->id, kf->timestamp);
     size_t frame_q_size = 0;
     size_t sem_q_size = 0;
@@ -1359,9 +1496,18 @@ void MappingModule::onSemanticLandmarks(const SemanticLandmarkEvent& ev) {
     const uint64_t trace_id = semanticTraceId(
         ev.keyframe_id_hint != 0 ? ev.keyframe_id_hint : static_cast<uint64_t>(std::max(0.0, ev.timestamp) * 1000.0),
         ev.timestamp);
-    RCLCPP_DEBUG(node_->get_logger(),
-        "[SEMANTIC][Mapping][onSemanticLandmarks] step=entry trace=%lu ts=%.3f landmarks=%zu",
-        static_cast<unsigned long>(trace_id), ev.timestamp, ev.landmarks.size());
+    RCLCPP_INFO_THROTTLE(
+        node_->get_logger(),
+        *node_->get_clock(),
+        2500,
+        "[SEMANTIC][Mapping][onSemanticLandmarks] step=entry trace=%lu ts=%.3f trees_in=%zu planes_in=%zu kf_hint_id=%lu kf_hint_ts=%.3f "
+        "(trees/planes 入图前仍受关联/support/gating；地面标签走 SemanticCloudEvent 不在此事件)",
+        static_cast<unsigned long>(trace_id),
+        ev.timestamp,
+        ev.landmarks.size(),
+        ev.plane_landmarks.size(),
+        static_cast<unsigned long>(ev.keyframe_id_hint),
+        ev.keyframe_timestamp_hint);
 
     auto defer_semantic_event = [this, trace_id](const SemanticLandmarkEvent& pending_ev, const char* reason, uint64_t kf_id, int sm_id) {
         std::lock_guard<std::mutex> lk(pending_semantic_mutex_);
@@ -1387,14 +1533,16 @@ void MappingModule::onSemanticLandmarks(const SemanticLandmarkEvent& ev) {
             "[SEMANTIC][Mapping][onSemanticLandmarks] step=defer reason=%s ts=%.3f kf_id=%lu sm_id=%d pending=%zu",
             reason, pending_ev.timestamp, static_cast<unsigned long>(kf_id), sm_id, pending_semantic_landmarks_.size());
         RCLCPP_INFO_THROTTLE(node_->get_logger(), *node_->get_clock(), 2000,
-            "[CHAIN][B3 MAP_IN] action=defer trace=%lu reason=%s sem_defer=%lu pending=%zu ts=%.3f kf_id=%lu sm_id=%d",
+            "[CHAIN][B3 MAP_IN] action=defer trace=%lu reason=%s sem_defer=%lu pending=%zu ts=%.3f kf_id=%lu sm_id=%d trees=%zu planes=%zu",
             static_cast<unsigned long>(trace_id),
             reason,
             static_cast<unsigned long>(semantic_defer_total_.load(std::memory_order_relaxed)),
             pending_semantic_landmarks_.size(),
             pending_ev.timestamp,
             static_cast<unsigned long>(kf_id),
-            sm_id);
+            sm_id,
+            pending_ev.landmarks.size(),
+            pending_ev.plane_landmarks.size());
     };
 
     // 1. 查找对应的关键帧（优先 keyframe_id_hint，其次 keyframe timestamp hint，再兜底语义事件时间戳）
@@ -1427,17 +1575,22 @@ void MappingModule::onSemanticLandmarks(const SemanticLandmarkEvent& ev) {
 
     // 2. 更新关键帧的地标
     // 🏛️ [架构契约] 数据完整性校验
-    std::vector<CylinderLandmark::Ptr> valid_landmarks;
+    std::vector<CylinderLandmark::Ptr> valid_trees;
     for (const auto& l : ev.landmarks) {
         if (l && l->isValid()) {
-            valid_landmarks.push_back(l);
-        } else {
-            RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000,
-                "[SEMANTIC][CONTRACT] Drop invalid landmark: non-finite or zero radius");
+            valid_trees.push_back(l);
         }
     }
-    if (valid_landmarks.empty()) return;
-    kf->landmarks = valid_landmarks;
+    std::vector<PlaneLandmark::Ptr> valid_planes;
+    for (const auto& l : ev.plane_landmarks) {
+        if (l && l->isValid()) {
+            valid_planes.push_back(l);
+        }
+    }
+
+    if (valid_trees.empty() && valid_planes.empty()) return;
+    kf->landmarks = valid_trees;
+    kf->plane_landmarks = valid_planes;
 
     // 3. 关联到子图（由 SubMapManager 内部完成互斥，避免外层重复加锁导致自锁）
     auto sm = sm_manager_.getSubmap(static_cast<int>(kf->submap_id));
@@ -1453,23 +1606,154 @@ void MappingModule::onSemanticLandmarks(const SemanticLandmarkEvent& ev) {
         OptTaskItem landmark_task;
         landmark_task.type = OptTaskItem::Type::CYLINDER_LANDMARK_FACTOR;
         landmark_task.to_id = static_cast<int>(kf->id);
+        OptTaskItem plane_task;
+        plane_task.type = OptTaskItem::Type::PLANE_LANDMARK_FACTOR;
+        plane_task.to_id = static_cast<int>(kf->id);
         
+        const auto& cfg = ConfigManager::instance();
+        const int min_confirmations = cfg.semanticAssocCylinderMinConfirmations();
+        const double min_observability = cfg.semanticAssocCylinderMinObservability();
+        const int plane_min_confirmations = cfg.semanticAssocPlaneMinConfirmations();
+        const double plane_min_observability = cfg.semanticAssocPlaneMinObservability();
+        const bool protection_mode_active = sm_manager_.isSemanticProtectionModeActive();
+        const bool weak_semantic_context = !gps_aligned_.load(std::memory_order_relaxed) && [&]() {
+            std::lock_guard<std::mutex> lk(loop_constraints_mutex_);
+            return loop_constraints_.empty();
+        }();
+        const int sample_stride = protection_mode_active
+            ? cfg.semanticAssocFactorSampleStrideProtected()
+            : cfg.semanticAssocFactorSampleStrideNormal();
+        const int weak_min_support = cfg.semanticAssocFactorWeakContextMinSupport();
+        const double weak_min_observability = cfg.semanticAssocFactorWeakContextMinObservability();
+        const uint64_t tree_input_this_frame = static_cast<uint64_t>(kf->landmarks.size());
+        uint64_t tree_emitted_this_frame = 0;
+        uint64_t tree_suppressed_this_frame = 0;
+        uint64_t tree_suppressed_sampling_this_frame = 0;
+        std::unordered_set<int> used_cylinder_idx;
+        size_t candidate_idx = 0;
         for (const auto& l_kf : kf->landmarks) {
             if (l_kf->associated_idx >= 0 && l_kf->associated_idx < static_cast<int>(sm->landmarks.size())) {
+                if (used_cylinder_idx.find(l_kf->associated_idx) != used_cylinder_idx.end()) {
+                    ++tree_suppressed_this_frame;
+                    continue;
+                }
                 const auto& l_sm = sm->landmarks[l_kf->associated_idx];
+                if (!l_sm || !l_sm->isValid()) {
+                    ++tree_suppressed_this_frame;
+                    continue;
+                }
+                if (static_cast<int>(l_sm->support_count) < min_confirmations ||
+                    l_sm->observability_score < min_observability) {
+                    ++tree_suppressed_this_frame;
+                    continue;
+                }
+                if (weak_semantic_context &&
+                    (static_cast<int>(l_sm->support_count) < weak_min_support ||
+                     l_sm->observability_score < weak_min_observability)) {
+                    ++tree_suppressed_this_frame;
+                    continue;
+                }
+                // 手动防呆：若树干 root 贴近强支撑墙面，则视为墙边伪树干，直接拒绝本帧因子。
+                if (semanticBackendCylinderTooCloseToPlanes(
+                        cfg, kf->T_submap_kf, l_kf, sm->plane_landmarks)) {
+                    ++tree_suppressed_this_frame;
+                    continue;
+                }
+                if (!semanticBackendCylinderPassesGating(cfg, kf->T_submap_kf, l_kf, l_sm)) {
+                    ++tree_suppressed_this_frame;
+                    continue;
+                }
+                if (sample_stride > 1 && ((candidate_idx++ % static_cast<size_t>(sample_stride)) != 0)) {
+                    ++tree_suppressed_sampling_this_frame;
+                    ++tree_suppressed_this_frame;
+                    continue;
+                }
                 
                 CylinderFactorItemKF factor;
                 factor.kf_id = kf->id;
                 factor.sm_id = static_cast<uint64_t>(sm->id);
-                factor.point_body = l_kf->root; 
+                factor.point_body = semanticBackendCylinderSampleBody(l_kf);
                 factor.root_submap = l_sm->root; 
                 factor.ray_submap = l_sm->ray;
                 factor.radius = l_sm->radius;
-                factor.weight = l_kf->confidence;
+                factor.weight = semanticBackendFactorWeight(l_kf->confidence, l_sm->observability_score);
                 
                 landmark_task.cylinder_factors.push_back(factor);
+                used_cylinder_idx.insert(l_kf->associated_idx);
+                ++tree_emitted_this_frame;
             }
         }
+
+        const uint64_t plane_input_this_frame = static_cast<uint64_t>(kf->plane_landmarks.size());
+        uint64_t plane_emitted_this_frame = 0;
+        uint64_t plane_suppressed_this_frame = 0;
+        std::unordered_set<int> used_plane_idx;
+        for (const auto& p_kf : kf->plane_landmarks) {
+            if (!p_kf || !p_kf->isValid()) {
+                continue;
+            }
+
+            if (p_kf->associated_idx < 0 || p_kf->associated_idx >= static_cast<int>(sm->plane_landmarks.size())) {
+                continue;
+            }
+            if (used_plane_idx.find(p_kf->associated_idx) != used_plane_idx.end()) {
+                ++plane_suppressed_this_frame;
+                continue;
+            }
+            const auto& p_sm = sm->plane_landmarks[p_kf->associated_idx];
+            if (!p_sm || !p_sm->isValid()) continue;
+            if (static_cast<int>(p_sm->support_count) < plane_min_confirmations ||
+                p_sm->observability_score < plane_min_observability) {
+                ++plane_suppressed_this_frame;
+                continue;
+            }
+            if (weak_semantic_context &&
+                (static_cast<int>(p_sm->support_count) < weak_min_support ||
+                 p_sm->observability_score < weak_min_observability)) {
+                ++plane_suppressed_this_frame;
+                continue;
+            }
+            if (!semanticBackendPlanePassesGating(cfg, p_kf)) {
+                ++plane_suppressed_this_frame;
+                continue;
+            }
+
+            Eigen::Vector3d centroid_b = Eigen::Vector3d::Zero();
+            size_t cnt = 0;
+            if (p_kf->points && !p_kf->points->empty()) {
+                for (const auto& pt : p_kf->points->points) {
+                    if (!std::isfinite(pt.x) || !std::isfinite(pt.y) || !std::isfinite(pt.z)) continue;
+                    centroid_b += Eigen::Vector3d(pt.x, pt.y, pt.z);
+                    ++cnt;
+                }
+            }
+            if (cnt == 0) {
+                Eigen::Vector3d n_b = p_kf->normal;
+                if (!n_b.allFinite() || n_b.norm() < 1e-6) continue;
+                n_b.normalize();
+                centroid_b = -p_kf->distance * n_b;
+            } else {
+                centroid_b /= static_cast<double>(cnt);
+            }
+
+            PlaneFactorItemKF pf;
+            pf.kf_id = kf->id;
+            pf.sm_id = static_cast<uint64_t>(sm->id);
+            pf.point_body = centroid_b;
+            pf.normal_submap = p_sm->normal.normalized();
+            pf.distance_submap = p_sm->distance;
+            pf.weight = semanticBackendFactorWeight(std::max(1e-3, p_kf->confidence), p_sm->observability_score);
+            plane_task.plane_factors.push_back(pf);
+            used_plane_idx.insert(p_kf->associated_idx);
+            ++plane_emitted_this_frame;
+        }
+
+        semantic_assoc_tree_input_total_.fetch_add(tree_input_this_frame, std::memory_order_relaxed);
+        semantic_assoc_tree_emitted_total_.fetch_add(tree_emitted_this_frame, std::memory_order_relaxed);
+        semantic_assoc_tree_suppressed_total_.fetch_add(tree_suppressed_this_frame, std::memory_order_relaxed);
+        semantic_assoc_plane_input_total_.fetch_add(plane_input_this_frame, std::memory_order_relaxed);
+        semantic_assoc_plane_emitted_total_.fetch_add(plane_emitted_this_frame, std::memory_order_relaxed);
+        semantic_assoc_plane_suppressed_total_.fetch_add(plane_suppressed_this_frame, std::memory_order_relaxed);
         
         if (!landmark_task.cylinder_factors.empty()) {
             GraphTaskEvent landmark_ev;
@@ -1492,6 +1776,62 @@ void MappingModule::onSemanticLandmarks(const SemanticLandmarkEvent& ev) {
             RCLCPP_DEBUG(node_->get_logger(),
                 "[SEMANTIC][Mapping][onSemanticLandmarks] step=no_factors ts=%.3f kf_id=%lu sm_id=%d landmarks=%zu (none associated)",
                 ev.timestamp, kf->id, sm->id, kf->landmarks.size());
+        }
+        if (tree_suppressed_sampling_this_frame > 0 || protection_mode_active || weak_semantic_context) {
+            RCLCPP_INFO_THROTTLE(node_->get_logger(), *node_->get_clock(), 2000,
+                "[SEMANTIC][Mapping][factor_sampling] ts=%.3f kf_id=%lu sm_id=%d protection=%d weak_ctx=%d stride=%d "
+                "tree(input/emitted/suppressed/sampling_suppressed)=(%lu/%lu/%lu/%lu)",
+                ev.timestamp,
+                static_cast<unsigned long>(kf->id),
+                sm->id,
+                protection_mode_active ? 1 : 0,
+                weak_semantic_context ? 1 : 0,
+                sample_stride,
+                static_cast<unsigned long>(tree_input_this_frame),
+                static_cast<unsigned long>(tree_emitted_this_frame),
+                static_cast<unsigned long>(tree_suppressed_this_frame),
+                static_cast<unsigned long>(tree_suppressed_sampling_this_frame));
+        }
+
+        if (!plane_task.plane_factors.empty()) {
+            GraphTaskEvent plane_ev;
+            plane_ev.task = plane_task;
+            publishGraphTaskEvent(plane_ev, ev.timestamp);
+            RCLCPP_INFO(node_->get_logger(),
+                "[SEMANTIC][Mapping][onSemanticLandmarks] step=dispatch_plane ts=%.3f kf_id=%lu sm_id=%d factors=%zu → GraphTaskEvent",
+                ev.timestamp, kf->id, sm->id, plane_task.plane_factors.size());
+        }
+
+        const uint64_t tree_input_total = semantic_assoc_tree_input_total_.load(std::memory_order_relaxed);
+        const uint64_t tree_emitted_total = semantic_assoc_tree_emitted_total_.load(std::memory_order_relaxed);
+        const uint64_t tree_suppressed_total = semantic_assoc_tree_suppressed_total_.load(std::memory_order_relaxed);
+        const uint64_t plane_input_total = semantic_assoc_plane_input_total_.load(std::memory_order_relaxed);
+        const uint64_t plane_emitted_total = semantic_assoc_plane_emitted_total_.load(std::memory_order_relaxed);
+        const uint64_t plane_suppressed_total = semantic_assoc_plane_suppressed_total_.load(std::memory_order_relaxed);
+        if (((tree_input_total + plane_input_total) % 50) == 0) {
+            const double tree_supp_ratio = tree_input_total > 0
+                ? (100.0 * static_cast<double>(tree_suppressed_total) / static_cast<double>(tree_input_total))
+                : 0.0;
+            const double plane_supp_ratio = plane_input_total > 0
+                ? (100.0 * static_cast<double>(plane_suppressed_total) / static_cast<double>(plane_input_total))
+                : 0.0;
+            const double tree_emit_ratio = tree_input_total > 0
+                ? (100.0 * static_cast<double>(tree_emitted_total) / static_cast<double>(tree_input_total))
+                : 0.0;
+            const double plane_emit_ratio = plane_input_total > 0
+                ? (100.0 * static_cast<double>(plane_emitted_total) / static_cast<double>(plane_input_total))
+                : 0.0;
+            RCLCPP_INFO(node_->get_logger(),
+                "[SEMANTIC][Mapping][assoc_factor_stats] tree(input/emitted/suppressed)=(%lu/%lu/%lu) tree_rates(emitted/suppressed)=(%.1f%%/%.1f%%) "
+                "plane(input/emitted/suppressed)=(%lu/%lu/%lu) plane_rates(emitted/suppressed)=(%.1f%%/%.1f%%)",
+                static_cast<unsigned long>(tree_input_total),
+                static_cast<unsigned long>(tree_emitted_total),
+                static_cast<unsigned long>(tree_suppressed_total),
+                tree_emit_ratio, tree_supp_ratio,
+                static_cast<unsigned long>(plane_input_total),
+                static_cast<unsigned long>(plane_emitted_total),
+                static_cast<unsigned long>(plane_suppressed_total),
+                plane_emit_ratio, plane_supp_ratio);
         }
     }
 }

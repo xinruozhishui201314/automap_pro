@@ -91,6 +91,7 @@ private:
         std::vector<LoopConstraint::Ptr> loops;
         // 🏛️ [架构增强] 语义因子列表，支持 HBA 语义优化
         std::vector<CylinderFactorItemKF> semantic_factors;
+        std::vector<PlaneFactorItemKF> semantic_plane_factors;
         // 🏛️ [架构增强] 子图锚点快照，用于约束语义地标
         std::unordered_map<int, Pose3d> submap_anchor_poses;
         uint64_t alignment_epoch_snapshot = 0;

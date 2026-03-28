@@ -2,6 +2,7 @@
 #include "automap_pro/loop_closure/icp_refiner.h"
 #include "automap_pro/core/config_manager.h"
 #include "automap_pro/core/logger.h"
+#include "automap_pro/core/utils.h"
 
 // ScanContext 依赖
 #include "Scancontext/Scancontext.h"
@@ -19,8 +20,57 @@
 #include <exception>
 #include <future>
 #include <thread>
+#include <unordered_map>
 
 namespace automap_pro {
+namespace {
+
+IcpRefiner makeLoopIcpRefiner() {
+    const auto& cfg = ConfigManager::instance();
+    IcpRefiner::Config c;
+    c.method = ICPMethod::POINT_TO_PLANE;
+    c.max_iterations = 50;
+    c.max_correspondence_distance = 0.5;
+    c.transformation_epsilon = 1e-8;
+    c.euclidean_fitness_epsilon = 1e-8;
+    c.validate_result = true;
+    c.preprocess_downsample = cfg.loopIcpPreprocessDownsample();
+    c.downsample_before_refine = cfg.loopIcpPreprocessDownsample();
+    c.preprocess_sor = cfg.loopIcpPreprocessSor();
+    c.semantic_icp_enabled = cfg.loopSemanticIcpEnabled();
+    c.semantic_min_label_ratio = cfg.loopSemanticIcpMinLabelRatio();
+    c.semantic_weight_match = cfg.loopSemanticIcpWeightMatch();
+    c.semantic_weight_mismatch = cfg.loopSemanticIcpWeightMismatch();
+    c.semantic_weight_unknown = cfg.loopSemanticIcpWeightUnknown();
+    c.semantic_weight_dynamic = cfg.loopSemanticIcpWeightDynamic();
+    c.semantic_max_iterations = cfg.loopSemanticIcpMaxIterations();
+    c.semantic_dynamic_class_ids = cfg.loopSemanticIcpDynamicClassIds();
+    c.semantic_gray_zone_linear_trust = cfg.loopSemanticIcpGrayZoneLinearTrust();
+    return IcpRefiner(c);
+}
+
+IcpRefiner::Result refineLoopClosureIcp(IcpRefiner& icp, const CloudXYZIPtr& src, const CloudXYZIPtr& tgt,
+                                        const Pose3d& init) {
+    if (icp.getConfig().semantic_icp_enabled) {
+        IcpRefiner::Result sr = icp.refineSemanticWeighted(src, tgt, init);
+        if (sr.converged) return sr;
+    }
+    return icp.refine(src, tgt, init);
+}
+
+/** TEASER 初值与 ICP 输出相对差；max_trans_m/max_rot_deg 均 ≤0 时不判失败 */
+bool teaserIcpPoseDisagrees(const Pose3d& T_teaser, const Pose3d& T_icp, double max_trans_m, double max_rot_deg,
+                            double& out_dtrans_m, double& out_drot_deg) {
+    const Pose3d d = T_teaser.inverse() * T_icp;
+    out_dtrans_m = d.translation().norm();
+    out_drot_deg = Eigen::AngleAxisd(d.linear()).angle() * 180.0 / M_PI;
+    if (max_trans_m <= 0.0 && max_rot_deg <= 0.0) return false;
+    const bool bad_t = max_trans_m > 0.0 && out_dtrans_m > max_trans_m;
+    const bool bad_r = max_rot_deg > 0.0 && out_drot_deg > max_rot_deg;
+    return bad_t || bad_r;
+}
+
+}  // namespace
 
 LoopDetector::LoopDetector() {
     const auto& cfg = ConfigManager::instance();
@@ -72,6 +122,10 @@ LoopDetector::LoopDetector() {
     // 缓存 pose_consistency 参数，避免 processMatchTask 中访问 ConfigManager 单例导致 shutdown 时 SIGSEGV（析构/卸载顺序不确定）
     pose_consistency_max_trans_m_ = cfg.loopPoseConsistencyMaxTransDiffM();
     pose_consistency_max_rot_deg_ = cfg.loopPoseConsistencyMaxRotDiffDeg();
+    teaser_icp_agreement_max_trans_m_ = cfg.loopTeaserIcpAgreementMaxTransDiffM();
+    teaser_icp_agreement_max_rot_deg_ = cfg.loopTeaserIcpAgreementMaxRotDiffDeg();
+    constraint_inlier_soft_margin_ = cfg.loopConstraintInlierSoftMargin();
+    constraint_low_trust_information_scale_ = cfg.loopConstraintLowTrustInformationScale();
     loop_max_desc_queue_size_ = cfg.loopMaxDescQueueSize();
     loop_max_match_queue_size_ = cfg.loopMaxMatchQueueSize();
     teaser_min_safe_inliers_ = cfg.teaserMinSafeInliers();
@@ -176,6 +230,10 @@ void LoopDetector::init(rclcpp::Node::SharedPtr node) {
     parallel_teaser_max_inflight_ = cfg.parallelTeaserMaxInflight();
     pose_consistency_max_trans_m_ = cfg.loopPoseConsistencyMaxTransDiffM();
     pose_consistency_max_rot_deg_ = cfg.loopPoseConsistencyMaxRotDiffDeg();
+    teaser_icp_agreement_max_trans_m_ = cfg.loopTeaserIcpAgreementMaxTransDiffM();
+    teaser_icp_agreement_max_rot_deg_ = cfg.loopTeaserIcpAgreementMaxRotDiffDeg();
+    constraint_inlier_soft_margin_ = cfg.loopConstraintInlierSoftMargin();
+    constraint_low_trust_information_scale_ = cfg.loopConstraintLowTrustInformationScale();
     loop_max_desc_queue_size_ = cfg.loopMaxDescQueueSize();
     loop_max_match_queue_size_ = cfg.loopMaxMatchQueueSize();
     teaser_min_safe_inliers_ = cfg.teaserMinSafeInliers();
@@ -1018,7 +1076,6 @@ void LoopDetector::matchWorkerLoop() {
 #if defined(__unix__) || defined(__linux__)
     setenv("OMP_NUM_THREADS", "1", 1);
 #endif
-    IcpRefiner icp_refiner;
     while (running_) {
         MatchTask task;
         {
@@ -1074,7 +1131,7 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
         int inter_kf_skip_empty_target_cloud = 0;
         int inter_kf_skip_keyframe_gap = 0;
         int inter_kf_skip_odom_rel_rot_prefilter = 0;
-        IcpRefiner icp;
+        int inter_kf_reject_teaser_icp = 0;
         // 几何诊断：query 关键帧位姿（世界系）
         const KeyFrame::Ptr query_kf = (task.query_kf_idx >= 0 && task.query_kf_idx < static_cast<int>(task.query->keyframes.size()))
             ? task.query->keyframes[task.query_kf_idx] : nullptr;
@@ -1313,6 +1370,43 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
                 }
             }
 
+            const Pose3d T_teaser_inter = res.T_tgt_src;
+            Pose3d delta_loop = T_teaser_inter;
+            float rmse_loop = static_cast<float>(res.rmse);
+            if (use_icp_refine_) {
+                IcpRefiner icp_inter = makeLoopIcpRefiner();
+                auto icp_res = refineLoopClosureIcp(icp_inter, query_cloud, tgt_copy, delta_loop);
+                if (icp_res.converged && icp_res.rmse < static_cast<double>(rmse_loop)) {
+                    double d_icp_t = 0.0;
+                    double d_icp_r = 0.0;
+                    if (teaserIcpPoseDisagrees(T_teaser_inter, icp_res.T_refined, teaser_icp_agreement_max_trans_m_,
+                                               teaser_icp_agreement_max_rot_deg_, d_icp_t, d_icp_r)) {
+                        inter_kf_reject_teaser_icp++;
+                        ALOG_WARN(MOD,
+                                  "[INTER_KF][REJECT] teaser_icp_disagree sm_i={} kf_i={} sm_j={} kf_j={} "
+                                  "dtrans={:.3f}m drot={:.2f}deg limits trans={:.2f}m rot={:.2f}deg",
+                                  kfc.submap_id, kfc.keyframe_idx, task.query->id, task.query_kf_idx, d_icp_t, d_icp_r,
+                                  teaser_icp_agreement_max_trans_m_, teaser_icp_agreement_max_rot_deg_);
+                        if (node()) {
+                            RCLCPP_WARN(node()->get_logger(),
+                                        "[INTER_KF][REJECT] teaser_icp_disagree sm_i=%d kf_i=%d sm_j=%d kf_j=%d dtrans=%.3f drot=%.2f",
+                                        kfc.submap_id, kfc.keyframe_idx, task.query->id, task.query_kf_idx, d_icp_t,
+                                        d_icp_r);
+                        }
+                        continue;
+                    }
+                    delta_loop = icp_res.T_refined;
+                    rmse_loop = static_cast<float>(icp_res.rmse);
+                }
+            }
+            if (rmse_loop > static_cast<float>(max_rmse_)) {
+                inter_kf_teaser_fail++;
+                ALOG_DEBUG(MOD,
+                           "[INTER_KF][REJECT] rmse_after_icp sm_i={} kf_i={} sm_j={} kf_j={} rmse={:.4f} max={:.3f}",
+                           kfc.submap_id, kfc.keyframe_idx, task.query->id, task.query_kf_idx, rmse_loop, max_rmse_);
+                continue;
+            }
+
             auto lc = std::make_shared<LoopConstraint>();
             lc->submap_i = kfc.submap_id;
             lc->submap_j = task.query->id;
@@ -1322,10 +1416,10 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
             lc->keyframe_global_id_j = query_kf ? static_cast<int>(query_kf->id) : -1;
             lc->session_i = target ? target->session_id : 0;
             lc->session_j = task.query->session_id;
-            lc->delta_T = res.T_tgt_src;
+            lc->delta_T = delta_loop;
             lc->overlap_score = kfc.score;
             lc->inlier_ratio = res.inlier_ratio;
-            lc->rmse = static_cast<float>(res.rmse);
+            lc->rmse = rmse_loop;
             // 修复: 使用更合理的信息矩阵计算，避免过度自信
             // 之前的计算方式 lc->inlier_ratio / (lc->rmse + 1e-3f) 在 RMSE 极小时会导致权重过大
             // 改进：增加 RMSE 偏置 (0.01m) 并调整旋转/平移比例，使之更均衡
@@ -1335,6 +1429,7 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
             Mat66d information = Mat66d::Identity();
             information.block<3,3>(0,0) *= info_scale * 0.5;  // 适度增加平移权重 (0.1 -> 0.5)
             information.block<3,3>(3,3) *= info_scale;        // 旋转权重保持比例
+            applyLoopInformationMargins_(information, lc->inlier_ratio);
             lc->information = information;
 
             // [GHOSTING_DIAG] 记录子图间回环信息矩阵强度
@@ -1351,20 +1446,20 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
         }
         ALOG_INFO(MOD,
             "[INTER_KF][SUMMARY] query_id={} kf_j={} candidates_kf={} tried={} skip_empty_tgt={} skip_kf_gap={} "
-            "skip_odom_rot_prefilter={} teaser_fail={} reject_inconsistent={} reject_pose_anomaly={} published={} "
+            "skip_odom_rot_prefilter={} teaser_fail={} reject_teaser_icp={} reject_inconsistent={} reject_pose_anomaly={} published={} "
             "(grep INTER_KF SUMMARY 闭环统计)",
             task.query->id, task.query_kf_idx, static_cast<int>(task.candidates_kf.size()),
             inter_kf_tried, inter_kf_skip_empty_target_cloud, inter_kf_skip_keyframe_gap,
-            inter_kf_skip_odom_rel_rot_prefilter, inter_kf_teaser_fail, inter_kf_reject_inconsistent,
-            inter_kf_reject_pose_anomaly, inter_kf_published);
+            inter_kf_skip_odom_rel_rot_prefilter, inter_kf_teaser_fail, inter_kf_reject_teaser_icp,
+            inter_kf_reject_inconsistent, inter_kf_reject_pose_anomaly, inter_kf_published);
         if (node()) {
             RCLCPP_INFO(node()->get_logger(),
                 "[INTER_KF][SUMMARY] query_id=%d kf_j=%d candidates_kf=%zu tried=%d skip_empty_tgt=%d skip_kf_gap=%d "
-                "skip_odom_rot_prefilter=%d teaser_fail=%d reject_inconsistent=%d reject_pose_anomaly=%d published=%d",
+                "skip_odom_rot_prefilter=%d teaser_fail=%d reject_teaser_icp=%d reject_inconsistent=%d reject_pose_anomaly=%d published=%d",
                 task.query->id, task.query_kf_idx, task.candidates_kf.size(),
                 inter_kf_tried, inter_kf_skip_empty_target_cloud, inter_kf_skip_keyframe_gap,
-                inter_kf_skip_odom_rel_rot_prefilter, inter_kf_teaser_fail, inter_kf_reject_inconsistent,
-                inter_kf_reject_pose_anomaly, inter_kf_published);
+                inter_kf_skip_odom_rel_rot_prefilter, inter_kf_teaser_fail, inter_kf_reject_teaser_icp,
+                inter_kf_reject_inconsistent, inter_kf_reject_pose_anomaly, inter_kf_published);
         }
         return;
     }
@@ -1375,7 +1470,7 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
         return;
     }
 
-    IcpRefiner icp;
+    IcpRefiner icp = makeLoopIcpRefiner();
     const auto& query = task.query;
     // 优先使用入队时拷贝的 query_cloud，避免读 SubMap::downsampled_cloud 与主线程并发
     CloudXYZIPtr query_cloud = task.query_cloud;
@@ -1438,6 +1533,7 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
 
     int count_reject_success_or_inlier = 0;
     int count_reject_rmse = 0;
+    int count_reject_teaser_icp = 0;
     int count_accepted = 0;
     int count_exception = 0;
 
@@ -1469,7 +1565,7 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
         }
         if (!works.empty()) {
             const size_t max_inflight = static_cast<size_t>(std::max(1, parallel_teaser_max_inflight_));
-            IcpRefiner icp_par;
+            IcpRefiner icp_par = makeLoopIcpRefiner();
             for (size_t batch_begin = 0; batch_begin < works.size(); batch_begin += max_inflight) {
                 const size_t batch_end = std::min(works.size(), batch_begin + max_inflight);
                 std::vector<size_t> work_indices;
@@ -1570,11 +1666,29 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
                 const auto& cand = works[i].cand;
                 SubMap::Ptr target = works[i].target;
                 CloudXYZIPtr target_cloud = works[i].target_cloud;
-                Pose3d final_T = teaser_res.T_tgt_src;
+                const Pose3d T_teaser = teaser_res.T_tgt_src;
+                Pose3d final_T = T_teaser;
                 double final_rmse = teaser_res.rmse;
                 if (use_icp_refine_) {
-                    auto icp_res = icp_par.refine(query_cloud, target_cloud, final_T);
+                    auto icp_res = refineLoopClosureIcp(icp_par, query_cloud, target_cloud, final_T);
                     if (icp_res.converged && icp_res.rmse < final_rmse) {
+                        double d_icp_t = 0.0;
+                        double d_icp_r = 0.0;
+                        if (teaserIcpPoseDisagrees(T_teaser, icp_res.T_refined, teaser_icp_agreement_max_trans_m_,
+                                                   teaser_icp_agreement_max_rot_deg_, d_icp_t, d_icp_r)) {
+                            count_reject_teaser_icp++;
+                            ALOG_WARN(MOD,
+                                      "[LOOP_REJECTED] query_id={} target_id={} primary_reason=teaser_icp_disagree "
+                                      "dtrans={:.3f}m drot={:.2f}deg limits trans={:.2f}m rot={:.2f}deg (parallel)",
+                                      query->id, target->id, d_icp_t, d_icp_r, teaser_icp_agreement_max_trans_m_,
+                                      teaser_icp_agreement_max_rot_deg_);
+                            if (node()) {
+                                RCLCPP_WARN(node()->get_logger(),
+                                            "[LOOP_REJECTED] query_id=%d target_id=%d teaser_icp_disagree dtrans=%.3f drot=%.2f (parallel)",
+                                            query->id, target->id, d_icp_t, d_icp_r);
+                            }
+                            continue;
+                        }
                         final_T = icp_res.T_refined;
                         final_rmse = icp_res.rmse;
                     }
@@ -1608,6 +1722,7 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
                 Mat66d information = Mat66d::Identity();
                 information.block<3,3>(0,0) *= info_scale * 0.5;  // 适度增加平移权重 (0.1 -> 0.5)
                 information.block<3,3>(3,3) *= info_scale;        // 旋转权重保持比例
+                applyLoopInformationMargins_(information, lc->inlier_ratio);
                 lc->information = information;
                 ALOG_INFO(MOD, "[LoopDetector][LOOP_OK] 回环约束已发布(parallel) query_id={} target_id={} inlier={:.3f} rmse={:.4f}m",
                           query->id, target->id, lc->inlier_ratio, lc->rmse);
@@ -1621,11 +1736,11 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
                 for (auto& cb : loop_cbs_) cb(lc);
             }
             }
-            ALOG_INFO(MOD, "[TEASER_SUMMARY] query_id={} total_candidates={} reject_success_or_inlier={} reject_rmse={} reject_exception={} accepted={} (若 accepted=0 则本 query 所有回环被 TEASER 拒绝，见上方 [TEASER_REJECT] primary_reason 或 grep LOOP_COMPUTE][TEASER] reason=)",
-                      query->id, static_cast<int>(works.size()), count_reject_success_or_inlier, count_reject_rmse, count_exception, count_accepted);
+            ALOG_INFO(MOD, "[TEASER_SUMMARY] query_id={} total_candidates={} reject_success_or_inlier={} reject_rmse={} reject_teaser_icp={} reject_exception={} accepted={} (若 accepted=0 则本 query 所有回环被 TEASER 拒绝，见上方 [TEASER_REJECT] primary_reason 或 grep LOOP_COMPUTE][TEASER] reason=)",
+                      query->id, static_cast<int>(works.size()), count_reject_success_or_inlier, count_reject_rmse, count_reject_teaser_icp, count_exception, count_accepted);
             if (node()) {
-                RCLCPP_INFO(node()->get_logger(), "[TEASER_SUMMARY] query_id=%d total=%zu reject_success_or_inlier=%d reject_rmse=%d reject_exception=%d accepted=%d (分析回环全被拒: grep TEASER_REJECT)",
-                            query->id, works.size(), count_reject_success_or_inlier, count_reject_rmse, count_exception, count_accepted);
+                RCLCPP_INFO(node()->get_logger(), "[TEASER_SUMMARY] query_id=%d total=%zu reject_success_or_inlier=%d reject_rmse=%d reject_teaser_icp=%d reject_exception=%d accepted=%d (分析回环全被拒: grep TEASER_REJECT)",
+                            query->id, works.size(), count_reject_success_or_inlier, count_reject_rmse, count_reject_teaser_icp, count_exception, count_accepted);
             }
             updateLoopHealthKpi(query->id, static_cast<int>(works.size()), count_accepted);
         } else {
@@ -1637,6 +1752,7 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
 
     count_reject_success_or_inlier = 0;
     count_reject_rmse = 0;
+    count_reject_teaser_icp = 0;
     count_exception = 0;
     count_accepted = 0;
     for (const auto& cand : valid_candidates) {
@@ -1746,15 +1862,32 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
             continue;
         }
 
-        // Stage 3: ICP 精配准（可选）
-        Pose3d final_T = teaser_res.T_tgt_src;
+        // Stage 3: ICP 精配准（可选）；与 TEASER 初值一致性门控，抑制 ICP 落入错误局部极小
+        const Pose3d T_teaser = teaser_res.T_tgt_src;
+        Pose3d final_T = T_teaser;
         double final_rmse = teaser_res.rmse;
 
         if (use_icp_refine_) {
-            auto icp_res = icp.refine(
-                query_cloud, target_cloud, final_T);
+            auto icp_res = refineLoopClosureIcp(icp, query_cloud, target_cloud, final_T);
             if (icp_res.converged && icp_res.rmse < final_rmse) {
-                final_T    = icp_res.T_refined;
+                double d_icp_t = 0.0;
+                double d_icp_r = 0.0;
+                if (teaserIcpPoseDisagrees(T_teaser, icp_res.T_refined, teaser_icp_agreement_max_trans_m_,
+                                           teaser_icp_agreement_max_rot_deg_, d_icp_t, d_icp_r)) {
+                    count_reject_teaser_icp++;
+                    ALOG_WARN(MOD,
+                              "[LOOP_REJECTED] query_id={} target_id={} primary_reason=teaser_icp_disagree "
+                              "dtrans={:.3f}m drot={:.2f}deg limits trans={:.2f}m rot={:.2f}deg score={:.3f}",
+                              query->id, target->id, d_icp_t, d_icp_r, teaser_icp_agreement_max_trans_m_,
+                              teaser_icp_agreement_max_rot_deg_, cand.score);
+                    if (node()) {
+                        RCLCPP_WARN(node()->get_logger(),
+                                    "[LOOP_REJECTED] query_id=%d target_id=%d teaser_icp_disagree dtrans=%.3f drot=%.2f",
+                                    query->id, target->id, d_icp_t, d_icp_r);
+                    }
+                    continue;
+                }
+                final_T = icp_res.T_refined;
                 final_rmse = icp_res.rmse;
             }
         }
@@ -1792,6 +1925,7 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
         Mat66d information = Mat66d::Identity();
         information.block<3,3>(0,0) *= info_scale * 0.5;  // 适度增加平移权重 (0.1 -> 0.5)
         information.block<3,3>(3,3) *= info_scale;        // 旋转权重保持比例
+        applyLoopInformationMargins_(information, lc->inlier_ratio);
         lc->information = information;
 
         ALOG_INFO(MOD, "[LoopDetector][LOOP_OK] 回环约束已发布 query_id={} target_id={} inlier={:.3f} rmse={:.4f}m score={:.3f}",
@@ -1812,11 +1946,11 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
         for (auto& cb : loop_cbs_) cb(lc);
     }
 
-    ALOG_INFO(MOD, "[TEASER_SUMMARY] query_id={} total_candidates={} reject_success_or_inlier={} reject_rmse={} reject_exception={} accepted={} (若 accepted=0 则本 query 所有回环被 TEASER 拒绝，见 [TEASER_REJECT] primary_reason 或 grep LOOP_COMPUTE][TEASER] reason=)",
-              query->id, static_cast<int>(valid_candidates.size()), count_reject_success_or_inlier, count_reject_rmse, count_exception, count_accepted);
+    ALOG_INFO(MOD, "[TEASER_SUMMARY] query_id={} total_candidates={} reject_success_or_inlier={} reject_rmse={} reject_teaser_icp={} reject_exception={} accepted={} (若 accepted=0 则本 query 所有回环被 TEASER 拒绝，见 [TEASER_REJECT] primary_reason 或 grep LOOP_COMPUTE][TEASER] reason=)",
+              query->id, static_cast<int>(valid_candidates.size()), count_reject_success_or_inlier, count_reject_rmse, count_reject_teaser_icp, count_exception, count_accepted);
     if (node()) {
-        RCLCPP_INFO(node()->get_logger(), "[TEASER_SUMMARY] query_id=%d total=%zu reject_success_or_inlier=%d reject_rmse=%d reject_exception=%d accepted=%d (分析回环全被拒: grep TEASER_REJECT)",
-                    query->id, valid_candidates.size(), count_reject_success_or_inlier, count_reject_rmse, count_exception, count_accepted);
+        RCLCPP_INFO(node()->get_logger(), "[TEASER_SUMMARY] query_id=%d total=%zu reject_success_or_inlier=%d reject_rmse=%d reject_teaser_icp=%d reject_exception=%d accepted=%d (分析回环全被拒: grep TEASER_REJECT)",
+                    query->id, valid_candidates.size(), count_reject_success_or_inlier, count_reject_rmse, count_reject_teaser_icp, count_exception, count_accepted);
     }
     updateLoopHealthKpi(query->id, static_cast<int>(valid_candidates.size()), count_accepted);
 }
@@ -1877,6 +2011,14 @@ std::vector<std::pair<int, Eigen::VectorXf>> LoopDetector::exportDescriptorDB() 
         }
     }
     return db;
+}
+
+void LoopDetector::applyLoopInformationMargins_(Mat66d& information, float inlier_ratio) const {
+    if (constraint_inlier_soft_margin_ <= 0.0) return;
+    if (constraint_low_trust_information_scale_ >= 1.0 - 1e-9) return;
+    if (static_cast<double>(inlier_ratio) >= static_cast<double>(min_inlier_ratio_) + constraint_inlier_soft_margin_)
+        return;
+    information *= constraint_low_trust_information_scale_;
 }
 
 void LoopDetector::publishLoopConstraint(const LoopConstraint::Ptr& lc) {
@@ -2080,11 +2222,22 @@ void LoopDetector::prepareIntraSubmapDescriptors(const SubMap::Ptr& submap) {
             continue;
         }
 
-        CloudXYZIPtr cloud_ds = std::make_shared<pcl::PointCloud<pcl::PointXYZI>>();
-        pcl::VoxelGrid<pcl::PointXYZI> voxel;
-        voxel.setLeafSize(0.5f, 0.5f, 0.5f);
-        voxel.setInputCloud(kf->cloud_body);
-        voxel.filter(*cloud_ds);
+        CloudXYZIPtr cloud_ds;
+        {
+            const CloudXYZIPtr sem = (kf->cloud_semantic_labeled_body &&
+                kf->cloud_semantic_labeled_body->size() == kf->cloud_body->size())
+                ? kf->cloud_semantic_labeled_body
+                : nullptr;
+            if (sem) {
+                cloud_ds = utils::voxelDownsampleBodyWithSemanticLabels(kf->cloud_body, sem, 0.5f);
+            } else {
+                cloud_ds = std::make_shared<pcl::PointCloud<pcl::PointXYZI>>();
+                pcl::VoxelGrid<pcl::PointXYZI> voxel;
+                voxel.setLeafSize(0.5f, 0.5f, 0.5f);
+                voxel.setInputCloud(kf->cloud_body);
+                voxel.filter(*cloud_ds);
+            }
+        }
 
         size_t pts_before = kf->cloud_body->size();
         size_t pts_after = cloud_ds->size();
@@ -2165,11 +2318,22 @@ void LoopDetector::ensureIntraSubmapDescriptorsUpTo(const SubMap::Ptr& submap, i
             submap->keyframe_clouds_ds.push_back(nullptr);
             continue;
         }
-        CloudXYZIPtr cloud_ds = std::make_shared<pcl::PointCloud<pcl::PointXYZI>>();
-        pcl::VoxelGrid<pcl::PointXYZI> voxel;
-        voxel.setLeafSize(0.5f, 0.5f, 0.5f);
-        voxel.setInputCloud(kf->cloud_body);
-        voxel.filter(*cloud_ds);
+        CloudXYZIPtr cloud_ds;
+        {
+            const CloudXYZIPtr sem = (kf->cloud_semantic_labeled_body &&
+                kf->cloud_semantic_labeled_body->size() == kf->cloud_body->size())
+                ? kf->cloud_semantic_labeled_body
+                : nullptr;
+            if (sem) {
+                cloud_ds = utils::voxelDownsampleBodyWithSemanticLabels(kf->cloud_body, sem, 0.5f);
+            } else {
+                cloud_ds = std::make_shared<pcl::PointCloud<pcl::PointXYZI>>();
+                pcl::VoxelGrid<pcl::PointXYZI> voxel;
+                voxel.setLeafSize(0.5f, 0.5f, 0.5f);
+                voxel.setInputCloud(kf->cloud_body);
+                voxel.filter(*cloud_ds);
+            }
+        }
         if (use_sc) {
             Eigen::MatrixXd sc;
             {
@@ -2593,6 +2757,7 @@ std::vector<LoopConstraint::Ptr> LoopDetector::detectIntraSubmapLoop(
         Mat66d information = Mat66d::Identity();
         information.block<3,3>(0,0) *= info_scale * 0.5;  // 适度增加平移权重 (0.1 -> 0.5)
         information.block<3,3>(3,3) *= info_scale;        // 旋转权重保持比例
+        applyLoopInformationMargins_(information, static_cast<float>(teaser_res.inlier_ratio));
 
         // [GHOSTING_DIAG] 记录信息矩阵强度，防止过强导致系统“硬扭”
         RCLCPP_INFO(node()->get_logger(), 

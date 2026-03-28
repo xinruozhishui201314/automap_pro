@@ -105,6 +105,184 @@ CloudXYZIPtr voxelDownsampleGridNoPCLParallel(const CloudXYZIPtr& input, float l
 #endif
 }
 
+inline int semanticLabelFromIntensityLocal(float intensity) {
+    if (!std::isfinite(intensity)) return 0;
+    long v = std::lround(static_cast<double>(intensity));
+    if (v < 0) return 0;
+    if (v > 65535) return 65535;
+    return static_cast<int>(v);
+}
+
+struct SemanticBodyCell {
+    Eigen::Vector3d sum_xyz = Eigen::Vector3d::Zero();
+    double sum_lidar_i = 0.0;
+    uint32_t n = 0;
+    std::unordered_map<int, uint32_t> label_votes;
+};
+
+CloudXYZIPtr voxelDownsampleBodyWithSemanticLabelsImpl(const CloudXYZIPtr& body,
+                                                       const CloudXYZIPtr& sem_labels,
+                                                       float leaf) {
+    CloudXYZIPtr out(new CloudXYZI);
+    if (!body || body->empty()) return out;
+    const float inv = 1.0f / leaf;
+    const bool use_lab = sem_labels && sem_labels->size() == body->size();
+    std::unordered_map<VoxelKey, SemanticBodyCell, VoxelKeyHash> grid;
+    grid.reserve(std::min(body->size() / 4, size_t(500000)));
+    for (size_t i = 0; i < body->size(); ++i) {
+        const auto& p = body->points[i];
+        if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) continue;
+        int64_t ix = static_cast<int64_t>(std::floor(static_cast<double>(p.x) * static_cast<double>(inv)));
+        int64_t iy = static_cast<int64_t>(std::floor(static_cast<double>(p.y) * static_cast<double>(inv)));
+        int64_t iz = static_cast<int64_t>(std::floor(static_cast<double>(p.z) * static_cast<double>(inv)));
+        VoxelKey key{ix, iy, iz};
+        SemanticBodyCell& c = grid[key];
+        c.sum_xyz += Eigen::Vector3d(p.x, p.y, p.z);
+        c.sum_lidar_i += static_cast<double>(p.intensity);
+        ++c.n;
+        if (use_lab) {
+            const int lab = semanticLabelFromIntensityLocal(sem_labels->points[i].intensity);
+            c.label_votes[lab]++;
+        }
+    }
+    out->reserve(grid.size());
+    for (const auto& e : grid) {
+        const SemanticBodyCell& c = e.second;
+        if (c.n == 0) continue;
+        pcl::PointXYZI q;
+        q.x = static_cast<float>(c.sum_xyz.x() / static_cast<double>(c.n));
+        q.y = static_cast<float>(c.sum_xyz.y() / static_cast<double>(c.n));
+        q.z = static_cast<float>(c.sum_xyz.z() / static_cast<double>(c.n));
+        if (use_lab) {
+            int best = 0;
+            uint32_t best_c = 0;
+            for (const auto& kv : c.label_votes) {
+                if (kv.second > best_c) {
+                    best_c = kv.second;
+                    best = kv.first;
+                }
+            }
+            q.intensity = static_cast<float>(best);
+        } else {
+            q.intensity = static_cast<float>(c.sum_lidar_i / static_cast<double>(c.n));
+        }
+        out->push_back(q);
+    }
+    return out;
+}
+
+struct MajorityCell {
+    Eigen::Vector3d sum_xyz = Eigen::Vector3d::Zero();
+    uint32_t n = 0;
+    std::unordered_map<int, uint32_t> votes;
+};
+
+CloudXYZIPtr voxelDownsampleGridMajorityNoPCL(const CloudXYZIPtr& input, float leaf) {
+    if (!input || input->empty() || leaf <= 0.f) return input;
+    auto out = std::make_shared<CloudXYZI>();
+    std::unordered_map<VoxelKey, MajorityCell, VoxelKeyHash> grid;
+    grid.reserve(std::min(input->size() / 4, size_t(500000)));
+    const float inv_leaf = 1.f / leaf;
+    for (size_t i = 0; i < input->points.size(); ++i) {
+        const auto& p = input->points[i];
+        if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) continue;
+        int64_t ix = static_cast<int64_t>(std::floor(static_cast<double>(p.x) * static_cast<double>(inv_leaf)));
+        int64_t iy = static_cast<int64_t>(std::floor(static_cast<double>(p.y) * static_cast<double>(inv_leaf)));
+        int64_t iz = static_cast<int64_t>(std::floor(static_cast<double>(p.z) * static_cast<double>(inv_leaf)));
+        VoxelKey key{ix, iy, iz};
+        MajorityCell& c = grid[key];
+        c.sum_xyz += Eigen::Vector3d(p.x, p.y, p.z);
+        ++c.n;
+        c.votes[semanticLabelFromIntensityLocal(p.intensity)]++;
+    }
+    out->reserve(grid.size());
+    for (const auto& e : grid) {
+        const MajorityCell& c = e.second;
+        if (c.n == 0) continue;
+        pcl::PointXYZI q;
+        q.x = static_cast<float>(c.sum_xyz.x() / static_cast<double>(c.n));
+        q.y = static_cast<float>(c.sum_xyz.y() / static_cast<double>(c.n));
+        q.z = static_cast<float>(c.sum_xyz.z() / static_cast<double>(c.n));
+        int best = 0;
+        uint32_t best_c = 0;
+        for (const auto& kv : c.votes) {
+            if (kv.second > best_c) {
+                best_c = kv.second;
+                best = kv.first;
+            }
+        }
+        q.intensity = static_cast<float>(best);
+        out->push_back(q);
+    }
+    return out;
+}
+
+#if defined(_OPENMP)
+CloudXYZIPtr voxelDownsampleGridMajorityNoPCLParallel(const CloudXYZIPtr& input, float leaf) {
+    if (!input || input->empty() || leaf <= 0.f) return input;
+    const size_t n = input->points.size();
+    const float inv_leaf = 1.f / leaf;
+    const int max_t = omp_get_max_threads();
+    std::vector<std::unordered_map<VoxelKey, MajorityCell, VoxelKeyHash>> thread_maps(static_cast<size_t>(max_t));
+#pragma omp parallel
+    {
+        int t = omp_get_thread_num();
+        auto& m = thread_maps[static_cast<size_t>(t)];
+        m.reserve(std::min(n / 4 + 1, size_t(500000)));
+#pragma omp for
+        for (size_t i = 0; i < n; ++i) {
+            const auto& p = input->points[i];
+            if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) continue;
+            int64_t ix = static_cast<int64_t>(std::floor(static_cast<double>(p.x) * static_cast<double>(inv_leaf)));
+            int64_t iy = static_cast<int64_t>(std::floor(static_cast<double>(p.y) * static_cast<double>(inv_leaf)));
+            int64_t iz = static_cast<int64_t>(std::floor(static_cast<double>(p.z) * static_cast<double>(inv_leaf)));
+            VoxelKey key{ix, iy, iz};
+            MajorityCell& c = m[key];
+            c.sum_xyz += Eigen::Vector3d(p.x, p.y, p.z);
+            ++c.n;
+            c.votes[semanticLabelFromIntensityLocal(p.intensity)]++;
+        }
+    }
+    std::unordered_map<VoxelKey, MajorityCell, VoxelKeyHash> merged;
+    merged.reserve(std::min(n / 4, size_t(500000)));
+    for (const auto& m : thread_maps) {
+        for (const auto& [k, c0] : m) {
+            MajorityCell& c = merged[k];
+            c.sum_xyz += c0.sum_xyz;
+            c.n += c0.n;
+            for (const auto& kv : c0.votes) {
+                c.votes[kv.first] += kv.second;
+            }
+        }
+    }
+    auto out = std::make_shared<CloudXYZI>();
+    out->reserve(merged.size());
+    for (const auto& e : merged) {
+        const MajorityCell& c = e.second;
+        if (c.n == 0) continue;
+        pcl::PointXYZI q;
+        q.x = static_cast<float>(c.sum_xyz.x() / static_cast<double>(c.n));
+        q.y = static_cast<float>(c.sum_xyz.y() / static_cast<double>(c.n));
+        q.z = static_cast<float>(c.sum_xyz.z() / static_cast<double>(c.n));
+        int best = 0;
+        uint32_t best_c = 0;
+        for (const auto& kv : c.votes) {
+            if (kv.second > best_c) {
+                best_c = kv.second;
+                best = kv.first;
+            }
+        }
+        q.intensity = static_cast<float>(best);
+        out->push_back(q);
+    }
+    return out;
+}
+#else
+CloudXYZIPtr voxelDownsampleGridMajorityNoPCLParallel(const CloudXYZIPtr& input, float leaf) {
+    return voxelDownsampleGridMajorityNoPCL(input, leaf);
+}
+#endif
+
 }  // namespace
 
 CloudXYZIPtr sanitizePointCloudForVoxel(const CloudXYZIPtr& cloud, float max_abs_coord) {
@@ -181,6 +359,58 @@ CloudXYZIPtr voxelDownsample(const CloudXYZIPtr& cloud, float leaf_size, bool pa
         return cloud;
     } catch (...) {
         ALOG_ERROR("Utils", "voxelDownsample unknown exception");
+        return cloud;
+    }
+}
+
+CloudXYZIPtr voxelDownsampleBodyWithSemanticLabels(const CloudXYZIPtr& body,
+                                                   const CloudXYZIPtr& sem_labels,
+                                                   float leaf_size) {
+    const float leaf = std::max(leaf_size, kMinVoxelLeafSize);
+    if (leaf_size < kMinVoxelLeafSize) {
+        ALOG_DEBUG("Utils", "voxelDownsampleBodyWithSemanticLabels: leaf_size={:.3f} clamped to {:.3f}", leaf_size, leaf);
+    }
+    return voxelDownsampleBodyWithSemanticLabelsImpl(body, sem_labels, leaf);
+}
+
+CloudXYZIPtr voxelDownsampleMajorityIntensity(const CloudXYZIPtr& cloud, float leaf_size, bool parallel) {
+    try {
+        if (!cloud || cloud->empty()) {
+            ALOG_WARN("Utils", "voxelDownsampleMajorityIntensity: invalid input");
+            return cloud;
+        }
+        float leaf = std::max(leaf_size, kMinVoxelLeafSize);
+        if (leaf_size < kMinVoxelLeafSize) {
+            ALOG_DEBUG("Utils", "voxelDownsampleMajorityIntensity: leaf_size={:.3f} clamped to {:.3f}", leaf_size, leaf);
+        }
+        CloudXYZIPtr input = sanitizePointCloudForVoxel(cloud, kDefaultMaxAbsCoord);
+        if (!input || input->empty()) {
+            ALOG_WARN("Utils", "voxelDownsampleMajorityIntensity: cloud empty after sanitization");
+            return cloud;
+        }
+        float min_x = 1e9f, max_x = -1e9f, min_y = 1e9f, max_y = -1e9f, min_z = 1e9f, max_z = -1e9f;
+        for (const auto& p : input->points) {
+            min_x = std::min(min_x, p.x); max_x = std::max(max_x, p.x);
+            min_y = std::min(min_y, p.y); max_y = std::max(max_y, p.y);
+            min_z = std::min(min_z, p.z); max_z = std::max(max_z, p.z);
+        }
+        if (voxelGridWouldOverflow(min_x, max_x, min_y, max_y, min_z, max_z, leaf)) {
+            ALOG_DEBUG("Utils",
+                       "voxelDownsampleMajorityIntensity: overflow risk leaf={:.4f}, fallback to voxelDownsample",
+                       leaf_size);
+            return voxelDownsample(cloud, leaf_size, parallel);
+        }
+        CloudXYZIPtr out = parallel ? voxelDownsampleGridMajorityNoPCLParallel(input, leaf)
+                                    : voxelDownsampleGridMajorityNoPCL(input, leaf);
+        if (out && out->empty()) {
+            ALOG_WARN("Utils", "voxelDownsampleMajorityIntensity: output empty after filter");
+        }
+        return out ? out : input;
+    } catch (const std::exception& e) {
+        ALOG_ERROR("Utils", "voxelDownsampleMajorityIntensity exception: {}", e.what());
+        return cloud;
+    } catch (...) {
+        ALOG_ERROR("Utils", "voxelDownsampleMajorityIntensity unknown exception");
         return cloud;
     }
 }

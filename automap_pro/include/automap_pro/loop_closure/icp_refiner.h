@@ -3,6 +3,8 @@
 #include <pcl/registration/icp.h>
 #include <pcl/registration/ndt.h>
 #include <pcl/registration/gicp.h>
+#include <unordered_set>
+#include <vector>
 
 namespace automap_pro {
 
@@ -76,6 +78,22 @@ public:
         double max_rotation_deg = 30.0;
         double max_translation_m = 5.0;
         double min_inlier_ratio = 0.3;
+
+        // 预处理细粒度开关（回环点云已下采样时建议 false，且语义 ICP 需保留 intensity=label）
+        bool preprocess_downsample = true;
+        bool preprocess_sor = true;
+
+        // ── SuMa++ 类语义加权 ICP：PointXYZI.intensity 存语义类 id，0=未知
+        bool semantic_icp_enabled = false;
+        double semantic_min_label_ratio = 0.06;
+        float semantic_weight_match = 1.0f;
+        float semantic_weight_mismatch = 0.18f;
+        float semantic_weight_unknown = 0.5f;
+        float semantic_weight_dynamic = 0.08f;
+        int semantic_max_iterations = 40;
+        std::vector<int> semantic_dynamic_class_ids;
+        /** true：标签占比 ∈ [min_ratio, 2*min_ratio) 时线性降低语义权重、向几何 ICP 靠拢 */
+        bool semantic_gray_zone_linear_trust = true;
     };
 
     IcpRefiner();
@@ -89,6 +107,13 @@ public:
     // 配准（主要接口）
     Result refine(const CloudXYZIPtr& src, const CloudXYZIPtr& tgt,
                  const Pose3d& initial) const;
+
+    /**
+     * 语义加权点对点迭代（加权 Procrustes）。要求 src/tgt 的 intensity 为类别 id。
+     * 若标签覆盖率不足则内部退回 refineICP(..., point_to_plane)。
+     */
+    Result refineSemanticWeighted(const CloudXYZIPtr& src, const CloudXYZIPtr& tgt,
+                                  const Pose3d& initial) const;
     
     // 多尺度配准
     Result refineMultiscale(const CloudXYZIPtr& src, const CloudXYZIPtr& tgt,
@@ -113,6 +138,11 @@ public:
 
 private:
     Config config_;
+
+    static int intensityToSemanticLabel(float intensity);
+    static double semanticLabelRatio(const CloudXYZIPtr& cloud);
+    double semanticCorrespondenceWeight(int ls, int lt,
+                                        const std::unordered_set<int>& dynamic_set) const;
     
     // 预处理
     CloudXYZIPtr preprocessCloud(const CloudXYZIPtr& cloud) const;

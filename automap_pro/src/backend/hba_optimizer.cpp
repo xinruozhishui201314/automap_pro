@@ -3,6 +3,7 @@
 #include "automap_pro/backend/gtsam_guard.h"
 #include "automap_pro/backend/isam2_factor_types.h"
 #include "automap_pro/core/config_manager.h"
+#include "automap_pro/v3/semantic_backend_gates.h"
 #include "automap_pro/core/logger.h"
 #include "automap_pro/core/metrics.h"
 #define MOD "HBAOptimizer"
@@ -346,6 +347,7 @@ void HBAOptimizer::triggerAsync(
 
     // 🏛️ [架构增强] 收集并构建所有子图内的语义因子，准备进行 HBA 语义优化
     std::vector<CylinderFactorItemKF> all_semantic_factors;
+    std::vector<PlaneFactorItemKF> all_semantic_plane_factors;
     std::unordered_map<int, Pose3d> sm_anchor_poses;
     for (const auto& sm : all_submaps) {
         if (!sm) continue;
@@ -359,13 +361,14 @@ void HBAOptimizer::triggerAsync(
                 CylinderFactorItemKF factor;
                 factor.kf_id = kf->id;
                 factor.sm_id = static_cast<uint64_t>(sm->id);
-                factor.point_body = l_kf->root;
                 factor.weight = l_kf->confidence;
 
                 bool factor_ready = false;
+                CylinderLandmark::Ptr l_sm_gate;
                 if (l_kf->associated_idx >= 0 && l_kf->associated_idx < static_cast<int>(sm->landmarks.size())) {
                     const auto& l_sm = sm->landmarks[l_kf->associated_idx];
                     if (l_sm) {
+                        l_sm_gate = l_sm;
                         factor.root_submap = l_sm->root;
                         factor.ray_submap = l_sm->ray;
                         factor.radius = l_sm->radius;
@@ -382,19 +385,77 @@ void HBAOptimizer::triggerAsync(
                 }
 
                 if (factor_ready && factor.root_submap.allFinite() && factor.ray_submap.allFinite()) {
+                    const auto& ccfg = ConfigManager::instance();
+                    // 与 MappingModule 一致：若 trunk root 贴近强支撑墙面，则视为墙边伪树干，跳过该因子。
+                    if (v3::semanticBackendCylinderTooCloseToPlanes(ccfg, kf->T_submap_kf, l_kf, sm->plane_landmarks)) {
+                        continue;
+                    }
+                    if (!v3::semanticBackendCylinderPassesGating(ccfg, kf->T_submap_kf, l_kf, l_sm_gate)) {
+                        continue;
+                    }
+                    factor.point_body = v3::semanticBackendCylinderSampleBody(l_kf);
                     all_semantic_factors.push_back(factor);
+                }
+            }
+            for (const auto& p_kf : kf->plane_landmarks) {
+                if (!p_kf || !p_kf->isValid()) continue;
+                PlaneFactorItemKF pf;
+                pf.kf_id = kf->id;
+                pf.sm_id = static_cast<uint64_t>(sm->id);
+                // Prefer associated canonical plane in submap.
+                bool ready = false;
+                if (p_kf->associated_idx >= 0 && p_kf->associated_idx < static_cast<int>(sm->plane_landmarks.size())) {
+                    const auto& p_sm = sm->plane_landmarks[p_kf->associated_idx];
+                    if (p_sm && p_sm->isValid()) {
+                        pf.normal_submap = p_sm->normal.normalized();
+                        pf.distance_submap = p_sm->distance;
+                        ready = true;
+                    }
+                }
+                if (!ready) {
+                    Eigen::Vector3d n_b = p_kf->normal;
+                    if (!n_b.allFinite() || n_b.norm() < 1e-6) continue;
+                    n_b.normalize();
+                    pf.normal_submap = (kf->T_submap_kf.rotation() * n_b).normalized();
+                    pf.distance_submap = p_kf->distance - pf.normal_submap.dot(kf->T_submap_kf.translation());
+                    ready = true;
+                }
+                Eigen::Vector3d centroid_b = Eigen::Vector3d::Zero();
+                size_t cnt = 0;
+                if (p_kf->points && !p_kf->points->empty()) {
+                    for (const auto& pt : p_kf->points->points) {
+                        if (!std::isfinite(pt.x) || !std::isfinite(pt.y) || !std::isfinite(pt.z)) continue;
+                        centroid_b += Eigen::Vector3d(pt.x, pt.y, pt.z);
+                        ++cnt;
+                    }
+                }
+                if (cnt == 0) {
+                    centroid_b = -p_kf->distance * p_kf->normal.normalized();
+                } else {
+                    centroid_b /= static_cast<double>(cnt);
+                }
+                pf.point_body = centroid_b;
+                pf.weight = std::max(1e-3, p_kf->confidence);
+                if (ready && pf.point_body.allFinite() && pf.normal_submap.allFinite() && std::isfinite(pf.distance_submap)) {
+                    const auto& ccfg = ConfigManager::instance();
+                    if (!v3::semanticBackendPlanePassesGating(ccfg, p_kf)) {
+                        continue;
+                    }
+                    all_semantic_plane_factors.push_back(pf);
                 }
             }
         }
     }
 
     size_t semantic_count = all_semantic_factors.size();
+    size_t semantic_plane_count = all_semantic_plane_factors.size();
     {
         std::lock_guard<std::mutex> lk(queue_mutex_);
         PendingTask task;
         task.keyframes  = std::move(kfs);
         task.loops      = std::move(resolved_loops);
         task.semantic_factors = std::move(all_semantic_factors);
+        task.semantic_plane_factors = std::move(all_semantic_plane_factors);
         task.submap_anchor_poses = std::move(sm_anchor_poses);
         task.alignment_epoch_snapshot = alignment_epoch_snapshot;
         task.enable_gps = gps_aligned_;
@@ -406,8 +467,8 @@ void HBAOptimizer::triggerAsync(
     { std::lock_guard<std::mutex> lk(queue_mutex_); queue_depth = pending_queue_.size(); }
     const char* src = trigger_source ? trigger_source : "unknown";
     RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-        "[HBA][STATE] enqueue source=%s submaps=%zu keyframes=%zu loops=%zu semantic_factors=%zu gps=%d trigger_count=%d queue_depth=%zu (重影诊断: 同一轮建图内 trigger_count>1 表示被多次触发)",
-        src, sm_count, kf_count, loop_count, semantic_count, gps_aligned_ ? 1 : 0, trigger_count_, queue_depth);
+        "[HBA][STATE] enqueue source=%s submaps=%zu keyframes=%zu loops=%zu semantic_factors=%zu semantic_plane_factors=%zu gps=%d trigger_count=%d queue_depth=%zu (重影诊断: 同一轮建图内 trigger_count>1 表示被多次触发)",
+        src, sm_count, kf_count, loop_count, semantic_count, semantic_plane_count, gps_aligned_ ? 1 : 0, trigger_count_, queue_depth);
     ALOG_INFO(MOD, "HBA triggerAsync: source={} submaps={} keyframes={} loops={} gps={} trigger_count={} queue_depth={}",
               src, sm_count, kf_count, loop_count, gps_aligned_ ? 1 : 0, trigger_count_, queue_depth);
 
@@ -611,19 +672,19 @@ HBAResult HBAOptimizer::runHBA(const PendingTask& task) {
 #ifdef USE_HBA_API
     // 语义契约强门控：一旦存在语义因子，禁止走 HBA API（当前 API 不支持语义因子）。
     // 为避免“看起来开了语义、运行时却丢语义”，强制切换到 GTSAM fallback。
-    if (!task.semantic_factors.empty()) {
+    if (!task.semantic_factors.empty() || !task.semantic_plane_factors.empty()) {
 #ifdef USE_GTSAM_FALLBACK
         RCLCPP_WARN(rclcpp::get_logger("automap_system"),
-            "[HBA][CONTRACT][SEMANTIC_GATE] semantic_factors=%zu detected: force backend switch API -> GTSAM_fallback",
-            task.semantic_factors.size());
+            "[HBA][CONTRACT][SEMANTIC_GATE] semantic_factors(cyl/plane)=(%zu/%zu) detected: force backend switch API -> GTSAM_fallback",
+            task.semantic_factors.size(), task.semantic_plane_factors.size());
         ALOG_WARN(MOD, "HBA semantic gate: forcing GTSAM fallback for {} semantic factors",
                   task.semantic_factors.size());
         return runGTSAMFallback(task);
 #else
         RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
-            "[HBA][CONTRACT][SEMANTIC_GATE] semantic_factors=%zu detected but GTSAM fallback is unavailable. "
+            "[HBA][CONTRACT][SEMANTIC_GATE] semantic_factors(cyl/plane)=(%zu/%zu) detected but GTSAM fallback is unavailable. "
             "Rejecting HBA run to prevent semantic loss.",
-            task.semantic_factors.size());
+            task.semantic_factors.size(), task.semantic_plane_factors.size());
         ALOG_ERROR(MOD, "HBA semantic gate: fallback unavailable, rejecting run to avoid semantic loss");
         result.success = false;
         return result;
@@ -684,11 +745,11 @@ HBAResult HBAOptimizer::runHBA(const PendingTask& task) {
     std::string params = "keyframes=" + std::to_string(task.keyframes.size()) + " gps=" + (task.enable_gps ? "1" : "0");
     
     // 🏛️ [架构报警] HBA API 目前不支持语义地标约束
-    if (!task.semantic_factors.empty()) {
+    if (!task.semantic_factors.empty() || !task.semantic_plane_factors.empty()) {
         RCLCPP_WARN(rclcpp::get_logger("automap_system"),
-            "[HBA][BACKEND][SEMANTIC_GAP] HBA API path does NOT support semantic landmarks yet (%zu factors ignored). "
+            "[HBA][BACKEND][SEMANTIC_GAP] HBA API path does NOT support semantic landmarks yet (cyl=%zu plane=%zu ignored). "
             "Consider enabling backend.hba.enable_gtsam_fallback for full semantic integration.",
-            task.semantic_factors.size());
+            task.semantic_factors.size(), task.semantic_plane_factors.size());
     }
 
     GtsamCallScope scope(GtsamCaller::HBA, "PGO", params, true);
@@ -1043,7 +1104,41 @@ HBAResult HBAOptimizer::runGTSAMFallback(const PendingTask& task) {
         }
 
         // 🏛️ [架构增强] 添加语义地标约束 (CylinderFactor)
+        // Keep consistency with IncrementalOptimizer: apply DCS-like dynamic down-weight
+        // from current initial residual to prevent wrong semantic pulls in fallback path.
+        constexpr double kSemanticSwitchableResidualScaleM = 0.25;
+        auto compute_cylinder_residual = [&](size_t kf_idx, int sm_id, const CylinderFactorItemKF& factor) -> double {
+            if (!initial.exists(KF(kf_idx)) || !initial.exists(SM(sm_id))) return 0.0;
+            const gtsam::Pose3 T_map_kf = initial.at<gtsam::Pose3>(KF(kf_idx));
+            const gtsam::Pose3 T_map_sm = initial.at<gtsam::Pose3>(SM(sm_id));
+            const gtsam::Point3 p_body(factor.point_body.x(), factor.point_body.y(), factor.point_body.z());
+            const gtsam::Point3 p_map = T_map_kf.transformFrom(p_body);
+            const gtsam::Point3 p_sm = T_map_sm.transformTo(p_map);
+            const Eigen::Vector3d p(p_sm.x(), p_sm.y(), p_sm.z());
+            const Eigen::Vector3d root = factor.root_submap;
+            Eigen::Vector3d ray = factor.ray_submap;
+            if (!ray.allFinite() || ray.norm() < 1e-6) return 0.0;
+            ray.normalize();
+            const double dist_to_axis = (p - root).cross(ray).norm();
+            return std::abs(dist_to_axis - std::max(1e-6, factor.radius));
+        };
+        auto compute_plane_residual = [&](size_t kf_idx, int sm_id, const PlaneFactorItemKF& factor) -> double {
+            if (!initial.exists(KF(kf_idx)) || !initial.exists(SM(sm_id))) return 0.0;
+            const gtsam::Pose3 T_map_kf = initial.at<gtsam::Pose3>(KF(kf_idx));
+            const gtsam::Pose3 T_map_sm = initial.at<gtsam::Pose3>(SM(sm_id));
+            const gtsam::Point3 p_body(factor.point_body.x(), factor.point_body.y(), factor.point_body.z());
+            const gtsam::Point3 p_map = T_map_kf.transformFrom(p_body);
+            const gtsam::Point3 p_sm = T_map_sm.transformTo(p_map);
+            Eigen::Vector3d n = factor.normal_submap;
+            if (!n.allFinite() || n.norm() < 1e-6) return 0.0;
+            n.normalize();
+            const double signed_dist = n.dot(Eigen::Vector3d(p_sm.x(), p_sm.y(), p_sm.z())) + factor.distance_submap;
+            return std::abs(signed_dist);
+        };
         size_t landmark_factors_added = 0;
+        size_t plane_landmark_factors_added = 0;
+        double semantic_residual_sum = 0.0;
+        size_t semantic_residual_cnt = 0;
         for (const auto& factor : task.semantic_factors) {
             auto it_kf = kf_id_to_idx.find(factor.kf_id);
             if (it_kf == kf_id_to_idx.end()) {
@@ -1065,8 +1160,12 @@ HBAResult HBAOptimizer::runGTSAMFallback(const PendingTask& task) {
                 continue;
             }
 
-            // 1D Isotropic Noise Model (与 IncrementalOptimizer 保持一致)
+            // 1D Isotropic Noise Model + DCS-like switch (align with IncrementalOptimizer)
+            const double residual = compute_cylinder_residual(it_kf->second, static_cast<int>(factor.sm_id), factor);
+            const double c = std::max(1e-3, kSemanticSwitchableResidualScaleM);
+            const double switch_scale = 1.0 / (1.0 + (residual * residual) / (c * c));
             double sigma = 0.1 / std::max(1e-3, factor.weight);
+            sigma = sigma / std::sqrt(std::max(0.05, switch_scale));
             auto noise = gtsam::noiseModel::Isotropic::Sigma(1, sigma);
 
             gtsam::Point3 point_body(factor.point_body.x(), factor.point_body.y(), factor.point_body.z());
@@ -1079,19 +1178,48 @@ HBAResult HBAOptimizer::runGTSAMFallback(const PendingTask& task) {
             
             factor_type_log.push_back("Landmark(k" + std::to_string(it_kf->second) + "-s" + std::to_string(factor.sm_id) + ")");
             landmark_factors_added++;
+            semantic_residual_sum += residual;
+            semantic_residual_cnt++;
+        }
+        for (const auto& factor : task.semantic_plane_factors) {
+            auto it_kf = kf_id_to_idx.find(factor.kf_id);
+            if (it_kf == kf_id_to_idx.end()) continue;
+            if (task.submap_anchor_poses.find(static_cast<int>(factor.sm_id)) == task.submap_anchor_poses.end()) continue;
+            if (!factor.point_body.allFinite() || !factor.normal_submap.allFinite() ||
+                factor.normal_submap.norm() < 1e-6 || !std::isfinite(factor.distance_submap)) {
+                continue;
+            }
+            const double residual = compute_plane_residual(it_kf->second, static_cast<int>(factor.sm_id), factor);
+            const double c = std::max(1e-3, kSemanticSwitchableResidualScaleM);
+            const double switch_scale = 1.0 / (1.0 + (residual * residual) / (c * c));
+            double sigma = 0.15 / std::max(1e-3, factor.weight);
+            sigma = sigma / std::sqrt(std::max(0.05, switch_scale));
+            auto noise = gtsam::noiseModel::Isotropic::Sigma(1, sigma);
+            const Eigen::Vector3d n = factor.normal_submap.normalized();
+            gtsam::Point3 point_body(factor.point_body.x(), factor.point_body.y(), factor.point_body.z());
+            gtsam::Unit3 normal_submap(n.x(), n.y(), n.z());
+            graph.add(boost::make_shared<PlaneFactor>(
+                KF(it_kf->second), SM(static_cast<int>(factor.sm_id)),
+                point_body, normal_submap, factor.distance_submap, noise));
+            factor_type_log.push_back("PlaneLandmark(k" + std::to_string(it_kf->second) + "-s" + std::to_string(factor.sm_id) + ")");
+            plane_landmark_factors_added++;
+            semantic_residual_sum += residual;
+            semantic_residual_cnt++;
         }
 
-        if (landmark_factors_added > 0) {
+        if (landmark_factors_added > 0 || plane_landmark_factors_added > 0) {
+            const double mean_semantic_residual =
+                semantic_residual_cnt > 0 ? (semantic_residual_sum / static_cast<double>(semantic_residual_cnt)) : 0.0;
             RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-                "[HBA][GTSAM][BACKEND] Semantic landmark factors added to HBA graph count=%zu", 
-                landmark_factors_added);
+                "[HBA][GTSAM][BACKEND] Semantic landmark factors added to HBA graph cylinder=%zu plane=%zu mean_residual=%.3f switch_scale_m=%.2f",
+                landmark_factors_added, plane_landmark_factors_added, mean_semantic_residual, kSemanticSwitchableResidualScaleM);
         }
 
         size_t n_factors = graph.size();
         size_t n_values = initial.size();
         RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-            "[HBA][GTSAM] graph built: factors=%zu values=%zu loop_factors=%zu gps_factors=%zu landmark_factors=%zu (building LM optimizer...)",
-            n_factors, n_values, loop_factors_added, gps_factors_added, landmark_factors_added);
+            "[HBA][GTSAM] graph built: factors=%zu values=%zu loop_factors=%zu gps_factors=%zu landmark_factors(cyl/plane)=(%zu/%zu) (building LM optimizer...)",
+            n_factors, n_values, loop_factors_added, gps_factors_added, landmark_factors_added, plane_landmark_factors_added);
         ALOG_INFO(MOD, "HBA GTSAM: factors={} values={} loops={} gps={} landmarks={}", 
                   n_factors, n_values, loop_factors_added, gps_factors_added, landmark_factors_added);
 
@@ -1190,8 +1318,8 @@ HBAResult HBAOptimizer::runGTSAMFallback(const PendingTask& task) {
 
         // [GHOSTING_DIAG] 记录优化前各类因子的残差
         auto logFactorErrors = [&](const gtsam::NonlinearFactorGraph& g, const gtsam::Values& v, const std::string& label) {
-            double total_err = 0, prior_err = 0, odom_err = 0, gps_err = 0, loop_err = 0;
-            size_t p_cnt = 0, o_cnt = 0, g_cnt = 0, l_cnt = 0;
+            double total_err = 0, prior_err = 0, odom_err = 0, gps_err = 0, loop_err = 0, landmark_err = 0;
+            size_t p_cnt = 0, o_cnt = 0, g_cnt = 0, l_cnt = 0, m_cnt = 0;
             
             for (size_t idx = 0; idx < g.size(); ++idx) {
                 if (!g[idx]) continue;
@@ -1203,10 +1331,11 @@ HBAResult HBAOptimizer::runGTSAMFallback(const PendingTask& task) {
                 else if (type.find("Between") != std::string::npos) { odom_err += e; o_cnt++; }
                 else if (type.find("GPS") != std::string::npos) { gps_err += e; g_cnt++; }
                 else if (type.find("Loop") != std::string::npos) { loop_err += e; l_cnt++; }
+                else if (type.find("Landmark") != std::string::npos) { landmark_err += e; m_cnt++; }
             }
             RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-                "[HBA][ERROR_BREAKDOWN][%s] total=%.2f prior=%.2f(%zu) odom=%.2f(%zu) gps=%.2f(%zu) loop=%.2f(%zu)",
-                label.c_str(), total_err, prior_err, p_cnt, odom_err, o_cnt, gps_err, g_cnt, loop_err, l_cnt);
+                "[HBA][ERROR_BREAKDOWN][%s] total=%.2f prior=%.2f(%zu) odom=%.2f(%zu) gps=%.2f(%zu) loop=%.2f(%zu) landmark=%.2f(%zu)",
+                label.c_str(), total_err, prior_err, p_cnt, odom_err, o_cnt, gps_err, g_cnt, loop_err, l_cnt, landmark_err, m_cnt);
         };
 
         logFactorErrors(graph_copy, initial_copy, "BEFORE");

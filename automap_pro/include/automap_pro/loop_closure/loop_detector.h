@@ -265,6 +265,12 @@ private:
     /** 回环位姿一致性：构造时从 ConfigManager 缓存，避免 processMatchTask 中访问单例导致 shutdown 时 SIGSEGV */
     double pose_consistency_max_trans_m_ = 10.0;
     double pose_consistency_max_rot_deg_ = 20.0;
+    /** TEASER 初值 vs ICP 精配一致性门控（米/度）；对应维 ≤0 表示关闭该维检查 */
+    double teaser_icp_agreement_max_trans_m_ = 4.0;
+    double teaser_icp_agreement_max_rot_deg_ = 35.0;
+    /** inlier 接近阈值时对信息矩阵降权（与 constraint_low_trust_information_scale_ 联用） */
+    double constraint_inlier_soft_margin_ = 0.035;
+    double constraint_low_trust_information_scale_ = 0.5;
     /** 队列/匹配参数：构造时缓存，避免 worker 线程访问 ConfigManager 单例 */
     size_t loop_max_desc_queue_size_ = 128;
     size_t loop_max_match_queue_size_ = 128;
@@ -295,6 +301,8 @@ private:
 
     bool computeDescExternal(const SubMap::Ptr& submap);
     void publishLoopConstraint(const LoopConstraint::Ptr& lc);
+    /** 弱几何信任：inlier 仅略高于阈值时降低回环信息矩阵强度 */
+    void applyLoopInformationMargins_(Mat66d& information, float inlier_ratio) const;
 
     /** 安全获取节点指针 */
     rclcpp::Node::SharedPtr node() const { return node_.lock(); }

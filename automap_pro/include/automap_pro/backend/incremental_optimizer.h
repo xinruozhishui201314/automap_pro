@@ -24,6 +24,7 @@
 #include <atomic>
 #include <future>
 #include <chrono>
+#include <deque>
 
 namespace automap_pro {
 
@@ -110,6 +111,8 @@ public:
 
     /** 添加 keyframe 级别的圆柱地标因子 */
     void addCylinderFactorForKeyFrame(int kf_id, const CylinderFactorItemKF& factor);
+    /** 添加 keyframe 级别的平面地标因子 */
+    void addPlaneFactorForKeyFrame(int kf_id, const PlaneFactorItemKF& factor);
 
     /** 获取 keyframe 节点位姿 */
     Pose3d getKeyFramePose(int kf_id) const;
@@ -292,6 +295,8 @@ public:
     
     /** 刷新 pending keyframe GPS 因子（内部版本，假设锁已由调用者持有） */
     int flushPendingGPSFactorsForKeyFramesInternal();
+    /** 刷新 pending 语义地标因子（内部版本，假设锁已由调用者持有） */
+    int flushPendingSemanticFactorsForKeyFramesInternal();
 
     /** 刷新 pending submap-level GPS 因子（在子图冻结成功后调用） */
     int flushPendingGPSFactors();
@@ -375,6 +380,8 @@ private:
     gtsam::noiseModel::Diagonal::shared_ptr infoToNoiseDiagonal(const Mat66d& info) const;
     OptimizationResult commitAndUpdate();
     void notifyPoseUpdate(const OptimizationResult& res);
+    double computeCylinderResidualUnsafe_(int kf_id, const CylinderFactorItemKF& factor) const;
+    void logSemanticResidualDiagnosticsUnsafe_(double residual);
 
     /** 首节点 defer 时无法加 GPS 因子，缓存待 forceUpdate 成功后补加 */
     std::vector<GPSFactorItem> pending_gps_factors_;
@@ -382,6 +389,10 @@ private:
     std::vector<OdomFactorItem> pending_odom_factors_submap_;
     /** KeyFrame 级别 pending GPS 因子 */
     std::vector<GPSFactorItemKF> pending_gps_factors_kf_;
+    /** KeyFrame 级别 pending 语义圆柱因子 */
+    std::vector<CylinderFactorItemKF> pending_cylinder_factors_kf_;
+    /** KeyFrame 级别 pending 语义平面因子 */
+    std::vector<PlaneFactorItemKF> pending_plane_factors_kf_;
     /** 内部版本：假设锁已由调用者持有（由 public flushPendingGPSFactors 调用） */
     int flushPendingGPSFactorsInternal();
     /** 失败路径：将本批 pending 中的 keyframe id 从 keyframe_node_exists_ 移除并回退 keyframe_count_/last_keyframe_id_（调用前由调用方从 pending_values_ 收集 kf_ids）。见 BACKEND_POTENTIAL_ISSUES 1.3.1 */
@@ -406,6 +417,14 @@ private:
     double gps_high_altitude_scale_{2.0};
     bool gps_enable_outlier_detection_{true};
     double gps_outlier_cov_scale_{100.0};
+    double semantic_switchable_residual_scale_m_{0.25};
+    mutable std::deque<double> semantic_residual_window_;
+    static constexpr size_t kSemanticResidualWindowSize = 400;
+    /** 回环 Between 相对量上限（与 ConfigManager loop_closure.constraint_max_*）；0=不启用 */
+    double loop_constraint_max_translation_m_{0.0};
+    double loop_constraint_max_rotation_deg_{0.0};
+    /** true=拒绝入图（addLoop* / rebuild 重放）；打 VALIDATION 日志 */
+    bool loopConstraintMaxNormViolated_(const Pose3d& rel, const char* tag, int from, int to) const;
 };
 
 } // namespace automap_pro

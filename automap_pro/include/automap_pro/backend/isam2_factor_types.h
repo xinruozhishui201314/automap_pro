@@ -17,6 +17,7 @@
 #include <gtsam/geometry/Point3.h>
 #include <gtsam/geometry/Unit3.h>
 #include <gtsam/nonlinear/NonlinearFactor.h>
+#include <gtsam/base/numericalDerivative.h>
 
 #include <functional>
 #include <vector>
@@ -135,6 +136,59 @@ private:
 };
 
 /**
+ * @brief 自定义 GTSAM 平面地标因子 (Plane Landmark Factor)
+ * 约束 Pose3 (KeyFrame) 与 Pose3 (Submap Anchor) 之间的关系，通过平面地标。
+ * 残差为关键帧 body 点在 submap 平面上的有符号距离。
+ */
+class PlaneFactor : public gtsam::NoiseModelFactor2<gtsam::Pose3, gtsam::Pose3> {
+public:
+    PlaneFactor(gtsam::Key kfKey, gtsam::Key smKey,
+                const gtsam::Point3& point_body,
+                const gtsam::Unit3& normal_submap,
+                double distance_submap,
+                const gtsam::SharedNoiseModel& model)
+        : gtsam::NoiseModelFactor2<gtsam::Pose3, gtsam::Pose3>(model, kfKey, smKey),
+          point_body_(point_body),
+          normal_submap_(normal_submap),
+          distance_submap_(distance_submap) {}
+
+    virtual ~PlaneFactor() {}
+
+    gtsam::Vector evaluateError(const gtsam::Pose3& T_w_kf, const gtsam::Pose3& T_w_sm,
+                                boost::optional<gtsam::Matrix&> H1 = boost::none,
+                                boost::optional<gtsam::Matrix&> H2 = boost::none) const override {
+        const gtsam::Point3 p_w = T_w_kf.transformFrom(point_body_);
+        const gtsam::Point3 n_w = T_w_sm.rotation().rotate(normal_submap_.point3());
+        const gtsam::Point3 t_w = T_w_sm.translation();
+
+        gtsam::Vector1 error;
+        error << n_w.dot(p_w - t_w) + distance_submap_;
+
+        if (H1) {
+            *H1 = gtsam::numericalDerivative21<gtsam::Vector1, gtsam::Pose3, gtsam::Pose3>(
+                [this](const gtsam::Pose3& a, const gtsam::Pose3& b) {
+                    return this->evaluateError(a, b, boost::none, boost::none);
+                },
+                T_w_kf, T_w_sm);
+        }
+        if (H2) {
+            *H2 = gtsam::numericalDerivative22<gtsam::Vector1, gtsam::Pose3, gtsam::Pose3>(
+                [this](const gtsam::Pose3& a, const gtsam::Pose3& b) {
+                    return this->evaluateError(a, b, boost::none, boost::none);
+                },
+                T_w_kf, T_w_sm);
+        }
+
+        return error;
+    }
+
+private:
+    gtsam::Point3 point_body_;
+    gtsam::Unit3 normal_submap_;
+    double distance_submap_;
+};
+
+/**
  * 圆柱因子项 (用于关键帧)
  */
 struct CylinderFactorItemKF {
@@ -144,6 +198,18 @@ struct CylinderFactorItemKF {
     Eigen::Vector3d root_submap; // 改为相对子图锚点的坐标 (NEW)
     Eigen::Vector3d ray_submap;  // 改为相对子图锚点的方向 (NEW)
     double radius;
+    double weight = 1.0;
+};
+
+/**
+ * 平面因子项 (用于关键帧)
+ */
+struct PlaneFactorItemKF {
+    uint64_t kf_id;
+    uint64_t sm_id;
+    Eigen::Vector3d point_body;
+    Eigen::Vector3d normal_submap;
+    double distance_submap = 0.0;
     double weight = 1.0;
 };
 

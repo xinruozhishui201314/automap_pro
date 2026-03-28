@@ -1,5 +1,6 @@
 #include "automap_pro/submap/submap_manager.h"
 #include "automap_pro/core/config_manager.h"
+#include "automap_pro/core/landmark_id.h"
 #include "automap_pro/core/logger.h"
 #include "automap_pro/core/structured_logger.h"
 #include "automap_pro/core/metrics.h"
@@ -24,6 +25,8 @@
 #include <pcl/io/pcd_io.h>
 #include <fstream>
 #include <filesystem>
+#include <cmath>
+#include <limits>
 
 namespace fs = std::filesystem;
 using json = nlohmann::json;
@@ -37,6 +40,7 @@ SubMapManager::SubMapManager() {
     max_temporal_ = cfg.submapMaxTemporal();
     match_res_    = cfg.submapMatchRes();
     merge_res_    = cfg.submapMergeRes();
+    submap_merge_semantic_intensity_vote_ = cfg.submapMergeSemanticIntensityVote();
     merge_thread_count_ = cfg.backendSubmapMergeThreads();
     retain_cloud_body_ = cfg.retainCloudBody();
     map_statistical_filter_ = cfg.mapStatisticalFilter();
@@ -46,6 +50,27 @@ SubMapManager::SubMapManager() {
     submap_rebuild_thresh_rot_ = cfg.submapRebuildThreshRot();
     parallel_voxel_downsample_ = cfg.parallelVoxelDownsample();
     backend_verbose_trace_ = cfg.backendVerboseTrace();
+    assoc_cyl_max_dist_xy_m_ = cfg.semanticAssocCylinderMaxDistXyM();
+    assoc_cyl_max_dist_z_m_ = cfg.semanticAssocCylinderMaxDistZM();
+    assoc_cyl_max_angle_deg_ = cfg.semanticAssocCylinderMaxAngleDeg();
+    assoc_cyl_max_radius_diff_m_ = cfg.semanticAssocCylinderMaxRadiusDiffM();
+    assoc_cyl_alpha_min_ = cfg.semanticAssocCylinderAlphaMin();
+    assoc_cyl_alpha_max_ = cfg.semanticAssocCylinderAlphaMax();
+    assoc_cyl_mahalanobis_gate_ = cfg.semanticAssocCylinderMahalanobisGate();
+    assoc_cyl_min_confirmations_ = cfg.semanticAssocCylinderMinConfirmations();
+    assoc_cyl_min_observability_ = cfg.semanticAssocCylinderMinObservability();
+    assoc_cyl_duplicate_merge_dist_xy_m_ = cfg.semanticAssocDuplicateMergeDistXyM();
+    assoc_cyl_duplicate_merge_max_angle_deg_ = cfg.semanticAssocDuplicateMergeMaxAngleDeg();
+    assoc_cyl_protection_mode_enabled_ = cfg.semanticAssocProtectionModeEnabled();
+    assoc_cyl_protect_trigger_tree_new_rate_pct_ = cfg.semanticAssocProtectionTriggerTreeNewRatePct();
+    assoc_cyl_protect_recover_tree_new_rate_pct_ = cfg.semanticAssocProtectionRecoverTreeNewRatePct();
+    assoc_cyl_protect_trigger_duplicate_density_ = cfg.semanticAssocProtectionTriggerDuplicateDensity();
+    assoc_cyl_protect_recover_duplicate_density_ = cfg.semanticAssocProtectionRecoverDuplicateDensity();
+    assoc_plane_max_angle_deg_ = cfg.semanticAssocPlaneMaxAngleDeg();
+    assoc_plane_max_distance_diff_m_ = cfg.semanticAssocPlaneMaxDistanceDiffM();
+    assoc_plane_max_tangent_offset_m_ = cfg.semanticAssocPlaneMaxTangentOffsetM();
+    assoc_plane_alpha_min_ = cfg.semanticAssocPlaneAlphaMin();
+    assoc_plane_alpha_max_ = cfg.semanticAssocPlaneAlphaMax();
     
     // ✅ P1 修复：配置检查
     bool retain_cloud = cfg.retainCloudBody();
@@ -410,7 +435,10 @@ void SubMapManager::freezeActiveSubmap(const SubMap::Ptr& sm) {
             Eigen::Isometry3d T_anchor_w = sm->pose_odom_anchor.inverse();
             pcl::transformPointCloud(*sm->merged_cloud, *body_cloud, T_anchor_w.matrix().cast<float>());
             
-            CloudXYZIPtr ds = utils::voxelDownsample(body_cloud, static_cast<float>(match_res_));
+            CloudXYZIPtr ds = submap_merge_semantic_intensity_vote_
+                ? utils::voxelDownsampleMajorityIntensity(body_cloud, static_cast<float>(match_res_),
+                                                            parallel_voxel_downsample_)
+                : utils::voxelDownsample(body_cloud, static_cast<float>(match_res_), parallel_voxel_downsample_);
             if (!ds || ds->empty()) ds = body_cloud;
             sm->downsampled_cloud = ds;
             METRICS_HISTOGRAM_OBSERVE(metrics::POINTCLOUD_SIZE, static_cast<double>(sm->merged_cloud->size()));
@@ -462,7 +490,10 @@ void SubMapManager::forceFreezeActiveSubmapForFinish() {
             Eigen::Isometry3d T_anchor_w = sm->pose_odom_anchor.inverse();
             pcl::transformPointCloud(*sm->merged_cloud, *body_cloud, T_anchor_w.matrix().cast<float>());
             
-            CloudXYZIPtr ds = utils::voxelDownsample(body_cloud, static_cast<float>(match_res_));
+            CloudXYZIPtr ds = submap_merge_semantic_intensity_vote_
+                ? utils::voxelDownsampleMajorityIntensity(body_cloud, static_cast<float>(match_res_),
+                                                            parallel_voxel_downsample_)
+                : utils::voxelDownsample(body_cloud, static_cast<float>(match_res_), parallel_voxel_downsample_);
             if (!ds || ds->empty()) ds = body_cloud;
             sm->downsampled_cloud = ds;
             METRICS_HISTOGRAM_OBSERVE(metrics::POINTCLOUD_SIZE, static_cast<double>(sm->merged_cloud->size()));
@@ -541,7 +572,10 @@ void SubMapManager::freezePostProcessLoop() {
                 Eigen::Isometry3d T_anchor_w = sm->pose_odom_anchor.inverse();
                 pcl::transformPointCloud(*sm->merged_cloud, *body_cloud, T_anchor_w.matrix().cast<float>());
                 
-                CloudXYZIPtr ds = utils::voxelDownsample(body_cloud, static_cast<float>(match_res_));
+                CloudXYZIPtr ds = submap_merge_semantic_intensity_vote_
+                    ? utils::voxelDownsampleMajorityIntensity(body_cloud, static_cast<float>(match_res_),
+                                                                parallel_voxel_downsample_)
+                    : utils::voxelDownsample(body_cloud, static_cast<float>(match_res_), parallel_voxel_downsample_);
                 if (!ds || ds->empty()) ds = body_cloud;
                 sm->downsampled_cloud = ds;
                 
@@ -589,6 +623,65 @@ namespace {
 constexpr size_t kDownsampleThreshold = 200000;
 }
 
+CloudXYZIPtr SubMapManager::downsampleKeyframeBodyForMerging_(const KeyFrame::Ptr& kf) const {
+    CloudXYZIPtr raw_cloud = kf->cloud_body;
+    if (!raw_cloud || raw_cloud->empty()) return std::make_shared<CloudXYZI>();
+
+    const CloudXYZIPtr sem =
+        (submap_merge_semantic_intensity_vote_ && kf->cloud_semantic_labeled_body &&
+         kf->cloud_semantic_labeled_body->size() == raw_cloud->size())
+            ? kf->cloud_semantic_labeled_body
+            : nullptr;
+
+    const float merge_res_f = static_cast<float>(merge_res_);
+
+    if (sem) {
+        CloudXYZIPtr ds = utils::voxelDownsampleBodyWithSemanticLabels(raw_cloud, sem, merge_res_f);
+        if (!ds || ds->empty()) ds = raw_cloud;
+        if (map_statistical_filter_) {
+            CloudXYZIPtr temp(new CloudXYZI());
+            try {
+                pcl::StatisticalOutlierRemoval<pcl::PointXYZI> sor;
+                sor.setInputCloud(ds);
+                sor.setMeanK(map_stat_filter_mean_k_);
+                sor.setStddevMulThresh(map_stat_filter_std_mul_);
+                sor.filter(*temp);
+                if (!temp->empty()) return temp;
+            } catch (const std::exception& e) {
+                RCLCPP_WARN(rclcpp::get_logger("automap_system"),
+                    "[SubMapMgr][CLARITY] SOR after semantic voxel failed kf_id=%lu: %s", kf->id, e.what());
+            }
+        }
+        return ds;
+    }
+
+    CloudXYZIPtr filtered_kf_cloud = raw_cloud;
+    if (map_statistical_filter_) {
+        CloudXYZIPtr temp(new CloudXYZI());
+        try {
+            pcl::StatisticalOutlierRemoval<pcl::PointXYZI> sor;
+            sor.setInputCloud(raw_cloud);
+            sor.setMeanK(map_stat_filter_mean_k_);
+            sor.setStddevMulThresh(map_stat_filter_std_mul_);
+            sor.filter(*temp);
+            if (!temp->empty()) filtered_kf_cloud = temp;
+        } catch (const std::exception& e) {
+            RCLCPP_WARN(rclcpp::get_logger("automap_system"),
+                "[SubMapMgr][CLARITY] SOR filter failed for kf_id=%lu: %s", kf->id, e.what());
+        }
+    }
+
+    CloudXYZIPtr ds_kf_cloud(new CloudXYZI());
+    {
+        pcl::VoxelGrid<pcl::PointXYZI> vg;
+        vg.setInputCloud(filtered_kf_cloud);
+        vg.setLeafSize(merge_res_f, merge_res_f, merge_res_f);
+        vg.filter(*ds_kf_cloud);
+    }
+    if (ds_kf_cloud->empty()) ds_kf_cloud = filtered_kf_cloud;
+    return ds_kf_cloud;
+}
+
 void SubMapManager::mergeCloudToSubmap(SubMap::Ptr& sm, const KeyFrame::Ptr& kf) const {
     if (!kf->cloud_body || kf->cloud_body->empty()) {
         RCLCPP_DEBUG(rclcpp::get_logger("automap_system"),
@@ -598,43 +691,17 @@ void SubMapManager::mergeCloudToSubmap(SubMap::Ptr& sm, const KeyFrame::Ptr& kf)
     }
 
     // 🏛️ [P0 性能优化] 架构重构：耗时操作移出锁外，支持多线程并行
-    // 1. 快照关键帧数据
     CloudXYZIPtr raw_cloud = kf->cloud_body;
     Pose3d T_map_b_snapshot = kf->T_map_b_optimized;
 
-    // 2. 耗时预处理 (Outside Lock)
-    CloudXYZIPtr filtered_kf_cloud = raw_cloud;
-    
-    // 2.1 SOR 滤波
-    if (map_statistical_filter_) {
-        CloudXYZIPtr temp(new CloudXYZI());
-        try {
-            pcl::StatisticalOutlierRemoval<pcl::PointXYZI> sor;
-            sor.setInputCloud(raw_cloud);
-            sor.setMeanK(map_stat_filter_mean_k_);
-            sor.setStddevMulThresh(map_stat_filter_std_mul_);
-            sor.filter(*temp);
-            if (!temp->empty()) {
-                filtered_kf_cloud = temp;
-            }
-        } catch (const std::exception& e) {
-            RCLCPP_WARN(rclcpp::get_logger("automap_system"),
-                "[SubMapMgr][CLARITY] SOR filter failed for kf_id=%lu: %s", kf->id, e.what());
-        }
+    CloudXYZIPtr ds_kf_cloud = downsampleKeyframeBodyForMerging_(kf);
+    if (!ds_kf_cloud || ds_kf_cloud->empty()) {
+        RCLCPP_DEBUG(rclcpp::get_logger("automap_system"),
+            "[GLOBAL_MAP_DIAG] mergeCloudToSubmap: kf_id=%lu downsample empty, skip merge", kf->id);
+        return;
     }
 
-    // 2.2 关键帧级别降采样 (核心优化：避免后续对整个子图进行全量降采样)
-    CloudXYZIPtr ds_kf_cloud(new CloudXYZI());
-    {
-        pcl::VoxelGrid<pcl::PointXYZI> vg;
-        vg.setInputCloud(filtered_kf_cloud);
-        const float res = static_cast<float>(merge_res_);
-        vg.setLeafSize(res, res, res);
-        vg.filter(*ds_kf_cloud);
-    }
-    if (ds_kf_cloud->empty()) ds_kf_cloud = filtered_kf_cloud;
-
-    // 2.3 变换到世界坐标系
+    // 变换到世界坐标系
     CloudXYZIPtr world_cloud(new CloudXYZI());
     Eigen::Affine3f T_wf;
     T_wf.matrix() = T_map_b_snapshot.cast<float>().matrix();
@@ -650,10 +717,9 @@ void SubMapManager::mergeCloudToSubmap(SubMap::Ptr& sm, const KeyFrame::Ptr& kf)
     {
         std::lock_guard<std::mutex> lk(mutex_);
         
-        // 更新关键帧本体点云（写回 SOR 过滤后的结果，不包含降采样）
-        if (filtered_kf_cloud != raw_cloud) {
-            kf->cloud_body = filtered_kf_cloud;
-        }
+        // 关键帧 cloud_body 必须始终保持为「原始完整点云」（与关键帧创建时一致）。
+        // SOR 仅用于本函数内的体素合并路径（merged_cloud），不得写回 kf->cloud_body，
+        // 否则 buildGlobalMap、语义模块、RViz current_cloud 等会丢失点数或偏离真实扫描。
 
         if (!sm->merged_cloud || sm->merged_cloud->empty()) {
             sm->merged_cloud = std::make_shared<CloudXYZI>(*world_cloud);
@@ -665,19 +731,26 @@ void SubMapManager::mergeCloudToSubmap(SubMap::Ptr& sm, const KeyFrame::Ptr& kf)
         
         // 偶尔检查是否需要对整个子图做一次全量降采样（例如点云极其稠密时）
         if (sm->merged_cloud->size() > kDownsampleThreshold * 4) {
-             CloudXYZIPtr temp(new CloudXYZI());
-             pcl::VoxelGrid<pcl::PointXYZI> vg;
-             vg.setInputCloud(sm->merged_cloud);
-             const float res = static_cast<float>(merge_res_);
-             vg.setLeafSize(res, res, res);
-             vg.filter(*temp);
-             sm->merged_cloud.swap(temp);
+            const float res = static_cast<float>(merge_res_);
+            CloudXYZIPtr temp;
+            if (submap_merge_semantic_intensity_vote_) {
+                temp = utils::voxelDownsampleMajorityIntensity(sm->merged_cloud, res, parallel_voxel_downsample_);
+            } else {
+                temp.reset(new CloudXYZI());
+                pcl::VoxelGrid<pcl::PointXYZI> vg;
+                vg.setInputCloud(sm->merged_cloud);
+                vg.setLeafSize(res, res, res);
+                vg.filter(*temp);
+            }
+            if (temp && !temp->empty()) {
+                sm->merged_cloud.swap(temp);
+            }
         }
     }
 
     RCLCPP_DEBUG(rclcpp::get_logger("automap_system"),
-        "[SubMapMgr][P0_OPT] merge sm_id=%d kf_id=%lu: raw=%zu -> filtered=%zu -> ds=%zu, merged_total=%zu",
-        sm->id, kf->id, raw_cloud->size(), filtered_kf_cloud->size(), world_cloud->size(), 
+        "[SubMapMgr][P0_OPT] merge sm_id=%d kf_id=%lu: raw=%zu -> ds_body=%zu -> world_pts=%zu, merged_total=%zu",
+        sm->id, kf->id, raw_cloud->size(), ds_kf_cloud->size(), world_cloud->size(),
         sm->merged_cloud ? sm->merged_cloud->size() : 0);
 
     // [GHOSTING_TRACE] 合并已用快照位姿 T_map_b_snapshot；与 odom 差异诊断
@@ -1024,13 +1097,15 @@ void SubMapManager::rebuildMergedCloudFromOptimizedPoses() {
         for (const auto& kf : sm->keyframes) {
             if (!kf || !kf->cloud_body || kf->cloud_body->empty()) continue;
 
-            // 使用优化后的位姿
+            CloudXYZIPtr ds_body = downsampleKeyframeBodyForMerging_(kf);
+            if (!ds_body || ds_body->empty()) continue;
+
             Eigen::Affine3f T_wf;
             T_wf.matrix() = kf->T_map_b_optimized.cast<float>().matrix();
 
             CloudXYZIPtr world_cloud = std::make_shared<CloudXYZI>();
             try {
-                pcl::transformPointCloud(*kf->cloud_body, *world_cloud, T_wf);
+                pcl::transformPointCloud(*ds_body, *world_cloud, T_wf);
             } catch (const std::exception& e) {
                 RCLCPP_ERROR(log, "[SubMapMgr][REBUILD_MERGE] kf_id=%lu transform failed: %s", kf->id, e.what());
                 continue;
@@ -1043,12 +1118,11 @@ void SubMapManager::rebuildMergedCloudFromOptimizedPoses() {
                 const auto& t = kf->T_map_b_optimized.translation();
                 double yaw_deg = std::atan2(kf->T_map_b_optimized.rotation()(1, 0), kf->T_map_b_optimized.rotation()(0, 0)) * 180.0 / M_PI;
                 RCLCPP_INFO(log,
-                    "[SubMapMgr][POSE_DIAG]   sm_id=%d kf_id=%lu 变换使用 T_map_b_optimized=[%.4f,%.4f,%.4f] yaw=%.2fdeg body_pts=%zu",
-                    sm->id, kf->id, t.x(), t.y(), t.z(), yaw_deg, kf->cloud_body->size());
+                    "[SubMapMgr][POSE_DIAG]   sm_id=%d kf_id=%lu 变换使用 T_map_b_optimized=[%.4f,%.4f,%.4f] yaw=%.2fdeg body_pts=%zu ds_body=%zu",
+                    sm->id, kf->id, t.x(), t.y(), t.z(), yaw_deg, kf->cloud_body->size(), ds_body->size());
             }
             kf_idx++;
 
-            // 合并点云
             size_t old_size = sm->merged_cloud->size();
             sm->merged_cloud->reserve(old_size + world_cloud->size());
             for (const auto& pt : world_cloud->points) {
@@ -1058,7 +1132,10 @@ void SubMapManager::rebuildMergedCloudFromOptimizedPoses() {
 
         // 降采样以控制大小
         if (sm->merged_cloud && sm->merged_cloud->size() > kDownsampleThreshold) {
-            CloudXYZIPtr ds = utils::voxelDownsample(sm->merged_cloud, static_cast<float>(merge_res_));
+            CloudXYZIPtr ds = submap_merge_semantic_intensity_vote_
+                ? utils::voxelDownsampleMajorityIntensity(sm->merged_cloud, static_cast<float>(merge_res_),
+                                                            parallel_voxel_downsample_)
+                : utils::voxelDownsample(sm->merged_cloud, static_cast<float>(merge_res_), parallel_voxel_downsample_);
             if (ds && !ds->empty()) {
                 sm->merged_cloud->swap(*ds);
             }
@@ -1667,6 +1744,15 @@ bool SubMapManager::loadArchivedSubmap(const std::string& dir, int submap_id, Su
                 l->confidence = l_json.value("confidence", 0.0);
                 sm->landmarks.push_back(l);
             }
+            uint64_t max_landmark_id = 0;
+            for (const auto& lm : sm->landmarks) {
+                if (lm && lm->id > max_landmark_id) {
+                    max_landmark_id = lm->id;
+                }
+            }
+            if (max_landmark_id > 0) {
+                seedLandmarkIdSeq(max_landmark_id + 1);
+            }
             SLOG_INFO(MOD, "[SEMANTIC][SubMapMgr][loadArchivedSubmap] step=landmarks_loaded sm_id={} count={}",
                       submap_id, sm->landmarks.size());
         } else {
@@ -1754,14 +1840,15 @@ void SubMapManager::associateLandmarks(SubMap::Ptr& sm, const KeyFrame::Ptr& kf)
         SLOG_DEBUG(MOD, "[SEMANTIC][SubMapMgr][associateLandmarks] step=skip reason=sm_or_kf_null");
         return;
     }
-    if (kf->landmarks.empty()) {
+    if (kf->landmarks.empty() && kf->plane_landmarks.empty()) {
         SLOG_DEBUG(MOD, "[SEMANTIC][SubMapMgr][associateLandmarks] step=skip kf_id={} sm_id={} reason=no_landmarks",
                    kf->id, sm->id);
         return;
     }
 
-    SLOG_DEBUG(MOD, "[SEMANTIC][SubMapMgr][associateLandmarks] step=entry kf_id={} sm_id={} kf_landmarks={} sm_landmarks={}",
-               kf->id, sm->id, kf->landmarks.size(), sm->landmarks.size());
+    SLOG_DEBUG(MOD, "[SEMANTIC][SubMapMgr][associateLandmarks] step=entry kf_id={} sm_id={} kf_trees={} sm_trees={} kf_planes={} sm_planes={}",
+               kf->id, sm->id, kf->landmarks.size(), sm->landmarks.size(),
+               kf->plane_landmarks.size(), sm->plane_landmarks.size());
 
     std::lock_guard<std::mutex> lk(mutex_);
 
@@ -1773,8 +1860,47 @@ void SubMapManager::associateLandmarks(SubMap::Ptr& sm, const KeyFrame::Ptr& kf)
         return;
     }
 
-    size_t n_matched = 0;
-    size_t n_new = 0;
+    size_t n_matched_tree = 0;
+    size_t n_new_tree = 0;
+    size_t n_protection_suppressed_tree = 0;
+    double sm_min_x = std::numeric_limits<double>::infinity();
+    double sm_min_y = std::numeric_limits<double>::infinity();
+    double sm_max_x = -std::numeric_limits<double>::infinity();
+    double sm_max_y = -std::numeric_limits<double>::infinity();
+    for (const auto& l : sm->landmarks) {
+        if (!l || !l->isValid()) continue;
+        sm_min_x = std::min(sm_min_x, l->root.x());
+        sm_min_y = std::min(sm_min_y, l->root.y());
+        sm_max_x = std::max(sm_max_x, l->root.x());
+        sm_max_y = std::max(sm_max_y, l->root.y());
+    }
+    const double sm_area = (std::isfinite(sm_min_x) && std::isfinite(sm_min_y) && std::isfinite(sm_max_x) && std::isfinite(sm_max_y))
+        ? std::max(1e-3, (sm_max_x - sm_min_x) * (sm_max_y - sm_min_y))
+        : 1.0;
+    const double duplicate_density_now =
+        static_cast<double>(assoc_tree_duplicate_merge_total_.load(std::memory_order_relaxed)) / sm_area;
+    const uint64_t tree_m_curr = assoc_tree_matched_total_.load(std::memory_order_relaxed);
+    const uint64_t tree_n_curr = assoc_tree_new_total_.load(std::memory_order_relaxed);
+    const double tree_new_rate_curr = (tree_m_curr + tree_n_curr) > 0
+        ? (100.0 * static_cast<double>(tree_n_curr) / static_cast<double>(tree_m_curr + tree_n_curr))
+        : 0.0;
+    if (assoc_cyl_protection_mode_enabled_) {
+        if (!assoc_cyl_protection_mode_active_ &&
+            (tree_new_rate_curr >= assoc_cyl_protect_trigger_tree_new_rate_pct_ ||
+             duplicate_density_now >= assoc_cyl_protect_trigger_duplicate_density_)) {
+            assoc_cyl_protection_mode_active_ = true;
+            SLOG_WARN(MOD,
+                      "[SEMANTIC][SubMapMgr][protection_mode] action=enter sm_id={} tree_new_rate={:.2f}% duplicate_density={:.4f}/m2",
+                      sm->id, tree_new_rate_curr, duplicate_density_now);
+        } else if (assoc_cyl_protection_mode_active_ &&
+                   tree_new_rate_curr <= assoc_cyl_protect_recover_tree_new_rate_pct_ &&
+                   duplicate_density_now <= assoc_cyl_protect_recover_duplicate_density_) {
+            assoc_cyl_protection_mode_active_ = false;
+            SLOG_INFO(MOD,
+                      "[SEMANTIC][SubMapMgr][protection_mode] action=exit sm_id={} tree_new_rate={:.2f}% duplicate_density={:.4f}/m2",
+                      sm->id, tree_new_rate_curr, duplicate_density_now);
+        }
+    }
     for (const auto& l_kf : kf->landmarks) {
         if (!l_kf) continue;
         
@@ -1785,64 +1911,412 @@ void SubMapManager::associateLandmarks(SubMap::Ptr& sm, const KeyFrame::Ptr& kf)
         l_s.radius = l_kf->radius;
         l_s.confidence = l_kf->confidence;
 
-        // 与子图中现有的地标进行关联
+        // 与子图中现有的地标进行关联（Mahalanobis-like probabilistic gating）
         bool associated = false;
         int matched_idx = -1;
+        double best_cost = std::numeric_limits<double>::infinity();
         for (size_t i = 0; i < sm->landmarks.size(); ++i) {
             auto& l_sm = sm->landmarks[i];
-            
-            // 1. 检查根节点距离 (2D 距离更适合树木)
-            double dist_xy = (l_sm->root.head<2>() - l_s.root.head<2>()).norm();
-            double dist_z = std::abs(l_sm->root.z() - l_s.root.z());
-            
-            // 2. 检查轴向夹角
-            double cos_theta = std::abs(l_sm->ray.dot(l_s.ray));
-            double angle = std::acos(std::min(1.0, cos_theta)) * 180.0 / M_PI;
-            
-            // 3. 检查半径差异
-            double radius_diff = std::abs(l_sm->radius - l_s.radius);
+            if (!l_sm || !l_sm->isValid()) continue;
 
-            // 🏛️ [鲁棒性改进] 使用更严格的关联阈值
-            if (dist_xy < 0.4 && dist_z < 1.0 && angle < 10.0 && radius_diff < 0.08) {
-                // 关联成功：加权平均更新地标参数
-                // 考虑观测置信度作为权重
-                double w_old = l_sm->confidence;
-                double w_new = l_s.confidence;
-                double total_w = w_old + w_new;
-                double alpha = w_new / std::max(1e-3, total_w);
-                
-                // 限制 alpha 范围，避免单次观测影响过大
-                alpha = std::clamp(alpha, 0.05, 0.4);
+            const double dist_xy = (l_sm->root.head<2>() - l_s.root.head<2>()).norm();
+            const double dist_z = std::abs(l_sm->root.z() - l_s.root.z());
+            const double cos_theta = std::abs(l_sm->ray.dot(l_s.ray));
+            const double angle = std::acos(std::min(1.0, cos_theta)) * 180.0 / M_PI;
+            const double radius_diff = std::abs(l_sm->radius - l_s.radius);
 
-                l_sm->root = (1.0 - alpha) * l_sm->root + alpha * l_s.root;
-                l_sm->ray = ((1.0 - alpha) * l_sm->ray + alpha * l_s.ray).normalized();
-                l_sm->radius = (1.0 - alpha) * l_sm->radius + alpha * l_s.radius;
-                l_sm->confidence = std::max(l_sm->confidence, l_s.confidence);
-                
+            const double sx = std::max(1e-3, assoc_cyl_max_dist_xy_m_);
+            const double sz = std::max(1e-3, assoc_cyl_max_dist_z_m_);
+            const double sa = std::max(1e-3, assoc_cyl_max_angle_deg_);
+            const double sr = std::max(1e-3, assoc_cyl_max_radius_diff_m_);
+            const double maha_cost =
+                (dist_xy * dist_xy) / (sx * sx) +
+                (dist_z * dist_z) / (sz * sz) +
+                (angle * angle) / (sa * sa) +
+                (radius_diff * radius_diff) / (sr * sr);
+
+            if (maha_cost >= assoc_cyl_mahalanobis_gate_) {
+                continue;
+            }
+            if (maha_cost < best_cost) {
+                best_cost = maha_cost;
                 matched_idx = static_cast<int>(i);
                 associated = true;
-                break;
             }
         }
 
         if (associated && matched_idx >= 0) {
+            auto& l_sm = sm->landmarks[static_cast<size_t>(matched_idx)];
+            // 关联成功：加权平均更新地标参数
+            double w_old = std::max(1e-3, l_sm->confidence);
+            double w_new = std::max(1e-3, l_s.confidence);
+            double total_w = w_old + w_new;
+            double alpha = w_new / std::max(1e-3, total_w);
+            alpha = std::clamp(alpha, assoc_cyl_alpha_min_, assoc_cyl_alpha_max_);
+
+            l_sm->root = (1.0 - alpha) * l_sm->root + alpha * l_s.root;
+            l_sm->ray = ((1.0 - alpha) * l_sm->ray + alpha * l_s.ray).normalized();
+            l_sm->radius = (1.0 - alpha) * l_sm->radius + alpha * l_s.radius;
+            l_sm->confidence = std::max(l_sm->confidence, l_s.confidence);
+            l_sm->support_count += 1;
+            const double geometric_consistency = 1.0 / (1.0 + best_cost);
+            const double obs = 0.5 * std::clamp(l_s.confidence, 0.0, 1.0) + 0.5 * geometric_consistency;
+            l_sm->observability_score = 0.9 * l_sm->observability_score + 0.1 * obs;
+
+            if (static_cast<size_t>(matched_idx) < sm->landmarks.size()) {
+                const auto& l_canon = sm->landmarks[static_cast<size_t>(matched_idx)];
+                if (l_canon) {
+                    l_kf->id = l_canon->id;
+                }
+            }
             l_kf->associated_idx = matched_idx;
             l_kf->submap_id = sm->id;
-            n_matched++;
+            n_matched_tree++;
         } else {
-            // 未关联，作为新地标加入
+            // Hard guardrail: if a new observation is close to an existing tree under relaxed
+            // duplicate criteria, force-attach instead of creating a new landmark. This prevents
+            // "one real tree -> multiple map trees" from amplifying odometry drift.
+            int relaxed_idx = -1;
+            double relaxed_best = std::numeric_limits<double>::infinity();
+            const double relaxed_xy = std::max(assoc_cyl_duplicate_merge_dist_xy_m_ * 1.8, assoc_cyl_max_dist_xy_m_);
+            const double relaxed_angle_deg = std::max(assoc_cyl_duplicate_merge_max_angle_deg_ * 2.0, assoc_cyl_max_angle_deg_);
+            for (size_t i = 0; i < sm->landmarks.size(); ++i) {
+                const auto& l_exist = sm->landmarks[i];
+                if (!l_exist || !l_exist->isValid()) continue;
+                const double dxy = (l_exist->root.head<2>() - l_s.root.head<2>()).norm();
+                if (dxy > relaxed_xy) continue;
+                const double axis_cos = std::abs(l_exist->ray.normalized().dot(l_s.ray.normalized()));
+                const double angle_deg = std::acos(std::min(1.0, axis_cos)) * 180.0 / M_PI;
+                if (angle_deg > relaxed_angle_deg) continue;
+                const double score = dxy + 0.05 * angle_deg;
+                if (score < relaxed_best) {
+                    relaxed_best = score;
+                    relaxed_idx = static_cast<int>(i);
+                }
+            }
+            if (relaxed_idx >= 0) {
+                auto& l_exist = sm->landmarks[static_cast<size_t>(relaxed_idx)];
+                if (l_exist) {
+                    l_exist->support_count += 1;
+                    l_exist->confidence = std::max(l_exist->confidence, l_s.confidence);
+                    l_exist->observability_score = 0.95 * l_exist->observability_score + 0.05 * std::clamp(l_s.confidence, 0.0, 1.0);
+                    l_kf->id = l_exist->id;
+                    l_kf->associated_idx = relaxed_idx;
+                    l_kf->submap_id = sm->id;
+                    n_matched_tree++;
+                    SLOG_DEBUG(MOD,
+                               "[SEMANTIC][SubMapMgr][associateLandmarks] hard_guardrail_attach kf_id={} sm_id={} assoc_idx={} score={:.3f}",
+                               kf->id, sm->id, relaxed_idx, relaxed_best);
+                    continue;
+                }
+            }
+            if (assoc_cyl_protection_mode_enabled_ && assoc_cyl_protection_mode_active_) {
+                ++n_protection_suppressed_tree;
+                SLOG_DEBUG(MOD,
+                           "[SEMANTIC][SubMapMgr][protection_mode] suppress_new_tree kf_id={} sm_id={} reason=drift_risk",
+                           kf->id, sm->id);
+                continue;
+            }
+            // 未关联，作为新地标加入（id=进程唯一；associated_idx=子图内向量下标）
+            if (l_kf->id == 0) {
+                l_kf->id = allocateLandmarkId();
+            }
+            l_s.id = l_kf->id;
+            l_s.support_count = 1;
+            l_s.observability_score = std::clamp(l_s.confidence, 0.0, 1.0);
             auto new_l = std::make_shared<CylinderLandmark>(l_s);
-            new_l->id = sm->landmarks.size();
-            sm->landmarks.push_back(new_l);
-
-            l_kf->associated_idx = static_cast<int>(new_l->id);
+            const int new_idx = static_cast<int>(sm->landmarks.size());
+            l_kf->associated_idx = new_idx;
             l_kf->submap_id = sm->id;
-            n_new++;
+            sm->landmarks.push_back(new_l);
+            n_new_tree++;
+        }
+    }
+    mergeDuplicateTreeLandmarks_(sm);
+
+    // Plane landmarks association (body -> submap)
+    size_t n_matched_plane = 0;
+    size_t n_new_plane = 0;
+    size_t n_protection_suppressed_plane = 0;
+    for (const auto& p_kf : kf->plane_landmarks) {
+        if (!p_kf || !p_kf->isValid()) continue;
+
+        PlaneLandmark p_s;
+        Eigen::Vector3d n_b = p_kf->normal;
+        if (!n_b.allFinite() || n_b.norm() < 1e-6) continue;
+        n_b.normalize();
+        p_s.normal = (T_s_kf.rotation() * n_b).normalized();
+        p_s.distance = p_kf->distance - p_s.normal.dot(T_s_kf.translation());
+        p_s.confidence = p_kf->confidence;
+        p_s.points = p_kf->points;
+        // Propagate geometric extents into submap frame; they remain approximate
+        // but are sufficient for backend gating (short/low planes like car bodies).
+        p_s.vertical_span_m = p_kf->vertical_span_m;
+        p_s.tangent_span_m = p_kf->tangent_span_m;
+
+        // 计算观测平面在 submap 系下的质心，用于平面局部一致性约束
+        Eigen::Vector3d centroid_s = Eigen::Vector3d::Zero();
+        size_t centroid_cnt = 0;
+        if (p_kf->points && !p_kf->points->empty()) {
+            for (const auto& pt : p_kf->points->points) {
+                if (!std::isfinite(pt.x) || !std::isfinite(pt.y) || !std::isfinite(pt.z)) continue;
+                centroid_s += (T_s_kf * Eigen::Vector3d(pt.x, pt.y, pt.z));
+                ++centroid_cnt;
+            }
+        }
+        if (centroid_cnt == 0) {
+            // 对于 n^T x + d = 0，取沿法向最近点 x0=-d*n 作为兜底参考点
+            centroid_s = -p_s.distance * p_s.normal;
+            centroid_cnt = 1;
+        } else {
+            centroid_s /= static_cast<double>(centroid_cnt);
+        }
+
+        bool associated = false;
+        int matched_idx = -1;
+        for (size_t i = 0; i < sm->plane_landmarks.size(); ++i) {
+            auto& p_sm = sm->plane_landmarks[i];
+            if (!p_sm || !p_sm->isValid()) continue;
+
+            Eigen::Vector3d n_sm = p_sm->normal;
+            if (!n_sm.allFinite() || n_sm.norm() < 1e-6) continue;
+            n_sm.normalize();
+
+            // 法向允许符号翻转（同一几何平面）
+            double cos_theta = n_sm.dot(p_s.normal);
+            double abs_cos = std::abs(cos_theta);
+            double angle_deg = std::acos(std::min(1.0, abs_cos)) * 180.0 / M_PI;
+            if (angle_deg >= assoc_plane_max_angle_deg_) continue;
+
+            const double d_obs = (cos_theta >= 0.0) ? p_s.distance : -p_s.distance;
+            const double d_diff = std::abs(p_sm->distance - d_obs);
+            if (d_diff >= assoc_plane_max_distance_diff_m_) continue;
+
+            // 子图已有平面的局部参考点
+            Eigen::Vector3d sm_ref = Eigen::Vector3d::Zero();
+            size_t sm_ref_cnt = 0;
+            if (p_sm->points && !p_sm->points->empty()) {
+                for (const auto& pt : p_sm->points->points) {
+                    if (!std::isfinite(pt.x) || !std::isfinite(pt.y) || !std::isfinite(pt.z)) continue;
+                    sm_ref += Eigen::Vector3d(pt.x, pt.y, pt.z);
+                    ++sm_ref_cnt;
+                }
+            }
+            if (sm_ref_cnt == 0) sm_ref = -p_sm->distance * n_sm;
+            else sm_ref /= static_cast<double>(sm_ref_cnt);
+
+            // 投影到切平面后比较平面内平移，避免把平行但相距很远的结构误关联
+            const Eigen::Vector3d d_vec = centroid_s - sm_ref;
+            const Eigen::Vector3d d_tangent = d_vec - n_sm.dot(d_vec) * n_sm;
+            if (d_tangent.norm() >= assoc_plane_max_tangent_offset_m_) continue;
+
+            const double w_old = std::max(1e-3, p_sm->confidence);
+            const double w_new = std::max(1e-3, p_s.confidence);
+            const double total_w = w_old + w_new;
+            double alpha = w_new / std::max(1e-6, total_w);
+            alpha = std::clamp(alpha, assoc_plane_alpha_min_, assoc_plane_alpha_max_);
+
+            Eigen::Vector3d n_obs = (cos_theta >= 0.0) ? p_s.normal : (-p_s.normal);
+            p_sm->normal = ((1.0 - alpha) * n_sm + alpha * n_obs).normalized();
+            p_sm->distance = (1.0 - alpha) * p_sm->distance + alpha * d_obs;
+            p_sm->confidence = std::max(p_sm->confidence, p_s.confidence);
+            p_sm->support_count += 1;
+            p_sm->observability_score = 0.9 * p_sm->observability_score + 0.1 * std::clamp(p_s.confidence, 0.0, 1.0);
+            if (!p_sm->points || p_sm->points->empty()) {
+                p_sm->points = p_s.points;
+            }
+
+            matched_idx = static_cast<int>(i);
+            associated = true;
+            break;
+        }
+
+        if (associated && matched_idx >= 0) {
+            if (static_cast<size_t>(matched_idx) < sm->plane_landmarks.size()) {
+                const auto& p_canon = sm->plane_landmarks[static_cast<size_t>(matched_idx)];
+                if (p_canon) {
+                    p_kf->id = p_canon->id;
+                }
+            }
+            p_kf->associated_idx = matched_idx;
+            p_kf->submap_id = sm->id;
+            n_matched_plane++;
+        } else {
+            // Hard guardrail (plane): relaxed attach before creating a new plane landmark.
+            // This avoids fragmenting one stable wall/facade into many nearby landmarks.
+            int relaxed_plane_idx = -1;
+            double relaxed_plane_best = std::numeric_limits<double>::infinity();
+            const double relaxed_angle_deg = std::max(assoc_plane_max_angle_deg_ * 1.8, assoc_plane_max_angle_deg_ + 2.0);
+            const double relaxed_d_diff_m = std::max(assoc_plane_max_distance_diff_m_ * 1.8, assoc_plane_max_distance_diff_m_ + 0.15);
+            const double relaxed_tangent_m = std::max(assoc_plane_max_tangent_offset_m_ * 1.8, assoc_plane_max_tangent_offset_m_ + 0.30);
+            for (size_t i = 0; i < sm->plane_landmarks.size(); ++i) {
+                const auto& p_exist = sm->plane_landmarks[i];
+                if (!p_exist || !p_exist->isValid()) continue;
+
+                Eigen::Vector3d n_sm = p_exist->normal;
+                if (!n_sm.allFinite() || n_sm.norm() < 1e-6) continue;
+                n_sm.normalize();
+
+                const double cos_theta = n_sm.dot(p_s.normal);
+                const double angle_deg = std::acos(std::min(1.0, std::abs(cos_theta))) * 180.0 / M_PI;
+                if (angle_deg > relaxed_angle_deg) continue;
+
+                const double d_obs = (cos_theta >= 0.0) ? p_s.distance : -p_s.distance;
+                const double d_diff = std::abs(p_exist->distance - d_obs);
+                if (d_diff > relaxed_d_diff_m) continue;
+
+                Eigen::Vector3d sm_ref = Eigen::Vector3d::Zero();
+                size_t sm_ref_cnt = 0;
+                if (p_exist->points && !p_exist->points->empty()) {
+                    for (const auto& pt : p_exist->points->points) {
+                        if (!std::isfinite(pt.x) || !std::isfinite(pt.y) || !std::isfinite(pt.z)) continue;
+                        sm_ref += Eigen::Vector3d(pt.x, pt.y, pt.z);
+                        ++sm_ref_cnt;
+                    }
+                }
+                if (sm_ref_cnt == 0) sm_ref = -p_exist->distance * n_sm;
+                else sm_ref /= static_cast<double>(sm_ref_cnt);
+
+                const Eigen::Vector3d d_vec = centroid_s - sm_ref;
+                const Eigen::Vector3d d_tangent = d_vec - n_sm.dot(d_vec) * n_sm;
+                const double tangent_norm = d_tangent.norm();
+                if (tangent_norm > relaxed_tangent_m) continue;
+
+                const double score = d_diff + 0.05 * angle_deg + 0.5 * tangent_norm;
+                if (score < relaxed_plane_best) {
+                    relaxed_plane_best = score;
+                    relaxed_plane_idx = static_cast<int>(i);
+                }
+            }
+            if (relaxed_plane_idx >= 0) {
+                auto& p_exist = sm->plane_landmarks[static_cast<size_t>(relaxed_plane_idx)];
+                if (p_exist) {
+                    p_exist->support_count += 1;
+                    p_exist->confidence = std::max(p_exist->confidence, p_s.confidence);
+                    p_exist->observability_score =
+                        0.95 * p_exist->observability_score + 0.05 * std::clamp(p_s.confidence, 0.0, 1.0);
+                    p_kf->id = p_exist->id;
+                    p_kf->associated_idx = relaxed_plane_idx;
+                    p_kf->submap_id = sm->id;
+                    n_matched_plane++;
+                    SLOG_DEBUG(MOD,
+                               "[SEMANTIC][SubMapMgr][associateLandmarks] hard_guardrail_attach_plane kf_id={} sm_id={} assoc_idx={} score={:.3f}",
+                               kf->id, sm->id, relaxed_plane_idx, relaxed_plane_best);
+                    continue;
+                }
+            }
+            if (assoc_cyl_protection_mode_enabled_ && assoc_cyl_protection_mode_active_) {
+                ++n_protection_suppressed_plane;
+                SLOG_DEBUG(MOD,
+                           "[SEMANTIC][SubMapMgr][protection_mode] suppress_new_plane kf_id={} sm_id={} reason=drift_risk",
+                           kf->id, sm->id);
+                continue;
+            }
+            if (p_kf->id == 0) {
+                p_kf->id = allocateLandmarkId();
+            }
+            p_s.id = p_kf->id;
+            p_s.support_count = 1;
+            p_s.observability_score = std::clamp(p_s.confidence, 0.0, 1.0);
+            auto new_p = std::make_shared<PlaneLandmark>(p_s);
+            const int new_idx = static_cast<int>(sm->plane_landmarks.size());
+            p_kf->associated_idx = new_idx;
+            p_kf->submap_id = sm->id;
+            sm->plane_landmarks.push_back(new_p);
+            n_new_plane++;
         }
     }
 
-    SLOG_DEBUG(MOD, "[SEMANTIC][SubMapMgr][associateLandmarks] step=done kf_id={} sm_id={} matched={} new={} sm_total={}",
-               kf->id, sm->id, n_matched, n_new, sm->landmarks.size());
+    assoc_tree_matched_total_.fetch_add(n_matched_tree, std::memory_order_relaxed);
+    assoc_tree_new_total_.fetch_add(n_new_tree, std::memory_order_relaxed);
+    assoc_plane_matched_total_.fetch_add(n_matched_plane, std::memory_order_relaxed);
+    assoc_plane_new_total_.fetch_add(n_new_plane, std::memory_order_relaxed);
+
+    const uint64_t tree_m = assoc_tree_matched_total_.load(std::memory_order_relaxed);
+    const uint64_t tree_n = assoc_tree_new_total_.load(std::memory_order_relaxed);
+    const uint64_t plane_m = assoc_plane_matched_total_.load(std::memory_order_relaxed);
+    const uint64_t plane_n = assoc_plane_new_total_.load(std::memory_order_relaxed);
+    const double tree_match_rate = (tree_m + tree_n) > 0 ? (100.0 * static_cast<double>(tree_m) / static_cast<double>(tree_m + tree_n)) : 0.0;
+    const double tree_new_rate = (tree_m + tree_n) > 0 ? (100.0 * static_cast<double>(tree_n) / static_cast<double>(tree_m + tree_n)) : 0.0;
+    const double plane_match_rate = (plane_m + plane_n) > 0 ? (100.0 * static_cast<double>(plane_m) / static_cast<double>(plane_m + plane_n)) : 0.0;
+    const double plane_new_rate = (plane_m + plane_n) > 0 ? (100.0 * static_cast<double>(plane_n) / static_cast<double>(plane_m + plane_n)) : 0.0;
+
+    SLOG_DEBUG(MOD, "[SEMANTIC][SubMapMgr][associateLandmarks] step=done kf_id={} sm_id={} tree_matched={} tree_new={} tree_suppressed_protection={} tree_total={} plane_matched={} plane_new={} plane_suppressed_protection={} plane_total={}",
+               kf->id, sm->id, n_matched_tree, n_new_tree, n_protection_suppressed_tree, sm->landmarks.size(),
+               n_matched_plane, n_new_plane, n_protection_suppressed_plane, sm->plane_landmarks.size());
+    if ((tree_m + tree_n + plane_m + plane_n) % 50 == 0) {
+        double min_x = std::numeric_limits<double>::infinity();
+        double min_y = std::numeric_limits<double>::infinity();
+        double max_x = -std::numeric_limits<double>::infinity();
+        double max_y = -std::numeric_limits<double>::infinity();
+        for (const auto& l : sm->landmarks) {
+            if (!l || !l->isValid()) continue;
+            min_x = std::min(min_x, l->root.x());
+            min_y = std::min(min_y, l->root.y());
+            max_x = std::max(max_x, l->root.x());
+            max_y = std::max(max_y, l->root.y());
+        }
+        const double area = (std::isfinite(min_x) && std::isfinite(min_y) && std::isfinite(max_x) && std::isfinite(max_y))
+            ? std::max(1e-3, (max_x - min_x) * (max_y - min_y))
+            : 1.0;
+        const double duplicate_density = static_cast<double>(assoc_tree_duplicate_merge_total_.load(std::memory_order_relaxed)) / area;
+        SLOG_INFO(MOD,
+                  "[SEMANTIC][SubMapMgr][assoc_stats] tree(match/new)=({}/{}) tree_rates(match/new)=({:.1f}%/{:.1f}%) "
+                  "plane(match/new)=({}/{}) plane_rates(match/new)=({:.1f}%/{:.1f}%) duplicate_density={:.4f}/m2 merged_total={} protection_mode_active={} suppressed_new_trees={} rule(tree_new_rate>35% && weak_loop_gps => drift_risk)",
+                  tree_m, tree_n, tree_match_rate, tree_new_rate,
+                  plane_m, plane_n, plane_match_rate, plane_new_rate,
+                  duplicate_density,
+                  assoc_tree_duplicate_merge_total_.load(std::memory_order_relaxed),
+                  assoc_cyl_protection_mode_active_ ? 1 : 0,
+                  n_protection_suppressed_tree);
+    }
+}
+
+bool SubMapManager::isSemanticProtectionModeActive() const {
+    std::lock_guard<std::mutex> lk(mutex_);
+    return assoc_cyl_protection_mode_enabled_ && assoc_cyl_protection_mode_active_;
+}
+
+void SubMapManager::mergeDuplicateTreeLandmarks_(SubMap::Ptr& sm) {
+    if (!sm || sm->landmarks.size() < 2) {
+        return;
+    }
+    const double max_xy = std::max(0.05, assoc_cyl_duplicate_merge_dist_xy_m_);
+    const double cos_th = std::cos(std::max(1.0, assoc_cyl_duplicate_merge_max_angle_deg_) * M_PI / 180.0);
+    size_t merged = 0;
+    for (size_t i = 0; i < sm->landmarks.size(); ++i) {
+        auto& a = sm->landmarks[i];
+        if (!a || !a->isValid()) continue;
+        for (size_t j = i + 1; j < sm->landmarks.size(); ++j) {
+            auto& b = sm->landmarks[j];
+            if (!b || !b->isValid()) continue;
+            const double dxy = (a->root.head<2>() - b->root.head<2>()).norm();
+            const double axis_cos = std::abs(a->ray.normalized().dot(b->ray.normalized()));
+            if (dxy > max_xy || axis_cos < cos_th) {
+                continue;
+            }
+            // Keep the more supported/observable landmark as canonical.
+            auto keep_a = (a->support_count > b->support_count) ||
+                          (a->support_count == b->support_count && a->observability_score >= b->observability_score);
+            auto& keep = keep_a ? a : b;
+            auto& drop = keep_a ? b : a;
+            const double wa = std::max(1.0, static_cast<double>(keep->support_count));
+            const double wb = std::max(1.0, static_cast<double>(drop->support_count));
+            const double wsum = wa + wb;
+            keep->root = (wa * keep->root + wb * drop->root) / wsum;
+            keep->ray = (wa * keep->ray + wb * drop->ray).normalized();
+            keep->radius = (wa * keep->radius + wb * drop->radius) / wsum;
+            keep->confidence = std::max(keep->confidence, drop->confidence);
+            keep->support_count += drop->support_count;
+            keep->observability_score = std::max(keep->observability_score, drop->observability_score);
+            drop.reset();
+            ++merged;
+        }
+    }
+    if (merged == 0) return;
+    // Keep vector indices stable within current association pass.
+    // Null entries are skipped by subsequent association/factor paths.
+    assoc_tree_duplicate_merge_total_.fetch_add(static_cast<uint64_t>(merged), std::memory_order_relaxed);
 }
 
 void SubMapManager::publishEvent(const SubMap::Ptr& sm, const std::string& event) {

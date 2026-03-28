@@ -2,6 +2,7 @@
 #include "automap_pro/core/config_manager.h"
 #include "automap_pro/core/utils.h"
 
+#include <pcl/common/transforms.h>
 #include <pcl_conversions/pcl_conversions.h>
 #include <rclcpp/rclcpp.hpp>
 #include <chrono>
@@ -34,6 +35,9 @@ void FastLIVO2Adapter::init(rclcpp::Node::SharedPtr node) {
     RCLCPP_INFO(node->get_logger(),
         "[FastLIVO2Adapter][TOPIC] subscribe: %s, %s | publish: /automap/odometry, /automap/odom_path",
         odom_topic.c_str(), cloud_topic.c_str());
+    RCLCPP_INFO(node->get_logger(),
+        "[FastLIVO2Adapter][COORD] frontend.cloud_frame=%s (world: KF cloud_body = T_odom_b^-1 * registered; body: pass-through)",
+        cfg.frontendCloudFrame().c_str());
 }
 
 void FastLIVO2Adapter::registerPoseCallback(PoseCallback cb) {
@@ -98,15 +102,32 @@ void FastLIVO2Adapter::onOdometry(const nav_msgs::msg::Odometry::SharedPtr msg) 
     {
         std::lock_guard<std::mutex> lk(state_mutex_);
         if (last_cloud_ && !last_cloud_->empty()) {
-            cloud_body = last_cloud_;
-            cloud_ds   = utils::voxelDownsample(last_cloud_, cloud_ds_res_);
+            const std::string& cf = ConfigManager::instance().frontendCloudFrame();
+            CloudXYZIPtr src = last_cloud_;
+            if (cf == "world") {
+                CloudXYZIPtr body_from_world(new CloudXYZI());
+                pcl::transformPointCloud(*last_cloud_, *body_from_world, pose.inverse().matrix().cast<float>());
+                body_from_world->header = last_cloud_->header;
+                body_from_world->width = static_cast<uint32_t>(body_from_world->size());
+                body_from_world->height = 1;
+                src = body_from_world;
+                RCLCPP_INFO_THROTTLE(
+                    node_->get_logger(),
+                    *node_->get_clock(),
+                    5000,
+                    "[FastLIVO2Adapter][KF][COORD] frontend.cloud_frame=world: applied T_odom_b^-1 to registered cloud -> "
+                    "kf.cloud_body pts=%zu (Patchwork/semantic geometric expect lidar BODY frame)",
+                    src->size());
+            }
+            cloud_body = src;
+            cloud_ds = utils::voxelDownsample(cloud_body, cloud_ds_res_);
         }
     }
     if (!cloud_body || !cloud_ds) return;
 
     GPSMeasurement gps;
     KeyFrame::Ptr kf = kf_manager_->createKeyFrame(
-        pose, pose, cov, t, cloud_body, cloud_ds, gps, false, session_id_);
+        pose, cov, t, cloud_body, cloud_ds, gps, false, session_id_);
     (void)kf;
 }
 

@@ -47,7 +47,9 @@ private:
     void workerLoop(size_t worker_idx);
     void maybeAdjustActiveWorkersLocked(double now_s);
     void enqueueTaskLocked(const SyncedFrameEvent& ev);
+    void handleKeyFrameInput(const KeyFrame::Ptr& kf, const char* source_tag);
     void handleGraphTaskEvent(const GraphTaskEvent& ev);
+    void handleSemanticInputEvent(const SemanticInputEvent& ev);
     void tryRecoverFromDegradedState(double now_s);
     void markSemanticDegraded(const char* reason);
 
@@ -92,6 +94,8 @@ private:
     std::atomic<uint64_t> sem_event_publish_total_{0};
     std::atomic<uint64_t> sem_event_drop_no_landmark_total_{0};
     std::atomic<uint64_t> semantic_event_seq_{0};
+    std::atomic<uint64_t> b2_gate_forced_log_count_{0};
+    std::atomic<uint64_t> b3_forced_log_count_{0};
     // dt = |frame_ts - kf_ts| 统计桶（秒）
     // [0,0.01], (0.01,0.03], (0.03,0.05], (0.05,0.10], (0.10,0.20], (0.20,0.50], >0.50, missing_kf_ts
     std::array<std::atomic<uint64_t>, 8> dt_hist_bins_{

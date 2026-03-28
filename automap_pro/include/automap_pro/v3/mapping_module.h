@@ -118,6 +118,12 @@ private:
     std::atomic<uint64_t> semantic_in_total_{0};
     std::atomic<uint64_t> semantic_defer_total_{0};
     std::atomic<uint64_t> semantic_dispatch_total_{0};
+    std::atomic<uint64_t> semantic_assoc_tree_input_total_{0};
+    std::atomic<uint64_t> semantic_assoc_tree_emitted_total_{0};
+    std::atomic<uint64_t> semantic_assoc_tree_suppressed_total_{0};
+    std::atomic<uint64_t> semantic_assoc_plane_input_total_{0};
+    std::atomic<uint64_t> semantic_assoc_plane_emitted_total_{0};
+    std::atomic<uint64_t> semantic_assoc_plane_suppressed_total_{0};
     std::atomic<uint64_t> graph_event_seq_{0};
     std::atomic<uint64_t> route_advice_recv_total_{0};
     std::atomic<bool> route_takeover_enabled_{false};
@@ -142,7 +148,7 @@ private:
     size_t max_frame_queue_size_ = 1024;
     size_t max_semantic_queue_size_ = 4096;
     size_t max_pending_semantic_events_ = 4096;
-    double semantic_timestamp_match_tolerance_s_ = 1e-4;
+    double semantic_timestamp_match_tolerance_s_ = 0.15;
     std::deque<SemanticLandmarkEvent> pending_semantic_landmarks_;
     mutable std::mutex pending_semantic_mutex_;
 };

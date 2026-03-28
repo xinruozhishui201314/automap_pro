@@ -220,6 +220,15 @@ public:
     /** 发布语义地标（如树木圆柱体） */
     void publishSemanticLandmarks(const std::vector<SubMap::Ptr>& submaps);
 
+    /** 发布语义点云 (按类别着色) */
+    void publishSemanticCloud(const CloudXYZIConstPtr& cloud, const std::string& frame_id = "body");
+
+    /** 聚类前树干点（maskCloud(tree_label) 后，单色）；frame_id 通常为 map */
+    void publishSemanticTrunkPreCluster(const CloudXYZIConstPtr& cloud, const std::string& frame_id = "map");
+
+    /** 聚类后树干点（intensity=簇 id，按 id 着色）；frame_id 通常为 map */
+    void publishSemanticTrunkPostCluster(const CloudXYZIConstPtr& cloud, const std::string& frame_id = "map");
+
     // ═══════════════════════════════════════════════════════════════════════
     // 9. 工具函数
     // ═══════════════════════════════════════════════════════════════════════
@@ -249,6 +258,9 @@ private:
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr colored_cloud_pub_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr density_heatmap_pub_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr loop_candidate_pub_;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr semantic_cloud_pub_;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr semantic_trunk_pre_pub_;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr semantic_trunk_post_pub_;
 
     // Marker发布者
     rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr loop_marker_pub_;

@@ -4,6 +4,11 @@
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/features/normal_3d.h>
 #include <pcl/filters/statistical_outlier_removal.h>
+#include <pcl/kdtree/kdtree_flann.h>
+#include <Eigen/SVD>
+#include <algorithm>
+#include <cmath>
+#include <unordered_set>
 #include <chrono>
 
 #define MOD "ICPRefiner"
@@ -354,8 +359,8 @@ CloudXYZIPtr IcpRefiner::preprocessCloud(const CloudXYZIPtr& cloud) const {
     
     CloudXYZIPtr processed(new CloudXYZI(*cloud));
     
-    // 降采样
-    if (config_.downsample_before_refine && config_.downsample_voxel_size > 0) {
+    // 降采样（回环侧可关闭以保留语义 intensity）
+    if (config_.preprocess_downsample && config_.downsample_before_refine && config_.downsample_voxel_size > 0) {
         pcl::VoxelGrid<pcl::PointXYZI> vg;
         vg.setInputCloud(processed);
         vg.setLeafSize(config_.downsample_voxel_size, 
@@ -364,8 +369,8 @@ CloudXYZIPtr IcpRefiner::preprocessCloud(const CloudXYZIPtr& cloud) const {
         vg.filter(*processed);
     }
     
-    // 统计去噪
-    if (processed->size() > 100) {
+    // 统计去噪（会破坏逐点语义标签对齐，回环语义 ICP 路径应关闭）
+    if (config_.preprocess_sor && processed->size() > 100) {
         pcl::StatisticalOutlierRemoval<pcl::PointXYZI> sor;
         sor.setInputCloud(processed);
         sor.setMeanK(20);
@@ -514,6 +519,205 @@ void IcpRefiner::computePoseChange(const Pose3d& T_initial, const Pose3d& T_fina
     
     // 提取平移距离
     translation = T_change.translation().norm();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 语义加权 ICP（SuMa++ 类：同类高权、异类/动态/未知降权）
+// ─────────────────────────────────────────────────────────────────────────────
+
+int IcpRefiner::intensityToSemanticLabel(float intensity) {
+    if (!std::isfinite(intensity)) return 0;
+    const int v = static_cast<int>(std::lround(intensity));
+    if (v < 0 || v > 65535) return 0;
+    return v;
+}
+
+double IcpRefiner::semanticLabelRatio(const CloudXYZIPtr& cloud) {
+    if (!cloud || cloud->empty()) return 0.0;
+    size_t n = 0;
+    for (const auto& p : cloud->points) {
+        if (intensityToSemanticLabel(p.intensity) != 0) ++n;
+    }
+    return static_cast<double>(n) / static_cast<double>(cloud->size());
+}
+
+double IcpRefiner::semanticCorrespondenceWeight(int ls, int lt,
+                                                const std::unordered_set<int>& dyn) const {
+    const bool dyn_s = dyn.count(ls) != 0;
+    const bool dyn_t = dyn.count(lt) != 0;
+    if (dyn_s || dyn_t) return static_cast<double>(config_.semantic_weight_dynamic);
+    const bool unk_s = (ls == 0);
+    const bool unk_t = (lt == 0);
+    if (unk_s || unk_t) return static_cast<double>(config_.semantic_weight_unknown);
+    if (ls == lt) return static_cast<double>(config_.semantic_weight_match);
+    return static_cast<double>(config_.semantic_weight_mismatch);
+}
+
+IcpRefiner::Result IcpRefiner::refineSemanticWeighted(const CloudXYZIPtr& src,
+                                                       const CloudXYZIPtr& tgt,
+                                                       const Pose3d& initial) const {
+    Result res;
+    if (!config_.semantic_icp_enabled) {
+        return refine(src, tgt, initial);
+    }
+    if (!src || !tgt || src->empty() || tgt->empty()) {
+        return res;
+    }
+
+    const double r_src = semanticLabelRatio(src);
+    const double r_tgt = semanticLabelRatio(tgt);
+    if (r_src < config_.semantic_min_label_ratio || r_tgt < config_.semantic_min_label_ratio) {
+        ALOG_DEBUG(MOD, "refineSemanticWeighted: label_ratio low (src={:.3f} tgt={:.3f} min={:.3f}) -> point-to-plane ICP",
+                   r_src, r_tgt, config_.semantic_min_label_ratio);
+        return refineICP(src, tgt, initial, true);
+    }
+
+    std::unordered_set<int> dyn;
+    dyn.reserve(config_.semantic_dynamic_class_ids.size());
+    for (int c : config_.semantic_dynamic_class_ids) dyn.insert(c);
+
+    double sem_trust_scale = 1.0;
+    if (config_.semantic_gray_zone_linear_trust) {
+        const double rmin = std::min(r_src, r_tgt);
+        const double mr = config_.semantic_min_label_ratio;
+        if (rmin >= mr && rmin < 2.0 * mr) {
+            sem_trust_scale = std::clamp((rmin - mr) / std::max(1e-9, mr), 0.0, 1.0);
+        }
+    }
+
+    pcl::KdTreeFLANN<pcl::PointXYZI> kdt;
+    kdt.setInputCloud(tgt);
+
+    Pose3d T = initial;
+    const int max_iter =
+        (config_.semantic_max_iterations > 0) ? config_.semantic_max_iterations : config_.max_iterations;
+    const double max_d = config_.max_correspondence_distance;
+    const double max_d2 = max_d * max_d;
+
+    int last_pairs = 0;
+    for (int it = 0; it < max_iter; ++it) {
+        std::vector<Eigen::Vector3d> P;
+        std::vector<Eigen::Vector3d> Q;
+        std::vector<double> Ww;
+        P.reserve(src->size());
+        Q.reserve(src->size());
+        Ww.reserve(src->size());
+
+        for (size_t i = 0; i < src->size(); ++i) {
+            const auto& sp = src->points[i];
+            if (!std::isfinite(sp.x) || !std::isfinite(sp.y) || !std::isfinite(sp.z)) continue;
+            Eigen::Vector3d p(sp.x, sp.y, sp.z);
+            Eigen::Vector3d tp = T * p;
+            pcl::PointXYZI qq;
+            qq.x = static_cast<float>(tp.x());
+            qq.y = static_cast<float>(tp.y());
+            qq.z = static_cast<float>(tp.z());
+            std::vector<int> idx(1);
+            std::vector<float> d2(1);
+            if (kdt.nearestKSearch(qq, 1, idx, d2) < 1) continue;
+            if (d2[0] > max_d2) continue;
+            const auto& tp_pt = tgt->points[static_cast<size_t>(idx[0])];
+            if (!std::isfinite(tp_pt.x) || !std::isfinite(tp_pt.y) || !std::isfinite(tp_pt.z)) continue;
+            const int ls = intensityToSemanticLabel(sp.intensity);
+            const int lt = intensityToSemanticLabel(tp_pt.intensity);
+            double w = semanticCorrespondenceWeight(ls, lt, dyn);
+            w = w * sem_trust_scale + 1.0 * (1.0 - sem_trust_scale);
+            if (w < 1e-9) continue;
+            P.push_back(p);
+            Q.push_back(Eigen::Vector3d(tp_pt.x, tp_pt.y, tp_pt.z));
+            Ww.push_back(w);
+        }
+
+        last_pairs = static_cast<int>(P.size());
+        if (P.size() < 12) {
+            ALOG_WARN(MOD, "refineSemanticWeighted: pairs={} < 12, fallback point-to-plane ICP", P.size());
+            return refineICP(src, tgt, initial, true);
+        }
+
+        double sum_w = 0.0;
+        Eigen::Vector3d p_mean = Eigen::Vector3d::Zero();
+        Eigen::Vector3d q_mean = Eigen::Vector3d::Zero();
+        for (size_t k = 0; k < P.size(); ++k) {
+            sum_w += Ww[k];
+            p_mean += Ww[k] * P[k];
+            q_mean += Ww[k] * Q[k];
+        }
+        p_mean /= sum_w;
+        q_mean /= sum_w;
+
+        Eigen::Matrix3d H = Eigen::Matrix3d::Zero();
+        for (size_t k = 0; k < P.size(); ++k) {
+            const Eigen::Vector3d a = P[k] - p_mean;
+            const Eigen::Vector3d b = Q[k] - q_mean;
+            H += Ww[k] * a * b.transpose();
+        }
+        Eigen::JacobiSVD<Eigen::Matrix3d> svd(H, Eigen::ComputeFullU | Eigen::ComputeFullV);
+        Eigen::Matrix3d R = svd.matrixV() * svd.matrixU().transpose();
+        if (R.determinant() < 0) {
+            Eigen::Matrix3d Vc = svd.matrixV();
+            Vc.col(2) *= -1.0;
+            R = Vc * svd.matrixU().transpose();
+        }
+        const Eigen::Vector3d tvec = q_mean - R * p_mean;
+        Eigen::Matrix4d Tf = Eigen::Matrix4d::Identity();
+        Tf.block<3, 3>(0, 0) = R;
+        Tf.block<3, 1>(0, 3) = tvec;
+        Pose3d T_new;
+        T_new.matrix() = Tf;
+
+        const Pose3d delta = T.inverse() * T_new;
+        const double dang = Eigen::AngleAxisd(delta.linear()).angle();
+        const double dtr = delta.translation().norm();
+        T = T_new;
+        if (dang < 1e-5 && dtr < 1e-5) {
+            break;
+        }
+    }
+
+    res.T_refined = T;
+    res.converged = true;
+    res.iterations = max_iter;
+    res.correspondences = last_pairs;
+
+    double serr = 0.0;
+    double sw = 0.0;
+    pcl::KdTreeFLANN<pcl::PointXYZI> kdt_rmse;
+    kdt_rmse.setInputCloud(tgt);
+    for (size_t i = 0; i < src->size(); ++i) {
+        const auto& sp = src->points[i];
+        if (!std::isfinite(sp.x) || !std::isfinite(sp.y) || !std::isfinite(sp.z)) continue;
+        Eigen::Vector3d p(sp.x, sp.y, sp.z);
+        Eigen::Vector3d tp = T * p;
+        pcl::PointXYZI qq;
+        qq.x = static_cast<float>(tp.x());
+        qq.y = static_cast<float>(tp.y());
+        qq.z = static_cast<float>(tp.z());
+        std::vector<int> idx(1);
+        std::vector<float> d2(1);
+        if (kdt_rmse.nearestKSearch(qq, 1, idx, d2) < 1) continue;
+        const double dist = std::sqrt(static_cast<double>(d2[0]));
+        const int ls = intensityToSemanticLabel(sp.intensity);
+        const auto& tp_pt = tgt->points[static_cast<size_t>(idx[0])];
+        const int lt = intensityToSemanticLabel(tp_pt.intensity);
+        const double w = semanticCorrespondenceWeight(ls, lt, dyn);
+        if (w < 1e-9) continue;
+        serr += w * dist * dist;
+        sw += w;
+    }
+    res.rmse = (sw > 1e-12) ? std::sqrt(serr / sw) : 1e6;
+
+    computePoseChange(initial, res.T_refined, res.rotation_angle_deg, res.translation_norm);
+
+    if (config_.validate_result) {
+        if (!validateResult(res, src, tgt)) {
+            ALOG_DEBUG(MOD, "refineSemanticWeighted: validateResult failed, fallback point-to-plane ICP");
+            return refineICP(src, tgt, initial, true);
+        }
+    }
+
+    ALOG_DEBUG(MOD, "refineSemanticWeighted: converged pairs={} rmse={:.4f} deg={:.2f} trans={:.3f}m",
+               res.correspondences, res.rmse, res.rotation_angle_deg, res.translation_norm);
+    return res;
 }
 
 } // namespace automap_pro

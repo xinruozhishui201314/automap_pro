@@ -27,13 +27,16 @@ struct OptTaskItem {
         // 活跃子图关键帧GPS绑定
         ACTIVE_SUBMAP_GPS_BIND,
         // 圆柱地标因子
-        CYLINDER_LANDMARK_FACTOR
+        CYLINDER_LANDMARK_FACTOR,
+        // 平面地标因子
+        PLANE_LANDMARK_FACTOR
     } type;
     int from_id = 0;
     int to_id = 0;
     
     // LANDMARK 专用字段
     std::vector<CylinderFactorItemKF> cylinder_factors;
+    std::vector<PlaneFactorItemKF> plane_factors;
     
     /** SUBMAP_NODE：首个子图锚点等场景传入 IncrementalOptimizer::addSubMapNode(..., fixed) */
     bool fixed = false;

@@ -12,6 +12,8 @@ which is included as part of this source code package.
 
 #include "preprocess.h"
 
+#include <algorithm>
+
 #define RETURN0 0x00
 #define RETURN0AND1 0x10
 
@@ -227,7 +229,8 @@ void Preprocess::oust64_handler(const sensor_msgs::msg::PointCloud2::ConstShared
   // pub_func(pl_surf, pub_corn, msg->header.stamp);
 }
 
-#define MAX_LINE_NUM 64
+// Must match pl_buff/typess capacity in preprocess.h (128) — N_SCANS can be up to 128.
+#define MAX_LINE_NUM 128
 
 void Preprocess::velodyne_handler(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &msg)
 {
@@ -235,11 +238,18 @@ void Preprocess::velodyne_handler(const sensor_msgs::msg::PointCloud2::ConstShar
   pl_corn.clear();
   pl_full.clear();
 
+  if (!msg) {
+    return;
+  }
+
   pcl::PointCloud<velodyne_ros::Point> pl_orig;
   pcl::fromROSMsg(*msg, pl_orig);
   int plsize = pl_orig.points.size();
   if (plsize == 0) return;
   pl_surf.reserve(plsize);
+
+  // pl_buff/typess are fixed at 128 entries; N_SCANS from YAML may exceed that.
+  const int scan_cap = std::min(std::max(N_SCANS, 0), MAX_LINE_NUM);
 
   bool is_first[MAX_LINE_NUM];
   double yaw_fp[MAX_LINE_NUM] = {0};     // yaw of first scan point
@@ -267,7 +277,7 @@ void Preprocess::velodyne_handler(const sensor_msgs::msg::PointCloud2::ConstShar
 
   if (feature_enabled)
   {
-    for (int i = 0; i < N_SCANS; i++)
+    for (int i = 0; i < scan_cap; i++)
     {
       pl_buff[i].clear();
       pl_buff[i].reserve(plsize);
@@ -279,8 +289,8 @@ void Preprocess::velodyne_handler(const sensor_msgs::msg::PointCloud2::ConstShar
       added_pt.normal_x = 0;
       added_pt.normal_y = 0;
       added_pt.normal_z = 0;
-      int layer = pl_orig.points[i].ring;
-      if (layer >= N_SCANS) continue;
+      int layer = static_cast<int>(pl_orig.points[i].ring);
+      if (layer < 0 || layer >= scan_cap) continue;
       added_pt.x = pl_orig.points[i].x;
       added_pt.y = pl_orig.points[i].y;
       added_pt.z = pl_orig.points[i].z;
@@ -313,7 +323,7 @@ void Preprocess::velodyne_handler(const sensor_msgs::msg::PointCloud2::ConstShar
       pl_buff[layer].points.push_back(added_pt);
     }
 
-    for (int j = 0; j < N_SCANS; j++)
+    for (int j = 0; j < scan_cap; j++)
     {
       PointCloudXYZI &pl = pl_buff[j];
       int linesize = pl.size();
@@ -352,7 +362,10 @@ void Preprocess::velodyne_handler(const sensor_msgs::msg::PointCloud2::ConstShar
 
       if (!given_offset_time)
       {
-        int layer = pl_orig.points[i].ring;
+        int layer = static_cast<int>(pl_orig.points[i].ring);
+        if (layer < 0 || layer >= scan_cap) {
+          continue;
+        }
         double yaw_angle = atan2(added_pt.y, added_pt.x) * 57.2957;
 
         if (is_first[layer])

@@ -29,7 +29,7 @@ system:
   api_version: "3.1"
   output_dir: "/data/automap_output"
   num_threads: 20             # 高资源可设 16~20；8 核及以下用 8
-  log_level: "DEBUG"          # DEBUG | INFO | WARN | ERROR
+  log_level: "INFO"           # DEBUG | INFO | WARN | ERROR
   # 传感器空闲结束建图与缓冲（计算跟不上时可增大 frame_queue_max_size 与 sensor_idle_timeout_sec）
   sensor_idle_timeout_sec: 150.0
   auto_finish_on_sensor_idle: true
@@ -83,7 +83,7 @@ sensor:
     type:     "VELODYNE"                  # M2DGR: VLP-32C (32线)
     frame_id: "velodyne"
   imu:
-    topic:    "/handsfree/imu"            # M2DGR: Xsens/Handsfree IMU
+    topic:    "/handsfree/imu"            # M2DGR: Handsfree IMU（标定见 calibration_results.txt %% Handsfree IMU）
     frame_id: "imu"
     frequency: 100.0                      # M2DGR IMU 约 100 Hz
   camera:
@@ -107,8 +107,8 @@ frontend:
 # ── 2.2c 语义模块（SLOAM 语义分割 + 树干地标）───────────────────────────────
 semantic:
   enabled: true
-  # 可选后端：sloam | lsk3dnet（纯 TorchScript 距离图）| lsk3dnet_hybrid（Python spconv 骨干 + LibTorch 分类头）
-  # 使用 LSK3DNet hybrid：Python 子进程跑 spconv 骨干，C++ LibTorch 跑分类头 TorchScript。
+  # 可选后端：sloam | lsk3dnet | lsk3dnet_hybrid |（geometric_only 时内部强制 noop_geometric，不加载本字段对应 NN）
+  # 当 mode=geometric_only 时仅用 GeometricProcessor（Patchwork++ 等），不启 Hybrid Python / Torch 分割；model_type 可保留作日后 hybrid 切换。
   model_type: "lsk3dnet_hybrid"
   # 离线 launch 会将 ${CMAKE_CURRENT_SOURCE_DIR} 解析为仓库绝对路径并写入 /tmp 补丁配置。
   # 若该路径不存在，离线 launch 会自动尝试仓库 models 下其它 segmentator onnx 候选。
@@ -123,45 +123,277 @@ semantic:
     # config_yaml / checkpoint / classifier_torchscript：可为绝对路径，或相对 repo_root
     # classifier：用 LSK3DNet-main/scripts/export_lsk3dnet_classifier_torchscript.py 从同一 checkpoint 导出
     repo_root: "${CMAKE_CURRENT_SOURCE_DIR}/thrid_party/LSK3DNet-main"
-    config_yaml: "config/lk-nuscenes_erk.yaml"
-    checkpoint: "${CMAKE_CURRENT_SOURCE_DIR}/models/LSK3DNET/opensource_9ks_s030_w64_0.pt"
-    classifier_torchscript: "${CMAKE_CURRENT_SOURCE_DIR}/models/LSK3DNET/lsk_classifier.ts"
-    # python: "python3"   # hybrid 推荐: /root/automap_ws/install_deps/lsk3dnet_venv/bin/python3（AUTOMAP_SETUP_LSK3DNET_VENV=1 编译后）
+    config_yaml: "config/lk-semantickitti_sub_tta.yaml"
+    checkpoint: "${CMAKE_CURRENT_SOURCE_DIR}/models/LSK3DNET_kitt/opensource_9ks_s030_w64_0.pt"
+    classifier_torchscript: "${CMAKE_CURRENT_SOURCE_DIR}/models/LSK3DNET_kitt/lsk_classifier.ts"
+    # python: "python3"   # hybrid 推荐: /home/wqs/Documents/github/automap_pro/automap_ws/install_deps/lsk3dnet_venv/bin/python3
     # 或设环境变量 AUTOMAP_LSK3DNET_PYTHON（优先于本字段）
     worker_script: "scripts/lsk3dnet_hybrid_worker.py"
     # 生产闭环（推荐）:
     # 1) 用 export_lsk3dnet_classifier_torchscript.py 导出 .pt，会生成同名的 .meta.json（SHA256 + feat_dim）
     # 2) hybrid_normal_mode=range 需 LSK 的 c_gen_normal_map；无扩展时用 zeros 仅调试
     # 3) normal_fov_* / normal_proj_* 应与训练时 dataset 距离图参数一致（默认 3,-25,64,900）
-    # 🏛️ [Fix] Align Normal estimation FOV with Lidar's actual physical FOV (from system config)
-    # This prevents 'black holes' in features at the FOV edges.
-    normal_fov_up_deg: 22.5
-    normal_fov_down_deg: -22.5
+    # Root-cause A/B baseline (official LSK3DNet normal profile, training-consistent):
+    # OFFICIAL: up=3.0, down=-25.0, H=64, W=900
+    # Rollback (previous local profile): up=15.0, down=-15.0
+    normal_fov_up_deg: 3.0
+    normal_fov_down_deg: -25.0
     normal_proj_h: 64
-    normal_proj_w: 2048
+    normal_proj_w: 900
+    # ── 贴近 LSK 验证集（可选，默认关闭保持与以往 mask FOV 行为一致）──
+    # align_upstream_eval: true   # 将 semantic.fov_* / img_* 覆写为与 normal_fov_* / normal_proj_* 一致（mask 与距离图法线 FOV 统一）
+    # training_volume_crop: true # 从 config_yaml 的 dataset_params.min/max_volume_space 裁剪，仅盒内点参与 hybrid（盒外标 0）
+    # num_vote: 1                 # >1 时 C++ 侧确定性 xy 增广并对 classifier logits 求和再 argmax（耗时≈倍数增长；非 Python 随机扩增的逐位复现）
   # 模型自描述驱动:
   # 0 = 自动从 ONNX 输入/输出维度读取（推荐，换模型无需改代码）
   input_channels: 0
   num_classes: 0
   # -1 = 自动回退（sloam->255；lsk3dnet/lsk3dnet_hybrid->16(trunk)）
-  tree_class_id: -1
+  tree_class_id: 16
+  # 圆柱拟合：相对「局部地面」沿竖直方向的高度窗（米），不是相对车体 z=0。
+  # 局部地面优先用 Patchwork ground 在簇 xy 邻域内的低分位数；地面点不足时回退为簇内沿重力方向的最低点（避免仅树冠时误把树冠底当“地面”）。
+  cylinder_fit_rel_z_min: 0.4
+  cylinder_fit_rel_z_max: 1.2
+  cylinder_fit_ground_search_radius_m: 5.0
+  cylinder_fit_ground_min_samples: 30
+  cylinder_fit_ground_percentile: 0.10
+  # 几何地面写入 range mask 的学习类别 ID（须与 LSK semantic-kitti-sub learning_map 一致）。
+  # 9=road；13 在该映射中为 building — 若用 SemanticKITTI 配色，误写 13 会把地面显示成墙/楼。
+  geometric_ground_paint_class_id: 9
+  # geometric_only：竖直树干 shaft 路径（2D 栅格粗判 → 柱周 refine → 与 LINE 共用圆柱拟合链）
+  geometric_only_shaft_enable: true
+  geometric_only_shaft_xy_cell_m: 0.42
+  geometric_only_shaft_min_extent_m: 1.62
+  geometric_only_shaft_min_points: 14
+  geometric_only_shaft_max_xy_spread_m: 0.95
+  geometric_only_shaft_refine_radius_m: 0.58
+  geometric_only_shaft_rel_z_max_m: 22.0
+  geometric_only_shaft_max_candidates: 64
+  geometric_only_shaft_skip_near_line_xy_m: 0.52
+  geometric_only_shaft_skip_near_tree_xy_m: 0.55
+  # 树干圆柱度：点到轴线距离相对离散度过大则拒判（行人等非近似圆柱）
+  cylinder_radial_cv_max: 0.42
+  # 沿拟合轴方向点跨度下限（米）；0 表示不检查
+  cylinder_min_axial_extent_m: 0.28
+  # line_ceres | pcl_sac | pcl_sac_ceres — pcl_sac* 使用 PCL SACMODEL_CYLINDER（需法线），pcl_sac_ceres 再 Ceres 细化
+  cylinder_fit_method: pcl_sac_ceres
+  cylinder_pcl_sac_distance: 0.08
+  cylinder_pcl_normal_radius: 0.22
+  # geometric_only 召回优先：先放宽圆柱拟合置信度门限，减少弱树干被误杀
+  # 建议范围 0.65~0.85，当前取中间偏保守值
+  min_tree_confidence: 0.72
+  backend_gating:
+    enabled: true
+    cylinder:
+      min_primitive_linearity: 0.52
+      min_detection_points: 10
+      max_abs_radial_error_m: 0.55
+      min_kf_confidence: 0.0
+    plane:
+      min_detection_points: 80
+  # 车体系下单帧：树干 root 与自车（原点）水平距离过小则告警/可选剔除（真实路旁树干不应与车体重叠）
+  # 全轨迹 polyline 距离需在 map 系另做；此处用于快速排查误检与锚点异常
+  trunk_ego_xy_clearance_warn_m: 1.8
+  trunk_ego_xy_clearance_reject_m: 0.0
+  # 稀疏雷达：几何 LINE 很细时，在轴线周围柱体内收集非地面点；若相对地面向上延伸≥extent 且上半段点数足够，与窄带点合并后重试圆柱拟合
+  sparse_trunk_column_enable: true
+  sparse_trunk_column_radius_m: 0.45
+  sparse_trunk_min_vertical_extent_m: 1.0
+  # 「上方」点相对局部地面的高度带（米），用于要求树冠/上层结构支撑
+  sparse_trunk_upper_rel_z_min_m: 1.0
+  sparse_trunk_upper_rel_z_max_m: 14.0
+  sparse_trunk_min_upper_points: 10
+  sparse_trunk_min_column_points: 18
+  sparse_trunk_max_fit_points: 900
+  # 标准柱门控过严时：竖向延伸 + 柱内下粗上细（锥度）+ 大半径窗口内冠层点簇（模拟「上端树叶多」）
+  sparse_trunk_structural_enable: true
+  sparse_trunk_structural_min_extent_m: 0.62
+  sparse_trunk_structural_min_column_points: 4
+  sparse_trunk_structural_min_foliage_points: 8
+  sparse_trunk_structural_foliage_radius_m: 0.62
+  sparse_trunk_structural_foliage_rel_z_min_m: 0.85
+  sparse_trunk_structural_foliage_rel_z_max_m: 18.0
+  sparse_trunk_structural_taper_min_ratio: 0.72
+  sparse_trunk_structural_taper_min_column_pts: 8
+  sparse_trunk_structural_taper_max_rel_z_m: 4.2
+  sparse_trunk_structural_merge_foliage_max_points: 400
+  # 结构化树干：轴线周围环形区（柱半径+内边距 至 外半径）内、与柱同高度带的非地面点过多则判为误检（墙/密集物）
+  sparse_trunk_structural_ambient_check_enable: true
+  sparse_trunk_structural_ambient_inner_margin_m: 0.10
+  sparse_trunk_structural_ambient_outer_radius_m: 1.35
+  sparse_trunk_structural_ambient_max_points: 45
+  sparse_trunk_structural_ambient_rel_z_pad_m: 0.12
+  # 结构化判树后直接用合并点构造圆柱（锥度近似半径），不再先 band_plus_column 拟合 / fallback
+  sparse_trunk_structural_direct_cylinder: true
+  # 柱门控通过（接地 + 上半段点足够）但圆柱 RANSAC/Ceres 仍失败时，用几何 LINE 轴 + 点云径向中位数构造树干
+  sparse_trunk_fallback_enable: true
+  sparse_trunk_fallback_min_confidence: 0.48
+  # 合并柱点圆柱仍失败：先用几何 LINE 退化；再失败则用合并点 PCA 竖直主轴（或重力轴）+ 放宽 r_med / 倾角
+  sparse_trunk_fallback_pca_after_merge: true
+  sparse_trunk_fallback_r_med_slack: 1.38
+  sparse_trunk_fallback_pca_min_up_cos: 0.40
+  sparse_trunk_fallback_pca_extra_tilt_deg: 15.0
+  # 语义融合模式：model_only | geometric_only | hybrid
+  # hybrid 模式下模型检出与几何残差协同工作
+  mode: "geometric_only"
+  # 几何语义增强（基于 Zhou22ral 辨识思想与 Patchwork++）
+  geometric:
+    enabled: true
+    # 证据链：前 10 帧 + 每 200 帧必有 [SEMANTIC][GEO_CHAIN]（与 log_level 无关）；地面/墙细分见 [GEOMETRIC][CHAIN][EVIDENCE][PRIMITIVE]（需 log_level!=off）
+    # 端到端几何诊断（grep GEO_PIPELINE）：[MAP_COORD][SEM_IN][PW_RESULT][PRIM_ROI][RV]；[GEOMETRIC][PRIMITIVE] RANSAC
+    # 几何日志分层：info=总览，debug=总览+细节，off=关闭；log_detail=true 可在 info 下附加细节日志
+    log_level: "info"
+    log_detail: false
+    max_lines_per_cluster: 3
+    euclidean_cluster:
+      tolerance_m: 0.38
+      min_points: 12
+      max_points: 12000
+    geometric_only_frame_merge:
+      max_xy_m: 0.48
+    patchwork:
+      # 手工高度：仅当 auto_sensor_height=false 或分位数样本不足时作为 Patchwork 回退
+      sensor_height: 1.73
+      # 每帧从点云自动估计 sensor_height（环带内 z 分位数 + EMA），减少车型/标定依赖
+      auto_sensor_height: true
+      # 略收近距环：首帧/稀疏扫描时仍易攒够分位数样本（代码另有 2–max_range 与 1–20m 两档回退）
+      auto_height_min_xy_m: 3.0
+      auto_height_max_xy_m: 55.0
+      # 原 400 在关键帧抽稀时易长期走 yaml 回退；220 与 Patchwork++ 类方法常见实践更匹配
+      auto_height_min_samples: 220
+      auto_height_percentile: 0.08
+      auto_height_clamp_min_m: 0.25
+      auto_height_clamp_max_m: 3.9
+      auto_height_ema_alpha: 0.12
+      auto_height_max_z_over_r: 0.55
+      # 用前端里程计姿态估计重力在 body 中的方向，改善大倾角时墙面法向/树干倾角判定（odom z 向上时 up_axis=2）
+      use_odom_gravity: true
+      odom_up_axis: 2
+      # LIO 大倾角时 Patchwork 对「水平地面」假设更稳：与 use_odom_gravity 联用（FAST-LIVO2 / M2DGR 类户外序列建议开）
+      level_cloud_for_patchwork: true
+      num_iter: 3
+      # 略增地面厚度容忍，减少欠分割导致的「地面点进 nonground」
+      th_dist: 0.22
+      max_range: 80.0
+    wall_ransac:
+      enabled: true
+      distance_threshold: 0.15
+      min_inliers: 100
+      # line/plane 分离阈值（不配置则回退到上面的 distance_threshold/min_inliers）
+      # 稀疏关键帧/街景：略降 inliers；代码侧已在「线后剩余点不足」时回退整簇平面尝试（见 [GEOMETRIC][PRIMITIVE] plane_full_cluster_fallback）
+      line_distance_threshold: 0.10
+      line_min_inliers: 28
+      plane_distance_threshold: 0.15
+      # 稀疏关键帧：略降立面 RANSAC 内点门槛；过严会导致「有墙无 primitive」
+      plane_min_inliers: 50
+      # 里程计小倾角 + 立面非完美铅垂：15° 过严；20–25° 为街景/SLAM 常见取值
+      max_normal_tilt_deg: 22.0
+    accumulator:
+      enabled: true
+      # 几何基元（线/面/聚类）在「当前车体」下叠加最近 N 帧原始扫描；稀疏 LiDAR 宜偏大（算力不足或延迟高时再降）
+      max_frames: 56
+      # 多帧累加到当前 body 后，将点的 intensity 置为「几何处理扫描序号」（与 [GEOMETRIC][FRAME]/PATCHWORK 中 idx 一致），便于区分点来自哪次扫描；会覆盖原反射强度仅作用于该累加分支
+      tag_intensity_with_scan_seq: true
+    # Patchwork nonground → 聚类/RANSAC 前：车体系 xy 环带（+ 可选体素），抑制大范围关键帧「全局稀疏」导致立面/线拟合失败；grep GEO_PIPELINE PRIM_ROI
+    primitive_roi:
+      enabled: true
+      body_xy_radius_m: 50.0
+      ring_min_xy_m: 3.0
+      # 0 = 仅用语义上界 body_xy_radius_m；若需硬性更近外圈可设 35~45
+      ring_max_xy_m: 0.0
+      # 0 = 不下采样；算力紧时可试 0.2~0.35（仅作用于 primitive 输入，不改变 result.nonground 全量）
+      voxel_leaf_m: 0.0
+    # Range-view：低分辨率投影 + Sobel 梯度 + 连通域 → 3D patch 上聚类/RANSAC（ONNX 见 mode onnx/hybrid + onnx_model_path）
+    range_view:
+      enabled: true
+      mode: "gradient"
+      image_width: 1024
+      image_height: 64
+      min_range_m: 0.5
+      max_range_m: 80.0
+      elev_min_deg: -24.0
+      elev_max_deg: 24.0
+      grad_mag_norm_thresh: 0.07
+      dilate_iterations: 1
+      min_cc_pixels: 6
+      max_cc_pixels: 12000
+      wall_min_width_u: 10
+      wall_max_aspect_h_over_w: 8.0
+      trunk_max_width_u: 10
+      trunk_min_aspect_h_over_w: 1.2
+      bbox_margin_u: 2
+      bbox_margin_v: 2
+      max_patches_per_frame: 64
+      max_patch_points: 14000
+      fallback_full_cloud: true
+      onnx_model_path: ""
+      onnx_input_width: 512
+      onnx_input_height: 64
+      onnx_n_classes: 4
+      onnx_wall_class_id: 2
+      onnx_trunk_class_id: 3
+      fusion_rv_boost_scale: 0.35
+    primitive_classifier:
+      enabled: true
+      linearity_threshold: 0.58
+      planarity_threshold: 0.6
+    association:
+      cylinder:
+        max_dist_xy_m: 0.4
+        max_dist_z_m: 1.0
+        max_angle_deg: 10.0
+        max_radius_diff_m: 0.08
+        alpha_min: 0.05
+        alpha_max: 0.4
+        # 概率门控（近似 Mahalanobis，4 维特征 dist_xy/dist_z/angle/radius）；9.49≈95% 卡方门
+        mahalanobis_gate: 9.49
+        # 延迟确认：达到最小支持观测次数后再进入强约束
+        min_confirmations: 2
+        min_observability: 0.25
+        # 周期重复树合并阈值（子图内）
+        duplicate_merge_dist_xy_m: 0.25
+        duplicate_merge_max_angle_deg: 8.0
+        # 开关因子降权尺度（m）：残差越大，语义约束自动降权
+        switchable_residual_scale_m: 0.25
+        protection_mode:
+          enabled: true
+          # 触发保护模式：仅允许关联，不允许新增树地标（防止“单树裂变”）
+          trigger_tree_new_rate_pct: 52.0
+          trigger_duplicate_density: 0.05
+          # 恢复到正常模式阈值（滞回，避免抖动）
+          recover_tree_new_rate_pct: 22.0
+          recover_duplicate_density: 0.012
+          # 因子采样：弱语义上下文（无GPS且无回环）与保护模式下，降低语义因子注入频率
+          factor_sample_stride_normal: 1
+          factor_sample_stride_protected: 2
+          weak_context_min_support: 3
+          weak_context_min_observability: 0.4
+      plane:
+        max_angle_deg: 10.0
+        max_distance_diff_m: 0.4
+        max_tangent_offset_m: 1.5
+        alpha_min: 0.05
+        alpha_max: 0.35
   # 可选：与 ONNX 输入通道数一致时的 per-channel 归一化 (x-mean)/std；不填则用默认 range=12.97/12.35 其余 mean=0 std=1
   # SqueezeSeg 风格 5 通道示例（需与训练一致）:
   # input_mean: [12.12, 10.88, 0.23, -1.04, 0.21]
   # input_std: [12.32, 11.47, 6.91, 0.86, 0.16]
-  fov_up: 22.5
-  fov_down: -22.5
-  img_w: 4096
-  img_h: 128
+  fov_up: 15.0
+  fov_down: -15.0
+  img_w: 1024
+  img_h: 64
   batch_size: 1
   do_destagger: true
   # 实例聚类参数（默认沿用历史值）
-  # 验证档（仅配置）: 放宽聚类门限，适配关键帧稀疏点云
-  beam_cluster_threshold: 0.5
-  max_dist_to_centroid: 0.35
-  min_vertex_size: 2
-  min_landmark_size: 2
-  min_landmark_height: 0.5
+  # 树截断高度 (m)：0.0 表示不截断（语义KITTI模型已有 trunk 类，通常设 0.0 或较小值如 3.0；NuScenes vegetation 建议 1.2）
+  tree_truncation_height: 0.0
+  # 高精度优先（减少“非树干”误检）：收紧聚类门限
+  # rollback candidates: 0.5 / 0.35 / 2 / 2 / 0.5
+  beam_cluster_threshold: 0.35
+  max_dist_to_centroid: 0.25
+  min_vertex_size: 6
+  min_landmark_size: 8
+  min_landmark_height: 1.0
   # 语义并行 worker 数：0=自动（按 system.num_threads 推导），建议 2~6；核数小时设 1~2
   worker_threads: 0
   autoscale:
@@ -177,25 +409,47 @@ semantic:
   # 验证档（仅配置）: 临时对所有帧做语义，验证稀疏关键帧是否为主因
   keyframes_only: false
   keyframe_time_tolerance_s: 0.03
+  # 语义点云再次挂到同一关键帧：与已存标签逐点一致比例低于此则拒收（抑闪烁）；0=关闭；0.7~0.9 常见
+  cloud_attach:
+    min_point_agreement: 0.0
+  # 语义输入事件解耦灰度开关：
+  # - use_independent_event=true: Mapping 发布独立 SemanticInputEvent 给 SemanticModule
+  # - dual_write_graph_task=true: 灰度期双写 GraphTaskEvent，确保旧链路兼容
+  # - accept_*: SemanticModule 端的输入订阅开关
+  input:
+    use_independent_event: true
+    dual_write_graph_task: true
+    accept_graph_task: true
+    accept_independent_event: true
   # 诊断开关（默认关闭，不改变主流程）
   diag:
     enable_detailed_stats: true
     log_class_histogram: true
     class_hist_top_k: 8
-    class_hist_interval_frames: 20
+    # 1 = every frame (max observability for inference/parsing diagnostics)
+    class_hist_interval_frames: 1
     # 调试：打印全部类别（类别 -> 像素数/点数）
     dump_all_classes: true
     # 调试：每个类别额外打印的点数量（0=不打印；>0=上限；-1=打印该类别全部点）
-    dump_points_per_class_limit: -1
+    # Keep bounded to reduce log flood while preserving per-class evidence.
+    dump_points_per_class_limit: 200
+    # true：每根几何 LINE 打印 [SEMANTIC][TRUNK_CHAIN]；并启用圆柱内部分段 [SEMANTIC][TRUNK_FIT]（enter/line_ransac|pcl_sac/ceres/sanity/done）、
+    # 稀疏柱 [SEMANTIC][TRUNK_COLUMN]、退化树干 [SEMANTIC][TRUNK_FALLBACK]。非 geometric_only 时 Trellis 簇另见 [SEMANTIC][TRUNK_CLUSTER_FIT]。
+    # 亦可设 semantic.geometric_log_level: debug 或 geometric_log_detail: true（不配 trunk_chain_log 也会打 TRUNK_FIT，但无 TRUNK_CHAIN 每行摘要）。
+    trunk_chain_log: false
     # 最小回退补丁：恢复默认，不覆盖 tree_label（避免与 255 掩码语义冲突）
     # -2: 不覆盖（默认）；-1: 自动；>=0: 强制 maskCloud 使用指定类 id
-    override_tree_class_id: -2
-    # default | relaxed（relaxed 用于快速验证“聚类阈值过严”）
-    cluster_profile: "relaxed"
-    # 诊断验证补丁：切到 dense_for_clustering，对齐 sloam_rec 原始链路输入形态。
+    # 高精度优先：强制使用 trunk 类(16)而非 vegetation(15)。
+    # 语义KITTI子标签中 learning id: 15=vegetation, 16=trunk。
+    # rollback candidate: 15（高召回）或 -2（不覆盖）
+    override_tree_class_id: 16
+    # default | relaxed（高精度模式建议 default）
+    cluster_profile: "default"
+    # 稳态运行使用 sparse：避免 dense_for_clustering 在大分辨率下引入大量 NaN 组织点，
+    # 导致 Trellis 有效聚类/拟合退化（见 full.log 中 finite_ratio 与 empty_fit 异常）。
     # sparse | dense_for_clustering（仅影响 automap_pro 调用方式，不改第三方代码）
-    cluster_input_mode: "dense_for_clustering"
-    # Trellis 硬门限（默认保持官方/历史行为，仅用于诊断验证“是否门限最后一环”）
+    cluster_input_mode: "sparse"
+    # geometric_only 召回优先：放宽 Trellis 最小簇门限，减少小树干/稀疏树干漏检
     trellis_min_cluster_points: 20
     trellis_min_tree_vertices: 3
 
@@ -243,8 +497,10 @@ fast_livo:
     ros_driver_bug_fix: true
 
   extrin_calib:                            # LiDAR ↔ IMU、Camera ↔ LiDAR 外参
-    # M2DGR: Xsens IMU to LiDAR [R, t]，IMU 系到 LiDAR 系
-    extrinsic_T: [0.27255, -0.00053,0.17954]
+    # M2DGR Handsfree IMU（/handsfree/imu）：calibration_results.txt「%% Handsfree IMU」
+    # 文件中为 OpenCV 4x4「to LIDAR」平移列 t=[-0.27255, 0.00053, -0.17954]（R=I）。
+    # Fast-LIVO2 此处 extrinsic_T 取 -t，与工程内点从 LiDAR 变到 IMU 系的约定一致。
+    extrinsic_T: [0.27255, -0.00053, 0.17954]
     extrinsic_R: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
     # M2DGR: Cam-head to LiDAR
     Rcl: [0.0, -1.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, -1.0]
@@ -273,6 +529,10 @@ fast_livo:
     lidar_type:       2         # 2=Velodyne
     scan_line:        32
     point_filter_num: 1
+    # Fast-LIVO crash guard (observed SIGSEGV in Preprocess::process):
+    # force feature path which has ring bounds check (layer >= N_SCANS -> continue).
+    # rollback candidate: false
+    feature_extract_enabled: true
     filter_size_surf: 0.25      # 验证档（仅配置）: 减小下采样，提升语义输入密度
     blind:            1.0       # 最小量程约 1.0 m
 
@@ -288,7 +548,7 @@ fast_livo:
     exposure_estimate_en:   true
     inv_expo_cov:           0.1
 
-  imu:                                     # IMU 噪声与积分（M2DGR Xsens）
+  imu:                                     # IMU 噪声与积分（M2DGR street 序列常用 Handsfree；标定文件另有 Xsens 块勿混用）
     imu_en:         true
     imu_int_frame:  30
     acc_cov:        2.0
@@ -325,8 +585,9 @@ fast_livo:
     pub_plane_en:           false
     pub_scan_num:           1
     blind_rgb_points:       0.0
-    # 每 N 帧发布一次 /Laser_map。若在第 10 帧附近发生 fast_livo SIGSEGV，可临时改为 0 关闭或 999 延后以验证（见 docs/CRASH_ANALYSIS_M2DGR_LOGS.md）
-    laser_map_interval:     10
+    # 每 N 帧发布一次 /Laser_map。已知 M2DGR 存在第10帧附近崩溃风险，先关闭做隔离验证。
+    # rollback candidate: 10
+    laser_map_interval:     0
     laser_map_voxel_size:   0.2  # 发布前体素下采样(m)，减轻前端累积图过稠/糊；0=关闭
 
   evo:
@@ -361,6 +622,8 @@ submap:
   max_temporal_s:    60.0
   match_resolution:   0.35     # 原 0.4，略细有利于回环位姿、减少重影
   merge_resolution:   0.2
+  # merged_cloud / downsampled_cloud：体素内 intensity 众数投票（子图间回环语义 ICP，intensity=class id）；与 system_config.yaml 一致
+  semantic_intensity_vote: true
 
 # ── 3.2 GPS 延迟对齐（M2DGR 含 /ublox/fix，可做 GPS 约束）────────────────────
 gps:
@@ -468,6 +731,27 @@ loop_closure:
     icp_refine:       true
     # 扩大搜索半径以支持横向偏移场景（原5m太短导致错失真匹配）
     fpfh_corr_max_distance_m: 25.0
+  teaser_icp_agreement:
+    max_trans_diff_m: 4.0
+    max_rot_diff_deg: 35.0
+  constraint_margin:
+    low_trust_information_scale: 0.5
+    inlier_soft_margin: 0.035
+  constraint_max_translation_m: 0.0
+  constraint_max_rotation_deg: 0.0
+  # SuMa++ 类：TEASER 后 ICP 用语义一致性加权（需语义模块产出 labeled_cloud 且已挂到关键帧；与 system_config.yaml 一致）
+  semantic_icp:
+    enabled: true
+    min_label_ratio: 0.06
+    weight_match: 1.0
+    weight_mismatch: 0.18
+    weight_unknown: 0.5
+    weight_dynamic: 0.08
+    max_iterations: 40
+    icp_preprocess_downsample: false
+    icp_preprocess_sor: false
+    dynamic_class_ids: [10, 11, 15, 16, 18]
+    gray_zone_linear_trust: true
   # 回环一致性检查：支持大漂移但拦截离谱偏移
   pose_consistency_max_trans_diff_m: 10.0   
   pose_consistency_max_rot_diff_deg: 20.0 # 拦截180度翻转等物理错误匹配（重影主因）

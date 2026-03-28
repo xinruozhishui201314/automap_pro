@@ -28,6 +28,7 @@ namespace { bool g_backend_verbose_trace = false; }
 #include <Eigen/SVD>
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <set>
 #include <string>
 
@@ -155,6 +156,29 @@ void logAllConstraintsAndValidate(
 }
 }  // anonymous namespace
 
+bool IncrementalOptimizer::loopConstraintMaxNormViolated_(const Pose3d& rel, const char* tag, int from, int to) const {
+    if (loop_constraint_max_translation_m_ > 0.0) {
+        const double tn = rel.translation().norm();
+        if (tn > loop_constraint_max_translation_m_) {
+            RCLCPP_WARN(rclcpp::get_logger("automap_system"),
+                "[IncrementalOptimizer][BACKEND][VALIDATION] %s from=%d to=%d skip: translation_norm=%.3f > constraint_max_translation_m=%.3f",
+                tag ? tag : "loop", from, to, tn, loop_constraint_max_translation_m_);
+            return true;
+        }
+    }
+    if (loop_constraint_max_rotation_deg_ > 0.0) {
+        const Eigen::AngleAxisd aa(rel.rotation());
+        const double deg = aa.angle() * (180.0 / std::acos(-1.0));
+        if (deg > loop_constraint_max_rotation_deg_) {
+            RCLCPP_WARN(rclcpp::get_logger("automap_system"),
+                "[IncrementalOptimizer][BACKEND][VALIDATION] %s from=%d to=%d skip: rotation_angle=%.2fdeg > constraint_max_rotation_deg=%.2f",
+                tag ? tag : "loop", from, to, deg, loop_constraint_max_rotation_deg_);
+            return true;
+        }
+    }
+    return false;
+}
+
 IncrementalOptimizer::IncrementalOptimizer() {
     // ===== 修复2: 初始化单节点pending开始时间 =====
     single_node_pending_start_ = std::chrono::steady_clock::now();
@@ -178,6 +202,9 @@ IncrementalOptimizer::IncrementalOptimizer() {
     gps_high_altitude_scale_ = cfg.gpsHighAltitudeScale();
     gps_enable_outlier_detection_ = cfg.gpsEnableOutlierDetection();
     gps_outlier_cov_scale_ = cfg.gpsOutlierCovScale();
+    semantic_switchable_residual_scale_m_ = cfg.semanticAssocSwitchableResidualScaleM();
+    loop_constraint_max_translation_m_ = cfg.loopConstraintMaxTranslationM();
+    loop_constraint_max_rotation_deg_ = cfg.loopConstraintMaxRotationDeg();
     g_backend_verbose_trace = backend_verbose_trace_;
 
     gtsam::ISAM2Params params;
@@ -350,6 +377,12 @@ void IncrementalOptimizer::addSubMapNode(int sm_id, const Pose3d& init_pose, boo
                 flushed, pending_odom_factors_submap_.size());
             tryMoveStagedToPendingInternal();
         }
+    }
+    const int sem_flushed = flushPendingSemanticFactorsForKeyFramesInternal();
+    if (sem_flushed > 0) {
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[SEMANTIC][Backend] addSubMapNode sm_id=%d flushed_semantic_factors=%d",
+            sm_id, sem_flushed);
     }
 
     // 🔧 V2 修复：addSubMapNode 不再直接调用 commitAndUpdate，由调用方在适当时候触发 forceUpdate
@@ -610,6 +643,10 @@ OptimizationResult IncrementalOptimizer::addLoopFactor(
                 from, to);
             return OptimizationResult{};
         }
+        if (loopConstraintMaxNormViolated_(rel, "addLoopFactor_sm", from, to)) {
+            CONSTRAINT_LOG("step=loop_inter from=%d to=%d result=skip reason=constraint_max_norm", from, to);
+            return OptimizationResult{};
+        }
 
         // 回环约束使用 Huber 鲁棒核；base 用 Diagonal 避免 linearize 路径 double free
         auto base_noise = infoToNoiseDiagonal(info_matrix);
@@ -706,6 +743,25 @@ OptimizationResult IncrementalOptimizer::addLoopFactorBetweenKeyframes(int kf_id
         return OptimizationResult{};
     }
 
+    const Eigen::Vector3d& rel_t = rel.translation();
+    const Eigen::Matrix3d& rel_R = rel.rotation();
+    if (!rel_t.allFinite() || !rel_R.allFinite()) {
+        CONSTRAINT_LOG("step=loop_inter_kf kf_i=%d kf_j=%d result=skip reason=rel_non_finite", kf_id_i, kf_id_j);
+        return OptimizationResult{};
+    }
+    if (rel_t.norm() > kMaxReasonableTranslationNorm) {
+        CONSTRAINT_LOG("step=loop_inter_kf kf_i=%d kf_j=%d result=skip reason=translation_too_large", kf_id_i, kf_id_j);
+        return OptimizationResult{};
+    }
+    if (!info_matrix.allFinite()) {
+        CONSTRAINT_LOG("step=loop_inter_kf kf_i=%d kf_j=%d result=skip reason=info_non_finite", kf_id_i, kf_id_j);
+        return OptimizationResult{};
+    }
+    if (loopConstraintMaxNormViolated_(rel, "addLoopFactor_kf", kf_id_i, kf_id_j)) {
+        CONSTRAINT_LOG("step=loop_inter_kf kf_i=%d kf_j=%d result=skip reason=constraint_max_norm", kf_id_i, kf_id_j);
+        return OptimizationResult{};
+    }
+
     auto base_noise = infoToNoiseDiagonal(info_matrix);
     auto robust_noise = gtsam::noiseModel::Robust::Create(
         gtsam::noiseModel::mEstimator::Huber::Create(1.345), base_noise);
@@ -783,6 +839,10 @@ void IncrementalOptimizer::addLoopFactorDeferred(int from, int to,
         }
         if (!info_matrix.allFinite()) {
             CONSTRAINT_LOG("step=loop_intra from=%d to=%d result=skip reason=info_non_finite", from, to);
+            return;
+        }
+        if (loopConstraintMaxNormViolated_(rel, "addLoopFactorDeferred", from, to)) {
+            CONSTRAINT_LOG("step=loop_intra from=%d to=%d result=skip reason=constraint_max_norm", from, to);
             return;
         }
         auto base_noise = infoToNoiseDiagonal(info_matrix);
@@ -1328,6 +1388,12 @@ void IncrementalOptimizer::addKeyFrameNode(int kf_id, const Pose3d& init_pose, b
             "[IncrementalOptimizer][BACKEND] addKeyFrameNode: kf_id=%d flushed %d pending GPS factors (submap level)",
             kf_id, flushed_sm);
     }
+    int flushed_sem = flushPendingSemanticFactorsForKeyFramesInternal();
+    if (flushed_sem > 0) {
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[SEMANTIC][Backend] addKeyFrameNode kf_id=%d flushed_semantic_factors=%d",
+            kf_id, flushed_sem);
+    }
 
     // 🔧 诊断: 添加完成后的状态
     RCLCPP_INFO(rclcpp::get_logger("automap_system"),
@@ -1472,21 +1538,77 @@ void IncrementalOptimizer::addGPSFactorForKeyFrame(int kf_id, const Eigen::Vecto
         vars(0), vars(1), vars(2), factor_count_, pending_graph_.size());
 }
 
+double IncrementalOptimizer::computeCylinderResidualUnsafe_(int kf_id, const CylinderFactorItemKF& factor) const {
+    if (!current_estimate_.exists(KF(kf_id)) || !current_estimate_.exists(SM(static_cast<int>(factor.sm_id)))) {
+        return 0.0;
+    }
+    try {
+        const gtsam::Pose3 T_w_kf = current_estimate_.at<gtsam::Pose3>(KF(kf_id));
+        const gtsam::Pose3 T_w_sm = current_estimate_.at<gtsam::Pose3>(SM(static_cast<int>(factor.sm_id)));
+        const gtsam::Point3 p_w = T_w_kf.transformFrom(gtsam::Point3(
+            factor.point_body.x(), factor.point_body.y(), factor.point_body.z()));
+        const gtsam::Point3 root_w = T_w_sm.transformFrom(gtsam::Point3(
+            factor.root_submap.x(), factor.root_submap.y(), factor.root_submap.z()));
+        const gtsam::Point3 ray_w = T_w_sm.rotation().rotate(gtsam::Point3(
+            factor.ray_submap.x(), factor.ray_submap.y(), factor.ray_submap.z()));
+        const gtsam::Point3 cross = (p_w - root_w).cross(ray_w);
+        const double dist_to_axis = cross.norm();
+        return std::abs(dist_to_axis - factor.radius);
+    } catch (...) {
+        return 0.0;
+    }
+}
+
+void IncrementalOptimizer::logSemanticResidualDiagnosticsUnsafe_(double residual) {
+    if (!std::isfinite(residual)) return;
+    semantic_residual_window_.push_back(std::max(0.0, residual));
+    while (semantic_residual_window_.size() > kSemanticResidualWindowSize) {
+        semantic_residual_window_.pop_front();
+    }
+    if (semantic_residual_window_.size() < 50 || (semantic_residual_window_.size() % 25) != 0) {
+        return;
+    }
+    std::vector<double> buf(semantic_residual_window_.begin(), semantic_residual_window_.end());
+    const size_t p95_idx = static_cast<size_t>(0.95 * static_cast<double>(buf.size() - 1));
+    std::nth_element(buf.begin(), buf.begin() + static_cast<long>(p95_idx), buf.end());
+    const double p95 = buf[p95_idx];
+
+    // Short-tail p95 for faster drift response: keep long-window stability while
+    // reacting sooner when semantic quality degrades abruptly.
+    const size_t tail_window = std::min<size_t>(semantic_residual_window_.size(), 120);
+    std::vector<double> tail_buf;
+    tail_buf.reserve(tail_window);
+    for (size_t i = semantic_residual_window_.size() - tail_window; i < semantic_residual_window_.size(); ++i) {
+        tail_buf.push_back(semantic_residual_window_[i]);
+    }
+    const size_t tail_p95_idx = static_cast<size_t>(0.95 * static_cast<double>(tail_buf.size() - 1));
+    std::nth_element(tail_buf.begin(), tail_buf.begin() + static_cast<long>(tail_p95_idx), tail_buf.end());
+    const double p95_tail = tail_buf[tail_p95_idx];
+    const double p95_effective = std::max(p95, p95_tail);
+
+    RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+        "[SEMANTIC][Backend][RESIDUAL_DIAG] semantic_residual_p95=%.3f semantic_residual_p95_tail=%.3f semantic_residual_p95_effective=%.3f "
+        "window=%zu tail_window=%zu scale_m=%.3f rule(new_rate_high && residual_high => downweight+reassociate)",
+        p95, p95_tail, p95_effective, semantic_residual_window_.size(), tail_window, semantic_switchable_residual_scale_m_);
+}
+
 void IncrementalOptimizer::addCylinderFactorForKeyFrame(int kf_id, const CylinderFactorItemKF& factor) {
     std::unique_lock<std::shared_mutex> lk(rw_mutex_);
 
     // 校验节点是否存在
     if (keyframe_node_exists_.find(kf_id) == keyframe_node_exists_.end()) {
+        pending_cylinder_factors_kf_.push_back(factor);
         RCLCPP_WARN(rclcpp::get_logger("automap_system"),
-            "[SEMANTIC][Backend][addCylinderFactor] step=skip reason=kf_node_not_found kf_id=%d sm_id=%lu (KF not in graph yet)",
-            kf_id, factor.sm_id);
+            "[SEMANTIC][Backend][addCylinderFactor] step=defer reason=kf_node_not_found kf_id=%d sm_id=%lu pending=%zu",
+            kf_id, factor.sm_id, pending_cylinder_factors_kf_.size());
         return;
     }
 
     if (node_exists_.find(static_cast<int>(factor.sm_id)) == node_exists_.end()) {
+        pending_cylinder_factors_kf_.push_back(factor);
         RCLCPP_WARN(rclcpp::get_logger("automap_system"),
-            "[SEMANTIC][Backend][addCylinderFactor] step=skip reason=sm_node_not_found kf_id=%d sm_id=%lu",
-            kf_id, factor.sm_id);
+            "[SEMANTIC][Backend][addCylinderFactor] step=defer reason=sm_node_not_found kf_id=%d sm_id=%lu pending=%zu",
+            kf_id, factor.sm_id, pending_cylinder_factors_kf_.size());
         return;
     }
 
@@ -1497,9 +1619,14 @@ void IncrementalOptimizer::addCylinderFactorForKeyFrame(int kf_id, const Cylinde
         return;
     }
 
-    // 1D Isotropic Noise Model
-    // 权重大则 sigma 小
+    // Switchable-constraint style dynamic down-weight (DCS-like):
+    // large residual => larger sigma => weaker semantic pull.
+    const double residual = computeCylinderResidualUnsafe_(kf_id, factor);
+    const double c = std::max(1e-3, semantic_switchable_residual_scale_m_);
+    const double switch_scale = 1.0 / (1.0 + (residual * residual) / (c * c));
+    // 1D Isotropic Noise Model: weight high => sigma low; switch_scale low => sigma high.
     double sigma = 0.1 / std::max(1e-3, factor.weight);
+    sigma = sigma / std::sqrt(std::max(0.05, switch_scale));
     auto noise = gtsam::noiseModel::Isotropic::Sigma(1, sigma);
 
     gtsam::Point3 point_body(factor.point_body.x(), factor.point_body.y(), factor.point_body.z());
@@ -1517,8 +1644,53 @@ void IncrementalOptimizer::addCylinderFactorForKeyFrame(int kf_id, const Cylinde
     tryMoveStagedToPendingInternal();
 
     RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-        "[SEMANTIC][Backend][addCylinderFactor] step=ok kf_id=%d sm_id=%lu radius=%.3f weight=%.2f factor_count=%d",
-        kf_id, factor.sm_id, factor.radius, factor.weight, factor_count_);
+        "[SEMANTIC][Backend][addCylinderFactor] step=ok kf_id=%d sm_id=%lu radius=%.3f weight=%.2f residual=%.3f switch=%.3f sigma=%.4f factor_count=%d",
+        kf_id, factor.sm_id, factor.radius, factor.weight, residual, switch_scale, sigma, factor_count_);
+    logSemanticResidualDiagnosticsUnsafe_(residual);
+}
+
+void IncrementalOptimizer::addPlaneFactorForKeyFrame(int kf_id, const PlaneFactorItemKF& factor) {
+    std::unique_lock<std::shared_mutex> lk(rw_mutex_);
+
+    if (keyframe_node_exists_.find(kf_id) == keyframe_node_exists_.end()) {
+        pending_plane_factors_kf_.push_back(factor);
+        RCLCPP_WARN(rclcpp::get_logger("automap_system"),
+            "[SEMANTIC][Backend][addPlaneFactor] step=defer reason=kf_node_not_found kf_id=%d sm_id=%lu pending=%zu",
+            kf_id, factor.sm_id, pending_plane_factors_kf_.size());
+        return;
+    }
+    if (node_exists_.find(static_cast<int>(factor.sm_id)) == node_exists_.end()) {
+        pending_plane_factors_kf_.push_back(factor);
+        RCLCPP_WARN(rclcpp::get_logger("automap_system"),
+            "[SEMANTIC][Backend][addPlaneFactor] step=defer reason=sm_node_not_found kf_id=%d sm_id=%lu pending=%zu",
+            kf_id, factor.sm_id, pending_plane_factors_kf_.size());
+        return;
+    }
+    if (!factor.normal_submap.allFinite() || factor.normal_submap.norm() < 1e-6 ||
+        !std::isfinite(factor.distance_submap) || !factor.point_body.allFinite()) {
+        RCLCPP_WARN(rclcpp::get_logger("automap_system"),
+            "[SEMANTIC][Backend][addPlaneFactor] step=skip reason=invalid_input kf_id=%d sm_id=%lu",
+            kf_id, factor.sm_id);
+        return;
+    }
+
+    const double sigma = 0.15 / std::max(1e-3, factor.weight);
+    auto noise = gtsam::noiseModel::Isotropic::Sigma(1, sigma);
+
+    const Eigen::Vector3d n = factor.normal_submap.normalized();
+    gtsam::Point3 point_body(factor.point_body.x(), factor.point_body.y(), factor.point_body.z());
+    gtsam::Unit3 normal_submap(n.x(), n.y(), n.z());
+
+    staged_factors_.add(boost::make_shared<PlaneFactor>(
+        KF(kf_id), SM(static_cast<int>(factor.sm_id)),
+        point_body, normal_submap, factor.distance_submap, noise));
+    factor_count_++;
+
+    tryMoveStagedToPendingInternal();
+
+    RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+        "[SEMANTIC][Backend][addPlaneFactor] step=ok kf_id=%d sm_id=%lu weight=%.2f factor_count=%d",
+        kf_id, factor.sm_id, factor.weight, factor_count_);
 }
 
 Pose3d IncrementalOptimizer::getKeyFramePose(int kf_id) const {
@@ -1654,6 +1826,73 @@ int IncrementalOptimizer::flushPendingGPSFactorsForKeyFramesInternal() {
         RCLCPP_INFO(rclcpp::get_logger("automap_system"),
             "[IncrementalOptimizer][BACKEND][GPS_KF] flushPendingGPSFactorsForKeyFramesInternal: added %d",
             added);
+    }
+    return added;
+}
+
+int IncrementalOptimizer::flushPendingSemanticFactorsForKeyFramesInternal() {
+    int added = 0;
+    if (!prior_noise_) return 0;
+
+    std::vector<CylinderFactorItemKF> still_cylinder;
+    for (const auto& f : pending_cylinder_factors_kf_) {
+        if (keyframe_node_exists_.find(f.kf_id) == keyframe_node_exists_.end() ||
+            node_exists_.find(static_cast<int>(f.sm_id)) == node_exists_.end()) {
+            still_cylinder.push_back(f);
+            continue;
+        }
+        if (f.radius <= 0.0 || !f.point_body.allFinite() || !f.root_submap.allFinite() ||
+            !f.ray_submap.allFinite() || f.ray_submap.norm() < 1e-6) {
+            continue;
+        }
+
+        const double residual = computeCylinderResidualUnsafe_(static_cast<int>(f.kf_id), f);
+        const double c = std::max(1e-3, semantic_switchable_residual_scale_m_);
+        const double switch_scale = 1.0 / (1.0 + (residual * residual) / (c * c));
+        double sigma = 0.1 / std::max(1e-3, f.weight);
+        sigma = sigma / std::sqrt(std::max(0.05, switch_scale));
+        auto noise = gtsam::noiseModel::Isotropic::Sigma(1, sigma);
+        gtsam::Point3 point_body(f.point_body.x(), f.point_body.y(), f.point_body.z());
+        gtsam::Point3 root_submap(f.root_submap.x(), f.root_submap.y(), f.root_submap.z());
+        gtsam::Unit3 ray_submap(f.ray_submap.x(), f.ray_submap.y(), f.ray_submap.z());
+        staged_factors_.add(boost::make_shared<CylinderFactor>(
+            KF(static_cast<int>(f.kf_id)), SM(static_cast<int>(f.sm_id)),
+            point_body, root_submap, ray_submap, f.radius, noise));
+        factor_count_++;
+        logSemanticResidualDiagnosticsUnsafe_(residual);
+        ++added;
+    }
+    pending_cylinder_factors_kf_ = std::move(still_cylinder);
+
+    std::vector<PlaneFactorItemKF> still_plane;
+    for (const auto& f : pending_plane_factors_kf_) {
+        if (keyframe_node_exists_.find(f.kf_id) == keyframe_node_exists_.end() ||
+            node_exists_.find(static_cast<int>(f.sm_id)) == node_exists_.end()) {
+            still_plane.push_back(f);
+            continue;
+        }
+        if (!f.normal_submap.allFinite() || f.normal_submap.norm() < 1e-6 ||
+            !std::isfinite(f.distance_submap) || !f.point_body.allFinite()) {
+            continue;
+        }
+        const double sigma = 0.15 / std::max(1e-3, f.weight);
+        auto noise = gtsam::noiseModel::Isotropic::Sigma(1, sigma);
+        const Eigen::Vector3d n = f.normal_submap.normalized();
+        gtsam::Point3 point_body(f.point_body.x(), f.point_body.y(), f.point_body.z());
+        gtsam::Unit3 normal_submap(n.x(), n.y(), n.z());
+        staged_factors_.add(boost::make_shared<PlaneFactor>(
+            KF(static_cast<int>(f.kf_id)), SM(static_cast<int>(f.sm_id)),
+            point_body, normal_submap, f.distance_submap, noise));
+        factor_count_++;
+        ++added;
+    }
+    pending_plane_factors_kf_ = std::move(still_plane);
+
+    if (added > 0) {
+        tryMoveStagedToPendingInternal();
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[SEMANTIC][Backend] flushPendingSemanticFactorsForKeyFramesInternal added=%d pending_cylinder=%zu pending_plane=%zu",
+            added, pending_cylinder_factors_kf_.size(), pending_plane_factors_kf_.size());
     }
     return added;
 }
@@ -2573,15 +2812,25 @@ OptimizationResult IncrementalOptimizer::commitAndUpdate() {
         "[ISAM2_GHOSTING_DIAG] commitAndUpdate_extract: total_poses=%zu (sm=%zu kf=%zu) elapsed_ms=%.1f (即将返回，由调用方在锁外 notifyPoseUpdate)",
         sm_poses.size() + kf_poses.size(), sm_poses.size(), kf_poses.size(), elapsed);
 
-    // 后端图优化后：记录所有提取的位姿（用于追踪）
+    // 后端图优化后：记录位姿采样与汇总（避免日志洪泛淹没语义链路诊断日志）
     {
         auto log = rclcpp::get_logger("automap_system");
+        constexpr size_t kPoseTraceSampleLimit = 30;
+        size_t sm_logged = 0;
+        size_t kf_logged = 0;
         for (const auto& [id, pose] : sm_poses) {
+            if (sm_logged >= kPoseTraceSampleLimit) break;
             logSubmapPoseTrace(log, "backend_after_sm", id, pose);
+            ++sm_logged;
         }
         for (const auto& [id, pose] : kf_poses) {
+            if (kf_logged >= kPoseTraceSampleLimit) break;
             logSubmapPoseTrace(log, "backend_after_kf", id, pose);
+            ++kf_logged;
         }
+        RCLCPP_INFO(log,
+            "[POSE_TRACE_SUMMARY] stage=backend_after_update sm_total=%zu sm_logged=%zu kf_total=%zu kf_logged=%zu sample_limit=%zu",
+            sm_poses.size(), sm_logged, kf_poses.size(), kf_logged, kPoseTraceSampleLimit);
     }
 
     OptimizationResult res;
@@ -2856,7 +3105,14 @@ void IncrementalOptimizer::rebuildAfterGPSAlign(const std::vector<SubmapData>& s
         staged_factors_.add(gtsam::BetweenFactor<gtsam::Pose3>(SM(f.from_id), SM(f.to_id), toPose3(f.rel_pose), noise));
         factor_count_++;
     }
+    std::vector<LoopFactorItem> loop_filtered;
+    loop_filtered.reserve(loop_factors.size());
     for (const auto& f : loop_factors) {
+        if (loopConstraintMaxNormViolated_(f.rel_pose, "rebuildAfterGPSAlign_loop_sm", f.from_id, f.to_id))
+            continue;
+        loop_filtered.push_back(f);
+    }
+    for (const auto& f : loop_filtered) {
         auto noise = infoToNoiseDiagonal(f.info_matrix);
         staged_factors_.add(gtsam::BetweenFactor<gtsam::Pose3>(SM(f.from_id), SM(f.to_id), toPose3(f.rel_pose), noise));
         factor_count_++;
@@ -2866,7 +3122,14 @@ void IncrementalOptimizer::rebuildAfterGPSAlign(const std::vector<SubmapData>& s
         staged_factors_.add(gtsam::BetweenFactor<gtsam::Pose3>(KF(f.from_id), KF(f.to_id), toPose3(f.rel_pose), noise));
         factor_count_++;
     }
+    std::vector<LoopFactorItemKF> kf_loop_filtered;
+    kf_loop_filtered.reserve(kf_loop_factors.size());
     for (const auto& f : kf_loop_factors) {
+        if (loopConstraintMaxNormViolated_(f.rel_pose, "rebuildAfterGPSAlign_loop_kf", f.from_id, f.to_id))
+            continue;
+        kf_loop_filtered.push_back(f);
+    }
+    for (const auto& f : kf_loop_filtered) {
         auto noise = infoToNoiseDiagonal(f.info_matrix);
         staged_factors_.add(gtsam::BetweenFactor<gtsam::Pose3>(KF(f.from_id), KF(f.to_id), toPose3(f.rel_pose), noise));
         factor_count_++;
@@ -2876,10 +3139,10 @@ void IncrementalOptimizer::rebuildAfterGPSAlign(const std::vector<SubmapData>& s
         std::lock_guard<std::mutex> h(history_mutex_);
         history_submap_data_ = submap_data;
         history_odom_factors_ = odom_factors;
-        history_loop_factors_ = loop_factors;
+        history_loop_factors_ = std::move(loop_filtered);
         history_keyframe_data_ = keyframe_data;
         history_kf_odom_factors_ = kf_odom_factors;
-        history_kf_loop_factors_ = kf_loop_factors;
+        history_kf_loop_factors_ = std::move(kf_loop_filtered);
     }
 
     // 🏛️ [架构加固] 触发事务提交检查

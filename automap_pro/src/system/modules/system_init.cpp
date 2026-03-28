@@ -7,9 +7,26 @@
 #include "automap_pro/core/utils.h"
 #include "automap_pro/core/protocol_contract.h" // 🏛️ [架构加固] 引入协议契约
 #include <pcl_conversions/pcl_conversions.h>
+#include <cctype>
 #include <filesystem>
+#include <rcutils/logging.h>
 
 namespace automap_pro {
+namespace {
+
+int toRcutilsSeverity(const std::string& level) {
+    std::string upper = level;
+    std::transform(upper.begin(), upper.end(), upper.begin(), [](unsigned char c) {
+        return static_cast<char>(std::toupper(c));
+    });
+    if (upper == "DEBUG") return RCUTILS_LOG_SEVERITY_DEBUG;
+    if (upper == "INFO") return RCUTILS_LOG_SEVERITY_INFO;
+    if (upper == "ERROR") return RCUTILS_LOG_SEVERITY_ERROR;
+    if (upper == "FATAL") return RCUTILS_LOG_SEVERITY_FATAL;
+    return RCUTILS_LOG_SEVERITY_WARN;
+}
+
+} // namespace
 
 AutoMapSystem::AutoMapSystem(const rclcpp::NodeOptions& options)
     : rclcpp::Node("automap_system", options)
@@ -106,14 +123,24 @@ void AutoMapSystem::loadConfigAndInit() {
         RCLCPP_INFO(get_logger(), "[PIPELINE][SYS] step=04 ConfigManager::load path=%s", config_path.c_str());
         ConfigManager::instance().load(config_path);
         RCLCPP_INFO(get_logger(), "[PIPELINE][SYS] step=04 ConfigManager::load OK");
+        const std::string ros_log_level = ConfigManager::instance().systemLogLevel();
+        const int severity = toRcutilsSeverity(ros_log_level);
+        rcutils_logging_set_default_logger_level(severity);
+        RCLCPP_WARN(get_logger(),
+            "[PIPELINE][SYS] step=04.1 ROS logger level set to %s (default=WARN when missing)",
+            ros_log_level.c_str());
         try {
             const auto& cfg = ConfigManager::instance();
             const std::string semantic_model_type = cfg.semanticModelType();
             const std::string semantic_model = cfg.semanticModelPath();
             const bool semantic_enabled = cfg.semanticEnabled();
+            const bool semantic_geometric_only = (cfg.semanticMode() == "geometric_only");
             bool semantic_model_exists = false;
             std::string semantic_model_hint;
-            if (semantic_model_type == "lsk3dnet_hybrid") {
+            if (semantic_geometric_only) {
+                semantic_model_exists = true;
+                semantic_model_hint = "geometric_only(GeometricProcessor; neural segmentor not loaded)";
+            } else if (semantic_model_type == "lsk3dnet_hybrid") {
                 const std::string ckpt = cfg.semanticLsk3dnetCheckpoint();
                 const std::string cls = cfg.semanticLsk3dnetClassifierTorchscript();
                 const std::string yaml = cfg.semanticLsk3dnetConfigYaml();
@@ -185,19 +212,10 @@ void AutoMapSystem::deferredSetupModules() {
             v3_context_->eventBus(), v3_context_->mapRegistry(), shared_from_this());
         v3_context_->registerModule(semantic_module_);
     } catch (const std::exception& e) {
-        semantic_module_.reset();
-        RCLCPP_ERROR(get_logger(),
-            "[PIPELINE][SYS] step=08a-2 semantic disabled due to init exception: %s", e.what());
-        try {
-            const auto& cfg = ConfigManager::instance();
-            const std::string semantic_model = cfg.semanticModelPath();
-            const bool exists = (!semantic_model.empty() && std::filesystem::exists(semantic_model));
-            RCLCPP_ERROR(
-                get_logger(),
-                "[DIAG][SEMANTIC][E_INIT] enabled=%d model_path=%s model_exists=%d (exact init error above)",
-                cfg.semanticEnabled() ? 1 : 0, semantic_model.c_str(), exists ? 1 : 0);
-        } catch (...) {
-        }
+        RCLCPP_FATAL(get_logger(),
+            "[PIPELINE][SYS][FATAL] step=08a-2 semantic init exception: %s", e.what());
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        std::exit(1);
     }
 
     RCLCPP_INFO(get_logger(), "[PIPELINE][SYS] step=08b ctor+register DynamicFilterModule");

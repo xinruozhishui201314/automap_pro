@@ -142,6 +142,7 @@ public:
      * @param kf 关键帧指针
      */
     void associateLandmarks(SubMap::Ptr& sm, const KeyFrame::Ptr& kf);
+    bool isSemanticProtectionModeActive() const;
 
 private:
     std::vector<SubMap::Ptr>  submaps_;
@@ -223,7 +224,40 @@ private:
     double submap_rebuild_thresh_trans_{2.0};
     double submap_rebuild_thresh_rot_{5.0};
     bool parallel_voxel_downsample_{true};
+    /** 子图 merge / 全量压缩 / freeze 下采样：语义 intensity 众数投票（构造时从配置读取） */
+    bool submap_merge_semantic_intensity_vote_{true};
     bool backend_verbose_trace_{false};
+
+    // Semantic association thresholds (configurable via semantic.geometric.association.*)
+    double assoc_cyl_max_dist_xy_m_{0.4};
+    double assoc_cyl_max_dist_z_m_{1.0};
+    double assoc_cyl_max_angle_deg_{10.0};
+    double assoc_cyl_max_radius_diff_m_{0.08};
+    double assoc_cyl_alpha_min_{0.05};
+    double assoc_cyl_alpha_max_{0.4};
+    double assoc_cyl_mahalanobis_gate_{9.49};
+    int assoc_cyl_min_confirmations_{2};
+    double assoc_cyl_min_observability_{0.25};
+    double assoc_cyl_duplicate_merge_dist_xy_m_{0.25};
+    double assoc_cyl_duplicate_merge_max_angle_deg_{8.0};
+    bool assoc_cyl_protection_mode_enabled_{true};
+    double assoc_cyl_protect_trigger_tree_new_rate_pct_{35.0};
+    double assoc_cyl_protect_recover_tree_new_rate_pct_{20.0};
+    double assoc_cyl_protect_trigger_duplicate_density_{0.03};
+    double assoc_cyl_protect_recover_duplicate_density_{0.01};
+    bool assoc_cyl_protection_mode_active_{false};
+    double assoc_plane_max_angle_deg_{10.0};
+    double assoc_plane_max_distance_diff_m_{0.4};
+    double assoc_plane_max_tangent_offset_m_{1.5};
+    double assoc_plane_alpha_min_{0.05};
+    double assoc_plane_alpha_max_{0.35};
+
+    // Semantic association stats
+    std::atomic<uint64_t> assoc_tree_matched_total_{0};
+    std::atomic<uint64_t> assoc_tree_new_total_{0};
+    std::atomic<uint64_t> assoc_plane_matched_total_{0};
+    std::atomic<uint64_t> assoc_plane_new_total_{0};
+    std::atomic<uint64_t> assoc_tree_duplicate_merge_total_{0};
 
     std::weak_ptr<rclcpp::Node> node_;
     rclcpp::Publisher<automap_pro::msg::SubMapEventMsg>::SharedPtr event_pub_;
@@ -288,7 +322,10 @@ private:
     /** 对指定子图执行冻结并触发回调。调用方不得持有 mutex_。回调在锁外执行，且禁止在回调中调用本类会获取 mutex_ 的接口（如 getFrozenSubmaps），否则可能死锁。 */
     void        freezeActiveSubmap(const SubMap::Ptr& sm);
     bool        isFull(const SubMap::Ptr& sm) const;
+    /** 与 merge / rebuild 一致：body 系 merge 分辨率下采样（可选对齐语义 + SOR） */
+    CloudXYZIPtr downsampleKeyframeBodyForMerging_(const KeyFrame::Ptr& kf) const;
     void        mergeCloudToSubmap(SubMap::Ptr& sm, const KeyFrame::Ptr& kf) const;
+    void        mergeDuplicateTreeLandmarks_(SubMap::Ptr& sm);
     void        publishEvent(const SubMap::Ptr& sm, const std::string& event);
 };
 

@@ -146,7 +146,7 @@ void Instance::findTrees(const CloudT::Ptr pc,
     for (size_t i = 0; i < label_indices.size(); i++){
       const size_t cluster_points = label_indices.at(i).indices.size();
       if (cluster_points > max_cluster_points) max_cluster_points = cluster_points;
-      if (cluster_points > static_cast<size_t>(params_.min_cluster_points)){
+      if (cluster_points >= static_cast<size_t>(params_.min_cluster_points)){
         ++pass_cluster_points;
         std::vector<TreeVertex> tree;
         for (int row_idx = pc->height - 1; row_idx >= 0; --row_idx) {
@@ -162,7 +162,7 @@ void Instance::findTrees(const CloudT::Ptr pc,
             if(v.isValid) tree.push_back(v);
           }
         }
-        if(tree.size() > static_cast<size_t>(params_.min_tree_vertices)){
+        if(tree.size() >= static_cast<size_t>(params_.min_tree_vertices)){
           ++pass_tree_vertices;
           if (tree.size() > max_tree_vertices) max_tree_vertices = tree.size();
           if(tree.size() > 56) {
@@ -179,8 +179,8 @@ void Instance::findTrees(const CloudT::Ptr pc,
     if (s_find_trees_calls <= 20 || (s_find_trees_calls % 20) == 0) {
       std::cout << "[Trellis][DIAG] calls=" << s_find_trees_calls
                 << " labels_total=" << labels_total
-                << " pass_cluster_points_gt" << params_.min_cluster_points << "=" << pass_cluster_points
-                << " pass_tree_vertices_gt" << params_.min_tree_vertices << "=" << pass_tree_vertices
+                << " pass_cluster_points_ge" << params_.min_cluster_points << "=" << pass_cluster_points
+                << " pass_tree_vertices_ge" << params_.min_tree_vertices << "=" << pass_tree_vertices
                 << " out_landmarks=" << landmarks.size()
                 << " max_cluster_points=" << max_cluster_points
                 << " max_tree_vertices=" << max_tree_vertices

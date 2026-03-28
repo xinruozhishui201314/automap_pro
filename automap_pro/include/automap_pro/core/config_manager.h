@@ -32,7 +32,8 @@ public:
     };
     struct MappingConfigView {
         size_t frame_queue_max_size = 1024;
-        double semantic_timestamp_match_tolerance_s = 1e-4;
+        /// 语义事件与关键帧时间对齐窗口（秒）；异步分割队列需显著大于单帧周期
+        double semantic_timestamp_match_tolerance_s = 0.15;
         double max_reasonable_velocity_mps = 50.0;
         double max_reasonable_jump_m = 10.0;
     };
@@ -99,6 +100,7 @@ public:
     // ── 系统 ──────────────────────────────────────────────
     std::string systemName()    const { return get<std::string>("system.name",    "AutoMap-Pro"); }
     std::string outputDir()     const { return get<std::string>("system.output_dir", "/data/automap_output"); }
+    std::string systemLogLevel() const { return get<std::string>("system.log_level", "WARN"); }
     int         numThreads()    const { return get<int>("system.num_threads", 8); }
     /** 传感器数据空闲超过该秒数且队列已空时，触发最终处理并结束建图（需同时开启 auto_finish_on_sensor_idle）；离线/在线由 mode 段区分，load() 时写入 */
     double      sensorIdleTimeoutSec() const { return std::max(1.0, sensor_idle_timeout_sec_); }
@@ -241,6 +243,8 @@ public:
     double submapMaxTemporal()  const { return get<double>("submap.max_temporal_s", 60.0); }
     double submapMatchRes()     const { return std::max(0.2, get<double>("submap.match_resolution", 0.4)); }
     double submapMergeRes()     const { return std::max(0.2, get<double>("submap.merge_resolution", 0.2)); }
+    /** merged_cloud / freeze downsample：体素内 intensity 众数投票，子图间回环语义 ICP 用 class id */
+    bool   submapMergeSemanticIntensityVote() const { return get<bool>("submap.semantic_intensity_vote", true); }
     /** 子图重建点云的阈值：当位姿跳变超过此值时触发 rebuild (trans_m, rot_deg) */
     double submapRebuildThreshTrans() const { return get<double>("submap.rebuild_threshold_trans_m", 2.0); }
     double submapRebuildThreshRot()   const { return get<double>("submap.rebuild_threshold_rot_deg", 5.0); }
@@ -501,6 +505,40 @@ public:
     double teaserMaxRMSE()      const { return get<double>("loop_closure.teaser.max_rmse_m", 0.3); }
     int    teaserMaxPoints()    const { return std::max(500, get<int>("loop_closure.teaser.max_points", 8000)); }
     bool   teaserICPRefine()    const { return get<bool>("loop_closure.teaser.icp_refine", true); }
+    /** SuMa++ 类：回环 ICP 用语义一致性加权/降权对应点（intensity=label） */
+    bool   loopSemanticIcpEnabled() const { return get<bool>("loop_closure.semantic_icp.enabled", true); }
+    double loopSemanticIcpMinLabelRatio() const {
+        double v = get<double>("loop_closure.semantic_icp.min_label_ratio", 0.06);
+        return std::max(0.0, std::min(0.95, v));
+    }
+    float  loopSemanticIcpWeightMatch() const {
+        float v = get<float>("loop_closure.semantic_icp.weight_match", 1.0f);
+        return std::max(0.01f, std::min(10.0f, v));
+    }
+    float  loopSemanticIcpWeightMismatch() const {
+        float v = get<float>("loop_closure.semantic_icp.weight_mismatch", 0.18f);
+        return std::max(0.0f, std::min(1.0f, v));
+    }
+    float  loopSemanticIcpWeightUnknown() const {
+        float v = get<float>("loop_closure.semantic_icp.weight_unknown", 0.5f);
+        return std::max(0.0f, std::min(1.0f, v));
+    }
+    float  loopSemanticIcpWeightDynamic() const {
+        float v = get<float>("loop_closure.semantic_icp.weight_dynamic", 0.08f);
+        return std::max(0.0f, std::min(1.0f, v));
+    }
+    int    loopSemanticIcpMaxIterations() const {
+        int v = get<int>("loop_closure.semantic_icp.max_iterations", 40);
+        return std::max(5, std::min(100, v));
+    }
+    bool   loopIcpPreprocessDownsample() const {
+        return get<bool>("loop_closure.semantic_icp.icp_preprocess_downsample", false);
+    }
+    bool   loopIcpPreprocessSor() const {
+        return get<bool>("loop_closure.semantic_icp.icp_preprocess_sor", false);
+    }
+    /** 逗号分隔整数，SemanticKITTI 常见动态类：car,person,bicycle,motorcycle,other-vehicle */
+    std::vector<int> loopSemanticIcpDynamicClassIds() const;
 
     // ── ScanContext ────────────────────────────────────────────────────────
     bool   scancontextEnabled()        const { return get<bool>("loop_closure.scancontext.enabled", false); }
@@ -533,6 +571,40 @@ public:
     double loopPoseConsistencyMaxRotDiffDeg() const {
         double v = get<double>("loop_closure.pose_consistency_max_rot_diff_deg", 25.0);
         return std::max(0.0, std::min(180.0, v));
+    }
+    /** TEASER 初值 vs ICP 精配：平移差(米)超阈值则拒收该闭环（防 ICP 错误收敛）。0=关闭 */
+    double loopTeaserIcpAgreementMaxTransDiffM() const {
+        double v = get<double>("loop_closure.teaser_icp_agreement.max_trans_diff_m", 4.0);
+        return std::max(0.0, std::min(100.0, v));
+    }
+    /** TEASER vs ICP：旋转差(度)超阈值则拒收。0=关闭 */
+    double loopTeaserIcpAgreementMaxRotDiffDeg() const {
+        double v = get<double>("loop_closure.teaser_icp_agreement.max_rot_diff_deg", 35.0);
+        return std::max(0.0, std::min(180.0, v));
+    }
+    /** inlier 仅略高于阈值时对信息矩阵乘此系数降权；需 inlier_soft_margin>0 */
+    double loopConstraintLowTrustInformationScale() const {
+        double v = get<double>("loop_closure.constraint_margin.low_trust_information_scale", 0.5);
+        return std::clamp(v, 0.05, 1.0);
+    }
+    /** inlier_ratio < min_inlier_ratio + margin 时应用 low_trust_information_scale */
+    double loopConstraintInlierSoftMargin() const {
+        double v = get<double>("loop_closure.constraint_margin.inlier_soft_margin", 0.035);
+        return std::max(0.0, std::min(0.5, v));
+    }
+    /** 回环 Between 相对平移范数上限(米)，超过不入图；0=不启用（沿用内部大范围检查） */
+    double loopConstraintMaxTranslationM() const {
+        double v = get<double>("loop_closure.constraint_max_translation_m", 0.0);
+        return std::max(0.0, std::min(1e6, v));
+    }
+    /** 回环 Between 相对旋转角上限(度)，超过不入图；0=关闭 */
+    double loopConstraintMaxRotationDeg() const {
+        double v = get<double>("loop_closure.constraint_max_rotation_deg", 0.0);
+        return std::max(0.0, std::min(180.0, v));
+    }
+    /** 标签占比在 [min_ratio, 2*min_ratio) 时线性把语义对应权重向几何(1.0)混合，抑标签稀疏时过信语义 */
+    bool   loopSemanticIcpGrayZoneLinearTrust() const {
+        return get<bool>("loop_closure.semantic_icp.gray_zone_linear_trust", true);
     }
 
     // ── 后端帧率控制（前端每帧都发，后端可每隔 N 帧处理一帧以减轻负载）────────────────
@@ -678,6 +750,15 @@ public:
     float semanticLsk3dnetNormalFovDownDeg() const { return get<float>("semantic.lsk3dnet.normal_fov_down_deg", -25.0f); }
     int semanticLsk3dnetNormalProjH() const { return get<int>("semantic.lsk3dnet.normal_proj_h", 64); }
     int semanticLsk3dnetNormalProjW() const { return get<int>("semantic.lsk3dnet.normal_proj_w", 900); }
+    /** 为贴近上游验证：将 semantic.fov_* / img_* 与 normal_fov_* / normal_proj_* 对齐（mask 与距离图 FOV 一致） */
+    bool semanticLsk3dnetAlignUpstreamEval() const { return get<bool>("semantic.lsk3dnet.align_upstream_eval", false); }
+    /** 从 semantic.lsk3dnet.config_yaml 的 dataset_params 读取体素盒，仅盒内点参与 hybrid 推理 */
+    bool semanticLsk3dnetTrainingVolumeCrop() const { return get<bool>("semantic.lsk3dnet.training_volume_crop", false); }
+    /** 与 LSK val num_vote 对应：>1 时在 C++ 侧对若干确定性视角累加 logits（非 Python 随机增广的逐位复现） */
+    int semanticLsk3dnetNumVote() const {
+        int v = get<int>("semantic.lsk3dnet.num_vote", 1);
+        return std::max(1, std::min(32, v));
+    }
     float       semanticFovUp()      const { return get<float>("semantic.fov_up", 22.5f); }
     float       semanticFovDown()    const { return get<float>("semantic.fov_down", -22.5f); }
     int         semanticImgW()       const { return get<int>("semantic.img_w", 2048); }
@@ -695,6 +776,388 @@ public:
         int v = get<int>("semantic.tree_class_id", -1);  // -1 = auto fallback
         return std::max(-1, std::min(511, v));
     }
+    /** 语义融合模式：model_only | geometric_only | hybrid */
+    std::string semanticMode() const { return get<std::string>("semantic.mode", "geometric_only"); }
+
+    // ── 几何语义 ──
+    bool   semanticGeometricEnabled() const { return get<bool>("semantic.geometric.enabled", true); }
+    // Patchwork
+    double semanticGeometricPatchworkSensorHeight() const { return get<double>("semantic.geometric.patchwork.sensor_height", 1.73); }
+    bool   semanticGeometricPatchworkAutoSensorHeight() const {
+        return get<bool>("semantic.geometric.patchwork.auto_sensor_height", true);
+    }
+    double semanticGeometricPatchworkAutoHeightMinXyM() const {
+        double v = get<double>("semantic.geometric.patchwork.auto_height_min_xy_m", 4.0);
+        return std::max(0.5, std::min(120.0, v));
+    }
+    double semanticGeometricPatchworkAutoHeightMaxXyM() const {
+        double v = get<double>("semantic.geometric.patchwork.auto_height_max_xy_m", 50.0);
+        return std::max(1.0, std::min(200.0, v));
+    }
+    int semanticGeometricPatchworkAutoHeightMinSamples() const {
+        int v = get<int>("semantic.geometric.patchwork.auto_height_min_samples", 400);
+        return std::max(50, std::min(50000, v));
+    }
+    double semanticGeometricPatchworkAutoHeightPercentile() const {
+        double v = get<double>("semantic.geometric.patchwork.auto_height_percentile", 0.08);
+        return std::max(0.01, std::min(0.45, v));
+    }
+    double semanticGeometricPatchworkAutoHeightClampMinM() const {
+        double v = get<double>("semantic.geometric.patchwork.auto_height_clamp_min_m", 0.25);
+        return std::max(0.05, std::min(2.0, v));
+    }
+    double semanticGeometricPatchworkAutoHeightClampMaxM() const {
+        double v = get<double>("semantic.geometric.patchwork.auto_height_clamp_max_m", 3.8);
+        return std::max(0.5, std::min(6.0, v));
+    }
+    double semanticGeometricPatchworkAutoHeightEmaAlpha() const {
+        double v = get<double>("semantic.geometric.patchwork.auto_height_ema_alpha", 0.12);
+        return std::max(0.0, std::min(1.0, v));
+    }
+    double semanticGeometricPatchworkAutoHeightMaxZOverR() const {
+        double v = get<double>("semantic.geometric.patchwork.auto_height_max_z_over_r", 0.55);
+        return std::max(0.1, std::min(2.0, v));
+    }
+    int    semanticGeometricPatchworkNumIter() const { return get<int>("semantic.geometric.patchwork.num_iter", 3); }
+    double semanticGeometricPatchworkThDist() const { return get<double>("semantic.geometric.patchwork.th_dist", 0.2); }
+    double semanticGeometricPatchworkMaxRange() const { return get<double>("semantic.geometric.patchwork.max_range", 80.0); }
+    bool semanticGeometricPatchworkUseOdomGravity() const {
+        return get<bool>("semantic.geometric.patchwork.use_odom_gravity", true);
+    }
+    int semanticGeometricPatchworkOdomUpAxis() const {
+        int v = get<int>("semantic.geometric.patchwork.odom_up_axis", 2);
+        return std::max(0, std::min(2, v));
+    }
+    bool semanticGeometricPatchworkLevelCloudForPatchwork() const {
+        return get<bool>("semantic.geometric.patchwork.level_cloud_for_patchwork", false);
+    }
+    // Wall RANSAC
+    bool   semanticGeometricWallRansacEnabled() const { return get<bool>("semantic.geometric.wall_ransac.enabled", true); }
+    double semanticGeometricWallRansacDistanceThresh() const { return get<double>("semantic.geometric.wall_ransac.distance_threshold", 0.15); }
+    int    semanticGeometricWallRansacMinInliers() const { return get<int>("semantic.geometric.wall_ransac.min_inliers", 100); }
+    double semanticGeometricWallRansacMaxNormalTiltDeg() const { return get<double>("semantic.geometric.wall_ransac.max_normal_tilt_deg", 15.0); }
+    double semanticGeometricLineRansacDistanceThresh() const {
+        double v = get<double>("semantic.geometric.wall_ransac.line_distance_threshold", semanticGeometricWallRansacDistanceThresh());
+        return std::max(0.005, std::min(2.0, v));
+    }
+    int semanticGeometricLineRansacMinInliers() const {
+        int v = get<int>("semantic.geometric.wall_ransac.line_min_inliers", semanticGeometricWallRansacMinInliers());
+        return std::max(3, std::min(100000, v));
+    }
+    double semanticGeometricPlaneRansacDistanceThresh() const {
+        double v = get<double>("semantic.geometric.wall_ransac.plane_distance_threshold", semanticGeometricWallRansacDistanceThresh());
+        return std::max(0.005, std::min(2.0, v));
+    }
+    int semanticGeometricPlaneRansacMinInliers() const {
+        int v = get<int>("semantic.geometric.wall_ransac.plane_min_inliers", semanticGeometricWallRansacMinInliers());
+        return std::max(3, std::min(100000, v));
+    }
+    // Accumulator
+    bool   semanticGeometricAccumulatorEnabled() const { return get<bool>("semantic.geometric.accumulator.enabled", true); }
+    int    semanticGeometricAccumulatorMaxFrames() const {
+        // 稀疏扫描下单帧过稀：默认多叠几帧；上限放宽供 YAML 按算力/内存调（过大 Patchwork+聚类会变慢）
+        int v = get<int>("semantic.geometric.accumulator.max_frames", 24);
+        return std::max(1, std::min(96, v));
+    }
+    bool   semanticGeometricAccumulatorTagIntensityWithScanSeq() const {
+        return get<bool>("semantic.geometric.accumulator.tag_intensity_with_scan_seq", true);
+    }
+    // Primitive Classifier (Zhou22ral)
+    bool   semanticGeometricPrimitiveClassifierEnabled() const { return get<bool>("semantic.geometric.primitive_classifier.enabled", true); }
+    double semanticGeometricPrimitiveClassifierLinearityThresh() const { return get<double>("semantic.geometric.primitive_classifier.linearity_threshold", 0.7); }
+    double semanticGeometricPrimitiveClassifierPlanarityThresh() const { return get<double>("semantic.geometric.primitive_classifier.planarity_threshold", 0.6); }
+    /** Euclidean cluster tolerance on nonground cloud (m). */
+    double semanticGeometricClusterToleranceM() const {
+        double v = get<double>("semantic.geometric.euclidean_cluster.tolerance_m", 0.5);
+        return std::max(0.05, std::min(3.0, v));
+    }
+    int semanticGeometricClusterMinPoints() const {
+        int v = get<int>("semantic.geometric.euclidean_cluster.min_points", 20);
+        return std::max(3, std::min(50000, v));
+    }
+    int semanticGeometricClusterMaxPoints() const {
+        int v = get<int>("semantic.geometric.euclidean_cluster.max_points", 5000);
+        return std::max(50, std::min(500000, v));
+    }
+    /** Nonground → primitive pipeline：车体系水平环带 + 可选体素（Patchwork 之后，聚类/RANSAC 之前）。 */
+    bool semanticGeometricPrimitiveRoiEnabled() const {
+        return get<bool>("semantic.geometric.primitive_roi.enabled", false);
+    }
+    double semanticGeometricPrimitiveRoiBodyXyRadiusM() const {
+        double v = get<double>("semantic.geometric.primitive_roi.body_xy_radius_m", 50.0);
+        return std::max(0.0, std::min(400.0, v));
+    }
+    double semanticGeometricPrimitiveRoiRingMinXyM() const {
+        double v = get<double>("semantic.geometric.primitive_roi.ring_min_xy_m", 3.0);
+        return std::max(0.0, std::min(200.0, v));
+    }
+    double semanticGeometricPrimitiveRoiRingMaxXyM() const {
+        double v = get<double>("semantic.geometric.primitive_roi.ring_max_xy_m", 0.0);
+        return std::max(0.0, std::min(400.0, v));
+    }
+    double semanticGeometricPrimitiveRoiVoxelLeafM() const {
+        double v = get<double>("semantic.geometric.primitive_roi.voxel_leaf_m", 0.0);
+        return std::max(0.0, std::min(3.0, v));
+    }
+    /** Range-view 候选：梯度/CC（V1）或 OpenCV DNN ONNX（V2），见 geometric_processor。 */
+    bool semanticGeometricRangeViewEnabled() const { return get<bool>("semantic.geometric.range_view.enabled", false); }
+    std::string semanticGeometricRangeViewMode() const {
+        return get<std::string>("semantic.geometric.range_view.mode", "gradient");
+    }
+    int semanticGeometricRangeViewImageWidth() const {
+        int v = get<int>("semantic.geometric.range_view.image_width", 1024);
+        return std::max(32, std::min(4096, v));
+    }
+    int semanticGeometricRangeViewImageHeight() const {
+        int v = get<int>("semantic.geometric.range_view.image_height", 64);
+        return std::max(16, std::min(2048, v));
+    }
+    double semanticGeometricRangeViewMinRangeM() const {
+        double v = get<double>("semantic.geometric.range_view.min_range_m", 0.5);
+        return std::max(0.05, std::min(50.0, v));
+    }
+    double semanticGeometricRangeViewMaxRangeM() const {
+        double v = get<double>("semantic.geometric.range_view.max_range_m", 80.0);
+        return std::max(1.0, std::min(300.0, v));
+    }
+    double semanticGeometricRangeViewElevMinDeg() const {
+        double v = get<double>("semantic.geometric.range_view.elev_min_deg", -24.0);
+        return std::max(-89.0, std::min(89.0, v));
+    }
+    double semanticGeometricRangeViewElevMaxDeg() const {
+        double v = get<double>("semantic.geometric.range_view.elev_max_deg", 24.0);
+        return std::max(-89.0, std::min(89.0, v));
+    }
+    double semanticGeometricRangeViewGradMagNormThresh() const {
+        double v = get<double>("semantic.geometric.range_view.grad_mag_norm_thresh", 0.07);
+        return std::max(0.005, std::min(0.9, v));
+    }
+    int semanticGeometricRangeViewDilateIterations() const {
+        int v = get<int>("semantic.geometric.range_view.dilate_iterations", 1);
+        return std::max(0, std::min(8, v));
+    }
+    int semanticGeometricRangeViewMinCcPixels() const {
+        int v = get<int>("semantic.geometric.range_view.min_cc_pixels", 6);
+        return std::max(1, std::min(100000, v));
+    }
+    int semanticGeometricRangeViewMaxCcPixels() const {
+        int v = get<int>("semantic.geometric.range_view.max_cc_pixels", 12000);
+        return std::max(10, std::min(500000, v));
+    }
+    int semanticGeometricRangeViewWallMinWidthU() const {
+        int v = get<int>("semantic.geometric.range_view.wall_min_width_u", 10);
+        return std::max(1, std::min(2000, v));
+    }
+    double semanticGeometricRangeViewWallMaxAspectHOverW() const {
+        double v = get<double>("semantic.geometric.range_view.wall_max_aspect_h_over_w", 8.0);
+        return std::max(0.5, std::min(80.0, v));
+    }
+    int semanticGeometricRangeViewTrunkMaxWidthU() const {
+        int v = get<int>("semantic.geometric.range_view.trunk_max_width_u", 10);
+        return std::max(1, std::min(2000, v));
+    }
+    double semanticGeometricRangeViewTrunkMinAspectHOverW() const {
+        double v = get<double>("semantic.geometric.range_view.trunk_min_aspect_h_over_w", 1.2);
+        return std::max(0.1, std::min(40.0, v));
+    }
+    int semanticGeometricRangeViewBboxMarginU() const {
+        int v = get<int>("semantic.geometric.range_view.bbox_margin_u", 2);
+        return std::max(0, std::min(64, v));
+    }
+    int semanticGeometricRangeViewBboxMarginV() const {
+        int v = get<int>("semantic.geometric.range_view.bbox_margin_v", 2);
+        return std::max(0, std::min(64, v));
+    }
+    int semanticGeometricRangeViewMaxPatchesPerFrame() const {
+        int v = get<int>("semantic.geometric.range_view.max_patches_per_frame", 64);
+        return std::max(1, std::min(256, v));
+    }
+    int semanticGeometricRangeViewMaxPatchPoints() const {
+        int v = get<int>("semantic.geometric.range_view.max_patch_points", 14000);
+        return std::max(500, std::min(200000, v));
+    }
+    bool semanticGeometricRangeViewFallbackFullCloud() const {
+        return get<bool>("semantic.geometric.range_view.fallback_full_cloud", true);
+    }
+    std::string semanticGeometricRangeViewOnnxModelPath() const {
+        return get<std::string>("semantic.geometric.range_view.onnx_model_path", "");
+    }
+    int semanticGeometricRangeViewOnnxInputWidth() const {
+        int v = get<int>("semantic.geometric.range_view.onnx_input_width", 512);
+        return std::max(32, std::min(2048, v));
+    }
+    int semanticGeometricRangeViewOnnxInputHeight() const {
+        int v = get<int>("semantic.geometric.range_view.onnx_input_height", 64);
+        return std::max(16, std::min(512, v));
+    }
+    int semanticGeometricRangeViewOnnxNClasses() const {
+        int v = get<int>("semantic.geometric.range_view.onnx_n_classes", 4);
+        return std::max(2, std::min(64, v));
+    }
+    int semanticGeometricRangeViewOnnxWallClassId() const {
+        int v = get<int>("semantic.geometric.range_view.onnx_wall_class_id", 2);
+        return std::max(0, std::min(63, v));
+    }
+    int semanticGeometricRangeViewOnnxTrunkClassId() const {
+        int v = get<int>("semantic.geometric.range_view.onnx_trunk_class_id", 3);
+        return std::max(0, std::min(63, v));
+    }
+    double semanticGeometricRangeViewFusionRvBoostScale() const {
+        double v = get<double>("semantic.geometric.range_view.fusion_rv_boost_scale", 0.35);
+        return std::max(0.0, std::min(3.0, v));
+    }
+    /** Peel-and-refit lines within one cluster (sparse multi-trunk). 1 = one line per cluster (legacy). */
+    int semanticGeometricMaxLinesPerCluster() const {
+        int v = get<int>("semantic.geometric.max_lines_per_cluster", 2);
+        return std::max(1, std::min(8, v));
+    }
+    /** <=0: use legacy max(0.4, 2*max_tree_radius+0.2) in SemanticProcessor. */
+    double semanticGeometricOnlyFrameMergeMaxXyM() const {
+        double v = get<double>("semantic.geometric.geometric_only_frame_merge.max_xy_m", 0.0);
+        return v;
+    }
+    /** <=0: use 2.0 m in SemanticProcessor. */
+    double semanticGeometricOnlyFrameMergeMaxZM() const {
+        double v = get<double>("semantic.geometric.geometric_only_frame_merge.max_z_m", 0.0);
+        return v;
+    }
+    /** <=0: use max(5, max_axis_theta) in SemanticProcessor. */
+    double semanticGeometricOnlyFrameMergeMaxAxisAngleDeg() const {
+        double v = get<double>("semantic.geometric.geometric_only_frame_merge.max_axis_angle_deg", 0.0);
+        return v;
+    }
+    std::string semanticGeometricLogLevel() const { return get<std::string>("semantic.geometric.log_level", "info"); }
+    bool   semanticGeometricLogDetail() const { return get<bool>("semantic.geometric.log_detail", false); }
+    // Landmark association thresholds (cross-frame association + dedup)
+    double semanticAssocCylinderMaxDistXyM() const { return get<double>("semantic.geometric.association.cylinder.max_dist_xy_m", 0.4); }
+    double semanticAssocCylinderMaxDistZM() const { return get<double>("semantic.geometric.association.cylinder.max_dist_z_m", 1.0); }
+    double semanticAssocCylinderMaxAngleDeg() const { return get<double>("semantic.geometric.association.cylinder.max_angle_deg", 10.0); }
+    double semanticAssocCylinderMaxRadiusDiffM() const { return get<double>("semantic.geometric.association.cylinder.max_radius_diff_m", 0.08); }
+    double semanticAssocCylinderAlphaMin() const { return get<double>("semantic.geometric.association.cylinder.alpha_min", 0.05); }
+    double semanticAssocCylinderAlphaMax() const { return get<double>("semantic.geometric.association.cylinder.alpha_max", 0.4); }
+    double semanticAssocPlaneMaxAngleDeg() const { return get<double>("semantic.geometric.association.plane.max_angle_deg", 10.0); }
+    double semanticAssocPlaneMaxDistanceDiffM() const { return get<double>("semantic.geometric.association.plane.max_distance_diff_m", 0.4); }
+    double semanticAssocPlaneMaxTangentOffsetM() const { return get<double>("semantic.geometric.association.plane.max_tangent_offset_m", 1.5); }
+    double semanticAssocPlaneAlphaMin() const { return get<double>("semantic.geometric.association.plane.alpha_min", 0.05); }
+    double semanticAssocPlaneAlphaMax() const { return get<double>("semantic.geometric.association.plane.alpha_max", 0.35); }
+    /** 平面地标入图前最少子图内支持帧数（与圆柱 delayed-confirmation 对齐，抑制单次 RANSAC 误检） */
+    int semanticAssocPlaneMinConfirmations() const {
+        int v = get<int>("semantic.geometric.association.plane.min_confirmations", 2);
+        return std::max(1, std::min(20, v));
+    }
+    double semanticAssocPlaneMinObservability() const {
+        double v = get<double>("semantic.geometric.association.plane.min_observability", 0.25);
+        return std::max(0.0, std::min(1.0, v));
+    }
+    // Probabilistic gating and delayed-confirmation controls.
+    double semanticAssocCylinderMahalanobisGate() const {
+        double v = get<double>("semantic.geometric.association.cylinder.mahalanobis_gate", 9.49);
+        return std::max(1.0, std::min(100.0, v));
+    }
+    int semanticAssocCylinderMinConfirmations() const {
+        int v = get<int>("semantic.geometric.association.cylinder.min_confirmations", 2);
+        return std::max(1, std::min(20, v));
+    }
+    double semanticAssocCylinderMinObservability() const {
+        double v = get<double>("semantic.geometric.association.cylinder.min_observability", 0.25);
+        return std::max(0.0, std::min(1.0, v));
+    }
+    double semanticAssocDuplicateMergeDistXyM() const {
+        double v = get<double>("semantic.geometric.association.cylinder.duplicate_merge_dist_xy_m", 0.25);
+        return std::max(0.05, std::min(3.0, v));
+    }
+    double semanticAssocDuplicateMergeMaxAngleDeg() const {
+        double v = get<double>("semantic.geometric.association.cylinder.duplicate_merge_max_angle_deg", 8.0);
+        return std::max(1.0, std::min(45.0, v));
+    }
+    double semanticAssocSwitchableResidualScaleM() const {
+        double v = get<double>("semantic.geometric.association.cylinder.switchable_residual_scale_m", 0.25);
+        return std::max(0.02, std::min(5.0, v));
+    }
+    bool semanticAssocProtectionModeEnabled() const {
+        return get<bool>("semantic.geometric.association.cylinder.protection_mode.enabled", true);
+    }
+    double semanticAssocProtectionTriggerTreeNewRatePct() const {
+        double v = get<double>("semantic.geometric.association.cylinder.protection_mode.trigger_tree_new_rate_pct", 35.0);
+        return std::max(1.0, std::min(95.0, v));
+    }
+    double semanticAssocProtectionRecoverTreeNewRatePct() const {
+        double v = get<double>("semantic.geometric.association.cylinder.protection_mode.recover_tree_new_rate_pct", 20.0);
+        return std::max(0.5, std::min(90.0, v));
+    }
+    double semanticAssocProtectionTriggerDuplicateDensity() const {
+        double v = get<double>("semantic.geometric.association.cylinder.protection_mode.trigger_duplicate_density", 0.03);
+        return std::max(0.0, std::min(10.0, v));
+    }
+    double semanticAssocProtectionRecoverDuplicateDensity() const {
+        double v = get<double>("semantic.geometric.association.cylinder.protection_mode.recover_duplicate_density", 0.01);
+        return std::max(0.0, std::min(10.0, v));
+    }
+    int semanticAssocFactorSampleStrideNormal() const {
+        int v = get<int>("semantic.geometric.association.cylinder.protection_mode.factor_sample_stride_normal", 1);
+        return std::max(1, std::min(10, v));
+    }
+    int semanticAssocFactorSampleStrideProtected() const {
+        int v = get<int>("semantic.geometric.association.cylinder.protection_mode.factor_sample_stride_protected", 2);
+        return std::max(1, std::min(20, v));
+    }
+    int semanticAssocFactorWeakContextMinSupport() const {
+        int v = get<int>("semantic.geometric.association.cylinder.protection_mode.weak_context_min_support", 3);
+        return std::max(1, std::min(100, v));
+    }
+    double semanticAssocFactorWeakContextMinObservability() const {
+        double v = get<double>("semantic.geometric.association.cylinder.protection_mode.weak_context_min_observability", 0.4);
+        return std::max(0.0, std::min(1.0, v));
+    }
+
+    /** 语义因子入 iSAM2 前额外门控（在 support/observability 之后）：几何一致性 + 观测稠密度。 */
+    bool semanticBackendGatingEnabled() const { return get<bool>("semantic.backend_gating.enabled", true); }
+    /** <0 关闭；仅当观测 primitive_linearity>=0 且低于阈值时拒绝（学习分割路径常无 linearity）。 */
+    double semanticBackendGatingCylinderMinPrimitiveLinearity() const {
+        double v = get<double>("semantic.backend_gating.cylinder.min_primitive_linearity", -1.0);
+        return std::max(-1.0, std::min(1.0, v));
+    }
+    /** 0 关闭；>0 且 detection_point_count>0 且小于阈值时拒绝。 */
+    int semanticBackendGatingCylinderMinDetectionPoints() const {
+        int v = get<int>("semantic.backend_gating.cylinder.min_detection_points", 0);
+        return std::max(0, std::min(100000, v));
+    }
+    /** 0 关闭；子图系 |d_perp(观测点,轴)-r_canonical| 超阈值则本帧不入因子。 */
+    double semanticBackendGatingCylinderMaxAbsRadialErrorM() const {
+        double v = get<double>("semantic.backend_gating.cylinder.max_abs_radial_error_m", 0.0);
+        return std::max(0.0, std::min(5.0, v));
+    }
+    /** 0 关闭；当前帧树干观测置信度硬下限。 */
+    double semanticBackendGatingCylinderMinKfConfidence() const {
+        double v = get<double>("semantic.backend_gating.cylinder.min_kf_confidence", 0.0);
+        return std::max(0.0, std::min(1.0, v));
+    }
+    /** 0 关闭；当 trunk root 到任一强支撑平面（墙）距离小于此值时拒绝该树干，避免贴墙假树。 */
+    double semanticBackendGatingCylinderMinPlaneDistanceM() const {
+        double v = get<double>("semantic.backend_gating.cylinder.min_plane_distance_m", 0.0);
+        return std::max(0.0, std::min(5.0, v));
+    }
+    /** 0 关闭；仅当平面 support_count >= 此值时参与“trunk 贴墙”判据（弱平面如小护栏不触发）。 */
+    int semanticBackendGatingCylinderMinPlaneSupport() const {
+        int v = get<int>("semantic.backend_gating.cylinder.min_plane_support", 0);
+        return std::max(0, std::min(1000, v));
+    }
+    /** 0 关闭；平面观测支撑点数下限。 */
+    int semanticBackendGatingPlaneMinDetectionPoints() const {
+        int v = get<int>("semantic.backend_gating.plane.min_detection_points", 0);
+        return std::max(0, std::min(100000, v));
+    }
+    /** 0 关闭；平面垂直高度小于该值且切向长度有限时视为“疑似车身/护栏”，不入地图因子。 */
+    double semanticBackendGatingPlaneMinHeightM() const {
+        double v = get<double>("semantic.backend_gating.plane.min_height_m", 0.0);
+        return std::max(0.0, std::min(10.0, v));
+    }
+    /** 0 关闭；与高度联合使用：高度 < min_height_m 且切向长度 < max_tangent_m 认为是短小平面。 */
+    double semanticBackendGatingPlaneMaxTangentM() const {
+        double v = get<double>("semantic.backend_gating.plane.max_tangent_m", 0.0);
+        return std::max(0.0, std::min(50.0, v));
+    }
+
     /** 与模型 input_channels 等长；空表示每层用内置默认（range 通道 12.97/12.35，其余 mean=0 std=1） */
     std::vector<float> semanticInputMean() const;
     std::vector<float> semanticInputStd() const;
@@ -719,6 +1182,228 @@ public:
         float v = get<float>("semantic.min_landmark_height", 1.0f);
         return std::max(0.0f, std::min(100.0f, v));
     }
+    float       semanticTreeTruncationHeight() const {
+        return get<float>("semantic.tree_truncation_height", 0.0f);
+    }
+    float       semanticCylinderFitRelZMin() const {
+        float v = get<float>("semantic.cylinder_fit_rel_z_min", 0.4f);
+        return std::max(0.0f, std::min(10.0f, v));
+    }
+    float       semanticCylinderFitRelZMax() const {
+        float v = get<float>("semantic.cylinder_fit_rel_z_max", 1.2f);
+        return std::max(0.0f, std::min(20.0f, v));
+    }
+    float semanticCylinderFitGroundSearchRadiusM() const {
+        float v = get<float>("semantic.cylinder_fit_ground_search_radius_m", 5.0f);
+        return std::max(0.5f, std::min(50.0f, v));
+    }
+    int semanticCylinderFitGroundMinSamples() const {
+        int v = get<int>("semantic.cylinder_fit_ground_min_samples", 30);
+        return std::max(5, std::min(5000, v));
+    }
+    float semanticCylinderFitGroundPercentile() const {
+        float v = get<float>("semantic.cylinder_fit_ground_percentile", 0.10f);
+        return std::max(0.01f, std::min(0.45f, v));
+    }
+    /// Mask intensity for geometric Patchwork ground paint; must match dataset learning labels (LSK uses semantic-kitti-sub).
+    int semanticGeometricGroundPaintClassId() const {
+        int v = get<int>("semantic.geometric_ground_paint_class_id", 9);
+        return std::max(0, std::min(255, v));
+    }
+    bool semanticGeometricOnlyShaftEnable() const {
+        return get<bool>("semantic.geometric_only_shaft_enable", true);
+    }
+    float semanticGeometricOnlyShaftXyCellM() const {
+        float v = get<float>("semantic.geometric_only_shaft_xy_cell_m", 0.42f);
+        return std::max(0.08f, std::min(3.0f, v));
+    }
+    float semanticGeometricOnlyShaftMinExtentM() const {
+        float v = get<float>("semantic.geometric_only_shaft_min_extent_m", 1.62f);
+        return std::max(0.3f, std::min(40.0f, v));
+    }
+    int semanticGeometricOnlyShaftMinPoints() const {
+        int v = get<int>("semantic.geometric_only_shaft_min_points", 14);
+        return std::max(4, std::min(500, v));
+    }
+    float semanticGeometricOnlyShaftMaxXySpreadM() const {
+        float v = get<float>("semantic.geometric_only_shaft_max_xy_spread_m", 0.95f);
+        return std::max(0.08f, std::min(5.0f, v));
+    }
+    float semanticGeometricOnlyShaftRefineRadiusM() const {
+        float v = get<float>("semantic.geometric_only_shaft_refine_radius_m", 0.58f);
+        return std::max(0.05f, std::min(4.0f, v));
+    }
+    float semanticGeometricOnlyShaftRelZMaxM() const {
+        float v = get<float>("semantic.geometric_only_shaft_rel_z_max_m", 22.0f);
+        return std::max(2.0f, std::min(80.0f, v));
+    }
+    int semanticGeometricOnlyShaftMaxCandidates() const {
+        int v = get<int>("semantic.geometric_only_shaft_max_candidates", 64);
+        return std::max(1, std::min(256, v));
+    }
+    float semanticGeometricOnlyShaftSkipNearLineXyM() const {
+        float v = get<float>("semantic.geometric_only_shaft_skip_near_line_xy_m", 0.52f);
+        return std::max(0.0f, std::min(5.0f, v));
+    }
+    float semanticGeometricOnlyShaftSkipNearTreeXyM() const {
+        float v = get<float>("semantic.geometric_only_shaft_skip_near_tree_xy_m", 0.55f);
+        return std::max(0.0f, std::min(5.0f, v));
+    }
+    float       semanticCylinderRadialCvMax() const {
+        float v = get<float>("semantic.cylinder_radial_cv_max", 0.42f);
+        return std::max(0.0f, std::min(3.0f, v));
+    }
+    float       semanticCylinderMinAxialExtentM() const {
+        float v = get<float>("semantic.cylinder_min_axial_extent_m", 0.28f);
+        return std::max(0.0f, std::min(5.0f, v));
+    }
+    std::string semanticCylinderFitMethod() const {
+        std::string s = get<std::string>("semantic.cylinder_fit_method", "line_ceres");
+        if (s.empty()) {
+            return "line_ceres";
+        }
+        return s;
+    }
+    float       semanticCylinderPclSacDistance() const {
+        float v = get<float>("semantic.cylinder_pcl_sac_distance", 0.08f);
+        return std::max(0.01f, std::min(0.5f, v));
+    }
+    float       semanticCylinderPclNormalRadius() const {
+        float v = get<float>("semantic.cylinder_pcl_normal_radius", 0.22f);
+        return std::max(0.05f, std::min(2.0f, v));
+    }
+    float       semanticMinTreeConfidence() const {
+        float v = get<float>("semantic.min_tree_confidence", 0.75f);
+        return std::max(0.0f, std::min(1.0f, v));
+    }
+    /// Body XY: warn when trunk root is closer than this to ego (m); 0 disables warn.
+    float       semanticTrunkEgoXyClearanceWarnM() const {
+        float v = get<float>("semantic.trunk_ego_xy_clearance_warn_m", 1.8f);
+        return std::max(0.0f, std::min(50.0f, v));
+    }
+    /// Body XY: reject landmark when closer than this to ego (m); 0 disables reject.
+    float       semanticTrunkEgoXyClearanceRejectM() const {
+        float v = get<float>("semantic.trunk_ego_xy_clearance_reject_m", 0.0f);
+        return std::max(0.0f, std::min(50.0f, v));
+    }
+    bool semanticSparseTrunkColumnEnable() const {
+        return get<bool>("semantic.sparse_trunk_column_enable", true);
+    }
+    float semanticSparseTrunkColumnRadiusM() const {
+        float v = get<float>("semantic.sparse_trunk_column_radius_m", 0.40f);
+        return std::max(0.05f, std::min(3.0f, v));
+    }
+    float semanticSparseTrunkMinVerticalExtentM() const {
+        float v = get<float>("semantic.sparse_trunk_min_vertical_extent_m", 1.0f);
+        return std::max(0.2f, std::min(30.0f, v));
+    }
+    float semanticSparseTrunkUpperRelZMinM() const {
+        float v = get<float>("semantic.sparse_trunk_upper_rel_z_min_m", 1.0f);
+        return std::max(0.0f, std::min(25.0f, v));
+    }
+    float semanticSparseTrunkUpperRelZMaxM() const {
+        float v = get<float>("semantic.sparse_trunk_upper_rel_z_max_m", 14.0f);
+        return std::max(0.5f, std::min(80.0f, v));
+    }
+    int semanticSparseTrunkMinUpperPoints() const {
+        int v = get<int>("semantic.sparse_trunk_min_upper_points", 12);
+        return std::max(3, std::min(5000, v));
+    }
+    int semanticSparseTrunkMinColumnPoints() const {
+        int v = get<int>("semantic.sparse_trunk_min_column_points", 20);
+        return std::max(5, std::min(50000, v));
+    }
+    int semanticSparseTrunkMaxFitPoints() const {
+        int v = get<int>("semantic.sparse_trunk_max_fit_points", 800);
+        return std::max(80, std::min(20000, v));
+    }
+    bool semanticSparseTrunkStructuralEnable() const {
+        return get<bool>("semantic.sparse_trunk_structural_enable", true);
+    }
+    float semanticSparseTrunkStructuralMinExtentM() const {
+        float v = get<float>("semantic.sparse_trunk_structural_min_extent_m", 0.68f);
+        return std::max(0.25f, std::min(8.0f, v));
+    }
+    int semanticSparseTrunkStructuralMinColumnPoints() const {
+        int v = get<int>("semantic.sparse_trunk_structural_min_column_points", 5);
+        return std::max(2, std::min(200, v));
+    }
+    int semanticSparseTrunkStructuralMinFoliagePoints() const {
+        int v = get<int>("semantic.sparse_trunk_structural_min_foliage_points", 12);
+        return std::max(3, std::min(50000, v));
+    }
+    float semanticSparseTrunkStructuralFoliageRadiusM() const {
+        float v = get<float>("semantic.sparse_trunk_structural_foliage_radius_m", 0.58f);
+        return std::max(0.12f, std::min(4.0f, v));
+    }
+    float semanticSparseTrunkStructuralFoliageRelZMinM() const {
+        float v = get<float>("semantic.sparse_trunk_structural_foliage_rel_z_min_m", 1.0f);
+        return std::max(0.0f, std::min(40.0f, v));
+    }
+    float semanticSparseTrunkStructuralFoliageRelZMaxM() const {
+        float v = get<float>("semantic.sparse_trunk_structural_foliage_rel_z_max_m", 18.0f);
+        return std::max(0.5f, std::min(120.0f, v));
+    }
+    float semanticSparseTrunkStructuralTaperMinRatio() const {
+        float v = get<float>("semantic.sparse_trunk_structural_taper_min_ratio", 0.78f);
+        return std::max(0.35f, std::min(1.5f, v));
+    }
+    int semanticSparseTrunkStructuralTaperMinColumnPts() const {
+        int v = get<int>("semantic.sparse_trunk_structural_taper_min_column_pts", 10);
+        return std::max(4, std::min(500, v));
+    }
+    float semanticSparseTrunkStructuralTaperMaxRelZM() const {
+        float v = get<float>("semantic.sparse_trunk_structural_taper_max_rel_z_m", 3.8f);
+        return std::max(0.5f, std::min(25.0f, v));
+    }
+    int semanticSparseTrunkStructuralMergeFoliageMaxPoints() const {
+        int v = get<int>("semantic.sparse_trunk_structural_merge_foliage_max_points", 320);
+        return std::max(40, std::min(5000, v));
+    }
+    bool semanticSparseTrunkStructuralDirectCylinder() const {
+        return get<bool>("semantic.sparse_trunk_structural_direct_cylinder", true);
+    }
+    bool semanticSparseTrunkStructuralAmbientCheckEnable() const {
+        return get<bool>("semantic.sparse_trunk_structural_ambient_check_enable", true);
+    }
+    float semanticSparseTrunkStructuralAmbientInnerMarginM() const {
+        float v = get<float>("semantic.sparse_trunk_structural_ambient_inner_margin_m", 0.10f);
+        return std::max(0.0f, std::min(0.5f, v));
+    }
+    float semanticSparseTrunkStructuralAmbientOuterRadiusM() const {
+        float v = get<float>("semantic.sparse_trunk_structural_ambient_outer_radius_m", 1.35f);
+        return std::max(0.25f, std::min(6.0f, v));
+    }
+    int semanticSparseTrunkStructuralAmbientMaxPoints() const {
+        int v = get<int>("semantic.sparse_trunk_structural_ambient_max_points", 45);
+        return std::max(0, std::min(500000, v));
+    }
+    float semanticSparseTrunkStructuralAmbientRelZPadM() const {
+        float v = get<float>("semantic.sparse_trunk_structural_ambient_rel_z_pad_m", 0.12f);
+        return std::max(0.0f, std::min(2.0f, v));
+    }
+    bool semanticSparseTrunkFallbackEnable() const {
+        return get<bool>("semantic.sparse_trunk_fallback_enable", true);
+    }
+    float semanticSparseTrunkFallbackMinConfidence() const {
+        float v = get<float>("semantic.sparse_trunk_fallback_min_confidence", 0.50f);
+        return std::max(0.05f, std::min(0.99f, v));
+    }
+    bool semanticSparseTrunkFallbackPcaAfterMerge() const {
+        return get<bool>("semantic.sparse_trunk_fallback_pca_after_merge", true);
+    }
+    float semanticSparseTrunkFallbackRMedSlack() const {
+        float v = get<float>("semantic.sparse_trunk_fallback_r_med_slack", 1.32f);
+        return std::max(1.0f, std::min(2.5f, v));
+    }
+    float semanticSparseTrunkFallbackPcaMinUpCos() const {
+        float v = get<float>("semantic.sparse_trunk_fallback_pca_min_up_cos", 0.45f);
+        return std::max(0.05f, std::min(0.99f, v));
+    }
+    float semanticSparseTrunkFallbackPcaExtraTiltDeg() const {
+        float v = get<float>("semantic.sparse_trunk_fallback_pca_extra_tilt_deg", 12.0f);
+        return std::max(0.0f, std::min(45.0f, v));
+    }
     // 诊断开关（默认关闭，确保主流程行为不变）
     bool        semanticDiagEnableDetailedStats() const {
         return get<bool>("semantic.diag.enable_detailed_stats", false);
@@ -736,6 +1421,9 @@ public:
     }
     bool        semanticDiagDumpAllClasses() const {
         return get<bool>("semantic.diag.dump_all_classes", false);
+    }
+    bool semanticDiagTrunkChainLog() const {
+        return get<bool>("semantic.diag.trunk_chain_log", false);
     }
     int         semanticDiagDumpPointsPerClassLimit() const {
         int v = get<int>("semantic.diag.dump_points_per_class_limit", 0);
@@ -785,6 +1473,22 @@ public:
         return std::max(1, std::min(32, v));
     }
     bool        semanticKeyframesOnly() const { return get<bool>("semantic.keyframes_only", false); }
+    /** 语义输入灰度：是否启用独立 SemanticInputEvent 输入。 */
+    bool        semanticInputUseIndependentEvent() const {
+        return get<bool>("semantic.input.use_independent_event", false);
+    }
+    /** 语义输入灰度：启用独立输入时，是否继续双写 GraphTaskEvent 路径。 */
+    bool        semanticInputDualWriteGraphTask() const {
+        return get<bool>("semantic.input.dual_write_graph_task", true);
+    }
+    /** 语义模块兼容开关：是否接受 GraphTaskEvent 输入。 */
+    bool        semanticInputAcceptGraphTask() const {
+        return get<bool>("semantic.input.accept_graph_task", true);
+    }
+    /** 语义模块兼容开关：是否接受独立 SemanticInputEvent 输入。 */
+    bool        semanticInputAcceptIndependentEvent() const {
+        return get<bool>("semantic.input.accept_independent_event", true);
+    }
     double      semanticKeyframeTimeToleranceS() const {
         double v = get<double>("semantic.keyframe_time_tolerance_s", 0.03);
         return std::max(1e-4, std::min(1.0, v));
@@ -798,8 +1502,14 @@ public:
         return static_cast<size_t>(std::max(128, std::min(200000, v)));
     }
     double      semanticTimestampMatchToleranceS() const {
-        double v = get<double>("semantic.timestamp_match_tolerance_s", 1e-4);
-        return std::max(1e-6, std::min(0.1, v));
+        // 默认 150ms：覆盖语义 worker 排队 + LSK3DNet 推理延迟；过严(1e-4)会导致 kf 匹配失败、因子链断裂
+        double v = get<double>("semantic.timestamp_match_tolerance_s", 0.15);
+        return std::max(1e-3, std::min(0.5, v));
+    }
+    /** 同一关键帧再次到达语义点云时，新标签与已挂标签逐点一致比例低于此则拒收（抑闪烁）；0=关闭 */
+    double      semanticCloudAttachMinPointAgreement() const {
+        double v = get<double>("semantic.cloud_attach.min_point_agreement", 0.0);
+        return std::clamp(v, 0.0, 1.0);
     }
 
     // ── 会话 ──────────────────────────────────────────────

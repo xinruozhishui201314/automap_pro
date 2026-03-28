@@ -19,6 +19,8 @@ constexpr float kGpsAlignedSphereRadius   = 0.08f;
 constexpr float kLoopConstraintLineWidth  = 0.12f;
 constexpr float kLoopEdgeLineWidthM       = 0.28f;
 constexpr float kLoopEndpointSphereRadius = 0.10f;
+// 子图平面地标在 RViz 中的有限贴片半宽（米）；仅用于可视化，与后端平面因子几何独立
+constexpr double kSemanticPlaneVizHalfExtentM = 6.0;
 }  // namespace
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -43,6 +45,9 @@ void RvizPublisher::init(rclcpp::Node::SharedPtr node) {
     colored_cloud_pub_  = node->create_publisher<sensor_msgs::msg::PointCloud2>("/automap/colored_cloud", sensor_qos);
     density_heatmap_pub_= node->create_publisher<sensor_msgs::msg::PointCloud2>("/automap/density_heatmap", sensor_qos);
     loop_candidate_pub_ = node->create_publisher<sensor_msgs::msg::PointCloud2>("/automap/loop_candidate_cloud", sensor_qos);
+    semantic_cloud_pub_ = node->create_publisher<sensor_msgs::msg::PointCloud2>("/automap/semantic_cloud", sensor_qos);
+    semantic_trunk_pre_pub_ = node->create_publisher<sensor_msgs::msg::PointCloud2>("/automap/semantic_trunk_pre_cluster", sensor_qos);
+    semantic_trunk_post_pub_ = node->create_publisher<sensor_msgs::msg::PointCloud2>("/automap/semantic_trunk_post_cluster", sensor_qos);
 
     // Marker
     loop_marker_pub_      = node->create_publisher<visualization_msgs::msg::MarkerArray>("/automap/loop_markers", reliable_qos);
@@ -83,7 +88,8 @@ void RvizPublisher::init(rclcpp::Node::SharedPtr node) {
         "/automap/submap_bboxes, /automap/submap_graph, /automap/covariance_ellipses, /automap/factor_graph, /automap/gps_quality, /automap/gps_positions_map, "
         "/automap/module_status, /automap/coordinate_frames, /automap/active_region, /automap/degeneration_regions, /automap/hba_result, "
         "/automap/convergence, /automap/convergence_residual, /automap/odom_path, /automap/optimized_path, /automap/gps_raw_path, "
-        "/automap/gps_aligned_path, /automap/gps_keyframe_path, /automap/hba_gps_deviation, /automap/hba_trajectory_points, /automap/gps_trajectory_points, /automap/keyframe_poses, /automap/semantic_landmarks");
+        "/automap/gps_aligned_path, /automap/gps_keyframe_path, /automap/hba_gps_deviation, /automap/hba_trajectory_points, /automap/gps_trajectory_points, /automap/keyframe_poses, /automap/semantic_landmarks, "
+        "/automap/semantic_trunk_pre_cluster, /automap/semantic_trunk_post_cluster");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -956,7 +962,148 @@ void RvizPublisher::publishDegenerationRegions(const std::vector<std::pair<doubl
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 8. 语义信息可视化
-// ─────────────────────────────────────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════════
+// 8. 语义信息可视化
+// ═════════════════════════════════════════════════════════════════════════════
+
+void RvizPublisher::publishSemanticCloud(const CloudXYZIConstPtr& cloud, const std::string& frame_id) {
+    if (!node() || !semantic_cloud_pub_ || !cloud || cloud->empty()) return;
+
+    static const std::map<uint8_t, std::array<uint8_t, 3>> kitti_colors = {
+        {0, {0, 0, 0}}, {1, {0, 0, 255}}, {10, {245, 150, 100}}, {11, {245, 230, 100}},
+        {13, {250, 80, 100}}, {15, {150, 60, 30}}, {16, {255, 0, 0}}, {18, {180, 30, 80}},
+        {20, {255, 0, 0}}, {30, {30, 30, 255}}, {31, {200, 40, 255}}, {32, {90, 30, 150}},
+        {40, {255, 0, 255}}, {44, {255, 150, 255}}, {48, {75, 0, 75}}, {49, {75, 0, 175}},
+        {50, {0, 200, 255}}, {51, {50, 120, 255}}, {52, {0, 150, 255}}, {60, {170, 255, 150}},
+        {70, {0, 175, 0}}, {71, {0, 60, 135}}, {72, {80, 240, 150}}, {80, {150, 240, 255}},
+        {81, {0, 0, 255}}, {99, {255, 255, 50}}
+    };
+
+    try {
+        pcl::PointCloud<pcl::PointXYZRGB>::Ptr rgb_cloud(new pcl::PointCloud<pcl::PointXYZRGB>);
+        rgb_cloud->reserve(cloud->size());
+
+        for (const auto& p : cloud->points) {
+            if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) continue;
+            
+            pcl::PointXYZRGB pr;
+            pr.x = p.x; pr.y = p.y; pr.z = p.z;
+            
+            uint8_t label = static_cast<uint8_t>(p.intensity);
+            auto it = kitti_colors.find(label);
+            if (it != kitti_colors.end()) {
+                pr.r = it->second[2]; pr.g = it->second[1]; pr.b = it->second[0]; // BGR -> RGB
+            } else {
+                // Learning map fallback (many models output 0-19)
+                static const std::map<uint8_t, uint8_t> learning_to_raw = {
+                    {1, 10}, {2, 11}, {3, 15}, {4, 18}, {5, 20}, {6, 30}, {7, 31}, {8, 32},
+                    {9, 40}, {10, 44}, {11, 48}, {12, 49}, {13, 50}, {14, 51}, {15, 70},
+                    {16, 71}, {17, 72}, {18, 80}, {19, 81}
+                };
+                auto it2 = learning_to_raw.find(label);
+                if (it2 != learning_to_raw.end()) {
+                    auto it3 = kitti_colors.find(it2->second);
+                    if (it3 != kitti_colors.end()) {
+                        pr.r = it3->second[2]; pr.g = it3->second[1]; pr.b = it3->second[0];
+                    } else {
+                        pr.r = pr.g = pr.b = 128;
+                    }
+                } else {
+                    pr.r = pr.g = pr.b = 128;
+                }
+            }
+            rgb_cloud->push_back(pr);
+        }
+
+        sensor_msgs::msg::PointCloud2 msg;
+        pcl::toROSMsg(*rgb_cloud, msg);
+        msg.header.stamp = node()->now();
+        msg.header.frame_id = frame_id;
+        semantic_cloud_pub_->publish(msg);
+    } catch (const std::exception& e) {
+        RCLCPP_ERROR(node()->get_logger(), "[RvizPublisher] publishSemanticCloud failed: %s", e.what());
+    }
+}
+
+namespace {
+void clusterIdToRgb(float intensity_id, uint8_t& r, uint8_t& g, uint8_t& b) {
+    const uint32_t id = std::max(0, static_cast<int>(std::lround(intensity_id)));
+    const float golden = 0.618033988749895f;
+    float h = std::fmod(static_cast<float>(id) * golden, 1.0f);
+    if (h < 0.0f) h += 1.0f;
+    const float s = 0.85f;
+    const float v = 0.95f;
+    const int i = static_cast<int>(h * 6.0f);
+    const float f = h * 6.0f - static_cast<float>(i);
+    const float p = v * (1.0f - s);
+    const float q = v * (1.0f - f * s);
+    const float t = v * (1.0f - (1.0f - f) * s);
+    float rf = 0.f, gf = 0.f, bf = 0.f;
+    switch (i % 6) {
+        case 0: rf = v; gf = t; bf = p; break;
+        case 1: rf = q; gf = v; bf = p; break;
+        case 2: rf = p; gf = v; bf = t; break;
+        case 3: rf = p; gf = q; bf = v; break;
+        case 4: rf = t; gf = p; bf = v; break;
+        default: rf = v; gf = p; bf = q; break;
+    }
+    r = static_cast<uint8_t>(std::clamp(rf * 255.0f, 0.0f, 255.0f));
+    g = static_cast<uint8_t>(std::clamp(gf * 255.0f, 0.0f, 255.0f));
+    b = static_cast<uint8_t>(std::clamp(bf * 255.0f, 0.0f, 255.0f));
+}
+}  // namespace
+
+void RvizPublisher::publishSemanticTrunkPreCluster(const CloudXYZIConstPtr& cloud, const std::string& frame_id) {
+    if (!node() || !semantic_trunk_pre_pub_ || !cloud || cloud->empty()) return;
+    try {
+        pcl::PointCloud<pcl::PointXYZRGB>::Ptr rgb(new pcl::PointCloud<pcl::PointXYZRGB>);
+        rgb->reserve(cloud->size());
+        for (const auto& p : cloud->points) {
+            if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) continue;
+            pcl::PointXYZRGB pr;
+            pr.x = p.x;
+            pr.y = p.y;
+            pr.z = p.z;
+            pr.r = 204;
+            pr.g = 102;
+            pr.b = 30;
+            rgb->push_back(pr);
+        }
+        if (rgb->empty()) return;
+        sensor_msgs::msg::PointCloud2 msg;
+        pcl::toROSMsg(*rgb, msg);
+        msg.header.stamp = node()->now();
+        msg.header.frame_id = frame_id;
+        semantic_trunk_pre_pub_->publish(msg);
+    } catch (const std::exception& e) {
+        RCLCPP_ERROR(node()->get_logger(), "[RvizPublisher] publishSemanticTrunkPreCluster failed: %s", e.what());
+    }
+}
+
+void RvizPublisher::publishSemanticTrunkPostCluster(const CloudXYZIConstPtr& cloud, const std::string& frame_id) {
+    if (!node() || !semantic_trunk_post_pub_ || !cloud || cloud->empty()) return;
+    try {
+        pcl::PointCloud<pcl::PointXYZRGB>::Ptr rgb(new pcl::PointCloud<pcl::PointXYZRGB>);
+        rgb->reserve(cloud->size());
+        for (const auto& p : cloud->points) {
+            if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) continue;
+            pcl::PointXYZRGB pr;
+            pr.x = p.x;
+            pr.y = p.y;
+            pr.z = p.z;
+            clusterIdToRgb(p.intensity, pr.r, pr.g, pr.b);
+            rgb->push_back(pr);
+        }
+        if (rgb->empty()) return;
+        sensor_msgs::msg::PointCloud2 msg;
+        pcl::toROSMsg(*rgb, msg);
+        msg.header.stamp = node()->now();
+        msg.header.frame_id = frame_id;
+        semantic_trunk_post_pub_->publish(msg);
+    } catch (const std::exception& e) {
+        RCLCPP_ERROR(node()->get_logger(), "[RvizPublisher] publishSemanticTrunkPostCluster failed: %s", e.what());
+    }
+}
 
 void RvizPublisher::publishSemanticLandmarks(const std::vector<SubMap::Ptr>& submaps) {
     if (!node() || !semantic_landmark_pub_) return;
@@ -965,9 +1112,13 @@ void RvizPublisher::publishSemanticLandmarks(const std::vector<SubMap::Ptr>& sub
     // 首先删除所有旧的地标 Marker，防止残留
     markers.markers.push_back(makeDeleteAllMarkers("semantic_landmarks").markers.front());
     markers.markers.push_back(makeDeleteAllMarkers("semantic_labels").markers.front());
+    markers.markers.push_back(makeDeleteAllMarkers("semantic_plane_landmarks").markers.front());
+    markers.markers.push_back(makeDeleteAllMarkers("semantic_plane_labels").markers.front());
 
     int marker_id = 0;
     int label_id = 0;
+    int plane_marker_id = 0;
+    int plane_label_id = 0;
     for (const auto& sm : submaps) {
         if (!sm) continue;
         
@@ -1018,6 +1169,71 @@ void RvizPublisher::publishSemanticLandmarks(const std::vector<SubMap::Ptr>& sub
             std::string label_text = "Tree_" + std::to_string(lm->id) + " (conf:" + std::to_string(static_cast<int>(lm->confidence * 100)) + "%)";
             markers.markers.push_back(makeTextMarker("semantic_labels", label_id++, root_map + Eigen::Vector3d(0, 0, 2.0), label_text, 0.8));
         }
+
+        // 平面地标（墙面）：(n,d) 在子图锚点系，与 associateLandmarks 中 body→submap 变换一致
+        for (const auto& pl : sm->plane_landmarks) {
+            if (!pl || !pl->isValid()) continue;
+
+            Eigen::Vector3d n_s = pl->normal;
+            if (!n_s.allFinite() || n_s.norm() < 1e-6) continue;
+            n_s.normalize();
+            const double d_s = pl->distance;
+            if (!std::isfinite(d_s)) continue;
+
+            const Eigen::Isometry3d& T_ms = sm->pose_map_anchor_optimized;
+            Eigen::Vector3d n_map = (T_ms.rotation() * n_s).normalized();
+            const Eigen::Vector3d p0_map = T_ms * (-d_s * n_s);
+
+            Eigen::Vector3d ref = (std::abs(n_map.z()) < 0.9) ? Eigen::Vector3d::UnitZ() : Eigen::Vector3d::UnitX();
+            Eigen::Vector3d u = ref - ref.dot(n_map) * n_map;
+            if (u.norm() < 1e-6) {
+                ref = Eigen::Vector3d::UnitY();
+                u = ref - ref.dot(n_map) * n_map;
+            }
+            if (u.norm() < 1e-6) continue;
+            u.normalize();
+            Eigen::Vector3d v = n_map.cross(u);
+
+            const double h = kSemanticPlaneVizHalfExtentM;
+            const Eigen::Vector3d c0 = p0_map - h * u - h * v;
+            const Eigen::Vector3d c1 = p0_map + h * u - h * v;
+            const Eigen::Vector3d c2 = p0_map + h * u + h * v;
+            const Eigen::Vector3d c3 = p0_map - h * u + h * v;
+
+            visualization_msgs::msg::Marker wall;
+            wall.header.frame_id = frame_id_;
+            wall.header.stamp = node()->now();
+            wall.ns = "semantic_plane_landmarks";
+            wall.id = plane_marker_id++;
+            wall.type = visualization_msgs::msg::Marker::TRIANGLE_LIST;
+            wall.action = visualization_msgs::msg::Marker::ADD;
+            wall.pose.orientation.w = 1.0;
+            wall.scale.x = 1.0;
+            wall.scale.y = 1.0;
+            wall.scale.z = 1.0;
+            wall.color = makeColor(0.35f, 0.55f, 0.85f, 0.42f);
+
+            auto push_pt = [&wall](const Eigen::Vector3d& p) {
+                geometry_msgs::msg::Point gp;
+                gp.x = p.x();
+                gp.y = p.y();
+                gp.z = p.z();
+                wall.points.push_back(gp);
+            };
+            // 两个三角形，法向与 n_map 同向
+            push_pt(c0);
+            push_pt(c1);
+            push_pt(c2);
+            push_pt(c0);
+            push_pt(c2);
+            push_pt(c3);
+            markers.markers.push_back(wall);
+
+            std::string plabel = "Wall_" + std::to_string(pl->id) + " (conf:" +
+                std::to_string(static_cast<int>(pl->confidence * 100)) + "%)";
+            markers.markers.push_back(
+                makeTextMarker("semantic_plane_labels", plane_label_id++, p0_map + 0.35 * n_map, plabel, 0.7));
+        }
     }
     semantic_landmark_pub_->publish(markers);
 }
@@ -1033,6 +1249,14 @@ void RvizPublisher::clearAllMarkers() {
             factor_graph_pub_.get(), gps_quality_pub_.get(), module_status_pub_.get(), frame_marker_pub_.get(),
             active_region_pub_.get(), degen_region_pub_.get(), hba_result_pub_.get(), convergence_pub_.get()}) {
         if (pub) pub->publish(arr);
+    }
+    if (semantic_landmark_pub_) {
+        visualization_msgs::msg::MarkerArray sem_clear;
+        sem_clear.markers.push_back(makeDeleteAllMarkers("semantic_landmarks").markers.front());
+        sem_clear.markers.push_back(makeDeleteAllMarkers("semantic_labels").markers.front());
+        sem_clear.markers.push_back(makeDeleteAllMarkers("semantic_plane_landmarks").markers.front());
+        sem_clear.markers.push_back(makeDeleteAllMarkers("semantic_plane_labels").markers.front());
+        semantic_landmark_pub_->publish(sem_clear);
     }
 }
 

@@ -395,13 +395,37 @@ struct SemanticLandmarkEvent {
     double timestamp = 0.0;
     double keyframe_timestamp_hint = 0.0; // 关键帧模式下由前端 KFInfo 时间透传，优先用于绑定 KeyFrame
     uint64_t keyframe_id_hint = 0;        // 关键帧 ID 提示（优先于时间戳匹配）
-    std::vector<CylinderLandmark::Ptr> landmarks;
+    std::vector<CylinderLandmark::Ptr> landmarks; // 树干/杆状物
+    std::vector<PlaneLandmark::Ptr> plane_landmarks; // 墙面/平面
     EventMeta meta;
     ProcessingState processing_state = ProcessingState::NORMAL;
 
     bool isValid() const {
-        return std::isfinite(timestamp) && !landmarks.empty() && meta.isValid();
+        return std::isfinite(timestamp) && (!landmarks.empty() || !plane_landmarks.empty()) && meta.isValid();
     }
+};
+
+/**
+ * @brief 语义点云事件 (Semantic Cloud Event)
+ * 用于可视化带标签的点云。
+ */
+struct SemanticCloudEvent {
+    double timestamp = 0.0;
+    CloudXYZIConstPtr labeled_cloud; // intensity 字段存储 label
+    std::string frame_id = "body";
+    EventMeta meta;
+};
+
+/**
+ * @brief 树干（tree_label / maskCloud 结果）调试可视化：聚类前为 mask 后有效点；聚类后 intensity 为簇编号(1..N)。
+ * frame_id 与 SyncedFrameEvent / SemanticCloudEvent 一致（通常为 body）；VisualizationModule 将其变到 map 再发 RViz。
+ */
+struct SemanticTrunkVizEvent {
+    double timestamp = 0.0;
+    std::string frame_id = "body";
+    CloudXYZIPtr pre_cluster_body;
+    CloudXYZIPtr post_cluster_body;
+    EventMeta meta;
 };
 
 enum class FilterFallbackReason : uint8_t {
@@ -494,6 +518,21 @@ struct GraphTaskEvent {
     OptTaskItem task;
     EventMeta meta;
     ProcessingState processing_state = ProcessingState::NORMAL;
+};
+
+/**
+ * @brief Semantic 独立输入事件
+ * 与优化任务事件解耦，仅用于驱动语义链路。
+ */
+struct SemanticInputEvent {
+    double timestamp = 0.0;
+    KeyFrame::Ptr keyframe;
+    EventMeta meta;
+    ProcessingState processing_state = ProcessingState::NORMAL;
+
+    bool isValid() const {
+        return std::isfinite(timestamp) && keyframe != nullptr && meta.isValid();
+    }
 };
 
 struct GPSAlignRequestEvent {

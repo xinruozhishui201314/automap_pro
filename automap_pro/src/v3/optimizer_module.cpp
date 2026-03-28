@@ -298,6 +298,9 @@ void OptimizerModule::processTaskInternal(const OptTaskItem& task) {
         case OptTaskItem::Type::CYLINDER_LANDMARK_FACTOR:
             processCylinderLandmarkFactor(task);
             break;
+        case OptTaskItem::Type::PLANE_LANDMARK_FACTOR:
+            processPlaneLandmarkFactor(task);
+            break;
         default:
             break;
     }
@@ -331,6 +334,36 @@ void OptimizerModule::processCylinderLandmarkFactor(const OptTaskItem& task) {
     RCLCPP_INFO(node_->get_logger(),
         "[CHAIN][B5 SEM->OPT] action=factor_applied trace=%lu kf_id=%d factors=%zu",
         static_cast<unsigned long>(trace_id), task.to_id, task.cylinder_factors.size());
+}
+
+void OptimizerModule::processPlaneLandmarkFactor(const OptTaskItem& task) {
+    if (task.plane_factors.empty()) {
+        RCLCPP_DEBUG(node_->get_logger(),
+            "[SEMANTIC][Optimizer][processPlaneLandmarkFactor] step=skip reason=empty_factors kf_id=%d",
+            task.to_id);
+        return;
+    }
+    uint64_t kf_id = static_cast<uint64_t>(task.to_id);
+    double approx_ts = 0.0;
+    if (!task.plane_factors.empty()) {
+        kf_id = task.plane_factors.front().kf_id;
+        if (auto kf = map_registry_->getKeyFrame(static_cast<int>(kf_id))) {
+            approx_ts = kf->timestamp;
+        }
+    }
+    const uint64_t trace_id = semanticTraceId(kf_id, approx_ts);
+
+    RCLCPP_DEBUG(node_->get_logger(),
+        "[SEMANTIC][Optimizer][processPlaneLandmarkFactor] step=entry trace=%lu kf_id=%d factors=%zu",
+        static_cast<unsigned long>(trace_id), task.to_id, task.plane_factors.size());
+
+    for (const auto& factor : task.plane_factors) {
+        optimizer_.addPlaneFactorForKeyFrame(static_cast<int>(factor.kf_id), factor);
+    }
+
+    RCLCPP_INFO(node_->get_logger(),
+        "[CHAIN][B5 SEM->OPT] action=plane_factor_applied trace=%lu kf_id=%d factors=%zu",
+        static_cast<unsigned long>(trace_id), task.to_id, task.plane_factors.size());
 }
 
 void OptimizerModule::processTask(const OptTaskItem& task) {

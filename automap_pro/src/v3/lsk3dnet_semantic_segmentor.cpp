@@ -152,6 +152,7 @@ public:
         (void)cloud;
         (void)mask;
         if (result != nullptr) {
+            result->per_point_labels.clear();
             result->success = false;
             result->backend_name = name();
             result->message = "USE_TORCH disabled";
@@ -161,12 +162,16 @@ public:
         if (!cloud || cloud->empty()) {
             mask = cv::Mat::zeros(cfg_.img_h, cfg_.img_w, CV_8U);
             if (result != nullptr) {
+                result->per_point_labels.clear();
                 result->success = true;
                 result->backend_name = name();
                 result->message = "empty cloud";
                 result->inference_ms = 0.0;
             }
             return;
+        }
+        if (result != nullptr) {
+            result->per_point_labels.clear();
         }
         const auto t0 = std::chrono::steady_clock::now();
         const int channels = std::max(4, cfg_.input_channels > 0 ? cfg_.input_channels : 4);

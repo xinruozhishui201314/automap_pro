@@ -4,7 +4,7 @@
 # 配置结构：
 #   一、总体参数     system（名称、输出目录、线程、日志、工程化/健康检查/告警/性能/诊断/状态机）
 #   二、前端参数     sensor、frontend、keyframe、fast_livo（使能/外参/预处理/VIO/IMU/LIO/发布/保存/调试）
-#   三、后端参数     submap、gps 对齐、loop_closure、backend、map、session
+#   三、后端参数     submap、gps 对齐、loop_closure、backend、map、semantic、session
 #
 # 话题唯一来源：sensor 节；fast_livo.common 仅保留 img_en/lidar_en 等开关。
 # ══════════════════════════════════════════════════════════════════════════════
@@ -243,6 +243,8 @@ submap:
   max_temporal_s:    60.0
   match_resolution:   0.4
   merge_resolution:   0.2
+  # merged_cloud / downsampled_cloud：体素内对 intensity 做众数投票（整块地图子图间回环语义 ICP，intensity=class id）
+  semantic_intensity_vote: true
   # 子图重建点云的阈值：当位姿跳变超过此值时触发 rebuild (trans_m, rot_deg)
   rebuild_threshold_trans_m: 2.0
   rebuild_threshold_rot_deg: 5.0
@@ -316,6 +318,31 @@ loop_closure:
     min_safe_inliers: 10     # TEASER 内点数低于此拒绝；弱重叠场景可放宽至 6，需关注误匹配
     max_rmse_m:       0.3
     icp_refine:       true
+  # TEASER 初值 vs ICP 精配：差异过大则拒收闭环（0=关闭该维）
+  teaser_icp_agreement:
+    max_trans_diff_m: 4.0
+    max_rot_diff_deg: 35.0
+  # inlier 贴近阈值时对信息矩阵降权（配合 loop_detector）
+  constraint_margin:
+    low_trust_information_scale: 0.5
+    inlier_soft_margin: 0.035
+  # 后端入图前再拦一刀：相对平移范数/旋转角过大则拒绝（0=不启用）
+  constraint_max_translation_m: 0.0
+  constraint_max_rotation_deg: 0.0
+  # SuMa++ 类：TEASER 后 ICP 用语义一致性加权（需语义模块产出 labeled_cloud 且已挂到关键帧）
+  semantic_icp:
+    enabled: true
+    min_label_ratio: 0.06
+    weight_match: 1.0
+    weight_mismatch: 0.18
+    weight_unknown: 0.5
+    weight_dynamic: 0.08
+    max_iterations: 40
+    icp_preprocess_downsample: false
+    icp_preprocess_sor: false
+    dynamic_class_ids: [10, 11, 15, 16, 18]
+    # 标签占比在灰区时线性向几何权重混合，避免稀疏标签过信语义
+    gray_zone_linear_trust: true
   # ── ScanContext 回环粗匹配 ───────────────────────────────────────────
   scancontext:
     enabled:           true    # 是否启用 ScanContext 进行回环检索（默认启用）
@@ -379,7 +406,79 @@ map:
   # 地图坐标系原点经纬度配置文件：先创建再写入；默认 output_dir/map_frame.cfg
   frame_config_path: ""   # 空则用 system.output_dir + "/map_frame.cfg"
 
-# ── 3.6 多会话建图 ─────────────────────────────────────────────────────────
+# ── 3.6 语义链路（LSK3DNet / 几何地面+立面 / 圆柱树干 → 子图关联 → iSAM2/HBA 因子）────────
+# 与 docs 及 ConfigManager semantic.* 键一致；未写则使用代码内默认值。
+semantic:
+  enabled: true
+  # geometric_only | model_only | hybrid（有 GPU/模型权重时用 hybrid 可融合学习分割与 Patchwork++/RANSAC）
+  mode: geometric_only
+  # 异步语义结果与关键帧时间对齐窗口(s)。过小会导致 E_KF_NOT_FOUND、因子不入图；0.10~0.25 常见
+  timestamp_match_tolerance_s: 0.15
+  keyframe_time_tolerance_s: 0.03
+  # 语义点云再次挂到同一关键帧时：与已存标签逐点一致比例低于此则拒收更新（抑闪烁）；0=关闭
+  cloud_attach:
+    min_point_agreement: 0.0
+  lsk3dnet:
+    num_vote: 2          # 多视图投票：稀疏场景下 trunk 标签更稳（2~3，延迟略增）
+    device: cpu          # cuda:0 若已部署 Torch+CUDA
+  # 稀疏 LiDAR / 多树干：提高召回（误检略增时可收紧 min_tree_confidence 或 linearity_threshold）
+  min_tree_confidence: 0.68
+  # geometric_only：树冠–地面间竖直 shaft 粗判→refine→与 LINE 共用圆柱链（键与 ConfigManager semantic.* 一致）
+  geometric_only_shaft_enable: true
+  geometric_only_shaft_xy_cell_m: 0.42
+  geometric_only_shaft_min_extent_m: 1.62
+  geometric_only_shaft_min_points: 14
+  geometric_only_shaft_max_xy_spread_m: 0.95
+  geometric_only_shaft_refine_radius_m: 0.58
+  geometric_only_shaft_rel_z_max_m: 22.0
+  geometric_only_shaft_max_candidates: 64
+  geometric_only_shaft_skip_near_line_xy_m: 0.52
+  geometric_only_shaft_skip_near_tree_xy_m: 0.55
+  # 入 iSAM2 前最后一道门：多帧 support/observability 通过后仍可做几何一致性过滤（漏检风险见各 0/-1 关闭项）
+  backend_gating:
+    enabled: true
+    cylinder:
+      min_primitive_linearity: 0.52
+      min_detection_points: 10
+      max_abs_radial_error_m: 0.55
+      min_kf_confidence: 0.0
+    plane:
+      min_detection_points: 80
+  geometric:
+    enabled: true
+    log_level: info
+    max_lines_per_cluster: 3
+    euclidean_cluster:
+      tolerance_m: 0.38
+      min_points: 12
+      max_points: 12000
+    geometric_only_frame_merge:
+      max_xy_m: 0.48
+    accumulator:
+      enabled: true
+      # 几何辨识前叠加最近 N 帧到当前车体；稀疏雷达宜 24~48，过大则 Patchwork/聚类耗时与内存上升
+      max_frames: 32
+    wall_ransac:
+      enabled: true
+      line_distance_threshold: 0.11
+      line_min_inliers: 40
+      plane_min_inliers: 100
+    primitive_classifier:
+      linearity_threshold: 0.58
+    association:
+      cylinder:
+        min_confirmations: 2
+        min_observability: 0.22
+        protection_mode:
+          trigger_tree_new_rate_pct: 52.0
+          trigger_duplicate_density: 0.05
+          recover_tree_new_rate_pct: 22.0
+          recover_duplicate_density: 0.012
+      plane:
+        min_confirmations: 2      # 与圆柱一致：至少两帧支持再发平面因子，抑制单次立面误检
+        min_observability: 0.25
+
+# ── 3.7 多会话建图 ─────────────────────────────────────────────────────────
 session:
   multi_session: false
   session_dir:   ""

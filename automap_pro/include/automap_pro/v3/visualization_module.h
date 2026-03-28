@@ -1,6 +1,7 @@
 #pragma once
 
 #include "automap_pro/v3/module_base.h"
+#include <algorithm>
 #include <cmath>
 #include "automap_pro/visualization/rviz_publisher.h"
 #include "automap_pro/core/config_manager.h"
@@ -28,7 +29,8 @@ public:
         rviz_publisher_.init(node_);
         rviz_publisher_.setFrameId("map");
 
-        // 订阅同步帧（用于显示当前点云）
+        // 订阅同步帧（用于显示当前点云：完整扫描，强度为原始值）
+        // 语义着色与地标见 SemanticCloudEvent + publishEverything(semantic_landmarks)。
         // 🏛️ [P0 性能优化] 使用 onEventAsync 确保可视化点云变换不阻塞 FrontEndModule 发布线程
         onEventAsync<SyncedFrameEvent>([this](const SyncedFrameEvent& ev) {
             // 与 global_map / optimized_path 一致：回环或 iSAM2 修正后 T_map_b_optimized ≠ T_odom_b，
@@ -91,12 +93,159 @@ public:
             requestRefresh();
         });
 
+        // 订阅语义点云：与输入同点数（强度为类别 id，RViz 中映射为 RGB），用于「在完整几何上叠加语义」；
+        // 树干/目标标注另见 /automap/semantic_landmarks（圆柱 Marker）。
+        onEventAsync<SemanticCloudEvent>([this](const SemanticCloudEvent& ev) {
+            const auto recv_count = semantic_cloud_events_received_.fetch_add(1, std::memory_order_relaxed) + 1;
+            const auto recv_count_snapshot = semantic_cloud_events_received_.load(std::memory_order_relaxed);
+            const auto pub_count_snapshot = semantic_cloud_events_published_.load(std::memory_order_relaxed);
+            RCLCPP_INFO_THROTTLE(node_->get_logger(), *node_->get_clock(), 2000,
+                "[V3][SEM_CLOUD][STATS] stage=recv recv_total=%lu pub_total=%lu frame_id=%s pts=%zu",
+                static_cast<unsigned long>(recv_count_snapshot),
+                static_cast<unsigned long>(pub_count_snapshot),
+                ev.frame_id.c_str(),
+                ev.labeled_cloud ? ev.labeled_cloud->size() : 0);
+            try {
+                auto snapshot = map_registry_->getPoseSnapshot();
+                CloudXYZIPtr cloud_map(new CloudXYZI());
+
+                Pose3d T_map_odom = Pose3d::Identity();
+                if (snapshot->gps_aligned) {
+                    T_map_odom.linear()      = snapshot->R_enu_to_map;
+                    T_map_odom.translation() = snapshot->t_enu_to_map;
+                }
+
+                KeyFrame::Ptr anchor_kf = map_registry_->getLatestKeyFrameByTimestamp();
+                Pose3d T_world_to_map = T_map_odom;
+                if (anchor_kf) {
+                    Pose3d T_k_opt = anchor_kf->T_map_b_optimized;
+                    auto it = snapshot->keyframe_poses.find(anchor_kf->id);
+                    if (it != snapshot->keyframe_poses.end()) {
+                        T_k_opt = it->second;
+                    }
+                    if (anchor_kf->pose_frame == PoseFrame::ODOM && snapshot->gps_aligned) {
+                        T_k_opt = T_map_odom * T_k_opt;
+                    }
+                    T_world_to_map = T_k_opt * anchor_kf->T_odom_b.inverse();
+                }
+
+                const double sem_ts_tol = ConfigManager::instance().semanticTimestampMatchToleranceS();
+                if (ev.frame_id == "world") {
+                    pcl::transformPointCloud(*ev.labeled_cloud, *cloud_map, T_world_to_map.matrix().cast<float>());
+                } else {
+                    // body：必须用该帧对应关键帧位姿；误用「最新锚点链」会把地面/语义整体拉偏
+                    auto kf = map_registry_->getKeyFrameByTimestamp(ev.timestamp, sem_ts_tol);
+                    if (!kf && std::isfinite(ev.timestamp) && ev.timestamp > 0.0) {
+                        kf = map_registry_->getKeyFrameByTimestamp(ev.timestamp, std::min(0.5, sem_ts_tol * 2.0));
+                    }
+                    if (!kf) {
+                        RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 3000,
+                            "[V3][SEM_CLOUD] skip publish: no keyframe for ts=%.3f (body frame); "
+                            "avoid wrong T_map_body fallback",
+                            ev.timestamp);
+                        return;
+                    }
+                    Pose3d T_kf_opt = kf->T_map_b_optimized;
+                    auto it = snapshot->keyframe_poses.find(kf->id);
+                    if (it != snapshot->keyframe_poses.end()) {
+                        T_kf_opt = it->second;
+                    }
+                    if (kf->pose_frame == PoseFrame::ODOM && snapshot->gps_aligned) {
+                        T_kf_opt = T_map_odom * T_kf_opt;
+                    }
+                    pcl::transformPointCloud(*ev.labeled_cloud, *cloud_map, T_kf_opt.matrix().cast<float>());
+                }
+                rviz_publisher_.publishSemanticCloud(cloud_map, "map");
+                const auto pub_count = semantic_cloud_events_published_.fetch_add(1, std::memory_order_relaxed) + 1;
+                requestRefresh(); // 语义地标等随 MapUpdate 刷新；此处再触发一次以免仅语义帧到达时滞后
+                RCLCPP_INFO_THROTTLE(node_->get_logger(), *node_->get_clock(), 2000,
+                    "[V3][SEM_CLOUD][STATS] stage=publish recv_total=%lu pub_total=%lu map_pts=%zu",
+                    static_cast<unsigned long>(recv_count),
+                    static_cast<unsigned long>(pub_count),
+                    cloud_map->size());
+            } catch (const std::exception& e) {
+                const auto recv_now = semantic_cloud_events_received_.load(std::memory_order_relaxed);
+                const auto pub_now = semantic_cloud_events_published_.load(std::memory_order_relaxed);
+                RCLCPP_ERROR(node_->get_logger(), "[V3][DIAG] step=SemanticCloud EXCEPTION: %s", e.what());
+                RCLCPP_ERROR(node_->get_logger(),
+                    "[V3][SEM_CLOUD][STATS] stage=exception recv_total=%lu pub_total=%lu",
+                    static_cast<unsigned long>(recv_now),
+                    static_cast<unsigned long>(pub_now));
+            }
+        });
+
+        // 树干：maskCloud(tree_label) 后聚类前 / Trellis 聚类后 → /automap/semantic_trunk_pre_cluster|post_cluster
+        onEventAsync<SemanticTrunkVizEvent>([this](const SemanticTrunkVizEvent& ev) {
+            try {
+                auto snapshot = map_registry_->getPoseSnapshot();
+                Pose3d T_map_odom = Pose3d::Identity();
+                if (snapshot->gps_aligned) {
+                    T_map_odom.linear()      = snapshot->R_enu_to_map;
+                    T_map_odom.translation() = snapshot->t_enu_to_map;
+                }
+                KeyFrame::Ptr anchor_kf = map_registry_->getLatestKeyFrameByTimestamp();
+                Pose3d T_world_to_map = T_map_odom;
+                if (anchor_kf) {
+                    Pose3d T_k_opt = anchor_kf->T_map_b_optimized;
+                    auto it_a = snapshot->keyframe_poses.find(anchor_kf->id);
+                    if (it_a != snapshot->keyframe_poses.end()) {
+                        T_k_opt = it_a->second;
+                    }
+                    if (anchor_kf->pose_frame == PoseFrame::ODOM && snapshot->gps_aligned) {
+                        T_k_opt = T_map_odom * T_k_opt;
+                    }
+                    T_world_to_map = T_k_opt * anchor_kf->T_odom_b.inverse();
+                }
+
+                const double trunk_ts_tol = ConfigManager::instance().semanticTimestampMatchToleranceS();
+                const auto to_map = [&](const CloudXYZIPtr& body) -> CloudXYZIPtr {
+                    if (!body || body->empty()) return nullptr;
+                    CloudXYZIPtr out(new CloudXYZI());
+                    if (ev.frame_id == "world") {
+                        pcl::transformPointCloud(*body, *out, T_world_to_map.matrix().cast<float>());
+                    } else {
+                        auto kf = map_registry_->getKeyFrameByTimestamp(ev.timestamp, trunk_ts_tol);
+                        if (!kf && std::isfinite(ev.timestamp) && ev.timestamp > 0.0) {
+                            kf = map_registry_->getKeyFrameByTimestamp(ev.timestamp, std::min(0.5, trunk_ts_tol * 2.0));
+                        }
+                        if (!kf) {
+                            RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 3000,
+                                "[V3][SEM_TRUNK_VIZ] skip cloud: no keyframe for ts=%.3f (body frame)",
+                                ev.timestamp);
+                            return nullptr;
+                        }
+                        Pose3d T_kf_opt = kf->T_map_b_optimized;
+                        auto it_k = snapshot->keyframe_poses.find(kf->id);
+                        if (it_k != snapshot->keyframe_poses.end()) {
+                            T_kf_opt = it_k->second;
+                        }
+                        if (kf->pose_frame == PoseFrame::ODOM && snapshot->gps_aligned) {
+                            T_kf_opt = T_map_odom * T_kf_opt;
+                        }
+                        pcl::transformPointCloud(*body, *out, T_kf_opt.matrix().cast<float>());
+                    }
+                    return out;
+                };
+
+                CloudXYZIPtr pre_map = to_map(ev.pre_cluster_body);
+                CloudXYZIPtr post_map = to_map(ev.post_cluster_body);
+                if (pre_map && !pre_map->empty()) {
+                    rviz_publisher_.publishSemanticTrunkPreCluster(pre_map, "map");
+                }
+                if (post_map && !post_map->empty()) {
+                    rviz_publisher_.publishSemanticTrunkPostCluster(post_map, "map");
+                }
+            } catch (const std::exception& e) {
+                RCLCPP_ERROR(node_->get_logger(), "[V3][DIAG] step=SemanticTrunkViz EXCEPTION: %s", e.what());
+            }
+        });
+
         // 订阅优化结果事件
         onEventAsync<OptimizationResultEvent>([this](const OptimizationResultEvent& /*ev*/) {
             requestRefresh();
         });
         RCLCPP_INFO(node_->get_logger(),
-                    "[PIPELINE][VIZ] ctor OK RvizPublisher+SyncedFrame/GPSAligned/MapUpdate/OptResult");
+                    "[PIPELINE][VIZ] ctor OK RvizPublisher+SyncedFrame/GPSAligned/MapUpdate/SemanticTrunk/OptResult");
     }
 
 protected:
@@ -159,6 +308,8 @@ private:
     RvizPublisher rviz_publisher_;
     
     std::atomic<bool> refresh_pending_{false};
+    std::atomic<uint64_t> semantic_cloud_events_received_{0};
+    std::atomic<uint64_t> semantic_cloud_events_published_{0};
 };
 
 } // namespace automap_pro::v3

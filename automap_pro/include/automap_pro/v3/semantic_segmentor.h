@@ -29,6 +29,17 @@ struct SegmentorConfig {
     float fov_down = -22.5f;
     int img_w = 2048;
     int img_h = 64;
+    /** test_skitti 风格：对固定增强视角的 classifier logits 做 index_add 式累加后再 argmax；1=关闭 TTA */
+    int lsk_num_vote = 1;
+    /** 与训练 dataloader 一致：仅对 dataset_params 体积盒内点跑骨干/分类，盒外点语义标为 0 */
+    bool lsk_training_volume_crop = false;
+    bool lsk_volume_bounds_valid = false;
+    float lsk_vol_min_x = 0.f;
+    float lsk_vol_min_y = 0.f;
+    float lsk_vol_min_z = 0.f;
+    float lsk_vol_max_x = 0.f;
+    float lsk_vol_max_y = 0.f;
+    float lsk_vol_max_z = 0.f;
     int input_channels = 0;
     int num_classes = 0;
     int tree_class_id = -1;
@@ -43,6 +54,12 @@ struct SemanticSegResult {
     std::string backend_name;
     std::string message;
     double inference_ms = 0.0;
+    /**
+     * 与 run(cloud,...) 的 cloud->points 顺序一一对应（通常即 SemanticProcessor 的 flipped 点云）。
+     * 非空时语义标签来自骨干+分类头逐点 argmax，不经过 range mask 的「每像素最后一次写入」坍缩。
+     * 下游应优先用此构造稠密 labeled / 树干子集；mask 仍保留供 RViz 与 Trellis organized 路径。
+     */
+    std::vector<uint8_t> per_point_labels;
 };
 
 class ISemanticSegmentor {
@@ -55,5 +72,11 @@ public:
     virtual void maskCloud(const CloudXYZIConstPtr& cloud, const cv::Mat& mask, CloudXYZIPtr& out_cloud,
                            int tree_label, bool dense_for_clustering) = 0;
 };
+
+// Process-wide shutdown guard for hybrid semantic worker recovery path.
+// SemanticModule sets this flag before fatal shutdown to block worker restart
+// during teardown and avoid exit-phase races.
+void SetSemanticHybridShutdownGuard(bool enabled);
+bool IsSemanticHybridShutdownGuard();
 
 }  // namespace automap_pro::v3

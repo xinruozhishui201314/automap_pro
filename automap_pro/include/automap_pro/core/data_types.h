@@ -131,14 +131,25 @@ struct GPSMeasurement {
 // 语义地标：圆柱体 (Tree Trunk)
 // ─────────────────────────────────────────────────────────────────────────────
 struct CylinderLandmark {
+    /// 进程内唯一实例 id（与 associated_idx 不同；后者为所属 SubMap 内线地标向量下标）。
+    /// SubMapManager::associateLandmarks 匹配成功后会把关键帧观测的 id 置为子图规范化 id。
     uint64_t id = 0;
     uint64_t submap_id = 0;                          // 所属子图 ID
     int associated_idx = -1;                        // 关联到的子图内地标索引
-    Eigen::Vector3d root = Eigen::Vector3d::Zero(); // 底部中心点 (body 系或 submap 系)
+    /// 轴线上参考点：拟合后沿轴平移到低分位 t（抗离群），且轴线与 +Z 对齐时再取近地端；非绝对地面真值。
+    Eigen::Vector3d root = Eigen::Vector3d::Zero();
     Eigen::Vector3d ray = Eigen::Vector3d::UnitZ(); // 轴向向量
     double radius = 0.1;                            // 半径
     double confidence = 0.0;                        // 拟合置信度/得分
-    
+    // Data-association lifecycle: only landmarks with enough support enter strong backend constraints.
+    uint32_t support_count = 1;
+    // [0,1], higher means this landmark is repeatedly observed and geometrically stable.
+    double observability_score = 0.5;
+    /// Zhou22 线状性 L=(l3-l2)/l3，来自几何基元；<0 表示非几何线分支或未设置。
+    double primitive_linearity = -1.0;
+    /// 参与圆柱拟合/附着的点数，用于后端稀疏观测门控。
+    int detection_point_count = 0;
+
     // 原始点云索引或简易点集（可选，用于可视化或进一步优化）
     CloudXYZIPtr points; 
 
@@ -150,6 +161,39 @@ struct CylinderLandmark {
     }
 
     using Ptr = std::shared_ptr<CylinderLandmark>;
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 语义地标：平面 (Wall/Plane)
+// ─────────────────────────────────────────────────────────────────────────────
+struct PlaneLandmark {
+    /// 进程内唯一实例 id（圆柱与平面共用分配序列；与 associated_idx 解耦）。
+    /// associateLandmarks 匹配成功后关键帧观测 id 与子图内地标 id 对齐。
+    uint64_t id = 0;
+    uint64_t submap_id = 0;
+    int associated_idx = -1;
+    Eigen::Vector3d normal = Eigen::Vector3d::UnitZ(); // 法向量 (a, b, c)
+    double distance = 0.0;                             // 到原点距离 d (ax + by + cz + d = 0)
+    double confidence = 0.0;
+    uint32_t support_count = 1;
+    double observability_score = 0.5;
+    int detection_point_count = 0;
+
+    // Estimated geometric extents in the local frame where the landmark is defined.
+    // For KF-level landmarks this is the body frame; for SubMap-level landmarks it
+    // is the submap frame. Used by backend gating to filter out short/low planes
+    // such as car bodies / guardrails.
+    double vertical_span_m = 0.0;   // extent along local "up" when available
+    double tangent_span_m = 0.0;    // dominant in-plane tangent extent (e.g. wall length)
+
+    CloudXYZIPtr points;
+
+    bool isValid() const {
+        return normal.norm() > 0.9 && std::isfinite(distance) && 
+               std::isfinite(confidence) && confidence >= 0.0;
+    }
+
+    using Ptr = std::shared_ptr<PlaneLandmark>;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -187,6 +231,8 @@ struct KeyFrame {
     // 点云（body系下）
     CloudXYZIPtr cloud_body;      // 原始体素化点云（body frame）
     CloudXYZIPtr cloud_ds_body;   // 下采样点云（用于匹配）
+    /// 与 cloud_body 同点数、同序时有效：intensity 存语义类别 id（0=未知）；供回环语义加权 ICP
+    CloudXYZIPtr cloud_semantic_labeled_body;
 
     // GPS
     GPSMeasurement gps;
@@ -197,6 +243,7 @@ struct KeyFrame {
 
     // 语义地标 (相对于 body 系)
     std::vector<CylinderLandmark::Ptr> landmarks;
+    std::vector<PlaneLandmark::Ptr> plane_landmarks;
 
     // 图像（可选）
     cv::Mat image;
@@ -262,6 +309,7 @@ struct SubMap {
 
     // 语义地标 (相对于 submap 锚点系)
     std::vector<CylinderLandmark::Ptr> landmarks;
+    std::vector<PlaneLandmark::Ptr> plane_landmarks;
 
     // 锚定位姿
     Pose3d pose_odom_anchor        = Pose3d::Identity(); // 锚点在里程计系下的位姿

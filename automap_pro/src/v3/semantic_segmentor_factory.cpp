@@ -7,8 +7,12 @@ namespace automap_pro::v3 {
 std::unique_ptr<ISemanticSegmentor> CreateSloamSemanticSegmentor(const SegmentorConfig& cfg);
 std::unique_ptr<ISemanticSegmentor> CreateLsk3dnetSemanticSegmentor(const SegmentorConfig& cfg);
 std::unique_ptr<ISemanticSegmentor> CreateLsk3dnetHybridSemanticSegmentor(const SegmentorConfig& cfg);
+std::unique_ptr<ISemanticSegmentor> CreateNoopGeometricSemanticSegmentor(const SegmentorConfig& cfg);
 
 std::unique_ptr<ISemanticSegmentor> SemanticSegmentorFactory::Create(const SegmentorConfig& cfg) {
+    if (cfg.model_type == "noop_geometric") {
+        return CreateNoopGeometricSemanticSegmentor(cfg);
+    }
     if (cfg.model_type == "sloam") {
         return CreateSloamSemanticSegmentor(cfg);
     }

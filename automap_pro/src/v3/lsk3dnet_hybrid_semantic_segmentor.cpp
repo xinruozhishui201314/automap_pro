@@ -1,11 +1,14 @@
 #include "automap_pro/v3/semantic_segmentor.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cerrno>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <exception>
+#include <filesystem>
 #include <iostream>
 #include <limits>
 #include <mutex>
@@ -37,8 +40,51 @@
 
 namespace automap_pro::v3 {
 
+namespace {
+std::atomic<bool>& hybridShutdownGuard() {
+    static std::atomic<bool> g{false};
+    return g;
+}
+}  // namespace
+
+void SetSemanticHybridShutdownGuard(bool enabled) {
+    hybridShutdownGuard().store(enabled, std::memory_order_relaxed);
+}
+
+bool IsSemanticHybridShutdownGuard() {
+    return hybridShutdownGuard().load(std::memory_order_relaxed);
+}
+
 #ifdef USE_TORCH
 namespace detail_hybrid {
+
+void appendNestedException(std::ostringstream& oss, const std::exception& e, int depth) {
+    oss << "[depth=" << depth << "] " << e.what();
+    try {
+        std::rethrow_if_nested(e);
+    } catch (const std::exception& nested) {
+        oss << " | ";
+        appendNestedException(oss, nested, depth + 1);
+    } catch (...) {
+        oss << " | [depth=" << (depth + 1) << "] <non-std nested exception>";
+    }
+}
+
+std::string describeExceptionFull(const std::exception& e) {
+    std::ostringstream oss;
+    appendNestedException(oss, e, 0);
+    return oss.str();
+}
+
+std::string describeCurrentExceptionFull() {
+    try {
+        throw;
+    } catch (const std::exception& e) {
+        return describeExceptionFull(e);
+    } catch (...) {
+        return "<non-std exception>";
+    }
+}
 
 struct ProjectionIndex {
     int x = 0;
@@ -129,7 +175,9 @@ struct ClassifierMetaFile {
     bool present = false;
     uint32_t feat_dim = 0;
     uint32_t num_classes = 0;
+    uint32_t input_dims = 0;
     std::string checkpoint_sha256_hex;
+    std::string config_yaml_export;
 };
 
 static std::string jsonEscape(std::string s) {
@@ -157,8 +205,14 @@ ClassifierMetaFile loadClassifierMeta(const std::string& classifier_torchscript_
         if (j.contains("num_classes")) {
             out.num_classes = static_cast<uint32_t>(j.at("num_classes").get<int>());
         }
+        if (j.contains("input_dims")) {
+            out.input_dims = static_cast<uint32_t>(j.at("input_dims").get<int>());
+        }
         if (j.contains("checkpoint_sha256_hex")) {
             out.checkpoint_sha256_hex = j.at("checkpoint_sha256_hex").get<std::string>();
+        }
+        if (j.contains("config_yaml_export")) {
+            out.config_yaml_export = j.at("config_yaml_export").get<std::string>();
         }
     } catch (const std::exception& e) {
         throw std::runtime_error(std::string("lsk3dnet_hybrid: failed to parse classifier meta JSON: ") + path + ": " + e.what());
@@ -241,7 +295,12 @@ public:
             }
 
             if (::chdir(cfg_.lsk3dnet_repo_root.c_str()) != 0) _exit(122);
-            ::setenv("PYTHONPATH", cfg_.lsk3dnet_repo_root.c_str(), 1);
+            // 🏛️ [Fix] Add c_utils to PYTHONPATH so worker can find compiled normal generation libraries
+            std::string python_path = cfg_.lsk3dnet_repo_root + ":" + 
+                                     (std::filesystem::path(cfg_.lsk3dnet_repo_root) / "c_utils").string();
+            const char* old_pp = std::getenv("PYTHONPATH");
+            if (old_pp) python_path = std::string(old_pp) + ":" + python_path;
+            ::setenv("PYTHONPATH", python_path.c_str(), 1);
             // 🏛️ [架构加固] 降低语义推理进程优先级，确保前端 LIO 实时性 (解决 IMU Jumps)
             nice(10);
             const std::string& py = cfg_.lsk3dnet_python_exe;
@@ -264,6 +323,23 @@ public:
         const std::string json = buildInitJson(cfg_, expected_checkpoint_sha256_hex);
         RCLCPP_INFO(rclcpp::get_logger("automap_system"), 
                     "[SEMANTIC][HybridWorker] Sending INIT JSON to worker...");
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                    "[SEMANTIC][HybridWorker][INIT_AUDIT] source={SegmentorConfig from SemanticProcessor} "
+                    "effective={repo_root=%s config_yaml=%s checkpoint=%s python=%s worker=%s device=%s "
+                    "normal_mode=%s normal_profile=[up=%.1f,down=%.1f,h=%d,w=%d]}",
+                    cfg_.lsk3dnet_repo_root.c_str(),
+                    cfg_.lsk3dnet_config_yaml.c_str(),
+                    cfg_.lsk3dnet_checkpoint.c_str(),
+                    cfg_.lsk3dnet_python_exe.c_str(),
+                    cfg_.lsk3dnet_worker_script.c_str(),
+                    cfg_.lsk3dnet_device.c_str(),
+                    cfg_.lsk3dnet_hybrid_normal_mode.c_str(),
+                    cfg_.lsk3dnet_normal_fov_up_deg,
+                    cfg_.lsk3dnet_normal_fov_down_deg,
+                    cfg_.lsk3dnet_normal_proj_h,
+                    cfg_.lsk3dnet_normal_proj_w);
+        RCLCPP_DEBUG(rclcpp::get_logger("automap_system"),
+                    "[SEMANTIC][HybridWorker][INIT_AUDIT] init_json=%s", json.c_str());
         
         writeFrame(fd_write_, kCmdInit, json.data(), json.size());
 
@@ -351,6 +427,10 @@ private:
             try {
                 writeFrame(fd_write_, kCmdShutdown, nullptr, 0);
             } catch (...) {
+                RCLCPP_ERROR(
+                    rclcpp::get_logger("automap_system"),
+                    "[SEMANTIC][HybridWorker][SHUTDOWN] write shutdown frame failed: %s",
+                    describeCurrentExceptionFull().c_str());
             }
             close_safe(fd_write_);
         }
@@ -385,15 +465,51 @@ struct HybridSharedState {
     SegmentorConfig frozen_cfg;
     uint32_t validated_feat_dim = 0;
     uint32_t validated_num_classes = 0;
+    bool classifier_initialized = false;
     
     // 🏛️ [逻辑加固] 统一 FOV 状态，解决 C++/Python 映射不一致问题
     double nn_fov_up_rad = 0.0;
     double nn_fov_down_rad = 0.0;
+
+    // Recovery storm guard (protected by backbone_mu).
+    std::chrono::steady_clock::time_point last_restart_tp{};
+    uint64_t restart_attempts_total = 0;
+    uint64_t restart_success_total = 0;
+    uint64_t restart_throttled_total = 0;
 };
 
 HybridSharedState& hybridState() {
     static HybridSharedState s;
     return s;
+}
+
+bool isRecoverableWorkerTransportError(const std::string& msg) {
+    return (msg.find("hybrid worker EOF") != std::string::npos) ||
+           (msg.find("hybrid worker bad magic") != std::string::npos) ||
+           (msg.find("hybrid worker bad protocol version") != std::string::npos) ||
+           (msg.find("hybrid worker read failed") != std::string::npos) ||
+           (msg.find("hybrid worker write failed") != std::string::npos);
+}
+
+enum class HybridRecoverStatus : int {
+    kNoError = 0,
+    kNonRecoverable = 1,
+    kRecoverable = 2,
+    kRestartThrottled = 3,
+    kRestartSuccess = 4,
+    kRestartFailed = 5,
+};
+
+const char* toString(HybridRecoverStatus st) {
+    switch (st) {
+        case HybridRecoverStatus::kNoError: return "NO_ERROR";
+        case HybridRecoverStatus::kNonRecoverable: return "NON_RECOVERABLE";
+        case HybridRecoverStatus::kRecoverable: return "RECOVERABLE";
+        case HybridRecoverStatus::kRestartThrottled: return "RESTART_THROTTLED";
+        case HybridRecoverStatus::kRestartSuccess: return "RESTART_SUCCESS";
+        case HybridRecoverStatus::kRestartFailed: return "RESTART_FAILED";
+    }
+    return "UNKNOWN";
 }
 
 void hybridEnsureInit(const SegmentorConfig& cfg) {
@@ -406,31 +522,69 @@ void hybridEnsureInit(const SegmentorConfig& cfg) {
             if (cfg.lsk3dnet_checkpoint != st.init_checkpoint) {
                 throw std::runtime_error("lsk3dnet_hybrid: Checkpoint mismatch between threads");
             }
-            return;
+            // Do not return early here. Classifier init is guarded separately and
+            // must still be observed as complete by concurrent constructors.
+        } else {
+            st.frozen_cfg = cfg;
+            st.nn_fov_up_rad = static_cast<double>(cfg.fov_up) * M_PI / 180.0;
+            st.nn_fov_down_rad = static_cast<double>(cfg.fov_down) * M_PI / 180.0;
+
+            const ClassifierMetaFile meta = loadClassifierMeta(cfg.lsk3dnet_classifier_torchscript);
+            RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                "[SEMANTIC][LSK3DNET_HYBRID][LOAD] step=begin ts=%s py=%s worker=%s repo_root=%s cfg=%s ckpt=%s cls_ts=%s dev_req=%s normal(mode=%s fov=[%.1f,%.1f] proj=%dx%d)",
+                TORCH_VERSION, cfg.lsk3dnet_python_exe.c_str(), cfg.lsk3dnet_worker_script.c_str(),
+                cfg.lsk3dnet_repo_root.c_str(), cfg.lsk3dnet_config_yaml.c_str(),
+                cfg.lsk3dnet_checkpoint.c_str(), cfg.lsk3dnet_classifier_torchscript.c_str(),
+                cfg.lsk3dnet_device.c_str(), cfg.lsk3dnet_hybrid_normal_mode.c_str(),
+                cfg.lsk3dnet_normal_fov_up_deg, cfg.lsk3dnet_normal_fov_down_deg,
+                cfg.lsk3dnet_normal_proj_w, cfg.lsk3dnet_normal_proj_h);
+
+            st.worker = std::make_unique<HybridPythonWorker>(cfg, meta.checkpoint_sha256_hex);
+            st.validated_feat_dim = static_cast<uint32_t>(st.worker->feat_dim());
+            st.validated_num_classes = static_cast<uint32_t>(st.worker->num_classes());
+            st.init_checkpoint = cfg.lsk3dnet_checkpoint;
+
+            if (meta.present) {
+                const std::string cfg_yaml = std::filesystem::weakly_canonical(cfg.lsk3dnet_config_yaml).string();
+                std::string meta_yaml = meta.config_yaml_export;
+                if (!meta_yaml.empty()) {
+                    meta_yaml = std::filesystem::weakly_canonical(meta_yaml).string();
+                }
+                if (meta.num_classes > 0 && meta.num_classes != st.validated_num_classes) {
+                    throw std::runtime_error(
+                        "lsk3dnet_hybrid: classifier meta num_classes mismatch with worker runtime: meta=" +
+                        std::to_string(meta.num_classes) + " runtime=" + std::to_string(st.validated_num_classes));
+                }
+                if (meta.feat_dim > 0 && meta.feat_dim != st.validated_feat_dim) {
+                    throw std::runtime_error(
+                        "lsk3dnet_hybrid: classifier meta feat_dim mismatch with worker runtime: meta=" +
+                        std::to_string(meta.feat_dim) + " runtime=" + std::to_string(st.validated_feat_dim));
+                }
+                if (!meta_yaml.empty() && meta_yaml != cfg_yaml) {
+                    RCLCPP_WARN(
+                        rclcpp::get_logger("automap_system"),
+                        "[SEMANTIC][LSK3DNET_HYBRID] meta config_yaml_export differs from runtime config_yaml (meta=%s runtime=%s)",
+                        meta_yaml.c_str(), cfg_yaml.c_str());
+                }
+                RCLCPP_INFO(
+                    rclcpp::get_logger("automap_system"),
+                    "[SEMANTIC][LSK3DNET_HYBRID] meta check OK (feat_dim=%u num_classes=%u input_dims=%u sha256=%s)",
+                    meta.feat_dim, meta.num_classes, meta.input_dims,
+                    meta.checkpoint_sha256_hex.empty() ? "none" : "provided");
+            } else {
+                RCLCPP_WARN(
+                    rclcpp::get_logger("automap_system"),
+                    "[SEMANTIC][LSK3DNET_HYBRID] classifier meta not found; checkpoint/model consistency checks are limited");
+            }
         }
-        st.frozen_cfg = cfg;
-        st.nn_fov_up_rad = static_cast<double>(cfg.fov_up) * M_PI / 180.0;
-        st.nn_fov_down_rad = static_cast<double>(cfg.fov_down) * M_PI / 180.0;
-
-        const ClassifierMetaFile meta = loadClassifierMeta(cfg.lsk3dnet_classifier_torchscript);
-        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-            "[SEMANTIC][LSK3DNET_HYBRID][LOAD] step=begin ts=%s py=%s worker=%s repo_root=%s cfg=%s ckpt=%s cls_ts=%s dev_req=%s normal(mode=%s fov=[%.1f,%.1f] proj=%dx%d)",
-            TORCH_VERSION, cfg.lsk3dnet_python_exe.c_str(), cfg.lsk3dnet_worker_script.c_str(),
-            cfg.lsk3dnet_repo_root.c_str(), cfg.lsk3dnet_config_yaml.c_str(),
-            cfg.lsk3dnet_checkpoint.c_str(), cfg.lsk3dnet_classifier_torchscript.c_str(),
-            cfg.lsk3dnet_device.c_str(), cfg.lsk3dnet_hybrid_normal_mode.c_str(),
-            cfg.lsk3dnet_normal_fov_up_deg, cfg.lsk3dnet_normal_fov_down_deg,
-            cfg.lsk3dnet_normal_proj_w, cfg.lsk3dnet_normal_proj_h);
-
-        st.worker = std::make_unique<HybridPythonWorker>(cfg, meta.checkpoint_sha256_hex);
-        st.validated_feat_dim = static_cast<uint32_t>(st.worker->feat_dim());
-        st.validated_num_classes = static_cast<uint32_t>(st.worker->num_classes());
-        st.init_checkpoint = cfg.lsk3dnet_checkpoint;
     }
 
     // 2. 初始化 LibTorch 分类头 (独占锁)
     {
         std::unique_lock<std::shared_mutex> lock(st.classifier_mu);
+        if (st.classifier_initialized) {
+            return;
+        }
         at::globalContext().setUserEnabledMkldnn(false);
         torch::set_num_threads(1);
 
@@ -468,6 +622,7 @@ void hybridEnsureInit(const SegmentorConfig& cfg) {
         st.classifier.to(st.device);
         validateTorchscriptClassifier(st.classifier, st.device, static_cast<int>(st.validated_feat_dim),
                                       static_cast<int>(st.validated_num_classes));
+        st.classifier_initialized = true;
         
         RCLCPP_INFO(rclcpp::get_logger("automap_system"), 
                     "[SEMANTIC][LSK3DNET_HYBRID] Classifier contract validation OK (feat_dim=%u, num_classes=%u, device=%s)",
@@ -477,28 +632,166 @@ void hybridEnsureInit(const SegmentorConfig& cfg) {
 
 void inferFeaturesWithRecover(const std::vector<float>& pts, std::vector<float>* feat, torch::Device* out_dev) {
     HybridSharedState& st = hybridState();
+    constexpr auto kRestartCooldown = std::chrono::milliseconds(1500);
+    if (IsSemanticHybridShutdownGuard()) {
+        throw std::runtime_error("hybrid recover blocked: shutdown guard is active");
+    }
     
     // 🏛️ [架构加固] 仅在骨干推理时持有 backbone_mu，允许分类头并发
     std::lock_guard<std::mutex> lock(st.backbone_mu);
-    auto run_infer = [&] { st.worker->infer_features(pts, feat); };
+    auto run_infer = [&] {
+        if (!st.worker) {
+            throw std::runtime_error("hybrid worker unavailable before infer");
+        }
+        st.worker->infer_features(pts, feat);
+    };
     try {
         run_infer();
     } catch (const std::runtime_error& e) {
         const std::string msg = e.what();
-        if (msg.find("EOF") != std::string::npos || msg.find("worker") != std::string::npos) {
+        const bool recoverable = isRecoverableWorkerTransportError(msg);
+        RCLCPP_ERROR(
+            rclcpp::get_logger("automap_system"),
+            "[SEMANTIC][HybridRecover] infer exception: status=%s(%d) recoverable=%d msg=%s pts_floats=%zu feat_ptr=%p worker_present=%d",
+            toString(recoverable ? HybridRecoverStatus::kRecoverable : HybridRecoverStatus::kNonRecoverable),
+            static_cast<int>(recoverable ? HybridRecoverStatus::kRecoverable : HybridRecoverStatus::kNonRecoverable),
+            recoverable ? 1 : 0,
+            msg.c_str(),
+            pts.size(),
+            static_cast<void*>(feat),
+            st.worker ? 1 : 0);
+        if (recoverable) {
+            if (IsSemanticHybridShutdownGuard()) {
+                RCLCPP_ERROR(
+                    rclcpp::get_logger("automap_system"),
+                    "[SEMANTIC][HybridRecover] status=%s(%d) restart blocked by shutdown guard",
+                    toString(HybridRecoverStatus::kRestartThrottled),
+                    static_cast<int>(HybridRecoverStatus::kRestartThrottled));
+                throw;
+            }
+            const auto now = std::chrono::steady_clock::now();
+            if (st.last_restart_tp.time_since_epoch().count() != 0 &&
+                (now - st.last_restart_tp) < kRestartCooldown) {
+                ++st.restart_throttled_total;
+                const auto wait_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    kRestartCooldown - (now - st.last_restart_tp)).count();
+                RCLCPP_ERROR(
+                    rclcpp::get_logger("automap_system"),
+                    "[SEMANTIC][HybridRecover] status=%s(%d) cooldown_active wait_ms=%ld throttled_total=%lu reason=%s",
+                    toString(HybridRecoverStatus::kRestartThrottled),
+                    static_cast<int>(HybridRecoverStatus::kRestartThrottled),
+                    static_cast<long>(wait_ms),
+                    static_cast<unsigned long>(st.restart_throttled_total),
+                    msg.c_str());
+                throw;
+            }
+            st.last_restart_tp = now;
+            ++st.restart_attempts_total;
+            RCLCPP_WARN(
+                rclcpp::get_logger("automap_system"),
+                "[SEMANTIC][HybridRecover] status=%s(%d) restart worker attempt=%lu reason=%s",
+                toString(HybridRecoverStatus::kRecoverable),
+                static_cast<int>(HybridRecoverStatus::kRecoverable),
+                static_cast<unsigned long>(st.restart_attempts_total),
+                msg.c_str());
             st.worker.reset();
-            const ClassifierMetaFile meta = loadClassifierMeta(st.frozen_cfg.lsk3dnet_classifier_torchscript);
-            st.worker = std::make_unique<HybridPythonWorker>(st.frozen_cfg, meta.checkpoint_sha256_hex);
-            run_infer();
+            try {
+                const ClassifierMetaFile meta = loadClassifierMeta(st.frozen_cfg.lsk3dnet_classifier_torchscript);
+                st.worker = std::make_unique<HybridPythonWorker>(st.frozen_cfg, meta.checkpoint_sha256_hex);
+                RCLCPP_INFO(
+                    rclcpp::get_logger("automap_system"),
+                    "[SEMANTIC][HybridRecover] worker recreated successfully, retry infer now");
+                run_infer();
+                ++st.restart_success_total;
+                RCLCPP_INFO(
+                    rclcpp::get_logger("automap_system"),
+                    "[SEMANTIC][HybridRecover] status=%s(%d) retry infer succeeded restart_success_total=%lu",
+                    toString(HybridRecoverStatus::kRestartSuccess),
+                    static_cast<int>(HybridRecoverStatus::kRestartSuccess),
+                    static_cast<unsigned long>(st.restart_success_total));
+            } catch (const std::exception& restart_err) {
+                const std::string full_err = describeExceptionFull(restart_err);
+                RCLCPP_FATAL(
+                    rclcpp::get_logger("automap_system"),
+                    "[SEMANTIC][HybridRecover] status=%s(%d) worker restart/retry failed: %s",
+                    toString(HybridRecoverStatus::kRestartFailed),
+                    static_cast<int>(HybridRecoverStatus::kRestartFailed),
+                    restart_err.what());
+                RCLCPP_FATAL(
+                    rclcpp::get_logger("automap_system"),
+                    "[SEMANTIC][HybridRecover] FULL_EXCEPTION: %s",
+                    full_err.c_str());
+                throw;
+            }
         } else {
+            RCLCPP_ERROR(
+                rclcpp::get_logger("automap_system"),
+                "[SEMANTIC][HybridRecover] status=%s(%d) non-recoverable infer error, rethrow",
+                toString(HybridRecoverStatus::kNonRecoverable),
+                static_cast<int>(HybridRecoverStatus::kNonRecoverable));
             throw;
         }
+    } catch (const std::exception& e) {
+        const std::string full_err = describeExceptionFull(e);
+        RCLCPP_FATAL(
+            rclcpp::get_logger("automap_system"),
+            "[SEMANTIC][HybridRecover] non-runtime std::exception during infer: %s",
+            full_err.c_str());
+        throw;
+    } catch (...) {
+        RCLCPP_FATAL(
+            rclcpp::get_logger("automap_system"),
+            "[SEMANTIC][HybridRecover] unknown exception during infer: %s",
+            describeCurrentExceptionFull().c_str());
+        throw;
     }
     
     // 获取当前设备状态 (读锁)
     {
         std::shared_lock<std::shared_mutex> lock(st.classifier_mu);
         *out_dev = st.device;
+    }
+}
+
+/** vote_idx==0: identity; else deterministic xy aug (flip / in-plane rotation). Index-preserving for logits sum. */
+void applyDeterministicTtaToPts(std::vector<float>& pts, int c, int vote_idx) {
+    if (vote_idx <= 0 || c < 3) return;
+    const size_t n = pts.size() / static_cast<size_t>(c);
+    const int op = (vote_idx - 1) % 5;
+    for (size_t i = 0; i < n; ++i) {
+        const size_t b = i * static_cast<size_t>(c);
+        float x = pts[b + 0];
+        float y = pts[b + 1];
+        float z = pts[b + 2];
+        switch (op) {
+            case 0:
+                x = -x;
+                break;
+            case 1:
+                y = -y;
+                break;
+            case 2: {
+                const float nx = -y;
+                const float ny = x;
+                x = nx;
+                y = ny;
+            } break;
+            case 3:
+                x = -x;
+                y = -y;
+                break;
+            case 4: {
+                const float nx = y;
+                const float ny = -x;
+                x = nx;
+                y = ny;
+            } break;
+            default:
+                break;
+        }
+        pts[b + 0] = x;
+        pts[b + 1] = y;
+        pts[b + 2] = z;
     }
 }
 
@@ -531,6 +824,7 @@ public:
         if (!cloud || cloud->empty()) {
             mask = cv::Mat::zeros(cfg_.img_h, cfg_.img_w, CV_8U);
             if (result != nullptr) {
+                result->per_point_labels.clear();
                 result->success = true;
                 result->backend_name = name();
                 result->message = "empty cloud";
@@ -538,119 +832,203 @@ public:
             }
             return;
         }
+        if (result != nullptr) {
+            result->per_point_labels.clear();
+        }
         const auto t0 = std::chrono::steady_clock::now();
 
         const int c = input_dims_;
-        std::vector<float> pts(static_cast<size_t>(cloud->size()) * static_cast<size_t>(c), 0.0f);
-        for (size_t i = 0; i < cloud->size(); ++i) {
-            const auto& p = cloud->points[i];
-            const size_t base = i * static_cast<size_t>(c);
-            if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) {
-                pts[base + 0] = 0.0f; pts[base + 1] = 0.0f; pts[base + 2] = 0.0f;
-            } else {
-                pts[base + 0] = p.x;
-                pts[base + 1] = p.y;
-                pts[base + 2] = p.z;
+        const size_t N = cloud->size();
+
+        auto point_in_training_volume = [&](const pcl::PointXYZI& p) -> bool {
+            if (!cfg_.lsk_training_volume_crop || !cfg_.lsk_volume_bounds_valid) {
+                return true;
             }
-            if (c > 3) pts[base + 3] = std::isfinite(p.intensity) ? p.intensity : 0.0f;
+            if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) {
+                return false;
+            }
+            return p.x >= cfg_.lsk_vol_min_x && p.x <= cfg_.lsk_vol_max_x && p.y >= cfg_.lsk_vol_min_y &&
+                   p.y <= cfg_.lsk_vol_max_y && p.z >= cfg_.lsk_vol_min_z && p.z <= cfg_.lsk_vol_max_z;
+        };
+
+        std::vector<size_t> orig_idx;
+        orig_idx.reserve(N);
+        for (size_t i = 0; i < N; ++i) {
+            if (point_in_training_volume(cloud->points[i])) {
+                orig_idx.push_back(i);
+            }
         }
 
-        std::vector<float> feat;
-        torch::Device infer_device{torch::kCPU};
-        try {
-            detail_hybrid::inferFeaturesWithRecover(pts, &feat, &infer_device);
-        } catch (const std::exception& e) {
-            RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
-                "[SEMANTIC][Hybrid] Feature extraction failed: %s", e.what());
+        if (orig_idx.empty()) {
+            mask = cv::Mat::zeros(cfg_.img_h, cfg_.img_w, CV_8U);
             if (result != nullptr) {
-                result->success = false;
-                result->message = std::string("Feature extraction error: ") + e.what();
+                result->per_point_labels.assign(N, 0);
+                result->success = true;
+                result->backend_name = name();
+                result->message = "no points in inference set (volume crop or empty)";
+                result->inference_ms = 0.0;
             }
             return;
+        }
+
+        const size_t M = orig_idx.size();
+        std::vector<float> pts_base(M * static_cast<size_t>(c), 0.0f);
+        for (size_t k = 0; k < M; ++k) {
+            const auto& p = cloud->points[orig_idx[k]];
+            const size_t base = k * static_cast<size_t>(c);
+            if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) {
+                pts_base[base + 0] = 0.0f;
+                pts_base[base + 1] = 0.0f;
+                pts_base[base + 2] = 0.0f;
+            } else {
+                pts_base[base + 0] = p.x;
+                pts_base[base + 1] = p.y;
+                pts_base[base + 2] = p.z;
+            }
+            if (c > 3) {
+                const float val = std::isfinite(p.intensity) ? p.intensity : 0.0f;
+                pts_base[base + 3] = val;
+            }
+        }
+
+        const int num_votes = std::max(1, std::min(32, cfg_.lsk_num_vote));
+        std::vector<float> acc_logits;
+        torch::Device infer_device{torch::kCPU};
+        static std::atomic<uint64_t> run_call_idx{0};
+        const uint64_t call_idx = run_call_idx.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (call_idx == 1) {
+            RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                "[SEMANTIC][Hybrid][FIRST_FRAME_SNAPSHOT] cloud_pts=%zu infer_pts=%zu num_vote=%d vol_crop=%d "
+                "input_dims=%d feat_dim=%d normal_mode=%s normal_profile=[up=%.1f,down=%.1f,h=%d,w=%d] "
+                "sensor_fov=[up=%.1f,down=%.1f] img=[%dx%d] tree_class=%d",
+                N,
+                M,
+                num_votes,
+                (cfg_.lsk_training_volume_crop && cfg_.lsk_volume_bounds_valid) ? 1 : 0,
+                input_dims_,
+                feat_dim_,
+                cfg_.lsk3dnet_hybrid_normal_mode.c_str(),
+                cfg_.lsk3dnet_normal_fov_up_deg,
+                cfg_.lsk3dnet_normal_fov_down_deg,
+                cfg_.lsk3dnet_normal_proj_h,
+                cfg_.lsk3dnet_normal_proj_w,
+                cfg_.fov_up,
+                cfg_.fov_down,
+                cfg_.img_w,
+                cfg_.img_h,
+                cfg_.tree_class_id);
         }
 
         torch::NoGradGuard no_grad;
-        torch::Tensor logits;
-        try {
-            auto tfeat = torch::from_blob(feat.data(), {static_cast<long>(cloud->size()), static_cast<long>(feat_dim_)}, torch::kFloat32)
-                             .clone()
-                             .to(infer_device);
-            detail_hybrid::HybridSharedState& st = detail_hybrid::hybridState();
-            
-            // 🏛️ [架构演进] 读锁保护分类头推理，支持跨线程并发
-            std::shared_lock<std::shared_mutex> lock(st.classifier_mu);
-            if (st.validated_num_classes == 0 || st.validated_feat_dim == 0) {
-                throw std::runtime_error("Classifier state not initialized");
-            }
-            logits = st.classifier.forward({tfeat}).toTensor().to(torch::kCPU);
-        } catch (const std::exception& e) {
-            RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
-                "[SEMANTIC][Hybrid] Classifier inference failed: %s", e.what());
-            if (result != nullptr) {
-                result->success = false;
-                result->message = std::string("Inference error: ") + e.what();
-            }
-            return;
-        }
-        auto pred = logits.argmax(1).contiguous();
-        
-        // ... (smoothing logic omitted for brevity, keeping existing) ...
-        // 1. Point-level raw labels
-        std::vector<int64_t> raw_labels(cloud->size());
-        const int64_t* pred_ptr = pred.data_ptr<int64_t>();
-        std::copy(pred_ptr, pred_ptr + cloud->size(), raw_labels.begin());
+        detail_hybrid::HybridSharedState& st = detail_hybrid::hybridState();
+        int num_classes_runtime = 0;
 
-        // 2. Spatial smoothing (Radius-based voting in a sparse grid)
-        std::vector<int64_t> smoothed_labels = raw_labels;
-        if (cloud->size() > 0) {
-            const float filter_radius = 0.5f;
-            const int min_neighbors = 3;
-            struct VoxelKey {
-                int x, y, z;
-                bool operator==(const VoxelKey& o) const { return x == o.x && y == o.y && z == o.z; }
-            };
-            auto hash_fn = [](const VoxelKey& k) {
-                return std::hash<int>()(k.x) ^ (std::hash<int>()(k.y) << 1) ^ (std::hash<int>()(k.z) << 2);
-            };
-            std::unordered_map<VoxelKey, std::vector<size_t>, decltype(hash_fn)> grid(cloud->size() / 2, hash_fn);
-            float inv_res = 1.0f / filter_radius;
-            for (size_t i = 0; i < cloud->size(); ++i) {
-                const auto& p = cloud->points[i];
-                grid[{static_cast<int>(std::floor(p.x * inv_res)),
-                      static_cast<int>(std::floor(p.y * inv_res)),
-                      static_cast<int>(std::floor(p.z * inv_res))}].push_back(i);
-            }
-            #pragma omp parallel for
-            for (size_t i = 0; i < cloud->size(); ++i) {
-                const auto& p = cloud->points[i];
-                const int64_t my_label = raw_labels[i];
-                if (my_label == 0) continue;
-                const VoxelKey key{static_cast<int>(std::floor(p.x * inv_res)),
-                                   static_cast<int>(std::floor(p.y * inv_res)),
-                                   static_cast<int>(std::floor(p.z * inv_res))};
-                int same_label_count = 0; int total_neighbors = 0;
-                for (int dx = -1; dx <= 1; ++dx) {
-                    for (int dy = -1; dy <= 1; ++dy) {
-                        for (int dz = -1; dz <= 1; ++dz) {
-                            auto it = grid.find({key.x + dx, key.y + dy, key.z + dz});
-                            if (it != grid.end()) {
-                                for (size_t n_idx : it->second) {
-                                    const auto& np = cloud->points[n_idx];
-                                    if (((p.x-np.x)*(p.x-np.x) + (p.y-np.y)*(p.y-np.y) + (p.z-np.z)*(p.z-np.z)) < filter_radius * filter_radius) {
-                                        total_neighbors++;
-                                        if (raw_labels[n_idx] == my_label) same_label_count++;
-                                    }
-                                }
-                            }
-                        }
-                    }
+        for (int vi = 0; vi < num_votes; ++vi) {
+            std::vector<float> pts_work = pts_base;
+            detail_hybrid::applyDeterministicTtaToPts(pts_work, c, vi);
+
+            std::vector<float> feat;
+            try {
+                detail_hybrid::inferFeaturesWithRecover(pts_work, &feat, &infer_device);
+            } catch (const std::exception& e) {
+                const std::string full_err = detail_hybrid::describeExceptionFull(e);
+                RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+                    "[SEMANTIC][Hybrid] Feature extraction failed (likely worker crash or missing c_gen_normal_map): %s",
+                    e.what());
+                RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+                    "[SEMANTIC][Hybrid] Feature extraction FULL_EXCEPTION: %s", full_err.c_str());
+                if (result != nullptr) {
+                    result->per_point_labels.clear();
+                    result->success = false;
+                    result->message = std::string("Feature extraction error: ") + full_err;
                 }
-                if (same_label_count < min_neighbors || static_cast<float>(same_label_count) / std::max(1, total_neighbors) < 0.3f) smoothed_labels[i] = 0;
+                return;
+            } catch (...) {
+                const std::string full_err = detail_hybrid::describeCurrentExceptionFull();
+                RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+                    "[SEMANTIC][Hybrid] Feature extraction UNKNOWN_EXCEPTION: %s", full_err.c_str());
+                if (result != nullptr) {
+                    result->per_point_labels.clear();
+                    result->success = false;
+                    result->message = std::string("Feature extraction unknown error: ") + full_err;
+                }
+                return;
             }
+
+            torch::Tensor logits;
+            try {
+                auto tfeat = torch::from_blob(feat.data(), {static_cast<long>(M), static_cast<long>(feat_dim_)}, torch::kFloat32)
+                                 .clone()
+                                 .to(infer_device);
+                std::shared_lock<std::shared_mutex> lock(st.classifier_mu);
+                if (st.validated_num_classes == 0 || st.validated_feat_dim == 0) {
+                    throw std::runtime_error("Classifier state not initialized");
+                }
+                logits = st.classifier.forward({tfeat}).toTensor().to(torch::kCPU);
+            } catch (const std::exception& e) {
+                const std::string full_err = detail_hybrid::describeExceptionFull(e);
+                RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+                    "[SEMANTIC][Hybrid] Classifier inference failed: %s", e.what());
+                RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+                    "[SEMANTIC][Hybrid] Classifier inference FULL_EXCEPTION: %s", full_err.c_str());
+                if (result != nullptr) {
+                    result->per_point_labels.clear();
+                    result->success = false;
+                    result->message = std::string("Inference error: ") + full_err;
+                }
+                return;
+            } catch (...) {
+                const std::string full_err = detail_hybrid::describeCurrentExceptionFull();
+                RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+                    "[SEMANTIC][Hybrid] Classifier inference UNKNOWN_EXCEPTION: %s", full_err.c_str());
+                if (result != nullptr) {
+                    result->per_point_labels.clear();
+                    result->success = false;
+                    result->message = std::string("Inference unknown error: ") + full_err;
+                }
+                return;
+            }
+
+            if (logits.dim() != 2 || logits.size(0) != static_cast<int64_t>(M)) {
+                throw std::runtime_error(
+                    "hybrid classifier output shape mismatch: rows=" + std::to_string(logits.size(0)) +
+                    " expected_M=" + std::to_string(M));
+            }
+            num_classes_runtime = static_cast<int>(logits.size(1));
+            if (num_classes_runtime <= 0) {
+                throw std::runtime_error("hybrid classifier num_classes invalid");
+            }
+            if (vi == 0) {
+                acc_logits.assign(static_cast<size_t>(M) * static_cast<size_t>(num_classes_runtime), 0.0f);
+            } else if (static_cast<int>(logits.size(1)) != num_classes_runtime) {
+                throw std::runtime_error("hybrid classifier num_classes changed between TTA votes");
+            }
+
+            const auto* lp = logits.contiguous().data_ptr<float>();
+            for (size_t j = 0; j < acc_logits.size(); ++j) {
+                acc_logits[j] += lp[j];
+            }
+        }
+
+        auto acc_tensor =
+            torch::from_blob(acc_logits.data(), {static_cast<long>(M), static_cast<long>(num_classes_runtime)}, torch::kFloat32).clone();
+        auto pred = acc_tensor.argmax(1).contiguous();
+
+        std::vector<int64_t> raw_labels(N, 0);
+        const int64_t* pred_ptr = pred.data_ptr<int64_t>();
+        for (size_t k = 0; k < M; ++k) {
+            raw_labels[orig_idx[k]] = pred_ptr[k];
+        }
+
+        // 2. Keep raw argmax labels for upstream parity.
+        const std::vector<int64_t>& smoothed_labels = raw_labels;
+        std::unordered_map<int64_t, size_t> class_hist;
+        class_hist.reserve(64);
+        for (const auto cls : smoothed_labels) {
+            ++class_hist[cls];
         }
 
         mask = cv::Mat(cfg_.img_h, cfg_.img_w, CV_8U, cv::Scalar(0));
-        detail_hybrid::HybridSharedState& st = detail_hybrid::hybridState();
         for (size_t i = 0; i < cloud->size(); ++i) {
             const auto& p = cloud->points[i];
             // 🏛️ [逻辑加固] 使用 st.nn_fov_* 确保 Mask 投影与 Backbone 特征提取完全对齐
@@ -660,9 +1038,50 @@ public:
             if (cls < 0 || cls > 255) continue;
             mask.at<uint8_t>(proj.y, proj.x) = static_cast<uint8_t>(cls);
         }
+        const int nonzero_pixels = cv::countNonZero(mask);
+        const int tree_label = cfg_.tree_class_id >= 0 ? cfg_.tree_class_id : 255;
+        const int tree_label_u8 = std::clamp(tree_label, 0, 255);
+        const int mask_tree_pixels = cv::countNonZero(mask == static_cast<uint8_t>(tree_label_u8));
+        const size_t point_tree_count =
+            class_hist.count(static_cast<int64_t>(tree_label_u8)) > 0
+                ? class_hist[static_cast<int64_t>(tree_label_u8)]
+                : 0;
+        std::vector<std::pair<int64_t, size_t>> sorted_hist(class_hist.begin(), class_hist.end());
+        std::sort(sorted_hist.begin(), sorted_hist.end(), [](const auto& a, const auto& b) {
+            return a.second > b.second;
+        });
+        std::ostringstream topk;
+        const size_t topk_n = std::min<size_t>(sorted_hist.size(), 8);
+        for (size_t i = 0; i < topk_n; ++i) {
+            if (i > 0) topk << ",";
+            topk << sorted_hist[i].first << ":" << sorted_hist[i].second;
+        }
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[SEMANTIC][Hybrid][STAGE_RESULT] stage=run cloud_pts=%zu infer_pts=%zu num_vote=%d feat_floats=%zu pred_numel=%ld "
+            "mask_nonzero=%d "
+            "mask_tree_px=%d tree_label=%d point_tree_count=%zu classes=%zu topk=[%s] mask_wh=%dx%d device=%s",
+            N,
+            M,
+            num_votes,
+            static_cast<size_t>(M) * static_cast<size_t>(feat_dim_),
+            static_cast<long>(N),
+            nonzero_pixels,
+            mask_tree_pixels,
+            tree_label_u8,
+            point_tree_count,
+            class_hist.size(),
+            topk.str().c_str(),
+            mask.cols,
+            mask.rows,
+            infer_device.str().c_str());
 
         if (result != nullptr) {
             const auto t1 = std::chrono::steady_clock::now();
+            result->per_point_labels.resize(N);
+            for (size_t i = 0; i < N; ++i) {
+                const int64_t cls = smoothed_labels[i];
+                result->per_point_labels[i] = static_cast<uint8_t>(std::clamp(cls, static_cast<int64_t>(0), static_cast<int64_t>(255)));
+            }
             result->success = true;
             result->backend_name = name();
             result->message = std::string("device=") + infer_device.str();
@@ -676,34 +1095,65 @@ public:
         if (!cloud || cloud->empty()) return;
 
         const int label = tree_label >= 0 ? tree_label : 255;
-        if (dense_for_clustering) {
-            out_cloud->width = static_cast<uint32_t>(cfg_.img_w);
-            out_cloud->height = static_cast<uint32_t>(cfg_.img_h);
-            out_cloud->is_dense = false;
-            out_cloud->points.assign(static_cast<size_t>(cfg_.img_w * cfg_.img_h),
-                                     pcl::PointXYZI(std::numeric_limits<float>::quiet_NaN(),
-                                                    std::numeric_limits<float>::quiet_NaN(),
-                                                    std::numeric_limits<float>::quiet_NaN(),
-                                                    std::numeric_limits<float>::quiet_NaN()));
-        } else {
-            out_cloud->height = 1;
-            out_cloud->is_dense = false;
-            out_cloud->points.reserve(cloud->size());
-        }
+        
+        // 🛠️ [彻底修复] 无论外部配置如何，必须保持 Organized 契约 (img_w * img_h)
+        // 否则下游 Trellis 算子会因 at(u,v) 2D 索引访问而抛出异常并崩溃。
+        out_cloud->width = static_cast<uint32_t>(cfg_.img_w);
+        out_cloud->height = static_cast<uint32_t>(cfg_.img_h);
+        out_cloud->is_dense = false;
+        out_cloud->points.assign(static_cast<size_t>(cfg_.img_w * cfg_.img_h),
+                                 pcl::PointXYZI(std::numeric_limits<float>::quiet_NaN(),
+                                                std::numeric_limits<float>::quiet_NaN(),
+                                                std::numeric_limits<float>::quiet_NaN(),
+                                                0.0f));
 
+        size_t proj_valid = 0;
+        size_t label_hit = 0;
+        size_t valid_tree_points = 0;
         for (const auto& p : cloud->points) {
+            // 🏛️ [精度对齐] 使用 st.nn_fov_* 确保 Mask 投影与 LSK3DNet 特征提取位置 100% 重合。
             const auto proj = detail_hybrid::projectPoint(p, cfg_.img_w, cfg_.img_h, fov_up_rad_, fov_down_rad_);
             if (!proj.valid) continue;
+            ++proj_valid;
             if (mask.at<uint8_t>(proj.y, proj.x) != static_cast<uint8_t>(label)) continue;
-            if (dense_for_clustering) {
-                out_cloud->points[static_cast<size_t>(proj.y * cfg_.img_w + proj.x)] = p;
-            } else {
-                out_cloud->points.push_back(p);
+            ++label_hit;
+            
+            // 写入对应索引位置，保留组织化布局
+            const size_t idx = static_cast<size_t>(proj.y * cfg_.img_w + proj.x);
+            const auto& prev = out_cloud->points[idx];
+            if (!std::isfinite(prev.x) || !std::isfinite(prev.y) || !std::isfinite(prev.z)) {
+                ++valid_tree_points;
             }
+            out_cloud->points[idx] = p;
         }
 
-        if (!dense_for_clustering) {
-            out_cloud->width = static_cast<uint32_t>(out_cloud->points.size());
+        static std::atomic<uint64_t> maskcloud_calls{0};
+        const uint64_t call_idx = maskcloud_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (call_idx <= 10 || (call_idx % 20 == 0)) {
+            const double proj_valid_ratio = cloud->empty()
+                ? 0.0
+                : (100.0 * static_cast<double>(proj_valid) / static_cast<double>(cloud->size()));
+            const double label_hit_ratio = proj_valid == 0
+                ? 0.0
+                : (100.0 * static_cast<double>(label_hit) / static_cast<double>(proj_valid));
+            const double valid_tree_ratio = static_cast<double>(cfg_.img_w * cfg_.img_h) > 0.0
+                ? (100.0 * static_cast<double>(valid_tree_points) /
+                   static_cast<double>(static_cast<size_t>(cfg_.img_w) * static_cast<size_t>(cfg_.img_h)))
+                : 0.0;
+            const size_t placeholders = static_cast<size_t>(cfg_.img_w) * static_cast<size_t>(cfg_.img_h) - valid_tree_points;
+            RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                        "[SEMANTIC][HybridMaskCloud][DIAG] call=%lu cloud_pts=%zu proj_valid=%zu(%.2f%%) label_hit=%zu(%.2f%%) "
+                        "valid_tree_points=%zu(%.3f%% of image) placeholders=%zu tree_label=%d",
+                        static_cast<unsigned long>(call_idx),
+                        cloud->size(),
+                        proj_valid,
+                        proj_valid_ratio,
+                        label_hit,
+                        label_hit_ratio,
+                        valid_tree_points,
+                        valid_tree_ratio,
+                        placeholders,
+                        label);
         }
     }
 

@@ -54,6 +54,21 @@ CloudXYZIPtr voxelDownsampleChunkedWithTimeout(const CloudXYZIPtr& cloud, float 
  *  @return 降采样后的点云 */
 CloudXYZIPtr voxelDownsampleSafe(const CloudXYZIPtr& cloud, float leaf_size, float chunk_size_m = 0.0f);
 
+/**
+ * Body-frame voxel: centroid xyz; if sem_labels size matches body, intensity = majority semantic class id from
+ * sem_labels->points[i].intensity; otherwise intensity = mean lidar intensity from body.
+ * leaf_size is clamped to at least kMinVoxelLeafSize.
+ */
+CloudXYZIPtr voxelDownsampleBodyWithSemanticLabels(const CloudXYZIPtr& body,
+                                                   const CloudXYZIPtr& sem_labels,
+                                                   float leaf_size);
+
+/**
+ * Voxel downsample: centroid per cell, intensity = majority vote of rounded intensity (semantic class id).
+ * Input is sanitized like voxelDownsample; on grid overflow falls back to voxelDownsample (first point per voxel).
+ */
+CloudXYZIPtr voxelDownsampleMajorityIntensity(const CloudXYZIPtr& cloud, float leaf_size, bool parallel = true);
+
 /** @return true if path exists (file or directory). */
 bool fileExists(const std::string& path);
 
