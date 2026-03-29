@@ -393,13 +393,17 @@ void OptimizerModule::processGPSBatchKF(const OptTaskItem& task) {
     const double gps_max_dt = cfg.gpsKeyframeMatchWindowS();
 
     // 🏛️ [对齐逻辑] 若当前处于 ODOM 系，注入批量 GPS 因子前必须先进行坐标系转换与重建
+    // [RC1 修复] 传入 suppress_pose_notify=true：REBUILD 产生的是仅含 T_map_odom 平移的中间态，
+    // GPS 位置因子尚未注入，直接发布该状态会导致轨迹跳变 3-5m。
+    // addGPSFactorsForKeyFramesBatch 之后会在收敛后统一调用 notifyPoseUpdate。
     if (optimizer_.getPoseFrame() == PoseFrame::ODOM) {
         Pose3d T_map_odom = Pose3d::Identity();
         T_map_odom.linear() = R;
         T_map_odom.translation() = t;
-        optimizer_.transformHistoryAndRebuild(T_map_odom);
+        optimizer_.transformHistoryAndRebuild(T_map_odom, /*suppress_pose_notify=*/true);
         RCLCPP_INFO(node_->get_logger(),
-            "[V3][POSE_DIAG] step=processGPSBatchKF: Triggered IncrementalOptimizer REBUILD from ODOM to MAP");
+            "[V3][POSE_DIAG] step=processGPSBatchKF: Triggered IncrementalOptimizer REBUILD from ODOM to MAP "
+            "(suppress_pose_notify=true, GPS factors will notify after convergence)");
     }
 
     for (const auto& kf : all_kfs) {

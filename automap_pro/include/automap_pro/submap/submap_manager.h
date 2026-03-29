@@ -175,6 +175,12 @@ private:
     mutable float             last_build_voxel_size_ = 0.0f;
     uint64_t                  current_map_version_ = 0; // 跟踪 MapRegistry 传入的位姿版本
 
+    // [RC5/RC6 修复] 标记 merged_cloud 已被逻辑上废弃，等待 rebuildMergedCloudFromOptimizedPoses 完成。
+    // 在 applyGpsMapOriginToOdomKeyframes / batchUpdateSubmapPoses / batchUpdateKeyFramePoses
+    // 释放锁、触发重建之前设为 true；rebuildMergedCloudFromOptimizedPoses 结束时重置为 false。
+    // buildGlobalMap 的 fallback 路径在此标志为 true 时跳过 merged_cloud，避免旧坐标系点云重影。
+    mutable std::atomic<bool> merged_cloud_dirty_{false};
+
     // ✅ 修复：VoxelGrid 对象池缓存（按分辨率索引，mutable 以便 const 方法可延迟填充）
     mutable std::unordered_map<float, std::unique_ptr<pcl::VoxelGrid<pcl::PointXYZI>>> voxel_grid_cache_;
     mutable std::mutex vg_cache_mutex_;
@@ -301,6 +307,8 @@ private:
     std::vector<std::thread>  merge_threads_; // 🏛️ [P0 性能优化] 支持多线程合并
     std::atomic<bool>         merge_running_{true};
     std::atomic<int>          active_merge_tasks_{0}; // 🏛️ [修复] 跟踪正在处理的任务数，用于 isIdle 判断
+    // [RC-3 修复] 每个 merge 任务完成后通知等待者（freezeActiveSubmap 等 pending_merge_count==0）
+    std::condition_variable   merge_done_cv_;
     void mergeWorkerLoop();
 
     // ── 私有方法 ──────────────────────────────────────────────────────────

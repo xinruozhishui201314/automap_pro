@@ -723,30 +723,31 @@ void MappingModule::processFrame(const FilteredFrameEventRequiredDs& event) {
                 struct {
                     double xy_span = -1.0;
                     double z_span = -1.0;
+                    double x_min = 0, x_max = 0, y_min = 0, y_max = 0, z_min = 0, z_max = 0;
                 } out;
                 if (!pc || pc->empty()) {
                     return out;
                 }
-                double x_min = std::numeric_limits<double>::infinity();
-                double x_max = -std::numeric_limits<double>::infinity();
-                double y_min = std::numeric_limits<double>::infinity();
-                double y_max = -std::numeric_limits<double>::infinity();
-                double z_min = std::numeric_limits<double>::infinity();
-                double z_max = -std::numeric_limits<double>::infinity();
+                out.x_min = std::numeric_limits<double>::infinity();
+                out.x_max = -std::numeric_limits<double>::infinity();
+                out.y_min = std::numeric_limits<double>::infinity();
+                out.y_max = -std::numeric_limits<double>::infinity();
+                out.z_min = std::numeric_limits<double>::infinity();
+                out.z_max = -std::numeric_limits<double>::infinity();
                 for (const auto& p : pc->points) {
                     if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) {
                         continue;
                     }
-                    x_min = std::min(x_min, static_cast<double>(p.x));
-                    x_max = std::max(x_max, static_cast<double>(p.x));
-                    y_min = std::min(y_min, static_cast<double>(p.y));
-                    y_max = std::max(y_max, static_cast<double>(p.y));
-                    z_min = std::min(z_min, static_cast<double>(p.z));
-                    z_max = std::max(z_max, static_cast<double>(p.z));
+                    out.x_min = std::min(out.x_min, static_cast<double>(p.x));
+                    out.x_max = std::max(out.x_max, static_cast<double>(p.x));
+                    out.y_min = std::min(out.y_min, static_cast<double>(p.y));
+                    out.y_max = std::max(out.y_max, static_cast<double>(p.y));
+                    out.z_min = std::min(out.z_min, static_cast<double>(p.z));
+                    out.z_max = std::max(out.z_max, static_cast<double>(p.z));
                 }
-                if (std::isfinite(x_min) && std::isfinite(z_min)) {
-                    out.xy_span = std::max(x_max - x_min, y_max - y_min);
-                    out.z_span = z_max - z_min;
+                if (std::isfinite(out.x_min) && std::isfinite(out.z_min)) {
+                    out.xy_span = std::max(out.x_max - out.x_min, out.y_max - out.y_min);
+                    out.z_span = out.z_max - out.z_min;
                 }
                 return out;
             };
@@ -768,6 +769,17 @@ void MappingModule::processFrame(const FilteredFrameEventRequiredDs& event) {
                 tw.x(),
                 tw.y(),
                 tw.z());
+            
+            // 🏛️ [V3 诊断] 打印原始与转换后中心，验证 Body 云是否真正以 0,0,0 为中心（解决回环 p90>50m 问题）
+            if (log_geo) {
+                double cx_w = (sw.x_min + sw.x_max) * 0.5;
+                double cy_w = (sw.y_min + sw.y_max) * 0.5;
+                double cx_b = (sb.x_min + sb.x_max) * 0.5;
+                double cy_b = (sb.y_min + sb.y_max) * 0.5;
+                RCLCPP_INFO(node_->get_logger(),
+                    "[GEO_PIPELINE][CENTER_DIAG] seq=%u world_center=[%.2f,%.2f] body_center=[%.2f,%.2f] offset_to_zero=%.2fm",
+                    wk, cx_w, cy_w, cx_b, cy_b, std::sqrt(cx_b*cx_b + cy_b*cy_b));
+            }
         }
 
         RCLCPP_DEBUG(node_->get_logger(),
@@ -818,6 +830,20 @@ void MappingModule::processFrame(const FilteredFrameEventRequiredDs& event) {
             T_mo.translation() = t_snapshot;
             kf->T_map_b_optimized = pose_chain::mapBodyFromOdomBody(T_mo, kf->T_odom_b);
             kf->pose_frame = PoseFrame::MAP; // 🏛️ [架构加固] 标注语义已提升为 MAP
+
+            // [RC2 修复] 该帧由 ODOM 升级到 MAP 坐标系，其 ref_alignment_epoch 可能早于当前
+            // GPS 对齐纪元（帧在对齐前入队、对齐后才处理）。此时 publishOptimizedPath 的
+            // alignment_epoch_limit == current_epoch 会过滤这些 KF，导致轨迹帧数骤减闪烁。
+            // 修复：位姿已在当前 GPS 对齐变换下升级，将 alignment_epoch 同步到当前纪元。
+            const uint64_t current_epoch = processed_alignment_epoch_.load(std::memory_order_relaxed);
+            if (current_epoch > kf->alignment_epoch) {
+                RCLCPP_DEBUG(node_->get_logger(),
+                    "[V3][RC2_FIX] kf_id=%lu bump alignment_epoch %lu->%lu (ODOM->MAP upgrade, avoid epoch filter flicker)",
+                    static_cast<unsigned long>(kf->id),
+                    static_cast<unsigned long>(kf->alignment_epoch),
+                    static_cast<unsigned long>(current_epoch));
+                kf->alignment_epoch = current_epoch;
+            }
 
             RCLCPP_INFO_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000,
                 "[V3][POSE_DIAG] Keyframe upgraded to MAP: T_odom_b=[%.2f,%.2f,%.2f] -> T_map_b_optimized=[%.2f,%.2f,%.2f]",
@@ -1530,10 +1556,26 @@ void MappingModule::handleSaveMap(const SaveMapRequestEvent& ev) {
         RCLCPP_INFO(node_->get_logger(), "[V3][MappingModule] Building final global map for saving...");
         float save_voxel_size = ConfigManager::instance().mapVoxelSize();
         uint64_t current_epoch = map_registry_->getAlignmentEpoch();
+        
+        // 🏛️ [架构加固] 保存前强制触发一次增量重建，确保 fallback 路径的 merged_cloud 也是基于最新位姿的
+        sm_manager_.rebuildMergedCloudFromOptimizedPoses(); 
+        
         sm_manager_.invalidateGlobalMapCache();
         CloudXYZIPtr global_map = sm_manager_.buildGlobalMap(save_voxel_size, current_epoch);
         if (global_map && !global_map->empty()) {
-            std::string global_path = ev.output_dir + "/global_map_final.pcd";
+            // [RC-4 修复] 将最终 GPS 对齐地图保存在 optimized/ 子目录，与 fast-livo 保存的
+            // all_raw_points.pcd（odom 系）物理隔离，防止用户误将两个不同坐标系的点云同时加载导致重影。
+            const fs::path opt_dir = fs::path(ev.output_dir) / "optimized";
+            std::error_code ec;
+            fs::create_directories(opt_dir, ec);
+            if (ec) {
+                RCLCPP_WARN(node_->get_logger(),
+                    "[V3][MappingModule] Failed to create optimized/ subdir (%s), saving to output_dir",
+                    ec.message().c_str());
+            }
+            const std::string global_path = (!ec && fs::is_directory(opt_dir))
+                ? (opt_dir / "global_map_final.pcd").string()
+                : ev.output_dir + "/global_map_final.pcd";
             pcl::io::savePCDFileBinary(global_path, *global_map);
             RCLCPP_INFO(node_->get_logger(), "[V3][MappingModule] Global map saved to %s (%zu pts)", 
                         global_path.c_str(), global_map->size());

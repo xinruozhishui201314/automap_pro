@@ -270,6 +270,8 @@ void SubMapManager::addKeyFrame(const KeyFrame::Ptr& kf) {
         {
             std::lock_guard<std::mutex> lk_merge(merge_mutex_);
             if (merge_queue_.size() < kMaxMergeQueueSize) {
+                // [RC-3 修复] 先递增计数再入队，确保 freezeActiveSubmap 等待时不会提前放行
+                active_submap_->pending_merge_count.fetch_add(1, std::memory_order_relaxed);
                 merge_queue_.push({active_submap_, kf});
                 merge_cv_.notify_one();
             } else {
@@ -412,6 +414,34 @@ void SubMapManager::freezeActiveSubmap(const SubMap::Ptr& sm) {
 
     SLOG_START_SPAN(MOD, "freeze_submap");
 
+    // [RC-3 修复] 等待该子图所有挂起/执行中的 merge 任务完成，确保 merged_cloud 已填充。
+    // 若不等待，freeze_post_queue_ 消费时 merged_cloud 仍为空，downsampled_cloud 无法建立，
+    // 导致回环检测数据库始终为空（全程 NO_CAND，zero loop closures）。
+    {
+        const int pending = sm->pending_merge_count.load(std::memory_order_acquire);
+        if (pending > 0) {
+            RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                "[SubMapMgr][FREEZE_STEP][RC3] sm_id=%d waiting for %d pending merge tasks before freeze_post",
+                sm->id, pending);
+            std::unique_lock<std::mutex> lk_done(merge_mutex_);
+            static constexpr int kMergeWaitSec = 5;
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(kMergeWaitSec);
+            bool ok = merge_done_cv_.wait_until(lk_done, deadline, [&sm] {
+                return sm->pending_merge_count.load(std::memory_order_acquire) == 0;
+            });
+            if (!ok) {
+                RCLCPP_WARN(rclcpp::get_logger("automap_system"),
+                    "[SubMapMgr][FREEZE_STEP][RC3] sm_id=%d merge wait timeout (%ds), remaining=%d "
+                    "(merged_cloud may be partial, downsampled_cloud may be incomplete)",
+                    sm->id, kMergeWaitSec, sm->pending_merge_count.load());
+            } else {
+                RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                    "[SubMapMgr][FREEZE_STEP][RC3] sm_id=%d all merge tasks done, merged_cloud ready",
+                    sm->id);
+            }
+        }
+    }
+
     try {
         publishEvent(sm, "FROZEN");
         METRICS_INCREMENT(metrics::SUBMAPS_FROZEN);
@@ -501,6 +531,22 @@ void SubMapManager::forceFreezeActiveSubmapForFinish() {
     }
     RCLCPP_INFO(rclcpp::get_logger("automap_system"),
         "[SubMapMgr][FINISH_FREEZE] force-freeze sm_id=%d (sync, so last submap enters factor graph)", sm->id);
+
+    // [RC-3 修复] 结束冻结也需等待 merge 任务完成，确保最后一个子图的 merged_cloud 已填充
+    {
+        const int pending = sm->pending_merge_count.load(std::memory_order_acquire);
+        if (pending > 0) {
+            RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                "[SubMapMgr][FINISH_FREEZE][RC3] sm_id=%d waiting for %d pending merge tasks",
+                sm->id, pending);
+            std::unique_lock<std::mutex> lk_done(merge_mutex_);
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            merge_done_cv_.wait_until(lk_done, deadline, [&sm] {
+                return sm->pending_merge_count.load(std::memory_order_acquire) == 0;
+            });
+        }
+    }
+
     try {
         if (sm->merged_cloud && !sm->merged_cloud->empty()) {
             CloudXYZIPtr body_cloud(new CloudXYZI());
@@ -560,6 +606,12 @@ void SubMapManager::mergeWorkerLoop() {
             } catch (const std::exception& e) {
                 RCLCPP_ERROR(rclcpp::get_logger("automap_system"), 
                     "[SubMapMgr][ASYNC_MERGE] Exception: %s", e.what());
+            }
+            // [RC-3 修复] 任务完成（成功或失败）后递减计数并通知等待的 freezeActiveSubmap
+            task.sm->pending_merge_count.fetch_sub(1, std::memory_order_release);
+            {
+                std::lock_guard<std::mutex> lk_done(merge_mutex_);
+                merge_done_cv_.notify_all();
             }
         }
         active_merge_tasks_--; // 🏛️ [修复] 减少活动任务数
@@ -919,6 +971,7 @@ void SubMapManager::batchUpdateSubmapPoses(const std::unordered_map<int, Pose3d>
         RCLCPP_INFO(rclcpp::get_logger("automap_system"),
             "[SubMapMgr][AUTO_REBUILD] version=%lu drift large (%.2fm, %.2fdeg) -> triggering full rebuild",
             version, max_trans_diff, max_rot_deg);
+        merged_cloud_dirty_.store(true, std::memory_order_release); // [RC5/RC6] 标记即将重建
         lk.unlock();
         rebuildMergedCloudFromOptimizedPoses();
     }
@@ -1003,6 +1056,7 @@ void SubMapManager::batchUpdateKeyFramePoses(const std::unordered_map<uint64_t, 
         RCLCPP_INFO(rclcpp::get_logger("automap_system"),
             "[SubMapMgr][GHOST_GUARD] Large jump (%.3fm) detected in KF update, triggering merged_cloud rebuild",
             max_jump_dist);
+        merged_cloud_dirty_.store(true, std::memory_order_release); // [RC5/RC6] 标记即将重建
         lk.unlock();
         rebuildMergedCloudFromOptimizedPoses();
     }
@@ -1079,6 +1133,11 @@ void SubMapManager::updateAllFromHBA(const HBAResult& result) {
         // [HBA_GHOSTING_FIX] 直接覆盖为 HBA 优化后的绝对位姿
         kfs_in_hba_order[i]->T_map_b_optimized = result.optimized_poses[i];
         kfs_in_hba_order[i]->pose_frame = result.pose_frame; // 🏛️ [架构加固] 尊重 HBA 报告的坐标系语义
+        
+        // 🏛️ [修复] 同步更新对齐纪元，确保 buildGlobalMap 主路径不会因 alignment_epoch_limit 过滤掉这些已优化的帧
+        if (result.alignment_epoch_snapshot > 0) {
+            kfs_in_hba_order[i]->alignment_epoch = result.alignment_epoch_snapshot;
+        }
     }
 
     // [PCD_GHOSTING_VERIFY] ... (此处省略校验代码) ...
@@ -1096,6 +1155,9 @@ void SubMapManager::updateAllFromHBA(const HBAResult& result) {
 
         sm->pose_map_anchor_optimized = anchor->T_map_b_optimized;
         sm->pose_frame = result.pose_frame; // 🏛️ [架构加固] 尊重 HBA 报告的坐标系语义
+        if (result.alignment_epoch_snapshot > 0) {
+            sm->alignment_epoch = result.alignment_epoch_snapshot;
+        }
         sm->pose_odom_anchor = anchor->T_odom_b;
 
         // 🏛️ [架构重构] HBA 可能会改变子图内部结构，因此需要更新 T_submap_kf
@@ -1181,6 +1243,8 @@ void SubMapManager::applyGpsMapOriginToOdomKeyframes(const Eigen::Matrix3d& R_en
         current_map_version_ = map_version;
         cached_global_map_.reset();
         last_build_map_version_ = std::numeric_limits<uint64_t>::max();
+        // [RC5/RC6] 在锁内标记 merged_cloud 即将失效，防止锁释放到重建完成之间的竞争窗口
+        merged_cloud_dirty_.store(true, std::memory_order_release);
     }
 
     RCLCPP_INFO(log,
@@ -1290,6 +1354,8 @@ void SubMapManager::rebuildMergedCloudFromOptimizedPoses() {
     if (backend_verbose_trace_) {
         RCLCPP_INFO(log, "[GHOSTING_TRACE] rebuildMergedCloudFromOptimizedPoses DONE (fallback 路径此后无重影；grep GHOSTING_TRACE 查证据链)");
     }
+    // [RC5/RC6] 重建完成，cleared merged_cloud_dirty_ 标志，允许 buildGlobalMap fallback 路径使用
+    merged_cloud_dirty_.store(false, std::memory_order_release);
 }
 
 // ── 查询接口实现（头文件声明，此前未实现会导致 undefined symbol）────────────────────
@@ -1594,6 +1660,16 @@ CloudXYZIPtr SubMapManager::buildGlobalMap(float voxel_size, uint64_t alignment_
         RCLCPP_WARN(log, "[SubMapMgr][HBA_GHOSTING] buildGlobalMap 使用 fallback_merged_cloud：主路径 combined 为空，用各子图 merged_cloud 拼接；若 merged_cloud 未经 rebuildMergedCloudFromOptimizedPoses 则仍为 T_odom_b 世界系，与轨迹重影");
         RCLCPP_WARN(log, "[GLOBAL_MAP_DIAG] ┌─ 回退路径: 拼接 merged_cloud (旧世界系，可能不准确)");
         RCLCPP_INFO(log, "[GLOBAL_MAP_DIAG] path=fallback_merged_cloud (⚠️  if shown, global_map may be misaligned with optimized trajectory)");
+
+        // [RC5/RC6] merged_cloud_dirty_ 为 true 表示重建尚未完成，用旧 merged_cloud 必然重影，直接跳过 fallback
+        if (merged_cloud_dirty_.load(std::memory_order_acquire)) {
+            RCLCPP_WARN(log,
+                "[GHOSTING_GUARD] buildGlobalMap fallback_merged_cloud SKIPPED: merged_cloud_dirty_=true "
+                "(rebuildMergedCloudFromOptimizedPoses 尚未完成，返回空云以防止重影; "
+                "下一次 build 在 rebuild 完成后可正常拼接)");
+            lk.unlock();
+            return std::make_shared<CloudXYZI>(); // 返回空云，RViz 不更新，优于显示错位重影
+        }
         
         // 回退：拼接各子图的 merged_cloud
         for (const auto& sm : submaps_) {

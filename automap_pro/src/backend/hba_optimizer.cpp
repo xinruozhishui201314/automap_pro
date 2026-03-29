@@ -1084,10 +1084,15 @@ HBAResult HBAOptimizer::runGTSAMFallback(const PendingTask& task) {
                 gtsam::Point3 pt(pos_map.x(), pos_map.y(), pos_map.z());
                 Eigen::Matrix3d c = kf->gps.covariance;
                 
-                // 🔧 [修复] GPS Z轴降权：高度观测噪声通常远大于水平方向，放大 Z 轴方差
+                // [GPS高度约束修复] 当 disable_altitude_constraint=true（默认）时，将 Z 轴方差设为
+                // altitude_variance_override（默认 1e6），等效于去除高度约束，防止不可靠 GPS 高度数据
+                // 导致 HBA 优化后出现多重地面/地图层叠重影。
+                const auto& cfg_hba = ConfigManager::instance();
                 double v0 = std::max(1e-6, std::min(1e6, c(0, 0)));
                 double v1 = std::max(1e-6, std::min(1e6, c(1, 1)));
-                double v2 = std::max(1e-6, std::min(1e6, c(2, 2))) * 20.0; // 放大20倍
+                double v2 = cfg_hba.gpsDisableAltitudeConstraint()
+                    ? cfg_hba.gpsAltitudeVarianceOverride()
+                    : std::max(1e-6, std::min(1e6, c(2, 2)));
                 
                 gtsam::Vector3 vars(v0, v1, v2);
                 auto noise = gtsam::noiseModel::Diagonal::Variances(vars);

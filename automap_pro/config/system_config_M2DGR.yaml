@@ -665,9 +665,14 @@ gps:
   extrapolation_margin_s: 0.5
   extrapolation_uncertainty_scale: 2.0
   velocity_estimation_window_s: 2.0
-  quality_threshold_hdop:  12.0
-  keyframe_max_hdop:       15.0
+  quality_threshold_hdop:  8.0   # [RC-1 修复] 收紧（12.0→8.0），拒绝 HDOP>8 的低质量 GPS
+  keyframe_max_hdop:       10.0  # [RC-1 修复] 收紧（15.0→10.0），避免极低质量 GPS 进入因子图
   align_rmse_threshold_m:  5.0
+  # [RC-1 修复] 禁用 GPS Z 轴（高度）约束：单频 GPS 高度精度差（±1.5×HDOP），
+  # 若开启会导致 iSAM2 轨迹 Z 漂移数米，产生"地面双层+夹角"重影。
+  # 配合 flushPendingGPSFactorsForKeyFramesInternal() 的 altitude 检查修复同步生效。
+  disable_altitude_constraint: true
+  altitude_variance_override:  1.0e6
   good_samples_needed:    8       # 降低（10→8），更容易触发对齐
   add_constraints_on_align: true
   factor_interval_m:       3.0   # ⬇️ 降低（5.0→3.0），增加GPS因子密度

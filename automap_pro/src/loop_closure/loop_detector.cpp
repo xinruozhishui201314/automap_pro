@@ -1132,6 +1132,8 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
         int inter_kf_skip_keyframe_gap = 0;
         int inter_kf_skip_odom_rel_rot_prefilter = 0;
         int inter_kf_reject_teaser_icp = 0;
+        bool any_garbage_rejected = false;
+        float max_p90 = 0.0f;
         // 几何诊断：query 关键帧位姿（世界系）
         const KeyFrame::Ptr query_kf = (task.query_kf_idx >= 0 && task.query_kf_idx < static_cast<int>(task.query->keyframes.size()))
             ? task.query->keyframes[task.query_kf_idx] : nullptr;
@@ -1219,6 +1221,18 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
             try {
                 // 粗匹配：源=query 车体系，目标=target 车体系，T_tgt_src = T_w_tgt^{-1} T_w_query
                 res = teaser_matcher_.match(query_cloud, tgt_copy, T_tgt_src_odom);
+
+                // 🏛️ [V3 修复] 初始 SVD 对齐重试：应对里程计初值不可信 (p90 异常)
+                if (res.fpfh_garbage_rejected) {
+                    ALOG_WARN(MOD, "[INTER_KF][INITIAL_SVD_RETRY] Odom hint suspect (p90={:.2f}m). "
+                              "Retrying with Identity init to handle potential coordinate frame mismatch.", res.fpfh_p90);
+                    auto retry_res = teaser_matcher_.match(query_cloud, tgt_copy, Pose3d::Identity());
+                    if (retry_res.success) {
+                        res = retry_res;
+                        ALOG_INFO(MOD, "[INTER_KF][INITIAL_SVD_RETRY] SUCCESS after Identity retry! rmse={:.3f}m inlier={:.3f}", 
+                                  res.rmse, res.inlier_ratio);
+                    }
+                }
             } catch (const std::exception& e) {
                 inter_kf_teaser_fail++;
                 ALOG_WARN(MOD, "[INTER_KF][TEASER][EXCEPTION] std::exception what={} sm_j={} kf_j={} sm_i={} kf_i={}",
@@ -1807,6 +1821,19 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
                 query_cloud,
                 target_cloud,
                 T_submap_init);
+
+            // 🏛️ [V3 修复] 初始 SVD 对齐重试：应对里程计初值不可信 (p90 异常)
+            if (teaser_res.fpfh_garbage_rejected) {
+                ALOG_WARN(MOD, "[SUBMAP][INITIAL_SVD_RETRY] Odom hint suspect (p90={:.2f}m). "
+                          "Retrying with Identity init for query_id={} target_id={}.", 
+                          teaser_res.fpfh_p90, query->id, target->id);
+                auto retry_res = teaser_matcher_.match(query_cloud, target_cloud, Pose3d::Identity());
+                if (retry_res.success) {
+                    teaser_res = retry_res;
+                    ALOG_INFO(MOD, "[SUBMAP][INITIAL_SVD_RETRY] SUCCESS after Identity retry! rmse={:.3f}m inlier={:.3f}", 
+                              teaser_res.rmse, teaser_res.inlier_ratio);
+                }
+            }
             ALOG_DEBUG(MOD, "[tid={}] step=match_returned query_id={} target_id={} success={}", 
                       tid, query->id, target->id, teaser_res.success);
         } catch (const std::exception& e) {
@@ -2089,10 +2116,19 @@ void LoopDetector::publishLoopConstraint(const LoopConstraint::Ptr& lc) {
     }
 }
 
-void LoopDetector::updateLoopHealthKpi(int query_id, int candidates, int accepted) {
+void LoopDetector::updateLoopHealthKpi(int query_id, int candidates, int accepted, 
+                                        float last_p90, bool fpfh_garbage_rejected) {
     const uint64_t query_total = loop_query_total_.fetch_add(1, std::memory_order_relaxed) + 1;
     loop_candidate_total_.fetch_add(static_cast<uint64_t>(std::max(0, candidates)), std::memory_order_relaxed);
     loop_accept_total_.fetch_add(static_cast<uint64_t>(std::max(0, accepted)), std::memory_order_relaxed);
+    
+    // 🏛️ [V3 Watchdog] 坐标系健康监控：统计 FPFH Garbage Rejects (p90 异常)
+    if (fpfh_garbage_rejected) {
+        consecutive_fpfh_critical_rejects_++;
+    } else if (accepted > 0) {
+        consecutive_fpfh_critical_rejects_ = 0;
+    }
+
     {
         std::lock_guard<std::mutex> lk(loop_metrics_mutex_);
         query_accept_window_.push_back(accepted > 0 ? 1 : 0);
@@ -2105,6 +2141,15 @@ void LoopDetector::updateLoopHealthKpi(int query_id, int candidates, int accepte
         zero_streak = consecutive_zero_accept_queries_.fetch_add(1, std::memory_order_relaxed) + 1;
     } else {
         consecutive_zero_accept_queries_.store(0, std::memory_order_relaxed);
+    }
+
+    // [报警逻辑] 连续多帧出现 FPFH Garbage Reject (p90 异常)，极大概率是坐标系漂移或协议不匹配
+    if (node() && consecutive_fpfh_critical_rejects_ >= 5) {
+        RCLCPP_ERROR(node()->get_logger(),
+            "[COORDINATE_HEALTH][WATCHDOG] CRITICAL: Consecutive FPFH Garbage Rejects detected (count=%d)! "
+            "Recent p90=%.2f m. Potential Coordinate Frame Mismatch or Massive Odom Drift! "
+            "Check 'frontend.cloud_frame' and odom reliability.",
+            (int)consecutive_fpfh_critical_rejects_, last_p90);
     }
 
     if (node() && (query_total % 10 == 0 || accepted > 0)) {

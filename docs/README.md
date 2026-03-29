@@ -9,6 +9,7 @@
 | 文档 | 说明 |
 |------|------|
 | [../README.md](../README.md) | 项目总览、特性、一键开始 |
+| [../readme.txt](../readme.txt) | 纯文本速查与近期变更摘要 |
 | [../QUICK_START.md](../QUICK_START.md) | 快速开始、常用命令与错误排查速查 |
 | [BUILD_DEPLOY_RUN.md](BUILD_DEPLOY_RUN.md) | 编译/部署/运行（run_automap.sh、路径、Docker） |
 
@@ -77,5 +78,5 @@
 
 ---
 
-**文档版本**：v2.2  
-**更新日期**：2026-03-23
+**文档版本**：v2.3  
+**更新日期**：2026-03-29（根目录 `README.md` / `readme.txt` 已同步近期 GPS 与 V3 变更摘要）

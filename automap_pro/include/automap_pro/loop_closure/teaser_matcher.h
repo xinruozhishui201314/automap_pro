@@ -25,6 +25,7 @@ public:
         bool    used_teaser   = false;
         GeomPath geom_path    = GeomPath::UNKNOWN;
         bool    fpfh_garbage_rejected = false;
+        float   fpfh_p90              = 0.0f; // 🏛️ [新增] 用于健康度量监控
     };
 
     explicit TeaserMatcher();

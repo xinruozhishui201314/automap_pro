@@ -339,6 +339,11 @@ struct SubMap {
     // 统计
     double spatial_extent_m = 0.0;
 
+    // [RC-3 竞争条件修复] 待处理（队列中）+ 执行中的 merge 任务计数。
+    // addKeyFrame 推入队列前 +1，mergeWorkerLoop 完成（成功或失败）后 -1。
+    // freezeActiveSubmap 等待此值归零再投入 freeze_post_queue_，确保 merged_cloud 已填充。
+    std::atomic<int> pending_merge_count{0};
+
     using Ptr = std::shared_ptr<SubMap>;
 };
 

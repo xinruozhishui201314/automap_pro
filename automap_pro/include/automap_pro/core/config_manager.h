@@ -375,6 +375,19 @@ public:
     double gpsOutlierCovScale()      const { return get<double>("gps.outlier_cov_scale", 100.0); }
     double gpsResidualBaseline()     const { return get<double>("gps.residual_baseline", 2.0); }
 
+    /** gps.disable_altitude_constraint（默认 true）：
+     *  GPS 高度信息可靠性远低于水平位置（大气折射、多路径、天线相位中心误差均主要影响高度），
+     *  若将 Z 轴约束注入后端优化和 HBA 优化，会导致严重的多重地面/地图层叠重影。
+     *  true 时将所有 GPS 因子的 Z 轴方差设为 gps.altitude_variance_override（默认 1e6），
+     *  等效于去除高度约束；false 时保留原始协方差。 */
+    bool   gpsDisableAltitudeConstraint() const {
+        return get<bool>("gps.disable_altitude_constraint", true);
+    }
+    /** Z 轴被替换时使用的方差值（σ² 单位，默认 1e6 ≈ 1000m 标准差）*/
+    double gpsAltitudeVarianceOverride() const {
+        return get<double>("gps.altitude_variance_override", 1e6);
+    }
+
     // ── 回环检测 ──────────────────────────────────────────
     double overlapThreshold()   const { return get<double>("loop_closure.overlap_threshold", 0.3); }
     int    loopTopK()           const { return get<int>("loop_closure.top_k", 5); }

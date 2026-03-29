@@ -220,7 +220,11 @@ TeaserMatcher::Result TeaserMatcher::match(
         FPFHCloudPtr src_feat;
         try {
             ALOG_DEBUG(MOD, "[tid={}] step=fpfh_src_compute_start src_ptr={} src_pts={}", tid, static_cast<const void*>(src.get()), src->size());
-            src_feat = extractor.compute(src, 0.5f, 1.0f);
+            // 🏛️ [V3 修复] 自适应半径：确保法线搜索半径至少为体素大小的 2 倍，FPFH 半径为 4 倍。
+            // 否则在 sparse 下采样（如 0.5m）后，0.5m 半径无法找到邻域导致 FPFH 特征全是 NaN/垃圾。
+            const float normal_r = std::max(0.5f, static_cast<float>(voxel_size_ * 2.0));
+            const float fpfh_r   = std::max(1.0f, normal_r * 2.0f);
+            src_feat = extractor.compute(src, normal_r, fpfh_r);
         } catch (const std::bad_alloc& e) {
             ALOG_ERROR(MOD, "[tid={}] step=fpfh_src_exception reason=bad_alloc msg={}", tid, e.what());
             ALOG_INFO(MOD, "[TRACE] step=loop_match result=fail reason=fpfh_src_bad_alloc tid={} (精准定位: 源点云 FPFH 内存不足)", tid);
@@ -246,7 +250,9 @@ TeaserMatcher::Result TeaserMatcher::match(
         FPFHCloudPtr tgt_feat;
         try {
             ALOG_DEBUG(MOD, "[tid={}] step=fpfh_tgt_compute_start tgt_ptr={} tgt_pts={}", tid, static_cast<const void*>(tgt.get()), tgt->size());
-            tgt_feat = extractor.compute(tgt, 0.5f, 1.0f);
+            const float normal_r = std::max(0.5f, static_cast<float>(voxel_size_ * 2.0));
+            const float fpfh_r   = std::max(1.0f, normal_r * 2.0f);
+            tgt_feat = extractor.compute(tgt, normal_r, fpfh_r);
         } catch (const std::bad_alloc& e) {
             ALOG_ERROR(MOD, "[tid={}] step=fpfh_tgt_exception reason=bad_alloc msg={}", tid, e.what());
             ALOG_INFO(MOD, "[TRACE] step=loop_match result=fail reason=fpfh_tgt_bad_alloc tid={} (精准定位: 目标点云 FPFH 内存不足)", tid);
@@ -305,14 +311,17 @@ TeaserMatcher::Result TeaserMatcher::match(
             double p10 = distances[std::min(size_t(distances.size() * 0.1), distances.size() - 1)];
             double p50 = distances[distances.size() / 2];
             double p90 = distances[std::min(size_t(distances.size() * 0.9), distances.size() - 1)];
+            result.fpfh_p90 = static_cast<float>(p90);
             ALOG_WARN(MOD, "[FPFH_DIAG] tid={} corrs={} dist_p10={:.2f}m p50={:.2f}m p90={:.2f}m "
                       "(p90>>5m 表示存在大量误匹配；若 p10 也很大则 FPFH 特征可能在不同区域发生了严重哈希碰撞)",
                       tid, corrs.size(), p10, p50, p90);
             
-            // 【架构防护】拦截极端垃圾数据：若 90% 的对应点距离超过 20m，说明特征完全匹配错误
-            // 此时调用 TEASER++ 会触发内部 PMC 内存损坏风险，必须直接拒绝
-            if (p90 > 20.0) {
-                ALOG_ERROR(MOD, "[FPFH_DIAG][CRITICAL] High p90 distance ({:.2f}m) detected! REJECTING garbage input to prevent TEASER++ heap corruption.", p90);
+            // 【架构防护】拦截极端垃圾数据：若 90% 的对应点距离过大，说明特征完全匹配错误
+            // 此时调用 TEASER++ 会触发内部 PMC 内存损坏风险，必须直接拒绝。
+            // 🏛️ [V3 修复] 动态阈值：硬截断应略大于 FPFH 过滤阈值，避免合法的大位移候选被误杀（尤其在 coordinate offset 场景下）。
+            const double hard_reject_thresh = std::max(20.0, fpfh_corr_max_dist * 2.0);
+            if (p90 > hard_reject_thresh) {
+                ALOG_ERROR(MOD, "[FPFH_DIAG][CRITICAL] High p90 distance ({:.2f}m) detected (thresh={:.1f}m)! REJECTING garbage input to prevent TEASER++ heap corruption.", p90, hard_reject_thresh);
                 ALOG_INFO(MOD, "[TRACE] step=loop_match result=fail reason=fpfh_garbage_input tid={} p90={:.2f}", tid, p90);
                 result.success = false;
                 result.fpfh_garbage_rejected = true;

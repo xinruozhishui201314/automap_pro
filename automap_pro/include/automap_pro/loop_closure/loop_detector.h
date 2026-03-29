@@ -290,7 +290,8 @@ private:
     void onDescriptorReady(const SubMap::Ptr& submap);
     void processMatchTask(const MatchTask& task);
     bool shouldAllowSvdFallbackNow(const TeaserMatcher::Result& res, int query_id, int target_id, const char* stage_tag);
-    void updateLoopHealthKpi(int query_id, int candidates, int accepted);
+    void updateLoopHealthKpi(int query_id, int candidates, int accepted, 
+                             float last_p90 = 0.0f, bool fpfh_garbage_rejected = false);
     std::string makeSubmapKey(uint64_t session_id, int submap_id) const;
     double submapRepresentativeTime(const SubMap::Ptr& submap) const;
 

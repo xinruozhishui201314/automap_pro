@@ -202,6 +202,8 @@ IncrementalOptimizer::IncrementalOptimizer() {
     gps_high_altitude_scale_ = cfg.gpsHighAltitudeScale();
     gps_enable_outlier_detection_ = cfg.gpsEnableOutlierDetection();
     gps_outlier_cov_scale_ = cfg.gpsOutlierCovScale();
+    gps_disable_altitude_constraint_ = cfg.gpsDisableAltitudeConstraint();
+    gps_altitude_variance_override_ = cfg.gpsAltitudeVarianceOverride();
     semantic_switchable_residual_scale_m_ = cfg.semanticAssocSwitchableResidualScaleM();
     loop_constraint_max_translation_m_ = cfg.loopConstraintMaxTranslationM();
     loop_constraint_max_rotation_deg_ = cfg.loopConstraintMaxRotationDeg();
@@ -400,6 +402,18 @@ void IncrementalOptimizer::addSubMapNode(int sm_id, const Pose3d& init_pose, boo
         RCLCPP_INFO(rclcpp::get_logger("automap_system"),
             "[SEMANTIC][Backend] addSubMapNode sm_id=%d flushed_semantic_factors=%d",
             sm_id, sem_flushed);
+    }
+
+    // 记录子图节点到历史，供 transformHistoryAndRebuild（GPS 对齐后重建因子图）使用。
+    // 若不记录，GPS 对齐触发 rebuild 时 old_submaps 为空，所有非 KF0 的关键帧无法接地，
+    // 导致 forceUpdate 持续失败、PoseSnapshot 冻结、点云重影。
+    {
+        std::lock_guard<std::mutex> hlk(history_mutex_);
+        SubmapData d;
+        d.id = sm_id;
+        d.pose = init_pose;
+        d.is_fixed = fixed;
+        history_submap_data_.push_back(d);
     }
 
     // 🔧 V2 修复：addSubMapNode 不再直接调用 commitAndUpdate，由调用方在适当时候触发 forceUpdate
@@ -1031,9 +1045,14 @@ void IncrementalOptimizer::addGPSFactor(
         // 使用 Diagonal 噪声避免 Gaussian::Covariance(Matrix33) 在 linearize 路径触发 double free（borglab/gtsam#1189 同类）
         gtsam::Point3 gps_point(pos_map.x(), pos_map.y(), pos_map.z());
         gtsam::Vector3 vars;
+        // [GPS高度约束修复] 当 disable_altitude_constraint=true（默认）时，将 Z 轴方差设为大值，
+        // 防止不可靠的 GPS 高度数据通过子图级因子注入后导致多重地面重影。
+        const double z_var_sm = gps_disable_altitude_constraint_
+            ? gps_altitude_variance_override_
+            : std::max(1e-6, final_cov(2, 2));
         vars << std::max(1e-6, final_cov(0, 0)),
                 std::max(1e-6, final_cov(1, 1)),
-                std::max(1e-6, final_cov(2, 2));
+                z_var_sm;
         auto noise = gtsam::noiseModel::Diagonal::Variances(vars);
         staged_factors_.add(gtsam::GPSFactor(SM(sm_id), gps_point, noise));
         factor_count_++;
@@ -1776,9 +1795,15 @@ void IncrementalOptimizer::addGPSFactorsForKeyFramesBatch(const std::vector<GPSF
 
             gtsam::Point3 gps_point(f.pos.x(), f.pos.y(), f.pos.z());
             gtsam::Vector3 vars;
+            // [GPS高度约束修复] 当 disable_altitude_constraint=true（默认）时，将 Z 轴方差设为大值，
+            // 防止不可靠的 GPS 高度导致多重地面重影。
+            const auto& cfg_kf = ConfigManager::instance();
+            const double z_var_kf = cfg_kf.gpsDisableAltitudeConstraint()
+                ? cfg_kf.gpsAltitudeVarianceOverride()
+                : std::max(1e-6, f.cov(2, 2));
             vars << std::max(1e-6, f.cov(0, 0)),
                     std::max(1e-6, f.cov(1, 1)),
-                    std::max(1e-6, f.cov(2, 2));
+                    z_var_kf;
             auto noise = gtsam::noiseModel::Diagonal::Variances(vars);
             staged_factors_.add(gtsam::GPSFactor(KF(f.kf_id), gps_point, noise));
             factor_count_++;
@@ -1836,9 +1861,15 @@ int IncrementalOptimizer::flushPendingGPSFactorsForKeyFramesInternal() {
 
         gtsam::Point3 gps_point(f.pos.x(), f.pos.y(), f.pos.z());
         gtsam::Vector3 vars;
+        // [RC-1 修复] flush 路径与直接 add 路径保持一致：当 disable_altitude_constraint=true 时
+        // 将 Z 轴方差设为大值（altitude_variance_override），防止不可靠 GPS 高度数据导致 Z 漂移重影。
+        // 原来此处遗漏了该检查，导致 1000+ 个 deferred 因子以全量 Z 方差注入 GTSAM，引发 4m+ Z 漂移。
+        const double z_var_flush = gps_disable_altitude_constraint_
+            ? gps_altitude_variance_override_
+            : std::max(1e-6, f.cov(2, 2));
         vars << std::max(1e-6, f.cov(0, 0)),
                 std::max(1e-6, f.cov(1, 1)),
-                std::max(1e-6, f.cov(2, 2));
+                z_var_flush;
         auto noise = gtsam::noiseModel::Diagonal::Variances(vars);
         staged_factors_.add(gtsam::GPSFactor(KF(f.kf_id), gps_point, noise));
         factor_count_++;
@@ -3238,7 +3269,7 @@ void IncrementalOptimizer::reset() {
     resetInternal();
 }
 
-void IncrementalOptimizer::transformHistoryAndRebuild(const Pose3d& T_map_odom) {
+void IncrementalOptimizer::transformHistoryAndRebuild(const Pose3d& T_map_odom, bool suppress_pose_notify) {
     RCLCPP_INFO(rclcpp::get_logger("automap_system"),
         "[IncrementalOptimizer][BACKEND][REBUILD] transformHistoryAndRebuild ENTER: t=[%.2f, %.2f, %.2f]",
         T_map_odom.translation().x(), T_map_odom.translation().y(), T_map_odom.translation().z());
@@ -3314,11 +3345,19 @@ void IncrementalOptimizer::transformHistoryAndRebuild(const Pose3d& T_map_odom) 
 
     // 提交所有恢复的因子
     OptimizationResult res = commitAndUpdate();
-    
-    // 🏛️ [关键修复] 重建后必须显式通知所有观察者（MappingModule 等），
-    // 否则由于历史帧位姿已全量突变，下游模块若不即时同步将导致严重的重影。
+
     lk.unlock(); // 释放锁后再回调，防止死锁
-    notifyPoseUpdate(res);
+
+    // 🏛️ [RC1 修复] suppress_pose_notify=true 时跳过中间态通知。
+    // 当调用方（processGPSBatchKF）紧接着会调用 addGPSFactorsForKeyFramesBatch，
+    // 后者内部已有 notifyPoseUpdate，可避免发布 GPS 因子尚未收敛的中间位姿导致轨迹跳变。
+    if (!suppress_pose_notify) {
+        notifyPoseUpdate(res);
+    } else {
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[IncrementalOptimizer][BACKEND][REBUILD] transformHistoryAndRebuild: suppress_pose_notify=true, "
+            "skip intermediate notifyPoseUpdate (GPS factors not yet added)");
+    }
 
     RCLCPP_INFO(rclcpp::get_logger("automap_system"),
         "[IncrementalOptimizer][BACKEND][REBUILD] transformHistoryAndRebuild DONE: factors=%d nodes=%d (grep REBUILD DONE)",
@@ -3649,18 +3688,22 @@ void IncrementalOptimizer::tryMoveStagedToPendingInternal() {
             move_count++;
         }
         
-        // 3. 识别并移动 grounded factors
+        // 3. 识别并移动因子：仅当所有关联 key 的 value 已在 current_estimate_ 或 pending_values_ 时才迁移。
+        // 注意：不能使用 isGroundedInternal(k) 做此判断——该函数会递归检查 staged_factors_ 中的链路，
+        // 导致「KF1 value 仍在 staged_values_, 但 BetweenFactor(SM1,KF1) 因 SM1 已入 pending 而被
+        // 判定为 all_grounded=true」的假阳性。因子被提前移入 pending_graph_, 随后 commitAndUpdate
+        // 发现 KF1 不在 pending_values_ 而将该因子过滤丢弃，KF1 此后永久孤立无法接地（轨迹跳变根因）。
         gtsam::NonlinearFactorGraph still_staged;
         for (const auto& f : staged_factors_) {
             if (!f) continue;
-            bool all_grounded = true;
+            bool all_committed = true;
             for (gtsam::Key k : f->keys()) {
-                if (!isGroundedInternal(k)) {
-                    all_grounded = false;
+                if (!current_estimate_.exists(k) && !pending_values_.exists(k)) {
+                    all_committed = false;
                     break;
                 }
             }
-            if (all_grounded) {
+            if (all_committed) {
                 pending_graph_.add(f);
                 progress = true;
             } else {

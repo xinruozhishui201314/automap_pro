@@ -194,11 +194,17 @@ void ISAM2GPSManager::addGPSToGraph(
     gtsam::NonlinearFactorGraph& pending_graph,
     int& factor_count)
 {
+    const auto& cfg = ConfigManager::instance();
     gtsam::Point3 gps_point(pos.x(), pos.y(), pos.z());
     gtsam::Vector3 vars;
+    // [GPS高度约束修复] 当 disable_altitude_constraint=true（默认）时，将 Z 轴方差设为大值，
+    // 等效于去除高度约束，防止不可靠的 GPS 高度数据导致多重地面/地图层叠重影。
+    const double z_var = cfg.gpsDisableAltitudeConstraint()
+        ? cfg.gpsAltitudeVarianceOverride()
+        : std::max(1e-6, cov(2, 2));
     vars << std::max(1e-6, cov(0, 0)),
             std::max(1e-6, cov(1, 1)),
-            std::max(1e-6, cov(2, 2));
+            z_var;
     auto noise = gtsam::noiseModel::Diagonal::Variances(vars);
     pending_graph.add(gtsam::GPSFactor(SM(sm_id), gps_point, noise));
     factor_count++;

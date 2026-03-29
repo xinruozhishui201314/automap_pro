@@ -306,6 +306,9 @@ private:
     bool   publish_global_map_ = true;
     int    marker_id_counter_ = 0;
 
+    // [RC3] 记录上次发布 opt_path_pub_ 时的 snapshot 版本号，用于同版本去重
+    uint64_t last_opt_path_version_ = std::numeric_limits<uint64_t>::max();
+
     // ── 私有辅助方法 ───────────────────────────────────────────────────────
 
     /** 点云转换到ROS消息 */

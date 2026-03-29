@@ -37,9 +37,16 @@ void RvizPublisher::init(rclcpp::Node::SharedPtr node) {
     auto reliable_qos = rclcpp::QoS(rclcpp::KeepLast(10)).reliable();
     auto path_qos = rclcpp::QoS(rclcpp::KeepLast(100)).reliable();
 
-    // 点云（全局地图用 Reliable，便于 RViz 完整显示）
+    // 点云（全局地图用 Reliable；若配置了 transient_local 则用 TransientLocal，
+    // 使 RViz rviz_backend 以 TRANSIENT_LOCAL 订阅时不产生 DURABILITY_QOS_POLICY 不兼容）
     auto map_qos = rclcpp::QoS(rclcpp::KeepLast(5)).reliable();
-    global_map_pub_     = node->create_publisher<sensor_msgs::msg::PointCloud2>("/automap/global_map", map_qos);
+    rclcpp::QoS global_map_qos = map_qos;
+    if (cfg.vizGlobalMapRos2TransientLocal()) {
+        global_map_qos.durability(rclcpp::DurabilityPolicy::TransientLocal);
+        RCLCPP_INFO(node->get_logger(),
+            "[RvizPublisher] /automap/global_map QoS=TRANSIENT_LOCAL (global_map_ros2_transient_local=true)");
+    }
+    global_map_pub_     = node->create_publisher<sensor_msgs::msg::PointCloud2>("/automap/global_map", global_map_qos);
     current_cloud_pub_  = node->create_publisher<sensor_msgs::msg::PointCloud2>("/automap/current_cloud", sensor_qos);
     submap_cloud_pub_   = node->create_publisher<sensor_msgs::msg::PointCloud2>("/automap/submap_cloud", sensor_qos);
     colored_cloud_pub_  = node->create_publisher<sensor_msgs::msg::PointCloud2>("/automap/colored_cloud", sensor_qos);
@@ -260,6 +267,16 @@ void RvizPublisher::publishOptimizedPath(const std::vector<SubMap::Ptr>& submaps
                                          const PoseSnapshot::Ptr& snapshot,
                                          uint64_t alignment_epoch_limit) {
     if (!node() || !opt_path_pub_) return;
+
+    // [RC3] 同版本去重：若 snapshot 版本与上次发布相同则跳过，避免多事件触发导致闪烁
+    const uint64_t cur_version = snapshot ? snapshot->version : 0;
+    if (cur_version != 0 && cur_version == last_opt_path_version_) {
+        RCLCPP_DEBUG(node()->get_logger(),
+            "[RvizPublisher][RC3_DEDUP] publishOptimizedPath skip version=%lu (same as last published)",
+            static_cast<unsigned long>(cur_version));
+        return;
+    }
+
     nav_msgs::msg::Path path;
     path.header.stamp    = node()->now();
     path.header.frame_id = frame_id_;
@@ -321,6 +338,7 @@ void RvizPublisher::publishOptimizedPath(const std::vector<SubMap::Ptr>& submaps
         ps.pose.orientation.x = q.x(); ps.pose.orientation.y = q.y(); ps.pose.orientation.z = q.z(); ps.pose.orientation.w = q.w();
         path.poses.push_back(ps);
     }
+    last_opt_path_version_ = cur_version; // [RC3] 记录已发布版本
     opt_path_pub_->publish(path);
 }
 
@@ -414,20 +432,10 @@ void RvizPublisher::publishGPSTrajectory(const std::vector<SubMap::Ptr>& submaps
 void RvizPublisher::publishTrajectoryComparison(
     const std::vector<std::pair<double, Pose3d>>& odom_path,
     const std::vector<std::pair<double, Pose3d>>& opt_path) {
+    // [RC3] 只发布 odom 路径；opt_path_pub_ 由 publishOptimizedPath 统一管理（带版本去重）。
+    // 原先此处也写 opt_path_pub_，与 publishOptimizedPath 在毫秒内形成多路竞争，导致轨迹闪烁。
     publishOdometryPath(odom_path);
-    nav_msgs::msg::Path path;
-    path.header.stamp = node()->now();
-    path.header.frame_id = frame_id_;
-    for (const auto& [ts, pose] : opt_path) {
-        geometry_msgs::msg::PoseStamped ps;
-        ps.header = path.header;
-        const auto& p = pose.translation();
-        Eigen::Quaterniond q(pose.rotation());
-        ps.pose.position.x = p.x(); ps.pose.position.y = p.y(); ps.pose.position.z = p.z();
-        ps.pose.orientation.x = q.x(); ps.pose.orientation.y = q.y(); ps.pose.orientation.z = q.z(); ps.pose.orientation.w = q.w();
-        path.poses.push_back(ps);
-    }
-    opt_path_pub_->publish(path);
+    (void)opt_path; // opt_path 仅对外接口保留，不再写 opt_path_pub_
 }
 
 void RvizPublisher::publishGpsKeyframePath(const std::vector<Eigen::Vector3d>& gps_positions_map) {
@@ -911,20 +919,11 @@ void RvizPublisher::publishOptimizationConvergence(const std::vector<double>& re
 
 void RvizPublisher::publishPoseUpdateAnimation(const std::vector<Pose3d>& before,
                                                const std::vector<Pose3d>& after) {
-    if (!node() || !opt_path_pub_ || before.size() != after.size()) return;
-    nav_msgs::msg::Path path;
-    path.header.stamp = node()->now();
-    path.header.frame_id = frame_id_;
-    for (size_t i = 0; i < after.size(); ++i) {
-        geometry_msgs::msg::PoseStamped ps;
-        ps.header = path.header;
-        const auto& p = after[i].translation();
-        Eigen::Quaterniond q(after[i].rotation());
-        ps.pose.position.x = p.x(); ps.pose.position.y = p.y(); ps.pose.position.z = p.z();
-        ps.pose.orientation.x = q.x(); ps.pose.orientation.y = q.y(); ps.pose.orientation.z = q.z(); ps.pose.orientation.w = q.w();
-        path.poses.push_back(ps);
-    }
-    opt_path_pub_->publish(path);
+    // [RC3] opt_path_pub_ 统一由 publishOptimizedPath 管理（带版本去重），此处不再重复写入。
+    // 原先此处会在 publishOptimizedPath 之后再次发布相同位姿集，导致 RViz 在毫秒内收到多次
+    // 相同（或不同 epoch 过滤状态的）轨迹消息，引发闪烁。
+    (void)before;
+    (void)after;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

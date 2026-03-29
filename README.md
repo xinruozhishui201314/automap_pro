@@ -76,6 +76,15 @@ bash run_automap.sh --help
 
 `automap_start.sh` 仍可作为兼容入口，但默认推荐统一使用 `run_automap.sh`。
 
+### 近期更新（2026-03-29）
+
+- **GPS / 因子图（RC-1）**：新增 `gps.disable_altitude_constraint`（默认 `true`）与 `gps.altitude_variance_override`（默认 `1e6`），在单频 GPS 高度不可靠时等效弱化 Z 向约束，配合 `incremental_optimizer` 中 **直接 add** 与 **flush 待处理 GPS 因子** 两条路径的 Z 方差逻辑一致化，减轻轨迹 Z 漂移导致的地面“双层/夹角”重影。`isam2_gps_manager`、`hba_optimizer` 同步应用相同策略。
+- **M2DGR 配置**：`system_config_M2DGR.yaml` 中收紧 `quality_threshold_hdop`（12→8）、`keyframe_max_hdop`（15→10），并显式启用上述高度约束策略说明项。
+- **V3 建图链路**：`mapping_module`、`optimizer_module`、`submap_manager` 子图/优化任务组织与调度相关更新。
+- **回环与可视化**：`loop_detector`、`teaser_matcher` 回环几何验证链路调整；`rviz_publisher` 发布逻辑更新。
+
+纯文本速查与上述摘要的副本见仓库根目录 **`readme.txt`**。
+
 ---
 
 ## 🏗️ Architecture At A Glance
@@ -361,6 +370,7 @@ automap_pro/                    # 仓库根目录
 
 | 文档 | 说明 |
 |------|------|
+| [readme.txt](readme.txt) | 纯文本速查与近期变更摘要（与下文互补） |
 | [QUICK_START.md](QUICK_START.md) | 快速开始、常用命令与错误排查 |
 | [docs/BUILD_DEPLOY_RUN.md](docs/BUILD_DEPLOY_RUN.md) | 编译/部署/运行说明 |
 | [docs/README.md](docs/README.md) | 文档索引 |
@@ -371,14 +381,14 @@ automap_pro/                    # 仓库根目录
 
 ---
 
-## 📋 文档一致性矩阵（本次更新建议）
+## 📋 文档一致性矩阵
 
-| 文档 | 当前状态 | 建议 |
-|------|----------|------|
-| `README.md` | 已更新为 `run_automap.sh` 主入口 | 持续同步模块边界与语义管线 |
-| `docs/BUILD_DEPLOY_RUN.md` | 存在主入口描述冲突（部分段落提到 `automap_start.sh` 为推荐） | 统一为 `run_automap.sh` 主入口 |
-| `docs/CONFIG_SUMMARY.md` | 仍偏向历史入口描述 | 与当前脚本参数和配置方式对齐 |
-| `docs/MAPPING_WORKFLOW.md` | 包含历史启动流示例 | 增补 V3 模块链路与新入口 |
+| 文档 | 状态 |
+|------|------|
+| `README.md` | 主入口 `run_automap.sh`；含 V3 架构与语义管线；与 `readme.txt` 同步摘要 |
+| `readme.txt` | 根目录纯文本速查 + 近期变更 |
+| `docs/BUILD_DEPLOY_RUN.md` | 已统一以 `run_automap.sh` 为主入口说明 |
+| `docs/CONFIG_SUMMARY.md` / `docs/MAPPING_WORKFLOW.md` | 按需与脚本参数、V3 模块顺序对照维护 |
 
 ---
 
@@ -396,5 +406,5 @@ automap_pro/                    # 仓库根目录
 
 **Made with ❤️ by AutoMap-Pro Team**
 
-文档版本：v2.2（V3 架构与语义管线说明）  
-更新日期：2026-03-24
+文档版本：v2.3（GPS 高度约束与 M2DGR RC-1、V3/回环/RViz 同步说明）  
+更新日期：2026-03-29

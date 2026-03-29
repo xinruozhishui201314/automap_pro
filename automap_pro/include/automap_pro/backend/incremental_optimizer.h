@@ -170,9 +170,12 @@ public:
     void reset();
 
     /** 🏛️ [架构加固] 修复 GPS 对齐发散：将现有历史数据转换到 MAP 坐标系并重建因子图
-     * @param T_map_odom 坐标系转换：p_map = T_map_odom * p_odom
+     * @param T_map_odom         坐标系转换：p_map = T_map_odom * p_odom
+     * @param suppress_pose_notify 若为 true，REBUILD 后不立即调用 notifyPoseUpdate。
+     *        用于 processGPSBatchKF 场景：REBUILD 之后紧跟 addGPSFactorsForKeyFramesBatch，
+     *        后者有自己的 notifyPoseUpdate，避免发布 GPS 因子尚未收敛的中间态位姿。
      */
-    void transformHistoryAndRebuild(const Pose3d& T_map_odom);
+    void transformHistoryAndRebuild(const Pose3d& T_map_odom, bool suppress_pose_notify = false);
 
     /** 获取当前因子图坐标系语义 */
     PoseFrame getPoseFrame() const { return current_pose_frame_; }
@@ -438,6 +441,9 @@ private:
     double gps_high_altitude_scale_{2.0};
     bool gps_enable_outlier_detection_{true};
     double gps_outlier_cov_scale_{100.0};
+    // [GPS高度约束修复] 默认禁用高度约束，防止不可靠 GPS 高度导致多重地面重影
+    bool gps_disable_altitude_constraint_{true};
+    double gps_altitude_variance_override_{1e6};
     double semantic_switchable_residual_scale_m_{0.25};
     mutable std::deque<double> semantic_residual_window_;
     static constexpr size_t kSemanticResidualWindowSize = 400;
