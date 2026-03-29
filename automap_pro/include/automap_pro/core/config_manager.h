@@ -1,5 +1,6 @@
 #pragma once
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <map>
 #include <sstream>
@@ -356,7 +357,8 @@ public:
     /** 若已配置 ENU 原点，返回 [lat, lon, alt]；否则返回 [0,0,0]。调用前可用 gpsEnuOriginConfigured() 判断。 */
     Eigen::Vector3d gpsEnuOrigin() const;
     /**
-     * GPS 天线相对 IMU 原点的杆臂（米），在 **IMU/body 系** 下表达（与 HBA 中 pos_imu = pos_gps - R*T_w_b * lever_arm 一致）。
+     * GPS 天线相对 IMU 原点的杆臂（米），在 **IMU/body 系** 下表达；在 **GPS 入口**（V3 FrontEnd 缓存、GPSManager 窗口）
+     * 做 `position_enu -= R_enu_body * lever`，下游 `GPSMeasurement.position_enu` 表示 IMU 在 ENU，HBA/iSAM2 不再重复减杆臂。
      * 来自标定：t_gnss^L - t_imu^L（两外参均为 [to LIDAR] 且 R=I 时与 body 系轴对齐）。
      * 未配置或全零时 HBA 可回退 legacy `sensor_config/gps_imu_extrinsic.yaml`。
      */
@@ -375,6 +377,27 @@ public:
     double gpsOutlierCovScale()      const { return get<double>("gps.outlier_cov_scale", 100.0); }
     double gpsResidualBaseline()     const { return get<double>("gps.residual_baseline", 2.0); }
 
+    /** V1：按 HDOP/卫星数自适应放大 GPS 位置协方差（弱信号 → 更软约束） */
+    bool   gpsAdaptiveNoiseEnabled() const { return get<bool>("gps.adaptive_noise.enabled", true); }
+    double gpsAdaptiveHdopGood() const { return std::max(0.05, get<double>("gps.adaptive_noise.hdop_good", 1.0)); }
+    double gpsAdaptiveHdopPoor() const { return std::max(gpsAdaptiveHdopGood() + 1e-3, get<double>("gps.adaptive_noise.hdop_poor", 12.0)); }
+    double gpsAdaptiveVarScaleMaxHdop() const { return std::max(1.0, get<double>("gps.adaptive_noise.var_scale_max_hdop", 25.0)); }
+    int    gpsAdaptiveSatsGood() const { return std::max(4, get<int>("gps.adaptive_noise.sats_good", 12)); }
+    int    gpsAdaptiveSatsPoor() const {
+        const int g = gpsAdaptiveSatsGood();
+        int p = get<int>("gps.adaptive_noise.sats_poor", 4);
+        return std::max(1, std::min(g - 1, p));
+    }
+    double gpsAdaptiveVarScaleMaxSats() const { return std::max(1.0, get<double>("gps.adaptive_noise.var_scale_max_sats", 8.0)); }
+    /** V2：GPS 与当前图位姿水平 innovation 超出门控时放大 XY 方差（不跑额外线搜索 ICP） */
+    bool   gpsLocalConsistencyEnabled() const { return get<bool>("gps.local_consistency.enabled", true); }
+    double gpsLocalConsistencyInnovationGateSigma() const {
+        return std::max(0.5, get<double>("gps.local_consistency.innovation_gate_sigma", 3.0));
+    }
+    double gpsLocalConsistencyVarScaleMax() const {
+        return std::max(1.0, get<double>("gps.local_consistency.var_scale_max", 2500.0));
+    }
+
     /** gps.disable_altitude_constraint（默认 true）：
      *  GPS 高度信息可靠性远低于水平位置（大气折射、多路径、天线相位中心误差均主要影响高度），
      *  若将 Z 轴约束注入后端优化和 HBA 优化，会导致严重的多重地面/地图层叠重影。
@@ -390,6 +413,14 @@ public:
 
     // ── 回环检测 ──────────────────────────────────────────
     double overlapThreshold()   const { return get<double>("loop_closure.overlap_threshold", 0.3); }
+    /**
+     * TEASER/ICP 通过后仍要求 overlap/描述子 score ≥ 此值，否则拒绝入图（抑制 score≈0 的伪回环）。
+     * ≤0 表示关闭硬门槛（仅依赖 overlap_threshold 等原有逻辑）。
+     */
+    double loopMinAcceptOverlapScore() const {
+        double v = get<double>("loop_closure.min_accept_overlap_score", 0.03);
+        return std::max(0.0, std::min(1.0, v));
+    }
     int    loopTopK()           const { return get<int>("loop_closure.top_k", 5); }
     double loopMinTemporalGap() const { return get<double>("loop_closure.min_temporal_gap_s", 30.0); }
     /** 最小子图间隔：0=不按子图间隔过滤(允许相邻子图回环)；>0=候选与当前子图索引差须大于该值。默认 0 */
@@ -665,6 +696,13 @@ public:
     }
     /** 关键帧之间里程计因子的噪声参数 (trans_m, rot_rad) */
     double kfOdomTransNoise() const { return get<double>("backend.keyframe_odom_trans_noise", 0.005); }
+    /** 关键帧 Between 相对平移 Z 向标准差（米）。≤0 或未配置时用 kfOdomTransNoise()，与 XY 相同 */
+    double kfOdomTransNoiseZ() const {
+        const double z = get<double>("backend.keyframe_odom_trans_noise_z", -1.0);
+        const double xy = kfOdomTransNoise();
+        if (!std::isfinite(z) || z <= 0.0) return xy;
+        return z;
+    }
     double kfOdomRotNoise()   const { return get<double>("backend.keyframe_odom_rot_noise",   0.01); }
     /** 子图之间里程计因子的噪声参数 (trans_m, rot_rad) */
     double smOdomTransNoise() const { return get<double>("backend.submap_odom_trans_noise", 0.01); }
@@ -1607,7 +1645,7 @@ private:
 
     /** load() 时一次性读取的 GPS 配置缓存，避免重复解析 YAML 与默认值不一致 */
     bool gps_cached_{false};
-    /** load() 时从 gps.lever_arm_imu 钉死；gpsLeverArmImu() 优先返回，供 HBA 与 iSAM2 几何同源（避免运行时读 cfg_ 不一致读零） */
+    /** load() 时从 gps.lever_arm_imu 钉死；gpsLeverArmImu() 优先返回，供 FrontEnd/GPSManager 入口与排障一致（避免运行时读 cfg_ 不一致读零） */
     bool gps_lever_arm_imu_cached_valid_{false};
     Eigen::Vector3d gps_lever_arm_imu_cached_{0.0, 0.0, 0.0};
     int    gps_align_min_points_{50};

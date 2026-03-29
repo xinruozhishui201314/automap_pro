@@ -982,6 +982,8 @@ void SubMapManager::batchUpdateKeyFramePoses(const std::unordered_map<uint64_t, 
     std::unique_lock<std::mutex> lk(mutex_);
     current_map_version_ = version;
     size_t updated = 0;
+    double z_diag_max_abs_dz = 0.0;
+    double z_diag_max_anchor_mapz_minus_odomz = 0.0;
     
     // 🏛️ [架构加固] 记录哪些子图的锚点发生了变动，以便后续同步子图内其他帧并检查重影
     std::unordered_map<int, Pose3d> sm_anchor_updates;
@@ -1001,6 +1003,15 @@ void SubMapManager::batchUpdateKeyFramePoses(const std::unordered_map<uint64_t, 
                     if (kf->is_anchor) {
                         double jump = (it->second.translation() - kf->T_map_b_optimized.translation()).norm();
                         max_jump_dist = std::max(max_jump_dist, jump);
+                    }
+
+                    const double old_map_z = kf->T_map_b_optimized.translation().z();
+                    const double new_map_z = it->second.translation().z();
+                    z_diag_max_abs_dz = std::max(z_diag_max_abs_dz, std::abs(new_map_z - old_map_z));
+                    if (kf->is_anchor && kf->T_odom_b.matrix().allFinite()) {
+                        z_diag_max_anchor_mapz_minus_odomz = std::max(
+                            z_diag_max_anchor_mapz_minus_odomz,
+                            std::abs(new_map_z - kf->T_odom_b.translation().z()));
                     }
 
                     kf->T_map_b_optimized = it->second;
@@ -1050,6 +1061,10 @@ void SubMapManager::batchUpdateKeyFramePoses(const std::unordered_map<uint64_t, 
     RCLCPP_INFO(rclcpp::get_logger("automap_system"), 
                  "[SubMapMgr][Gateway] batchUpdateKeyFramePoses: updated %zu kfs, %zu sm_anchors to version %lu (max_jump=%.3fm)", 
                  updated, sm_anchor_updates.size(), version, max_jump_dist);
+    RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                "[Z_DRIFT_DIAG] stage=isam2_batch map_ver=%lu updated_kfs=%zu max_abs_dz=%.4fm "
+                "max_anchor_abs_mapz_minus_odomz=%.4fm (纯 yaw+tz=0 对齐后锚点应接近 0；偏大则查 GPS/回环/杆臂)",
+                static_cast<unsigned long>(version), updated, z_diag_max_abs_dz, z_diag_max_anchor_mapz_minus_odomz);
 
     // 🏛️ [架构加固] 如果检测到巨大跳变（如 GPS 对齐），强制重建点云，避免 merged_cloud 污染
     if (max_jump_dist > submap_rebuild_thresh_trans_) {
@@ -1129,15 +1144,49 @@ void SubMapManager::updateAllFromHBA(const HBAResult& result) {
             n_kfs, n_poses);
         std::abort();
     }
+    // Z 漂移诊断：写回前采样首/中/尾 map.z，写回后与 odom.z 对比（grep Z_DRIFT_DIAG stage=hba_writeback）
+    const size_t zi0 = 0;
+    const size_t zi1 = (n_kfs > 2) ? (n_kfs / 2) : 0;
+    const size_t zi2 = (n_kfs > 1) ? (n_kfs - 1) : 0;
+    const double z_b0 = kfs_in_hba_order[zi0]->T_map_b_optimized.translation().z();
+    const double z_b1 = kfs_in_hba_order[zi1]->T_map_b_optimized.translation().z();
+    const double z_b2 = kfs_in_hba_order[zi2]->T_map_b_optimized.translation().z();
+
     for (size_t i = 0; i < n_poses; ++i) {
         // [HBA_GHOSTING_FIX] 直接覆盖为 HBA 优化后的绝对位姿
         kfs_in_hba_order[i]->T_map_b_optimized = result.optimized_poses[i];
+        // [连续HBA跳变修复] 同步写入 T_map_b_hba，专用于下一轮 HBA 的初值读取。
+        // iSAM2 的 batchUpdateKeyFramePoses 路径不会触碰此字段，因此即使 iSAM2 在两次
+        // HBA 之间覆写了 T_map_b_optimized，下一轮 HBA 仍可从 T_map_b_hba 获得正确的
+        // GPS-aligned 初值，防止旋转角度在连续 HBA 之间退化（见：GHOST_GUARD kf_id=105 18.97deg）。
+        kfs_in_hba_order[i]->T_map_b_hba = result.optimized_poses[i];
+        // [HBA初值修复] 标记 T_map_b_hba 已由 HBA 写入，使 poseForInitial 可安全使用该字段。
+        kfs_in_hba_order[i]->hba_pose_valid = true;
         kfs_in_hba_order[i]->pose_frame = result.pose_frame; // 🏛️ [架构加固] 尊重 HBA 报告的坐标系语义
         
         // 🏛️ [修复] 同步更新对齐纪元，确保 buildGlobalMap 主路径不会因 alignment_epoch_limit 过滤掉这些已优化的帧
         if (result.alignment_epoch_snapshot > 0) {
             kfs_in_hba_order[i]->alignment_epoch = result.alignment_epoch_snapshot;
         }
+    }
+
+    {
+        auto absdz = [](double a, double b) { return std::abs(a - b); };
+        double max_abs_dz = absdz(kfs_in_hba_order[zi0]->T_map_b_optimized.translation().z(), z_b0);
+        max_abs_dz = std::max(max_abs_dz, absdz(kfs_in_hba_order[zi1]->T_map_b_optimized.translation().z(), z_b1));
+        max_abs_dz = std::max(max_abs_dz, absdz(kfs_in_hba_order[zi2]->T_map_b_optimized.translation().z(), z_b2));
+        double max_m_minus_o = 0.0;
+        for (size_t zix : {zi0, zi1, zi2}) {
+            const auto& kf = kfs_in_hba_order[zix];
+            if (kf && kf->T_odom_b.matrix().allFinite()) {
+                max_m_minus_o = std::max(max_m_minus_o,
+                    std::abs(kf->T_map_b_optimized.translation().z() - kf->T_odom_b.translation().z()));
+            }
+        }
+        RCLCPP_INFO(log,
+            "[Z_DRIFT_DIAG] stage=hba_writeback kfs=%zu sample_idx=[%zu,%zu,%zu] max_abs_dz_sample=%.4fm "
+            "max_abs_mapz_minus_odomz_sample=%.4fm (对齐后垂直向应贴近 LIO；偏大查回环/GPS/Between-Z)",
+            n_kfs, zi0, zi1, zi2, max_abs_dz, max_m_minus_o);
     }
 
     // [PCD_GHOSTING_VERIFY] ... (此处省略校验代码) ...

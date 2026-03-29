@@ -130,6 +130,7 @@ LoopDetector::LoopDetector() {
     loop_max_match_queue_size_ = cfg.loopMaxMatchQueueSize();
     teaser_min_safe_inliers_ = cfg.teaserMinSafeInliers();
     parallel_teaser_match_ = cfg.parallelTeaserMatch();
+    min_accept_overlap_score_hard_ = cfg.loopMinAcceptOverlapScore();
 }
 
 LoopDetector::~LoopDetector() { stop(); }
@@ -238,6 +239,7 @@ void LoopDetector::init(rclcpp::Node::SharedPtr node) {
     loop_max_match_queue_size_ = cfg.loopMaxMatchQueueSize();
     teaser_min_safe_inliers_ = cfg.teaserMinSafeInliers();
     parallel_teaser_match_ = cfg.parallelTeaserMatch();
+    min_accept_overlap_score_hard_ = cfg.loopMinAcceptOverlapScore();
     svd_temp_enable_after_fpfh_critical_ = 3;
     svd_temp_enable_budget_max_ = 24;
     svd_temp_enable_budget_left_ = 0;
@@ -259,6 +261,9 @@ void LoopDetector::init(rclcpp::Node::SharedPtr node) {
     RCLCPP_INFO(node->get_logger(),
         "[LoopDetector][CONFIG] geo_prefilter: max_distance_m=%.1f skip_above_score=%.2f (0=off; grep CONFIG 验证)",
         geo_prefilter_max_distance_m_, geo_prefilter_skip_above_score_);
+    RCLCPP_INFO(node->get_logger(),
+        "[LoopDetector][CONFIG] min_accept_overlap_score_hard=%.4f (0=off; TEASER 通过后仍拒绝低于此分的回环)",
+        min_accept_overlap_score_hard_);
     RCLCPP_INFO(node->get_logger(),
         "[DIAG][LOOP][CONFIG] flow_mode=%s ot_preferred=%d allow_sc_fallback=%d allow_descriptor_fallback=%d "
         "allow_svd_geom_fallback=%d scancontext_enabled=%d overlap_threshold=%.2f top_k=%d min_temporal_gap_s=%.1f "
@@ -938,13 +943,26 @@ void LoopDetector::onDescriptorReady(const SubMap::Ptr& submap) {
             tasks_enqueued++;
         }
         match_cv_.notify_one();
-        ALOG_INFO(MOD, "[LOOP_PHASE] stage=match_enqueue INTER_KEYFRAME query_id={} sampled_kf_tasks={} (关键帧级子图间)",
-                  submap->id, tasks_enqueued);
-        if (node()) {
-            RCLCPP_INFO(node()->get_logger(), "[LOOP_PHASE] stage=match_enqueue INTER_KEYFRAME query_id=%d tasks=%d",
-                        submap->id, tasks_enqueued);
+        // 与 INTER_KEYFRAME_OT 一致：仅当实际入队任务 >0 时提前 return；否则 fallthrough 子图级 TEASER，
+        // 避免「子图级 SC 有候选、关键帧级 SC 全空」时整次子图间几何验证被跳过。
+        if (tasks_enqueued > 0) {
+            ALOG_INFO(MOD, "[LOOP_PHASE] stage=match_enqueue INTER_KEYFRAME query_id={} sampled_kf_tasks={} (关键帧级子图间)",
+                      submap->id, tasks_enqueued);
+            if (node()) {
+                RCLCPP_INFO(node()->get_logger(), "[LOOP_PHASE] stage=match_enqueue INTER_KEYFRAME query_id=%d tasks=%d",
+                            submap->id, tasks_enqueued);
+            }
+            return;
         }
-        return;
+        ALOG_INFO(MOD,
+                  "[LOOP_PHASE] stage=match_enqueue INTER_KEYFRAME query_id={} sampled_kf_tasks=0 fallthrough=submap_level "
+                  "(与 OT 分支一致；grep fallthrough=submap_level)",
+                  submap->id);
+        if (node()) {
+            RCLCPP_INFO(node()->get_logger(),
+                        "[LOOP_PHASE] stage=match_enqueue INTER_KEYFRAME query_id=%d tasks=0 fallthrough=submap_level",
+                        submap->id);
+        }
     }
 
     // ── 子图间关键帧级（OverlapTransformer）：query 关键帧描述子 vs 候选子图内关键帧描述子（参考 SeqOT/EINet 关键帧级匹配）
@@ -1421,6 +1439,9 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
                            kfc.submap_id, kfc.keyframe_idx, task.query->id, task.query_kf_idx, rmse_loop, max_rmse_);
                 continue;
             }
+            if (rejectBelowMinAcceptOverlapScore_(kfc.score, "INTER_KF")) {
+                continue;
+            }
 
             auto lc = std::make_shared<LoopConstraint>();
             lc->submap_i = kfc.submap_id;
@@ -1723,6 +1744,9 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
                     }
                     continue;
                 }
+                if (rejectBelowMinAcceptOverlapScore_(cand.score, "SUBMAP_PARALLEL")) {
+                    continue;
+                }
                 count_accepted++;
                 auto lc = std::make_shared<LoopConstraint>();
                 lc->submap_i = target->id;
@@ -1941,6 +1965,9 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
             continue;
         }
 
+        if (rejectBelowMinAcceptOverlapScore_(cand.score, "SUBMAP_SEQUENTIAL")) {
+            continue;
+        }
         count_accepted++;
         // 构建回环约束
         auto lc = std::make_shared<LoopConstraint>();
@@ -2049,6 +2076,22 @@ std::vector<std::pair<int, Eigen::VectorXf>> LoopDetector::exportDescriptorDB() 
         }
     }
     return db;
+}
+
+bool LoopDetector::rejectBelowMinAcceptOverlapScore_(float score, const char* stage_tag) const {
+    if (min_accept_overlap_score_hard_ <= 0.0) return false;
+    if (static_cast<double>(score) + 1e-9 < min_accept_overlap_score_hard_) {
+        ALOG_WARN(MOD,
+                  "[LOOP_REJECTED] stage={} reason=min_accept_overlap_score score={:.4f} min_hard={:.4f}",
+                  stage_tag ? stage_tag : "?", score, min_accept_overlap_score_hard_);
+        if (node()) {
+            RCLCPP_WARN(node()->get_logger(),
+                        "[LOOP_REJECTED] stage=%s reason=min_accept_overlap_score score=%.4f min_hard=%.4f",
+                        stage_tag ? stage_tag : "?", score, min_accept_overlap_score_hard_);
+        }
+        return true;
+    }
+    return false;
 }
 
 void LoopDetector::applyLoopInformationMargins_(Mat66d& information, float inlier_ratio) const {
@@ -2798,6 +2841,10 @@ std::vector<LoopConstraint::Ptr> LoopDetector::detectIntraSubmapLoop(
                     continue;
                 }
             }
+        }
+
+        if (rejectBelowMinAcceptOverlapScore_(similarity, "INTRA_LOOP")) {
+            continue;
         }
 
         // ═══════════════════════════════════════════════════════════════════════

@@ -461,6 +461,27 @@ void FrontEndModule::onGPS(double ts, double lat, double lon, double alt, double
         double olat, olon, oalt;
         if (map_registry_->getGPSOrigin(olat, olon, oalt)) {
             m.position_enu = utils::wgs84ToEnu(lat, lon, alt, olat, olon, oalt);
+            // 与 GPSManager::addGPSMeasurement 一致：入口一次杆臂，缓存内为 IMU 在 ENU（避免后端/HBA 再减 lever）
+            const Eigen::Vector3d lever = ConfigManager::instance().gpsLeverArmImu();
+            if (lever.norm() > 1e-6) {
+                Pose3d odom_pose;
+                Mat66d odom_cov;
+                if (odomCacheGet(ts, odom_pose, odom_cov)) {
+                    Eigen::Matrix3d R_enu_body;
+                    if (map_registry_->isGPSAligned()) {
+                        Eigen::Matrix3d R_enu_odom;
+                        map_registry_->getGpsRenuOdom(R_enu_odom);
+                        R_enu_body = R_enu_odom * odom_pose.rotation();
+                    } else {
+                        R_enu_body = odom_pose.rotation();
+                    }
+                    m.position_enu -= R_enu_body * lever;
+                } else {
+                    RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 10000,
+                        "[V3][GPS] lever_arm_imu skipped: odom cache miss at ts=%.3f (position_enu stays antenna ENU)",
+                        ts);
+                }
+            }
         }
     }
     RCLCPP_DEBUG(node_->get_logger(),

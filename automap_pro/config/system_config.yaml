@@ -371,6 +371,8 @@ backend:
   publish_global_map_every_n_processed: 100
   # 关键帧之间里程计噪声 (trans_m, rot_rad)
   keyframe_odom_trans_noise: 0.005
+  # 相对平移 Z 向标准差（米）；≤0 或未写则与 keyframe_odom_trans_noise 相同。略大于 XY 可让 MAP 垂直更贴 LIO
+  keyframe_odom_trans_noise_z: -1.0
   keyframe_odom_rot_noise: 0.01
   # 子图之间里程计噪声 (trans_m, rot_rad)
   submap_odom_trans_noise: 0.01

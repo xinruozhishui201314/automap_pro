@@ -597,7 +597,7 @@ void ConfigManager::load(const std::string& yaml_path) {
         }
         if (gps_lever_arm_imu_cached_valid_) {
             RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-                "[ConfigManager][GPS_LEVER_ARM_CACHE] lever_arm_imu cached for runtime/HBA: [%.4f, %.4f, %.4f] m",
+                "[ConfigManager][GPS_LEVER_ARM_CACHE] lever_arm_imu cached for ingress/runtime: [%.4f, %.4f, %.4f] m",
                 gps_lever_arm_imu_cached_.x(), gps_lever_arm_imu_cached_.y(), gps_lever_arm_imu_cached_.z());
         }
         // ========== GPS 配置缓存结束 ==========
@@ -786,15 +786,15 @@ void ConfigManager::load(const std::string& yaml_path) {
                 gpsMinAcceptedQualityLevel());
             {
                 Eigen::Vector3d la = gpsLeverArmImu();
-                RCLCPP_INFO(L, "[ConfigManager][CONFIG_READ_BACK] gps.lever_arm_imu=[%.4f, %.4f, %.4f] (HBA GPS antenna vs IMU, m)",
+                RCLCPP_INFO(L, "[ConfigManager][CONFIG_READ_BACK] gps.lever_arm_imu=[%.4f, %.4f, %.4f] m (IMU 系杆臂；仅入口 FrontEnd/GPSManager 使用，HBA/iSAM2 因子不再减杆臂)",
                     la.x(), la.y(), la.z());
                 // run_20260329_091053：早期 load 路径未把杆臂写入缓存，HBA init 时 gpsLeverArmImu()=0 且 yaml=gps_section_missing，
-                // 与 READ_BACK 非零并存。此处将 READ_BACK 与 getter 一致的结果钉入缓存，保证 HBA/GPS 几何同源。
+                // 与 READ_BACK 非零并存。此处将 READ_BACK 与 getter 一致的结果钉入缓存，保证入口与 Config 读回一致。
                 if (la.norm() > 1e-12) {
                     gps_lever_arm_imu_cached_ = la;
                     gps_lever_arm_imu_cached_valid_ = true;
                     RCLCPP_INFO(L,
-                        "[ConfigManager][GPS_LEVER_ARM_CACHE] pinned at CONFIG_READ_BACK for HBA/runtime: [%.4f, %.4f, %.4f] m",
+                        "[ConfigManager][GPS_LEVER_ARM_CACHE] pinned at CONFIG_READ_BACK for ingress/runtime: [%.4f, %.4f, %.4f] m",
                         la.x(), la.y(), la.z());
                 }
             }

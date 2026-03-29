@@ -665,8 +665,8 @@ gps:
   extrapolation_margin_s: 0.5
   extrapolation_uncertainty_scale: 2.0
   velocity_estimation_window_s: 2.0
-  quality_threshold_hdop:  8.0   # [RC-1 修复] 收紧（12.0→8.0），拒绝 HDOP>8 的低质量 GPS
-  keyframe_max_hdop:       10.0  # [RC-1 修复] 收紧（15.0→10.0），避免极低质量 GPS 进入因子图
+  quality_threshold_hdop:  12.0  # [RC-1 修复 v2] 恢复 M2DGR 兼容阈值（M2DGR HDOP~10，需允许 GPS 触发对齐以提供 XY 参考）
+  keyframe_max_hdop:       12.0  # [RC-1 修复 v2] 同上，真正阻止 Z 漂移依赖 disable_altitude_constraint 而非过滤整个 GPS
   align_rmse_threshold_m:  5.0
   # [RC-1 修复] 禁用 GPS Z 轴（高度）约束：单频 GPS 高度精度差（±1.5×HDOP），
   # 若开启会导致 iSAM2 轨迹 Z 漂移数米，产生"地面双层+夹角"重影。
@@ -683,6 +683,21 @@ gps:
   factor_quality_scale_low:       0.3    # ⬆️ 提高（0.25→0.3）
   # GPS 因子准入最小质量（0~4=INVALID..EXCELLENT）。3=仅 HIGH/EXCELLENT；2=允许 MEDIUM。
   min_accepted_quality_level: 2
+
+  # V1：路段质量自适应噪声（HDOP↑/卫星数↓ → 放大协方差，GPS 更软，减轻与激光结构冲突）
+  adaptive_noise:
+    enabled: true
+    hdop_good: 1.0
+    hdop_poor: 12.0
+    var_scale_max_hdop: 28.0
+    sats_good: 12
+    sats_poor: 4
+    var_scale_max_sats: 10.0
+  # V2：GPS 与当前图位姿（激光/里程计链初值）水平 innovation 过大时放大 XY 方差（等效降权）
+  local_consistency:
+    enabled: true
+    innovation_gate_sigma: 3.0
+    var_scale_max: 2500.0
 
   delayed_compensation:
     enabled:                 true
@@ -710,6 +725,8 @@ gps:
 loop_closure:
   # M2DGR street_03（32 线 LIO-only）：略放宽 overlap / SC / 时间间隔，缓解 NO_CAND；误配由 pose_consistency 与 TEASER RMSE 约束
   overlap_threshold:   0.12
+  # TEASER/ICP 通过后仍要求 overlap score ≥ 此值；过滤极低分（如 0.007）伪回环。0=关闭硬门槛
+  min_accept_overlap_score: 0.035
   top_k:               25        # 多保留候选进入 TEASER，利于子图间回环
   min_temporal_gap_s: 12.0
   min_submap_gap:      0
@@ -822,6 +839,10 @@ backend:
   process_every_n_frames: 4
   # 每处理多少帧发布一次全局图
   publish_global_map_every_n_processed: 150
+  # 关键帧 Between：XY 噪声与可选更松的 Z（米，标准差），使 MAP 垂直更贴近 LIO；仅 Z 放宽不改变算法结构
+  keyframe_odom_trans_noise: 0.005
+  keyframe_odom_trans_noise_z: 0.02
+  keyframe_odom_rot_noise: 0.01
   max_pending_gps_keyframe_factors: 1000
   force_update_coalesce_on_submap_freeze: false
   isam2:

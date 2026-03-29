@@ -153,12 +153,18 @@ public:
 
     // --- GPS 状态 ---
     uint64_t setGPSAligned(bool aligned, const Eigen::Matrix3d& R = Eigen::Matrix3d::Identity(),
-                           const Eigen::Vector3d& t = Eigen::Vector3d::Zero(), double rmse = 0.0);
+                           const Eigen::Vector3d& t = Eigen::Vector3d::Zero(), double rmse = 0.0,
+                           const Eigen::Matrix3d& R_enu_odom = Eigen::Matrix3d::Identity());
     bool isGPSAligned() const { return gps_aligned_.load(); }
     void getGPSTransform(Eigen::Matrix3d& R, Eigen::Vector3d& t) const {
         std::lock_guard<std::mutex> lk(gps_state_mutex_);
         R = R_enu_to_map_;
         t = t_enu_to_map_;
+    }
+    /** 与 `GPSAlignResult::R_gps_lidar` 同源：odom→ENU 旋转，用于杆臂 R_enu_body = R_enu_odom * R_odom_body。未对齐时为 I。 */
+    void getGpsRenuOdom(Eigen::Matrix3d& R) const {
+        std::lock_guard<std::mutex> lk(gps_state_mutex_);
+        R = R_enu_odom_;
     }
     double getGPSRMSE() const {
         std::lock_guard<std::mutex> lk(gps_state_mutex_);
@@ -217,6 +223,7 @@ private:
     std::atomic<uint64_t> alignment_epoch_{1};
     Eigen::Matrix3d R_enu_to_map_ = Eigen::Matrix3d::Identity();
     Eigen::Vector3d t_enu_to_map_ = Eigen::Vector3d::Zero();
+    Eigen::Matrix3d R_enu_odom_ = Eigen::Matrix3d::Identity();
     double gps_rmse_ = 0.0;
 
     // GPS 原点
@@ -260,12 +267,15 @@ struct GPSAlignedEvent {
     uint64_t alignment_epoch = 0;
     Eigen::Matrix3d R_enu_to_map;
     Eigen::Vector3d t_enu_to_map;
+    /// 对齐成功时与 `GPSAlignResult::R_gps_lidar` 一致；供前端 GPS 杆臂与 Manager 窗口一致。
+    Eigen::Matrix3d R_enu_odom = Eigen::Matrix3d::Identity();
     double rmse = 0.0;
     EventMeta meta;
 
     bool isValid() const {
         if (event_seq == 0) return false;
         if (!R_enu_to_map.allFinite() || !t_enu_to_map.allFinite()) return false;
+        if (!R_enu_odom.allFinite()) return false;
         if (!meta.isValid()) return false;
         if (success) return std::isfinite(rmse);
         return true;

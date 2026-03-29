@@ -506,7 +506,10 @@ static constexpr double kMaxInterpIntervalSec = 0.5;
  * 方法：对 GPS ENU 轨迹和 LiDAR 轨迹进行点集配准
  *   1. 对每个高质量 GPS 时间戳，找「前、后」关键帧，在二者间线性插值得到 LiDAR 位置；
  *      若无双侧关键帧或插值区间过大，则退化为 100ms 内最近邻。
- *   2. 中心化 → 协方差矩阵 → SVD → R, t
+ *   2. 中心化 → 2D 协方差 → SVD → R_z、t_xy；**t_z 恒为 0**（4-DoF 地面/车载对齐）
+ *
+ * 说明：RMSE 只在 XY 上统计，因 GPS 高程与 LIO 世界 z 的零点/物理含义不可直接相减。
+ * 旧实现用 mean(lidar_z - gps_enu.U) 填 t.z，会把整图沿 z 错误平移近 1m 量级并造成“重影/错层”观感。
  */
 GPSAlignResult GPSManager::compute_svd_alignment() {
     GPSAlignResult result;
@@ -621,20 +624,11 @@ GPSAlignResult GPSManager::compute_svd_alignment() {
     Eigen::Matrix3d R = Eigen::Matrix3d::Identity();
     R.block<2,2>(0,0) = R_xy;
 
-    Eigen::Vector3d t = lio_centroid - R * gps_centroid;
-
-    // 🔧 [修复] 修正 Z 轴平移：2D SVD 只处理了 XY 平面，这里手动计算 Z 轴平均偏差作为平移的一部分
-    double z_sum = 0.0;
-    int z_count = 0;
-    for (const auto& p : pairs) {
-        // LiDAR Z - (R_enu_to_map * GPS_ENU)_z
-        // 注意 R 只是绕 Z 旋转，所以 (R*gps).z == gps.z
-        z_sum += (p.lidar_pos.z() - p.gps_enu.z());
-        z_count++;
-    }
-    if (z_count > 0) {
-        t.z() = z_sum / z_count;
-    }
+    // 4-DoF：仅 XY 平移 + 绕 Z 旋转；垂直保持 LIO 标高，不把 GPS U 与 odom z 混算进 t.z
+    const Eigen::Vector2d lio_xy(lio_centroid.x(), lio_centroid.y());
+    const Eigen::Vector2d gps_xy(gps_centroid.x(), gps_centroid.y());
+    const Eigen::Vector2d t_xy = lio_xy - R_xy * gps_xy;
+    const Eigen::Vector3d t(t_xy.x(), t_xy.y(), 0.0);
 
     // 计算 RMSE（仅在XY平面，GPS高度不可靠）
     double rmse = 0.0;

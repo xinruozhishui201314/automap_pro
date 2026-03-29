@@ -276,6 +276,8 @@ private:
     size_t loop_max_match_queue_size_ = 128;
     int teaser_min_safe_inliers_ = 10;
     bool parallel_teaser_match_ = true;
+    /** ≤0 关闭；>0 时几何验证通过后仍要求 overlap/描述子 score ≥ 该值（硬门槛） */
+    double min_accept_overlap_score_hard_ = 0.0;
 
     /** 回环检测节流：上次成功检测时的 query 关键帧 id，-1 表示未成功过 */
     int64_t last_keyframe_id_after_loop_success_ = -1;
@@ -304,6 +306,8 @@ private:
     void publishLoopConstraint(const LoopConstraint::Ptr& lc);
     /** 弱几何信任：inlier 仅略高于阈值时降低回环信息矩阵强度 */
     void applyLoopInformationMargins_(Mat66d& information, float inlier_ratio) const;
+    /** true=应拒绝（score 低于 loop_closure.min_accept_overlap_score） */
+    bool rejectBelowMinAcceptOverlapScore_(float score, const char* stage_tag) const;
 
     /** 安全获取节点指针 */
     rclcpp::Node::SharedPtr node() const { return node_.lock(); }

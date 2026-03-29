@@ -35,10 +35,12 @@ public:
             if (r.success) {
                 event.R_enu_to_map = r.R_enu_to_map;
                 event.t_enu_to_map = r.t_enu_to_map;
+                event.R_enu_odom = r.R_gps_lidar;
                 event.rmse = r.rmse_m;
             } else {
                 event.R_enu_to_map = Eigen::Matrix3d::Identity();
                 event.t_enu_to_map = Eigen::Vector3d::Zero();
+                event.R_enu_odom = Eigen::Matrix3d::Identity();
                 event.rmse = 0.0;
             }
             event.meta.event_id = event.event_seq;

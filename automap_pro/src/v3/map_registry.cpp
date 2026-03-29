@@ -35,11 +35,12 @@ void MapRegistry::setSessionId(uint64_t id) {
 }
 
 uint64_t MapRegistry::setGPSAligned(bool aligned, const Eigen::Matrix3d& R, const Eigen::Vector3d& t,
-                                    double rmse) {
+                                    double rmse, const Eigen::Matrix3d& R_enu_odom) {
     std::lock_guard<std::mutex> gps_lk(gps_state_mutex_);
     gps_aligned_.store(aligned);
     R_enu_to_map_ = R;
     t_enu_to_map_ = t;
+    R_enu_odom_ = aligned ? R_enu_odom : Eigen::Matrix3d::Identity();
     gps_rmse_ = rmse;
     alignment_epoch_.fetch_add(1, std::memory_order_relaxed);
     const uint64_t current_epoch = alignment_epoch_.load(std::memory_order_relaxed);

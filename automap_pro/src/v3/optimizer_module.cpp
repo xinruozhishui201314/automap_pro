@@ -58,6 +58,13 @@ uint64_t semanticTraceId(uint64_t kf_id, double ts) {
     const uint64_t ts_us = std::isfinite(ts) ? static_cast<uint64_t>(std::max(0.0, ts) * 1e6) : 0ull;
     return (kf_id << 20) ^ ts_us;
 }
+
+/** `kf->gps.position_enu` 为 IMU 在 ENU（前端 onGPS 已与 GPSManager 同步做杆臂）；仅 ENU→map。 */
+inline Eigen::Vector3d gpsImuPositionInMapFromImuEnu(const Eigen::Matrix3d& R_enu_to_map,
+                                                    const Eigen::Vector3d& t_enu_to_map,
+                                                    const Eigen::Vector3d& position_enu_imu) {
+    return R_enu_to_map * position_enu_imu + t_enu_to_map;
+}
 } // namespace
 
 namespace automap_pro::v3 {
@@ -417,8 +424,9 @@ void OptimizerModule::processGPSBatchKF(const OptTaskItem& task) {
             }
             continue;
         }
-        Eigen::Vector3d pos_map = R * kf->gps.position_enu + t;
-        factors.push_back({static_cast<int>(kf->id), pos_map, kf->gps.covariance});
+        Eigen::Vector3d pos_map = gpsImuPositionInMapFromImuEnu(R, t, kf->gps.position_enu);
+        factors.push_back(IncrementalOptimizer::GPSFactorItemKF{
+            static_cast<int>(kf->id), pos_map, kf->gps.covariance, kf->gps.hdop, kf->gps.num_satellites});
     }
     if (factors.empty()) {
         RCLCPP_DEBUG(node_->get_logger(),
@@ -465,22 +473,27 @@ void OptimizerModule::processKeyframeCreate(const OptTaskItem& task) {
     // 如果已对齐，T_map_b_optimized 已在 MappingModule 中由 T_odom_b 升级到 MAP 系；
     // 如果未对齐，T_map_b_optimized 与 T_odom_b 等同。
     // 若错误地始终使用 T_odom_b，当因子图已切换到 MAP 系时，新节点会产生巨大的初始位姿误差，导致优化后出现跳变。
-    optimizer_.addKeyFrameNode(static_cast<int>(kf->id), kf->T_map_b_optimized, false, is_first_kf_of_submap, sm_anchor);
+    optimizer_.addKeyFrameNode(static_cast<int>(kf->id), kf->T_map_b_optimized, kf->T_odom_b, false,
+                               is_first_kf_of_submap, sm_anchor);
     
     // 2. 里程计 Between 因子由 IncrementalOptimizer::addKeyFrameNode 统一添加。
     // 这里不再重复 add，避免同一 (prev, curr) 键值对被双重约束。
     
-    // 3. 添加 GPS 因子 (如果已对齐)，pos_map = R_enu_to_map * position_enu + t_enu_to_map
+    // 3. 添加 GPS 因子 (如果已对齐)：position_enu 已为 IMU/ENU，仅乘对齐 R,t 到 map
     // grep CONSTRAINT][GPS_KF 闭环：对齐状态 / 是否有观测 / 质量策略 / hdop
     const auto& gcfg = ConfigManager::instance();
     const double gps_dt = std::abs(kf->timestamp - kf->gps.timestamp);
     const auto gps_decision = evaluateKeyframeGpsConstraint(
         kf->gps, kf->has_valid_gps, gcfg.gpsMinAcceptedQualityLevel(), true, gps_dt, gcfg.gpsKeyframeMatchWindowS());
     if (task.gps_aligned && gps_decision.accepted) {
-        Eigen::Vector3d pos_map = task.gps_transform_R * kf->gps.position_enu + task.gps_transform_t;
-        optimizer_.addGPSFactorForKeyFrame(kf->id, pos_map, kf->gps.covariance);
+        Eigen::Vector3d pos_map = gpsImuPositionInMapFromImuEnu(
+            task.gps_transform_R, task.gps_transform_t, kf->gps.position_enu);
+        optimizer_.addGPSFactorForKeyFrame(
+            kf->id, pos_map, kf->gps.covariance, kf->gps.hdop, kf->gps.num_satellites);
         g_gps_kf_candidates_total.fetch_add(1, std::memory_order_relaxed);
         g_gps_kf_added_total.fetch_add(1, std::memory_order_relaxed);
+        RCLCPP_INFO_THROTTLE(node_->get_logger(), *node_->get_clock(), 30000,
+            "[Z_DRIFT_DIAG] stage=gps_factor_kf pos_map=R_enu_to_map*position_enu_imu+t (杆臂仅在前端/GPSManager 入口)");
         RCLCPP_INFO(node_->get_logger(),
             "[CONSTRAINT][GPS_KF] result=ok kf_id=%lu quality=%d rank=%d min_rank=%d hdop=%.2f sats=%d "
             "(grep CONSTRAINT GPS_KF)",
@@ -512,11 +525,17 @@ void OptimizerModule::processKeyframeCreate(const OptTaskItem& task) {
 }
 
 Mat66d OptimizerModule::computeOdomInfoMatrixForKeyframes(const KeyFrame::Ptr& prev_kf, const KeyFrame::Ptr& curr_kf, const Pose3d& rel) const {
+    (void)prev_kf;
+    (void)curr_kf;
+    (void)rel;
     Mat66d info = Mat66d::Identity();
     const auto& cfg = ConfigManager::instance();
-    double trans_noise = cfg.kfOdomTransNoise();
-    double rot_noise = cfg.kfOdomRotNoise();
-    for (int i = 0; i < 3; ++i) info(i, i) = 1.0 / (trans_noise * trans_noise);
+    const double trans_noise = cfg.kfOdomTransNoise();
+    const double trans_noise_z = cfg.kfOdomTransNoiseZ();
+    const double rot_noise = cfg.kfOdomRotNoise();
+    info(0, 0) = 1.0 / (trans_noise * trans_noise);
+    info(1, 1) = 1.0 / (trans_noise * trans_noise);
+    info(2, 2) = 1.0 / (trans_noise_z * trans_noise_z);
     for (int i = 3; i < 6; ++i) info(i, i) = 1.0 / (rot_noise * rot_noise);
     return info;
 }

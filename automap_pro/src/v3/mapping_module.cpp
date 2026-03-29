@@ -831,6 +831,15 @@ void MappingModule::processFrame(const FilteredFrameEventRequiredDs& event) {
             kf->T_map_b_optimized = pose_chain::mapBodyFromOdomBody(T_mo, kf->T_odom_b);
             kf->pose_frame = PoseFrame::MAP; // 🏛️ [架构加固] 标注语义已提升为 MAP
 
+            {
+                const double oz = kf->T_odom_b.translation().z();
+                const double mz = kf->T_map_b_optimized.translation().z();
+                RCLCPP_INFO_THROTTLE(node_->get_logger(), *node_->get_clock(), 10000,
+                    "[Z_DRIFT_DIAG] stage=odom_to_map_upgrade kf_id=%lu odom_z=%.4f map_z=%.4f dz_map_minus_odom=%.4f "
+                    "(对齐为 yaw+XY 平移、tz=0 时期望 dz≈0；grep Z_DRIFT_DIAG)",
+                    static_cast<unsigned long>(kf->id), oz, mz, mz - oz);
+            }
+
             // [RC2 修复] 该帧由 ODOM 升级到 MAP 坐标系，其 ref_alignment_epoch 可能早于当前
             // GPS 对齐纪元（帧在对齐前入队、对齐后才处理）。此时 publishOptimizedPath 的
             // alignment_epoch_limit == current_epoch 会过滤这些 KF，导致轨迹帧数骤减闪烁。
@@ -1076,7 +1085,8 @@ void MappingModule::updateGPSAlignment(const GPSAlignedEvent& ev) {
             gps_aligned_.store(false);
         }
         uint64_t version = map_registry_->setGPSAligned(
-            false, Eigen::Matrix3d::Identity(), Eigen::Vector3d::Zero(), 0.0);
+            false, Eigen::Matrix3d::Identity(), Eigen::Vector3d::Zero(), 0.0,
+            Eigen::Matrix3d::Identity());
         processed_map_version_.store(version);
         const uint64_t new_epoch = map_registry_->getAlignmentEpoch();
         processed_alignment_epoch_.store(new_epoch);
@@ -1108,7 +1118,8 @@ void MappingModule::updateGPSAlignment(const GPSAlignedEvent& ev) {
     }
 
     // 🏛️ 单一写者：由本模块根据 GPSAlignedEvent 同步 MapRegistry（GPSModule 不再 setGPSAligned）
-    uint64_t version = map_registry_->setGPSAligned(true, ev.R_enu_to_map, ev.t_enu_to_map, ev.rmse);
+    uint64_t version = map_registry_->setGPSAligned(true, ev.R_enu_to_map, ev.t_enu_to_map, ev.rmse,
+                                                    ev.R_enu_odom);
     processed_map_version_.store(version);
     const uint64_t new_epoch = map_registry_->getAlignmentEpoch();
     processed_alignment_epoch_.store(new_epoch);
@@ -1131,6 +1142,7 @@ void MappingModule::updateGPSAlignment(const GPSAlignedEvent& ev) {
 
     GPSAlignResult hba_align;
     hba_align.success = true;
+    hba_align.R_gps_lidar = ev.R_enu_odom;
     hba_align.R_enu_to_map = ev.R_enu_to_map;
     hba_align.t_enu_to_map = ev.t_enu_to_map;
     hba_align.rmse_m = ev.rmse;

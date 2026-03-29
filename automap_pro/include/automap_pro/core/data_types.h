@@ -107,7 +107,9 @@ struct AttitudeEstimate {
 // ─────────────────────────────────────────────────────────────────────────────
 struct GPSMeasurement {
     double timestamp          = 0.0;
-    Eigen::Vector3d position_enu = Eigen::Vector3d::Zero();  // ENU坐标（米）
+    /// ENU 下位置（米）。V3 前端缓存与关键帧绑定：在 `gps.lever_arm_imu` 非零且能取到同步里程计时，
+    /// 已为 **IMU/body 原点**（天线位置减 R_enu_body*lever）；与 `GPSManager` 滑动窗口语义一致。
+    Eigen::Vector3d position_enu = Eigen::Vector3d::Zero();
     GPSQuality quality        = GPSQuality::INVALID;
     double hdop               = 99.0;
     int num_satellites        = 0;
@@ -225,6 +227,12 @@ struct KeyFrame {
     Pose3d T_odom_b         = Pose3d::Identity(); // 原始里程计位姿 (odom 系)
     Pose3d T_map_b_optimized  = Pose3d::Identity(); // 优化后位姿 (map 系)
     Pose3d T_submap_kf      = Pose3d::Identity(); // 相对于子图锚点的位姿 (submap 系)
+    // HBA 最近一次写回的全局 GPS-aligned 位姿；仅由 updateAllFromHBA 写入，iSAM2 路径不触碰。
+    // 供下一轮 HBA 快照读取，防止连续两次 HBA 之间 iSAM2 覆写导致旋转初值退化，消除单帧位姿跳变。
+    Pose3d T_map_b_hba      = Pose3d::Identity();
+    // [HBA初值修复] 标记 T_map_b_hba 是否已由 updateAllFromHBA 写入过。
+    // 为 false 时不可使用 T_map_b_hba（初始值为 Identity，与 T_odom_b 不同会误触发 poseForInitial）。
+    bool   hba_pose_valid   = false;
     PoseFrame pose_frame    = PoseFrame::ODOM;    // 🏛️ [架构契约] 显式标注 T_map_b_optimized 所在的坐标系
     uint64_t alignment_epoch = 0; // 🏛️ [对齐纪元] 标记该位姿所在的坐标系世代，用于过滤旧世界点云
     Mat66d covariance       = Mat66d::Identity() * 1e-4;

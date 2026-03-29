@@ -103,15 +103,20 @@ public:
      * @param is_first_kf_of_submap 若为 true 则强制添加 Prior，避免新子图首帧无约束导致 IndeterminantLinearSystemException
      * @param submap_id_for_sm_kf_anchor 该关键帧所属子图 ID（与 KeyFrame::submap_id 一致）。用于 Between(SM(sm),KF(首帧))；
      *        不得使用 kf_id/MAX_KF_PER_SUBMAP（全局 kf id 递增时恒为 0）。传 -1 表示不登记锚点（仅兼容旧路径）。 */
-    void addKeyFrameNode(int kf_id, const Pose3d& init_pose, bool fixed = false,
+    /** @param T_odom_b 车体在里程计系位姿；用于 KF 间 Between 测量（与 HBA 一致：T_odom_{i-1}^{-1} T_odom_i），
+     *  避免仅用地图系 init 链在 GPS 修正后出现“测量与变量不一致”导致大幅跳变与 HBA odom 爆炸。 */
+    void addKeyFrameNode(int kf_id, const Pose3d& init_pose, const Pose3d& T_odom_b, bool fixed = false,
                          bool is_first_kf_of_submap = false, int submap_id_for_sm_kf_anchor = -1);
 
     /** 添加 keyframe 间的里程计因子 */
     void addOdomFactorBetweenKeyframes(int from, int to, const Pose3d& rel, const Mat66d& info_matrix);
 
-    /** 添加 keyframe 级别的 GPS 因子（KF 级别） */
+    /** 添加 keyframe 级别的 GPS 因子（KF 级别）
+     * @param hdop / num_satellites 用于 V1 自适应噪声；<0 / ≤0 表示未知，按最差档放宽协方差 */
     void addGPSFactorForKeyFrame(int kf_id, const Eigen::Vector3d& pos_map,
-                                 const Eigen::Matrix3d& cov3x3);
+                                 const Eigen::Matrix3d& cov3x3,
+                                 double hdop = -1.0,
+                                 int num_satellites = 0);
 
     /** 添加 keyframe 级别的圆柱地标因子 */
     void addCylinderFactorForKeyFrame(int kf_id, const CylinderFactorItemKF& factor);
@@ -125,7 +130,13 @@ public:
     bool keyFrameExists(int kf_id) const;
 
     /** 批量添加 keyframe GPS 因子 */
-    struct GPSFactorItemKF { int kf_id; Eigen::Vector3d pos; Eigen::Matrix3d cov; };
+    struct GPSFactorItemKF {
+        int kf_id = 0;
+        Eigen::Vector3d pos = Eigen::Vector3d::Zero();
+        Eigen::Matrix3d cov = Eigen::Matrix3d::Identity();
+        double hdop = -1.0;
+        int num_satellites = 0;
+    };
     void addGPSFactorsForKeyFramesBatch(const std::vector<GPSFactorItemKF>& factors);
 
     /** 批量添加 GPS 因子并只做一次 commitAndUpdate（由 opt 线程调用，用于避免多次 update 触发 GTSAM 内部竞态） */
@@ -321,6 +332,11 @@ private:
     gtsam::Values               pending_values_;
     gtsam::Values               current_estimate_;
 
+    /** 关键帧链 Between：平移 XY/Z、旋转方差（对角元），与 Mat66d 0~2 平移、3~5 旋转约定一致 */
+    double kf_between_var_trans_xy_ = 1e-4;
+    double kf_between_var_trans_z_ = 1e-4;
+    double kf_between_var_rot_ = 1e-4;
+
     /** 先验方差（6 维），用于每次 addSubMapNode 时新建 Prior noise，避免共享 noise 在 linearize 时 double free */
     gtsam::Vector prior_var6_;
     /** 仅用于 shutdown 检查与 has_prior_ 语义；Prior 因子改用 prior_var6_ 新建 noise */
@@ -335,6 +351,8 @@ private:
     /** 上一 keyframe 的 id 与位姿，用于添加 KF(i)->KF(i+1) 的 Between 因子，避免欠定 */
     int last_keyframe_id_ = -1;
     Pose3d last_keyframe_pose_;
+    /** 各 KF 的 T_odom_b，供 Between 使用纯里程计相对位姿；rollback 时同步擦除 */
+    std::unordered_map<int, Pose3d> keyframe_odom_pose_;
 
     // ── GPS对齐后重建所需历史数据 ──
     mutable std::mutex history_mutex_;

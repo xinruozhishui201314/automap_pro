@@ -1,5 +1,6 @@
 #include "automap_pro/backend/hba_optimizer.h"
 #include "automap_pro/backend/gps_constraint_policy.h"
+#include "automap_pro/backend/gps_factor_noise_util.h"
 #include "automap_pro/backend/gtsam_guard.h"
 #include "automap_pro/backend/isam2_factor_types.h"
 #include "automap_pro/core/config_manager.h"
@@ -169,7 +170,7 @@ void HBAOptimizer::init() {
     }
     if (lever_arm_.norm() > 1e-12) {
         RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-            "[HBA] GPS lever arm resolved=[%.4f, %.4f, %.4f] m source=%s (cfg_loaded=%d cfg_path=%s pre_resolve_gpsLeverArmImu=[%.4f, %.4f, %.4f])",
+            "[HBA] GPS lever arm resolved=[%.4f, %.4f, %.4f] m source=%s (diagnostic only; KF position_enu is IMU/ENU, factors use R_enu_to_map*p+t) cfg_loaded=%d cfg_path=%s pre_resolve_gpsLeverArmImu=[%.4f, %.4f, %.4f])",
             lever_arm_.x(), lever_arm_.y(), lever_arm_.z(),
             lever_arm_source,
             cfg_loaded ? 1 : 0, cfg_path.c_str(),
@@ -691,7 +692,7 @@ HBAResult HBAOptimizer::runHBA(const PendingTask& task) {
         }
     }
 
-    // lever_arm_ 在 init() 中通过 resolveGpsLeverArmForHba 已缓存，worker 路径不再访问 ConfigManager
+    // lever_arm_ 在 init() 中解析仅用于配置诊断；GPS 因子位姿用 gps_align_result_ 的 ENU→map，杆臂在前端/Manager 入口已做
 
 #ifdef USE_HBA_API
     // 语义契约强门控：一旦存在语义因子，禁止走 HBA API（当前 API 不支持语义因子）。
@@ -850,8 +851,6 @@ HBAResult HBAOptimizer::runGTSAMFallback(const PendingTask& task) {
         return result;
     }
 
-    // lever_arm_ 在 init() 中已缓存，worker 路径不再访问 ConfigManager
-
     std::vector<KeyFrame::Ptr> sorted_kfs = task.keyframes;
     std::sort(sorted_kfs.begin(), sorted_kfs.end(),
               [](const KeyFrame::Ptr& a, const KeyFrame::Ptr& b) {
@@ -896,7 +895,22 @@ HBAResult HBAOptimizer::runGTSAMFallback(const PendingTask& task) {
         input_has_map_offset ? 1 : 0, max_trans_diff, max_rot_diff_deg, static_cast<int>(result.pose_frame));
 
     // 约束合理性：所有关键帧位姿有限且平移在合理范围内，否则不进入 GTSAM 避免崩溃
+    // [连续HBA跳变修复] 优先使用 T_map_b_hba（上一轮 HBA 的 GPS-aligned 结果）作为初值。
+    // 两次 HBA 之间，iSAM2 的 batchUpdateKeyFramePoses 会用软 GPS 约束的估计覆写
+    // T_map_b_optimized，导致本轮 HBA 从退化初值出发，输出不同的旋转角度，最终写回时
+    // 产生单帧跳变（复现：GHOST_GUARD kf_id=105 delta_rot=18.97deg）。
+    // T_map_b_hba 仅由 updateAllFromHBA 写入，不被 iSAM2 覆写，保证连续 HBA 的初值 continuity。
+    //
+    // [HBA初值修复] 使用 hba_pose_valid 标志判断 T_map_b_hba 是否可用，替换原先比较
+    // (h-t).norm() 的方式。原条件存在 Bug：T_map_b_hba 初始化为 Identity，对于非起点帧
+    // T_odom_b 差异极大（如 kf=409 差 59m），误判为"HBA 已写入"并返回 Identity [0,0,0]，
+    // 导致第一次 HBA 所有关键帧均从 [0,0,0] 出发，GPS ENU 高度约束将各帧 z 轴牵拉到
+    // -7m ~ +6m 不等，产生严重点云重影。
     auto poseForInitial = [](const KeyFrame::Ptr& kf) -> Pose3d {
+        // 若 T_map_b_hba 已被 HBA 写入过，优先使用（iSAM2 不覆写此字段）
+        if (kf->hba_pose_valid)
+            return kf->T_map_b_hba;
+        // 否则回退到 T_map_b_optimized（iSAM2 GPS 对齐后的值，包含正确的 z 偏移）
         const Pose3d& o = kf->T_map_b_optimized;
         const Pose3d& t = kf->T_odom_b;
         if ((o.translation() - t.translation()).norm() > 1e-9 || !o.rotation().isApprox(t.rotation()))
@@ -939,15 +953,20 @@ HBAResult HBAOptimizer::runGTSAMFallback(const PendingTask& task) {
         // 原因：若初始对齐有微小偏差，过死的 Prior 会阻止轨迹向 GPS 整体偏移，导致拉花。
         const double prior_var = 0.25;
         const double between_rotate_var = 1e-6; // 降低旋转方差，增强轨迹刚度
-        const double between_trans_var = 1e-4;  // 降低平移方差
+        const auto& cfg_hba_nm = ConfigManager::instance();
+        const double hba_st = cfg_hba_nm.kfOdomTransNoise();
+        const double hba_sz = cfg_hba_nm.kfOdomTransNoiseZ();
+        // 与 ISAM2 KF Between 一致：平移 XY/Z 用配置方差（Z 可单独放宽以贴近 LIO 标高）
+        const double between_trans_var_xy = hba_st * hba_st;
+        const double between_trans_var_z = hba_sz * hba_sz;
 
         // 使用命名变量作为方差向量，避免将 Eigen 临时量传入 Variances() 导致 GTSAM 内部悬垂引用
         gtsam::Vector6 prior_var6;
         prior_var6 << prior_var, prior_var, prior_var, prior_var, prior_var, prior_var;
         
         gtsam::Vector6 between_var6;
-        between_var6 << between_rotate_var, between_rotate_var, between_rotate_var, 
-                        between_trans_var, between_trans_var, between_trans_var;
+        between_var6 << between_rotate_var, between_rotate_var, between_rotate_var,
+                        between_trans_var_xy, between_trans_var_xy, between_trans_var_z;
 
         // 🏛️ [架构增强] 添加子图锚点节点并固定（作为语义地标的参考坐标系）
         gtsam::SharedNoiseModel sm_prior_noise = gtsam::noiseModel::Isotropic::Sigma(6, 1e-6); 
@@ -1074,26 +1093,35 @@ HBAResult HBAOptimizer::runGTSAMFallback(const PendingTask& task) {
                     continue;
                 }
                 const auto& pos_enu = kf->gps.position_enu;
-                // 与 iSAM2 一致：由于地图已整体变换到 ENU 系，GPS 观测直接使用 ENU 坐标即可
-                // 🔧 [修复] GPS 杠臂补偿 (Lever-arm Compensation)
-                // 原理：pos_imu = pos_gps_antenna - R_map_body * p_lever_arm
-                // 注意：必须使用地图坐标系下的姿态 (T_map_b_optimized) 而非原始里程计 (T_odom_b)，
-                // 否则当系统存在较大的对齐偏角时，补偿方向会完全错位导致重影。
-                Eigen::Vector3d pos_map = pos_enu - kf->T_map_b_optimized.rotation() * lever_arm_;
-                
+                // position_enu 为 IMU 在 ENU（前端/GPSManager 入口已做杆臂）；与 iSAM2 一致做 ENU→map
+                const Eigen::Matrix3d& R_em = gps_align_result_.R_enu_to_map;
+                const Eigen::Vector3d& t_em = gps_align_result_.t_enu_to_map;
+                Eigen::Vector3d pos_map = R_em * pos_enu + t_em;
+
                 gtsam::Point3 pt(pos_map.x(), pos_map.y(), pos_map.z());
                 Eigen::Matrix3d c = kf->gps.covariance;
-                
-                // [GPS高度约束修复] 当 disable_altitude_constraint=true（默认）时，将 Z 轴方差设为
-                // altitude_variance_override（默认 1e6），等效于去除高度约束，防止不可靠 GPS 高度数据
-                // 导致 HBA 优化后出现多重地面/地图层叠重影。
                 const auto& cfg_hba = ConfigManager::instance();
+                Eigen::Vector3d graph_t;
+                const Eigen::Vector3d* pg = nullptr;
+                if (initial.exists(KF(i))) {
+                    try {
+                        graph_t = initial.at<gtsam::Pose3>(KF(i)).translation();
+                        pg = &graph_t;
+                    } catch (...) {
+                        pg = nullptr;
+                    }
+                }
+                gps_factor_noise::refineKeyFrameGpsCovariance(
+                    c, cfg_hba, kf->gps.hdop, kf->gps.num_satellites, pos_map, pg);
+                gps_factor_noise::applyGpsFactorWeight(c, cfg_hba.gpsFactorWeight());
+
+                // [GPS高度约束修复] disable_altitude_constraint=true 时用大 Z 方差，避免高度重影
                 double v0 = std::max(1e-6, std::min(1e6, c(0, 0)));
                 double v1 = std::max(1e-6, std::min(1e6, c(1, 1)));
                 double v2 = cfg_hba.gpsDisableAltitudeConstraint()
                     ? cfg_hba.gpsAltitudeVarianceOverride()
                     : std::max(1e-6, std::min(1e6, c(2, 2)));
-                
+
                 gtsam::Vector3 vars(v0, v1, v2);
                 auto noise = gtsam::noiseModel::Diagonal::Variances(vars);
                 

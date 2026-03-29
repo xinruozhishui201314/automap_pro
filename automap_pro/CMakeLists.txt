@@ -827,6 +827,7 @@ endif()
 add_library(automap_backend SHARED
   src/backend/load_trace.cpp
   src/backend/gtsam_guard.cpp
+  src/backend/gps_factor_noise_util.cpp
   src/backend/incremental_optimizer.cpp
   src/backend/delayed_gps_compensator.cpp
   src/backend/hba_optimizer.cpp

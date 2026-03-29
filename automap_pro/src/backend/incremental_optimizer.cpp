@@ -1,4 +1,5 @@
 #include "automap_pro/backend/incremental_optimizer.h"
+#include "automap_pro/backend/gps_factor_noise_util.h"
 #include "automap_pro/backend/gtsam_guard.h"
 #include "automap_pro/core/config_manager.h"
 #include "automap_pro/core/crash_report.h"
@@ -56,6 +57,39 @@ struct ConstraintValidation {
     bool all_values_reasonable = true;  // 平移/旋转在合理范围内
     std::string message;
 };
+
+/** V1/V2 GPS 对角方差：自适应 HDOP/卫星数 + 与图位姿水平 innovation 冲突时放大 XY 方差，再应用 factor_weight */
+static gtsam::Vector3 computeGpsDiagonalVariancesKeyFrame(
+    Eigen::Matrix3d cov,
+    const ConfigManager& cfg,
+    const Eigen::Vector3d& pos_gps,
+    double hdop,
+    int num_satellites,
+    bool disable_altitude,
+    double z_override,
+    const gtsam::Values& current_estimate,
+    const gtsam::Values& pending_values,
+    gtsam::Key kf_key) {
+    const Eigen::Vector3d* pos_graph = nullptr;
+    Eigen::Vector3d graph_t;
+    try {
+        if (current_estimate.exists(kf_key)) {
+            graph_t = current_estimate.at<gtsam::Pose3>(kf_key).translation();
+            pos_graph = &graph_t;
+        } else if (pending_values.exists(kf_key)) {
+            graph_t = pending_values.at<gtsam::Pose3>(kf_key).translation();
+            pos_graph = &graph_t;
+        }
+    } catch (...) {
+        pos_graph = nullptr;
+    }
+    gps_factor_noise::refineKeyFrameGpsCovariance(cov, cfg, hdop, num_satellites, pos_gps, pos_graph);
+    gps_factor_noise::applyGpsFactorWeight(cov, cfg.gpsFactorWeight());
+    const double z_var = disable_altitude ? z_override : std::max(1e-6, cov(2, 2));
+    gtsam::Vector3 vars;
+    vars << std::max(1e-6, cov(0, 0)), std::max(1e-6, cov(1, 1)), z_var;
+    return vars;
+}
 
 void logAllConstraintsAndValidate(
     const gtsam::NonlinearFactorGraph& graph,
@@ -208,6 +242,18 @@ IncrementalOptimizer::IncrementalOptimizer() {
     loop_constraint_max_translation_m_ = cfg.loopConstraintMaxTranslationM();
     loop_constraint_max_rotation_deg_ = cfg.loopConstraintMaxRotationDeg();
     g_backend_verbose_trace = backend_verbose_trace_;
+
+    {
+        const double st = cfg.kfOdomTransNoise();
+        const double sz = cfg.kfOdomTransNoiseZ();
+        const double sr = cfg.kfOdomRotNoise();
+        kf_between_var_trans_xy_ = st * st;
+        kf_between_var_trans_z_ = sz * sz;
+        kf_between_var_rot_ = sr * sr;
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[IncrementalOptimizer][CONFIG] kf_between variances: trans_xy=%.2e trans_z=%.2e rot=%.2e (sqrt→m/rad; grep CONFIG)",
+            kf_between_var_trans_xy_, kf_between_var_trans_z_, kf_between_var_rot_);
+    }
 
     gtsam::ISAM2Params params;
     // 重线性化阈值：误差变化超过阈值才重线性化（控制计算量）
@@ -1213,8 +1259,8 @@ int IncrementalOptimizer::flushPendingGPSFactorsInternal() {
 
 // ── KeyFrame 级别因子实现 ───────────────────────────────────────────────
 
-void IncrementalOptimizer::addKeyFrameNode(int kf_id, const Pose3d& init_pose, bool fixed, bool is_first_kf_of_submap,
-                                           int submap_id_for_sm_kf_anchor) {
+void IncrementalOptimizer::addKeyFrameNode(int kf_id, const Pose3d& init_pose, const Pose3d& T_odom_b, bool fixed,
+                                           bool is_first_kf_of_submap, int submap_id_for_sm_kf_anchor) {
     // 🔧 DEBUG: 记录锁等待开始
     auto lock_start = std::chrono::steady_clock::now();
     std::unique_lock<std::shared_mutex> lk(rw_mutex_);
@@ -1290,6 +1336,14 @@ void IncrementalOptimizer::addKeyFrameNode(int kf_id, const Pose3d& init_pose, b
             "[IncrementalOptimizer][BACKEND] addKeyFrameNode: kf_id=%d init_pose non-finite, skip. "
             "t=[%f,%f,%f] R_finite=%d",
             kf_id, t.x(), t.y(), t.z(), R.allFinite() ? 1 : 0);
+        return;
+    }
+    const Eigen::Vector3d& t_odom = T_odom_b.translation();
+    const Eigen::Matrix3d& R_odom = T_odom_b.rotation();
+    if (!t_odom.allFinite() || !R_odom.allFinite()) {
+        RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
+            "[IncrementalOptimizer][BACKEND] addKeyFrameNode: kf_id=%d T_odom_b non-finite, skip",
+            kf_id);
         return;
     }
 
@@ -1374,14 +1428,28 @@ void IncrementalOptimizer::addKeyFrameNode(int kf_id, const Pose3d& init_pose, b
     }
 
     // 🔧 修复欠定与跳变：建立连续的关键帧链
-    // 只要有上一帧，就建立 BetweenFactor，无论是否跨子图。这确保了轨迹在几何上的连续性。
+    // 测量必须与 HBA 一致：相对位姿取自里程计 T_odom_{i-1}^{-1} T_odom_i。
+    // 若仅用 last_keyframe_pose^{-1}*init_pose（地图系前端初值链），在上一帧已被 GPS/iSAM2 大幅修正后，
+    // Between 与当前变量初值严重不一致，会导致单帧跳变与 HBA odom 残差爆炸（见 run_20260329_183940）。
     if (last_keyframe_id_ >= 0 && kf_id > last_keyframe_id_) {
-        Pose3d rel = last_keyframe_pose_.inverse() * init_pose;
+        Pose3d rel;
+        const auto prev_odom_it = keyframe_odom_pose_.find(last_keyframe_id_);
+        if (prev_odom_it != keyframe_odom_pose_.end()) {
+            rel = prev_odom_it->second.inverse() * T_odom_b;
+        } else {
+            rel = last_keyframe_pose_.inverse() * init_pose;
+            RCLCPP_WARN(rclcpp::get_logger("automap_system"),
+                "[IncrementalOptimizer][BACKEND][KF_ODOM] addKeyFrameNode: kf_id=%d prev_kf=%d missing T_odom_b cache, "
+                "fallback to map init chain for Between (grep KF_ODOM)",
+                kf_id, last_keyframe_id_);
+        }
         const Eigen::Vector3d& t = rel.translation();
         const Eigen::Matrix3d& R = rel.rotation();
         if (t.allFinite() && R.allFinite() && t.norm() <= kMaxReasonableTranslationNorm) {
+            // 与 Mat66d / infoToNoiseDiagonal 约定一致：0~2 平移(x,y,z)，3~5 旋转；Z 可单独放宽以贴近 LIO 标高
             gtsam::Vector6 var6;
-            var6 << 1e-4, 1e-4, 1e-4, 1e-4, 1e-4, 1e-4;  // 平移/旋转方差，约 1cm / ~0.01rad
+            var6 << kf_between_var_trans_xy_, kf_between_var_trans_xy_, kf_between_var_trans_z_,
+                kf_between_var_rot_, kf_between_var_rot_, kf_between_var_rot_;
             auto noise = gtsam::noiseModel::Diagonal::Variances(var6);
             staged_factors_.add(gtsam::BetweenFactor<gtsam::Pose3>(
                 KF(last_keyframe_id_), KF(kf_id), toPose3(rel), noise));
@@ -1402,6 +1470,7 @@ void IncrementalOptimizer::addKeyFrameNode(int kf_id, const Pose3d& init_pose, b
             "[IncrementalOptimizer][BACKEND][KF_ODOM] addKeyFrameNode: skip non-monotonic relink last_kf=%d new_kf=%d (likely rollback/recovery path)",
             last_keyframe_id_, kf_id);
     }
+    keyframe_odom_pose_[kf_id] = T_odom_b;
     last_keyframe_id_ = kf_id;
     last_keyframe_pose_ = init_pose;
 
@@ -1449,7 +1518,9 @@ void IncrementalOptimizer::addKeyFrameNode(int kf_id, const Pose3d& init_pose, b
 }
 
 void IncrementalOptimizer::addGPSFactorForKeyFrame(int kf_id, const Eigen::Vector3d& pos_map,
-                                                   const Eigen::Matrix3d& cov3x3) {
+                                                     const Eigen::Matrix3d& cov3x3,
+                                                     double hdop,
+                                                     int num_satellites) {
     BACKEND_STEP("step=addGPSFactorForKeyFrame_enter kf_id=%d (关键帧级 GPS)", kf_id);
     // 🔧 DEBUG: 记录锁等待开始
     auto lock_start = std::chrono::steady_clock::now();
@@ -1501,7 +1572,7 @@ void IncrementalOptimizer::addGPSFactorForKeyFrame(int kf_id, const Eigen::Vecto
                 "[IncrementalOptimizer][BACKEND][GPS_KF] pending_gps_factors_kf_ at cap=%d, dropped oldest (grep BACKEND GPS_KF)",
                 max_pending);
         }
-        pending_gps_factors_kf_.push_back({kf_id, pos_map, cov3x3});
+        pending_gps_factors_kf_.push_back(GPSFactorItemKF{kf_id, pos_map, cov3x3, hdop, num_satellites});
         MetricsRegistry::instance().setGauge(metrics::ISAM2_PENDING_GPS_KF, static_cast<double>(pending_gps_factors_kf_.size()));
         RCLCPP_INFO(rclcpp::get_logger("automap_system"),
             "[IncrementalOptimizer][BACKEND][GPS_KF] addGPSFactorForKeyFrame: kf_id=%d deferred to pending_gps_factors_kf_ (size now=%zu)",
@@ -1509,10 +1580,13 @@ void IncrementalOptimizer::addGPSFactorForKeyFrame(int kf_id, const Eigen::Vecto
         return;
     }
 
-    // 检查是否已在 current_estimate_ 中
-    if (!current_estimate_.exists(KF(kf_id))) {
-        BACKEND_STEP("step=addGPSFactorForKeyFrame_defer kf_id=%d reason=not_in_estimate pending_kf=%zu", kf_id, pending_gps_factors_kf_.size() + 1);
-        CONSTRAINT_LOG("step=gps_kf kf_id=%d result=defer reason=not_in_estimate pending=%zu", kf_id, pending_gps_factors_kf_.size() + 1);
+    // 检查是否已在 current_estimate_ 或 pending_values_ 中。
+    // pending_values_ 中的 KF 已被 staged 且即将被提交；GPS 因子可以直接进入 staged_factors_，
+    // 与 KF 值在同一次 commitAndUpdate 中一起提交，避免两步提交导致的大批量 GPS 校正。
+    // （批量路径 addGPSFactorsForKeyFramesBatch 已采用相同策略，此处对齐）
+    if (!current_estimate_.exists(KF(kf_id)) && !pending_values_.exists(KF(kf_id))) {
+        BACKEND_STEP("step=addGPSFactorForKeyFrame_defer kf_id=%d reason=not_in_estimate_or_pending pending_kf=%zu", kf_id, pending_gps_factors_kf_.size() + 1);
+        CONSTRAINT_LOG("step=gps_kf kf_id=%d result=defer reason=not_in_estimate_or_pending pending=%zu", kf_id, pending_gps_factors_kf_.size() + 1);
         const uint64_t deferred = g_gps_kf_deferred_total.fetch_add(1, std::memory_order_relaxed) + 1;
         RCLCPP_INFO(rclcpp::get_logger("automap_system"),
             "[CONSTRAINT_KPI][GPS_KF][ISAM2] added=%lu deferred=%lu rejected=%lu",
@@ -1520,7 +1594,7 @@ void IncrementalOptimizer::addGPSFactorForKeyFrame(int kf_id, const Eigen::Vecto
             static_cast<unsigned long>(deferred),
             static_cast<unsigned long>(g_gps_kf_rejected_total.load(std::memory_order_relaxed)));
         RCLCPP_DEBUG(rclcpp::get_logger("automap_system"),
-            "[IncrementalOptimizer][BACKEND][GPS_KF] addGPSFactorForKeyFrame: kf_id=%d not in current_estimate_, defer",
+            "[IncrementalOptimizer][BACKEND][GPS_KF] addGPSFactorForKeyFrame: kf_id=%d not in current_estimate_ or pending_values_, defer",
             kf_id);
         const int max_pending = backend_max_pending_gps_kf_;
         while (static_cast<int>(pending_gps_factors_kf_.size()) >= max_pending && !pending_gps_factors_kf_.empty()) {
@@ -1529,7 +1603,7 @@ void IncrementalOptimizer::addGPSFactorForKeyFrame(int kf_id, const Eigen::Vecto
                 "[IncrementalOptimizer][BACKEND][GPS_KF] pending_gps_factors_kf_ at cap=%d, dropped oldest (grep BACKEND GPS_KF)",
                 max_pending);
         }
-        pending_gps_factors_kf_.push_back({kf_id, pos_map, cov3x3});
+        pending_gps_factors_kf_.push_back(GPSFactorItemKF{kf_id, pos_map, cov3x3, hdop, num_satellites});
         MetricsRegistry::instance().setGauge(metrics::ISAM2_PENDING_GPS_KF, static_cast<double>(pending_gps_factors_kf_.size()));
         RCLCPP_INFO(rclcpp::get_logger("automap_system"),
             "[IncrementalOptimizer][BACKEND][GPS_KF] addGPSFactorForKeyFrame: kf_id=%d deferred to pending_gps_factors_kf_ (size now=%zu)",
@@ -1555,10 +1629,11 @@ void IncrementalOptimizer::addGPSFactorForKeyFrame(int kf_id, const Eigen::Vecto
 
     // 添加 GPS 因子到 keyframe 节点
     gtsam::Point3 gps_point(pos_map.x(), pos_map.y(), pos_map.z());
-    gtsam::Vector3 vars;
-    vars << std::max(1e-6, cov3x3(0, 0)),
-            std::max(1e-6, cov3x3(1, 1)),
-            std::max(1e-6, cov3x3(2, 2));
+    const auto& cfg_kf_noise = ConfigManager::instance();
+    gtsam::Vector3 vars = computeGpsDiagonalVariancesKeyFrame(
+        cov3x3, cfg_kf_noise, pos_map, hdop, num_satellites,
+        gps_disable_altitude_constraint_, gps_altitude_variance_override_,
+        current_estimate_, pending_values_, KF(kf_id));
     auto noise = gtsam::noiseModel::Diagonal::Variances(vars);
     // 🏛️ [架构加固] 事务性插入：GPS 因子进入 staging
     staged_factors_.add(gtsam::GPSFactor(KF(kf_id), gps_point, noise));
@@ -1794,16 +1869,12 @@ void IncrementalOptimizer::addGPSFactorsForKeyFramesBatch(const std::vector<GPSF
             if (!f.pos.allFinite() || !f.cov.allFinite()) continue;
 
             gtsam::Point3 gps_point(f.pos.x(), f.pos.y(), f.pos.z());
-            gtsam::Vector3 vars;
-            // [GPS高度约束修复] 当 disable_altitude_constraint=true（默认）时，将 Z 轴方差设为大值，
-            // 防止不可靠的 GPS 高度导致多重地面重影。
             const auto& cfg_kf = ConfigManager::instance();
-            const double z_var_kf = cfg_kf.gpsDisableAltitudeConstraint()
-                ? cfg_kf.gpsAltitudeVarianceOverride()
-                : std::max(1e-6, f.cov(2, 2));
-            vars << std::max(1e-6, f.cov(0, 0)),
-                    std::max(1e-6, f.cov(1, 1)),
-                    z_var_kf;
+            Eigen::Matrix3d cov_copy = f.cov;
+            gtsam::Vector3 vars = computeGpsDiagonalVariancesKeyFrame(
+                cov_copy, cfg_kf, f.pos, f.hdop, f.num_satellites,
+                gps_disable_altitude_constraint_, gps_altitude_variance_override_,
+                current_estimate_, pending_values_, KF(f.kf_id));
             auto noise = gtsam::noiseModel::Diagonal::Variances(vars);
             staged_factors_.add(gtsam::GPSFactor(KF(f.kf_id), gps_point, noise));
             factor_count_++;
@@ -1853,23 +1924,21 @@ int IncrementalOptimizer::flushPendingGPSFactorsForKeyFramesInternal() {
             still_pending.push_back(std::move(f));
             continue;
         }
-        if (!current_estimate_.exists(KF(f.kf_id))) {
+        // 与 addGPSFactorForKeyFrame 一致：KF 在 pending_values_ 中时也允许 flush，
+        // 使 GPS 因子与 KF 值在同一次 commitAndUpdate 中提交，避免两步大批量校正。
+        if (!current_estimate_.exists(KF(f.kf_id)) && !pending_values_.exists(KF(f.kf_id))) {
             still_pending.push_back(std::move(f));
             continue;
         }
         if (!f.pos.allFinite() || !f.cov.allFinite()) continue;
 
         gtsam::Point3 gps_point(f.pos.x(), f.pos.y(), f.pos.z());
-        gtsam::Vector3 vars;
-        // [RC-1 修复] flush 路径与直接 add 路径保持一致：当 disable_altitude_constraint=true 时
-        // 将 Z 轴方差设为大值（altitude_variance_override），防止不可靠 GPS 高度数据导致 Z 漂移重影。
-        // 原来此处遗漏了该检查，导致 1000+ 个 deferred 因子以全量 Z 方差注入 GTSAM，引发 4m+ Z 漂移。
-        const double z_var_flush = gps_disable_altitude_constraint_
-            ? gps_altitude_variance_override_
-            : std::max(1e-6, f.cov(2, 2));
-        vars << std::max(1e-6, f.cov(0, 0)),
-                std::max(1e-6, f.cov(1, 1)),
-                z_var_flush;
+        const auto& cfg_flush = ConfigManager::instance();
+        Eigen::Matrix3d cov_copy = f.cov;
+        gtsam::Vector3 vars = computeGpsDiagonalVariancesKeyFrame(
+            cov_copy, cfg_flush, f.pos, f.hdop, f.num_satellites,
+            gps_disable_altitude_constraint_, gps_altitude_variance_override_,
+            current_estimate_, pending_values_, KF(f.kf_id));
         auto noise = gtsam::noiseModel::Diagonal::Variances(vars);
         staged_factors_.add(gtsam::GPSFactor(KF(f.kf_id), gps_point, noise));
         factor_count_++;
@@ -1963,6 +2032,7 @@ void IncrementalOptimizer::rollbackKeyframeStateForPendingKeys(const std::vector
         kf_ids_in_pending.size(), first_id, last_id);
     for (int id : kf_ids_in_pending) {
         keyframe_node_exists_.erase(id);
+        keyframe_odom_pose_.erase(id);
     }
     keyframe_count_ = static_cast<int>(keyframe_node_exists_.size());
     bool removed_last = (std::find(kf_ids_in_pending.begin(), kf_ids_in_pending.end(), last_keyframe_id_) != kf_ids_in_pending.end());
@@ -3120,6 +3190,7 @@ void IncrementalOptimizer::rebuildAfterGPSAlign(const std::vector<SubmapData>& s
     current_estimate_.clear();
     node_exists_.clear();
     keyframe_node_exists_.clear();
+    keyframe_odom_pose_.clear();
     pending_odom_factors_submap_.clear();
     keyframe_count_ = 0;
     last_keyframe_id_ = -1;
@@ -3386,6 +3457,7 @@ void IncrementalOptimizer::clearForShutdown() {
     current_estimate_.clear();
     node_exists_.clear();
     keyframe_node_exists_.clear();
+    keyframe_odom_pose_.clear();
     keyframe_count_ = 0;
     last_keyframe_id_ = -1;
     pending_gps_factors_.clear();
@@ -3645,6 +3717,7 @@ void IncrementalOptimizer::resetForRecovery() {
     factor_count_ = 0;
     has_prior_ = false;
     keyframe_node_exists_.clear();
+    keyframe_odom_pose_.clear();
     keyframe_count_ = 0;
     last_keyframe_id_ = -1;
     pending_gps_factors_kf_.clear();
@@ -3767,6 +3840,7 @@ void IncrementalOptimizer::resetInternal() {
     current_estimate_.clear();
     node_exists_.clear();
     keyframe_node_exists_.clear();
+    keyframe_odom_pose_.clear();
     submap_anchor_kf_id_.clear();
     submap_sm_kf_anchor_linked_.clear();
     node_count_ = 0;
