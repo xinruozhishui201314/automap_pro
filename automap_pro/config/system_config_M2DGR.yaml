@@ -778,6 +778,28 @@ loop_closure:
   teaser_icp_agreement:
     max_trans_diff_m: 4.0
     max_rot_diff_deg: 35.0
+  # TEASER 失败（含 inlier/rmse 未过、串行 TEASER 异常、SVD 被禁、TEASER–ICP 不一致、子图间关键帧级/子图内同级失败）后：
+  # 在锚点+里程计初值下用 NDT 或 GICP，并合并中心关键帧邻域点云提高密度。默认关闭；植被/稀疏场景可设 enabled:true 并先调 max_rmse、drift 门限。
+  teaser_fallback_register:
+    enabled: true
+    method: "ndt"   # ndt | gicp
+    # 合并窗口约 2N+1 个关键帧；N=10 → 约 21 帧（满足 >20；可调大至 50 以内）
+    multi_kf_half_window: 10
+    merge_voxel_m: 0.35
+    max_rmse: 1.2
+    max_iterations: 50
+    max_correspondence_distance_m: 1.5
+    ndt_resolution: 1.5
+    ndt_step_size: 0.15
+    max_pose_drift_trans_m: 3.0
+    max_pose_drift_rot_deg: 25.0
+    information_scale_factor: 0.35
+    synthetic_inlier_ratio: 0.10
+    submap_geo_merge_center: true
+    submap_weak_world_dist_m: 5.0
+    submap_weak_refined_trans_near_m: 1.2
+    # 150°：仅拦截平移方向近 180° 的离谱解；改 0 关闭以极限召回
+    submap_weak_max_trans_angle_deg: 150.0
   constraint_margin:
     low_trust_information_scale: 0.5
     inlier_soft_margin: 0.035

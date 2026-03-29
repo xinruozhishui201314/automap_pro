@@ -104,6 +104,19 @@ void MapRegistry::addKeyFrame(KeyFrame::Ptr kf) {
     event.type = MapUpdateEvent::ChangeType::KEYFRAME_ADDED;
     event.affected_ids = {kf->id};
     event_bus_->publish(event);
+
+    // V3：子图内回环由 LoopModule 消费 IntraLoopTaskEvent 并调用 detectIntraSubmapLoop。
+    // 此前无任何发布方，导致 full.log 中永不出现 [INTRA_LOOP][SUMMARY]/DETECTED。
+    if (ConfigManager::instance().intraSubmapLoopEnabled() &&
+        kf->submap_id >= 0 && kf->index_in_submap >= 0) {
+        SubMap::Ptr sm = getSubMap(kf->submap_id);
+        if (sm) {
+            IntraLoopTaskEvent intra_ev;
+            intra_ev.submap = std::move(sm);
+            intra_ev.query_idx = kf->index_in_submap;
+            event_bus_->publish(intra_ev);
+        }
+    }
 }
 
 KeyFrame::Ptr MapRegistry::getKeyFrame(int id) const {

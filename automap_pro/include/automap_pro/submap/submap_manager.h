@@ -348,6 +348,8 @@ private:
     /** 与 merge / rebuild 一致：body 系 merge 分辨率下采样（可选对齐语义 + SOR） */
     CloudXYZIPtr downsampleKeyframeBodyForMerging_(const KeyFrame::Ptr& kf) const;
     void        mergeCloudToSubmap(SubMap::Ptr& sm, const KeyFrame::Ptr& kf) const;
+    /** merged 已在地图世界系更新后，用当前 pose_map_anchor_optimized 投到锚点系并以 match_res_ 体素化生成 downsampled_cloud，与 freeze_post / 子图 TEASER 契约一致。调用方须已持 mutex_。 */
+    void        refreshDownsampledCloudFromMergedInAnchorFrame_(SubMap::Ptr& sm);
     void        mergeDuplicateTreeLandmarks_(SubMap::Ptr& sm);
     void        publishEvent(const SubMap::Ptr& sm, const std::string& event);
 };

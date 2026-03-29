@@ -1302,6 +1302,41 @@ void SubMapManager::applyGpsMapOriginToOdomKeyframes(const Eigen::Matrix3d& R_en
     rebuildMergedCloudFromOptimizedPoses();
 }
 
+void SubMapManager::refreshDownsampledCloudFromMergedInAnchorFrame_(SubMap::Ptr& sm) {
+    if (!sm) return;
+    const rclcpp::Logger log = rclcpp::get_logger("automap_system");
+    if (!sm->merged_cloud || sm->merged_cloud->empty()) {
+        sm->downsampled_cloud = std::make_shared<CloudXYZI>();
+        RCLCPP_DEBUG(log, "[SubMapMgr][REBUILD_DS] sm_id=%d merged empty -> downsampled cleared", sm->id);
+        return;
+    }
+    CloudXYZIPtr body_cloud(new CloudXYZI());
+    const Pose3d& T_w_anchor = sm->pose_map_anchor_optimized.matrix().allFinite()
+        ? sm->pose_map_anchor_optimized
+        : sm->pose_odom_anchor;
+    Eigen::Isometry3d T_anchor_w = T_w_anchor.inverse();
+    try {
+        pcl::transformPointCloud(*sm->merged_cloud, *body_cloud, T_anchor_w.matrix().cast<float>());
+    } catch (const std::exception& e) {
+        RCLCPP_WARN(log, "[SubMapMgr][REBUILD_DS] sm_id=%d anchor transform failed: %s -> downsampled cleared", sm->id, e.what());
+        sm->downsampled_cloud = std::make_shared<CloudXYZI>();
+        return;
+    } catch (...) {
+        RCLCPP_WARN(log, "[SubMapMgr][REBUILD_DS] sm_id=%d anchor transform unknown exception -> downsampled cleared", sm->id);
+        sm->downsampled_cloud = std::make_shared<CloudXYZI>();
+        return;
+    }
+    CloudXYZIPtr ds = submap_merge_semantic_intensity_vote_
+        ? utils::voxelDownsampleMajorityIntensity(body_cloud, static_cast<float>(match_res_),
+                                                    parallel_voxel_downsample_)
+        : utils::voxelDownsample(body_cloud, static_cast<float>(match_res_), parallel_voxel_downsample_);
+    if (!ds || ds->empty()) ds = body_cloud;
+    sm->downsampled_cloud = ds;
+    RCLCPP_INFO(log,
+                "[SubMapMgr][REBUILD_DS] sm_id=%d downsampled_cloud refreshed in ANCHOR frame (pts=%zu, match_res=%.3f)",
+                sm->id, ds->size(), match_res_);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // HBA 完成后重建 merged_cloud：使用优化后的位姿重新构建点云
 // 解决 merged_cloud 使用旧 T_odom_b 构建导致的点云重影问题
@@ -1391,6 +1426,9 @@ void SubMapManager::rebuildMergedCloudFromOptimizedPoses() {
         RCLCPP_INFO(log, "[SubMapMgr][REBUILD_MERGE] sm_id=%d rebuilt merged_cloud: %zu points (anchor_delta: trans=%.3fm)",
             sm->id, sm->merged_cloud ? sm->merged_cloud->size() : 0,
             delta_trans_norm);
+
+        // 与 LoopDetector 子图 TEASER 对齐：downsampled 必须对应当前 merged + pose_map_anchor_optimized（仅重建 merged 不刷新会导致初值/点云脱节）
+        refreshDownsampledCloudFromMergedInAnchorFrame_(sm);
     }
     
     RCLCPP_INFO(log, "[SubMapMgr][REBUILD_MERGE] Done rebuilding merged_cloud for all submaps");

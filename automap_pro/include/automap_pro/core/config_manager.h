@@ -657,6 +657,87 @@ public:
         return get<bool>("loop_closure.semantic_icp.gray_zone_linear_trust", true);
     }
 
+    /** TEASER（含 inlier/rmse 未过门限）失败后，在 ScanContext/锚点+里程计好初值下用 NDT 或 GICP 降级；默认 false */
+    bool teaserFallbackRegisterEnabled() const {
+        return get<bool>("loop_closure.teaser_fallback_register.enabled", false);
+    }
+    /** 降级配准算法："ndt" 或 "gicp"（大小写不敏感） */
+    bool teaserFallbackRegisterUseGicp() const {
+        std::string m = get<std::string>("loop_closure.teaser_fallback_register.method", "ndt");
+        for (char& c : m) {
+            c = static_cast<char>(::tolower(static_cast<unsigned char>(c)));
+        }
+        return m == "gicp";
+    }
+    /** 多关键帧合并：中心帧左右各扩展多少帧（0=仅中心帧）；合并帧数约 2N+1，默认 N=10 → 最多约 21 帧 */
+    int teaserFallbackRegisterMultiKfHalfWindow() const {
+        int v = get<int>("loop_closure.teaser_fallback_register.multi_kf_half_window", 10);
+        return std::max(0, std::min(50, v));
+    }
+    float teaserFallbackRegisterMergeVoxelM() const {
+        float v = static_cast<float>(get<double>("loop_closure.teaser_fallback_register.merge_voxel_m", 0.35));
+        return std::max(0.0f, std::min(5.0f, v));
+    }
+    double teaserFallbackRegisterMaxRmse() const {
+        double v = get<double>("loop_closure.teaser_fallback_register.max_rmse", 1.2);
+        return std::max(1e-6, std::min(100.0, v));
+    }
+    int teaserFallbackRegisterMaxIterations() const {
+        int v = get<int>("loop_closure.teaser_fallback_register.max_iterations", 50);
+        return std::max(1, std::min(500, v));
+    }
+    double teaserFallbackRegisterMaxCorrespondenceDistanceM() const {
+        double v = get<double>("loop_closure.teaser_fallback_register.max_correspondence_distance_m", 1.5);
+        return std::max(1e-3, std::min(50.0, v));
+    }
+    double teaserFallbackRegisterNdtResolution() const {
+        double v = get<double>("loop_closure.teaser_fallback_register.ndt_resolution", 1.5);
+        return std::max(0.1, std::min(20.0, v));
+    }
+    double teaserFallbackRegisterNdtStepSize() const {
+        double v = get<double>("loop_closure.teaser_fallback_register.ndt_step_size", 0.15);
+        return std::max(1e-4, std::min(1.0, v));
+    }
+    /** 相对初值最大平移漂移(米)；≤0 关闭 */
+    double teaserFallbackRegisterMaxPoseDriftTransM() const {
+        double v = get<double>("loop_closure.teaser_fallback_register.max_pose_drift_trans_m", 3.0);
+        return std::max(0.0, std::min(100.0, v));
+    }
+    /** 相对初值最大旋转漂移(度)；≤0 关闭 */
+    double teaserFallbackRegisterMaxPoseDriftRotDeg() const {
+        double v = get<double>("loop_closure.teaser_fallback_register.max_pose_drift_rot_deg", 25.0);
+        return std::max(0.0, std::min(180.0, v));
+    }
+    /** 对信息矩阵整体再乘以此系数（保守降权） */
+    double teaserFallbackRegisterInformationScaleFactor() const {
+        double v = get<double>("loop_closure.teaser_fallback_register.information_scale_factor", 0.35);
+        return std::clamp(v, 0.02, 1.0);
+    }
+    /** 写入 LoopConstraint::inlier_ratio 的保守占位值（NDT/GICP 无 TEASER inlier） */
+    float teaserFallbackRegisterSyntheticInlierRatio() const {
+        double v = get<double>("loop_closure.teaser_fallback_register.synthetic_inlier_ratio", 0.10);
+        return static_cast<float>(std::clamp(v, 0.02, 0.95));
+    }
+    /** 子图 fallback：按地图锚点位置选合并中心关键帧（提高与候选重叠处点云密度）；false=固定用最后一帧 */
+    bool teaserFallbackRegisterSubmapGeoMergeCenter() const {
+        return get<bool>("loop_closure.teaser_fallback_register.submap_geo_merge_center", true);
+    }
+    /** 弱一致性：两子图 pose_map_anchor 平移距离 > 此值(米) 且配准结果平移范数 < refined_trans_near_m 则拒（仿 inter_kf）；≤0 关闭 */
+    double teaserFallbackRegisterSubmapWeakWorldDistM() const {
+        double v = get<double>("loop_closure.teaser_fallback_register.submap_weak_world_dist_m", 5.0);
+        return std::max(0.0, std::min(500.0, v));
+    }
+    /** 与 submap_weak_world_dist_m 联用：配准平移范数小于此视为「接近单位平移」假阳性 */
+    double teaserFallbackRegisterSubmapWeakRefinedTransNearM() const {
+        double v = get<double>("loop_closure.teaser_fallback_register.submap_weak_refined_trans_near_m", 1.2);
+        return std::max(0.05, std::min(50.0, v));
+    }
+    /** 弱一致性：T_submap_init 与配准结果平移向量夹角超过此值(度)则拒；0=关闭（利于召回） */
+    double teaserFallbackRegisterSubmapWeakMaxTransAngleDeg() const {
+        double v = get<double>("loop_closure.teaser_fallback_register.submap_weak_max_trans_angle_deg", 0.0);
+        return std::max(0.0, std::min(180.0, v));
+    }
+
     // ── 后端帧率控制（前端每帧都发，后端可每隔 N 帧处理一帧以减轻负载）────────────────
     /** 每隔多少帧处理一帧（1=每帧都处理，5=默认跳过4帧处理1帧）；仅影响后端 tryCreateKeyFrame，队列仍每帧弹出不阻塞 */
     int backendProcessEveryNFrames() const {

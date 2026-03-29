@@ -1,6 +1,7 @@
 #pragma once
 
 #include "automap_pro/core/data_types.h"
+#include "automap_pro/loop_closure/icp_refiner.h"
 #include "automap_pro/loop_closure/overlap_transformer_infer.h"
 #include "automap_pro/loop_closure/teaser_matcher.h"
 #include <automap_pro/msg/loop_constraint_msg.hpp>
@@ -279,6 +280,25 @@ private:
     /** ≤0 关闭；>0 时几何验证通过后仍要求 overlap/描述子 score ≥ 该值（硬门槛） */
     double min_accept_overlap_score_hard_ = 0.0;
 
+    /** TEASER 失败后 NDT/GICP + 多关键帧合并降级（配置缓存，避免 worker 线程读 ConfigManager） */
+    bool teaser_fallback_register_enabled_ = false;
+    bool teaser_fallback_use_gicp_ = false;
+    int teaser_fallback_multi_kf_half_window_ = 10;
+    float teaser_fallback_merge_voxel_m_ = 0.35f;
+    double teaser_fallback_max_rmse_ = 1.2;
+    int teaser_fallback_max_iterations_ = 50;
+    double teaser_fallback_max_corr_dist_m_ = 1.5;
+    double teaser_fallback_ndt_resolution_ = 1.5;
+    double teaser_fallback_ndt_step_size_ = 0.15;
+    double teaser_fallback_max_pose_drift_trans_m_ = 3.0;
+    double teaser_fallback_max_pose_drift_rot_deg_ = 25.0;
+    double teaser_fallback_information_scale_factor_ = 0.35;
+    float teaser_fallback_synthetic_inlier_ratio_ = 0.10f;
+    bool teaser_fallback_submap_geo_merge_center_ = true;
+    double teaser_fallback_submap_weak_world_dist_m_ = 5.0;
+    double teaser_fallback_submap_weak_refined_trans_near_m_ = 1.2;
+    double teaser_fallback_submap_weak_max_trans_angle_deg_ = 0.0;
+
     /** 回环检测节流：上次成功检测时的 query 关键帧 id，-1 表示未成功过 */
     int64_t last_keyframe_id_after_loop_success_ = -1;
     /** 回环检测节流：成功检测后隔多少关键帧再检测，0=不节流 */
@@ -308,6 +328,25 @@ private:
     void applyLoopInformationMargins_(Mat66d& information, float inlier_ratio) const;
     /** true=应拒绝（score 低于 loop_closure.min_accept_overlap_score） */
     bool rejectBelowMinAcceptOverlapScore_(float score, const char* stage_tag) const;
+
+    IcpRefiner makeTeaserFallbackIcpRefiner_() const;
+    bool teaserFallbackPoseDriftOk_(const Pose3d& T_init, const Pose3d& T_final, double& out_dtrans_m,
+                                    double& out_drot_deg) const;
+    LoopConstraint::Ptr tryTeaserFallbackSubmapPair_(const SubMap::Ptr& query, const SubMap::Ptr& target,
+                                                     const OverlapTransformerInfer::Candidate& cand,
+                                                     const Pose3d& T_submap_init, const char* stage_tag) const;
+    LoopConstraint::Ptr tryTeaserFallbackInterKf_(const SubMap::Ptr& query, int query_kf_idx,
+                                                  const SubMap::Ptr& target, int target_kf_idx,
+                                                  const KeyFrame::Ptr& query_kf, const KeyFrame::Ptr& target_kf,
+                                                  float cand_score, const Pose3d& T_tgt_src_odom,
+                                                  double dist_world_m) const;
+    LoopConstraint::Ptr tryTeaserFallbackIntra_(const SubMap::Ptr& submap, int query_keyframe_idx,
+                                                int cand_keyframe_idx, float similarity, const Pose3d& T_kf_init,
+                                                const KeyFrame::Ptr& query_kf, const KeyFrame::Ptr& cand_kf) const;
+    /** 子图 fallback：地图锚点几何 + 同系平移方向弱门控；false=应拒收 */
+    bool submapFallbackWeakConsistencyOk_(const SubMap::Ptr& query, const SubMap::Ptr& target,
+                                          const Pose3d& T_submap_init, const Pose3d& T_refined,
+                                          const char* stage_tag) const;
 
     /** 安全获取节点指针 */
     rclcpp::Node::SharedPtr node() const { return node_.lock(); }

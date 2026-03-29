@@ -12,6 +12,7 @@
 #define MOD "LoopDetector"
 
 #include <automap_pro/msg/loop_constraint_msg.hpp>
+#include <pcl/common/transforms.h>
 #include <pcl_conversions/pcl_conversions.h>
 #include <pcl/filters/voxel_grid.h>
 #include <chrono>
@@ -68,6 +69,108 @@ bool teaserIcpPoseDisagrees(const Pose3d& T_teaser, const Pose3d& T_icp, double 
     const bool bad_t = max_trans_m > 0.0 && out_dtrans_m > max_trans_m;
     const bool bad_r = max_rot_deg > 0.0 && out_drot_deg > max_rot_deg;
     return bad_t || bad_r;
+}
+
+CloudXYZIPtr copyCloudIfAny(const CloudXYZIPtr& src) {
+    if (!src || src->empty()) return nullptr;
+    auto c = std::make_shared<CloudXYZI>();
+    *c = *src;
+    return c;
+}
+
+CloudXYZIPtr mergeKeyframeCloudsInSubmapFrame(const SubMap::Ptr& sm, int center_idx, int half_w, float voxel_m) {
+    if (!sm || sm->keyframes.empty()) return nullptr;
+    const int n = static_cast<int>(sm->keyframes.size());
+    center_idx = std::clamp(center_idx, 0, n - 1);
+    const int j0 = std::max(0, center_idx - half_w);
+    const int j1 = std::min(n - 1, center_idx + half_w);
+    CloudXYZI acc;
+    acc.points.reserve(1024);
+    for (int j = j0; j <= j1; ++j) {
+        if (j >= static_cast<int>(sm->keyframe_clouds_ds.size())) continue;
+        const auto& kf_j = sm->keyframes[j];
+        const CloudXYZIPtr& cloud_j = sm->keyframe_clouds_ds[j];
+        if (!kf_j || !cloud_j || cloud_j->empty()) continue;
+        Eigen::Affine3f aff;
+        aff.matrix() = kf_j->T_submap_kf.cast<float>().matrix();
+        CloudXYZI transformed;
+        pcl::transformPointCloud(*cloud_j, transformed, aff);
+        acc.points.insert(acc.points.end(), transformed.points.begin(), transformed.points.end());
+    }
+    if (acc.points.empty()) return nullptr;
+    acc.width = static_cast<uint32_t>(acc.points.size());
+    acc.height = 1;
+    acc.is_dense = false;
+    CloudXYZIPtr out(new CloudXYZI());
+    if (voxel_m > 1e-6f) {
+        pcl::VoxelGrid<pcl::PointXYZI> vg;
+        auto acc_ptr = std::make_shared<CloudXYZI>(acc);
+        vg.setInputCloud(acc_ptr);
+        vg.setLeafSize(voxel_m, voxel_m, voxel_m);
+        vg.filter(*out);
+    } else {
+        *out = acc;
+    }
+    return out->empty() ? nullptr : out;
+}
+
+CloudXYZIPtr mergeKeyframeCloudsInBodyOfCenter(const SubMap::Ptr& sm, int center_idx, int half_w, float voxel_m) {
+    if (!sm || sm->keyframes.empty()) return nullptr;
+    const int n = static_cast<int>(sm->keyframes.size());
+    center_idx = std::clamp(center_idx, 0, n - 1);
+    const auto& kf_c = sm->keyframes[center_idx];
+    if (!kf_c) return nullptr;
+    const int j0 = std::max(0, center_idx - half_w);
+    const int j1 = std::min(n - 1, center_idx + half_w);
+    CloudXYZI acc;
+    acc.points.reserve(1024);
+    for (int j = j0; j <= j1; ++j) {
+        if (j >= static_cast<int>(sm->keyframe_clouds_ds.size())) continue;
+        const auto& kf_j = sm->keyframes[j];
+        const CloudXYZIPtr& cloud_j = sm->keyframe_clouds_ds[j];
+        if (!kf_j || !cloud_j || cloud_j->empty()) continue;
+        const Pose3d T_cj = kf_c->T_odom_b.inverse() * kf_j->T_odom_b;
+        Eigen::Affine3f aff;
+        aff.matrix() = T_cj.cast<float>().matrix();
+        CloudXYZI transformed;
+        pcl::transformPointCloud(*cloud_j, transformed, aff);
+        acc.points.insert(acc.points.end(), transformed.points.begin(), transformed.points.end());
+    }
+    if (acc.points.empty()) return nullptr;
+    acc.width = static_cast<uint32_t>(acc.points.size());
+    acc.height = 1;
+    acc.is_dense = false;
+    CloudXYZIPtr out(new CloudXYZI());
+    if (voxel_m > 1e-6f) {
+        pcl::VoxelGrid<pcl::PointXYZI> vg;
+        auto acc_ptr = std::make_shared<CloudXYZI>(acc);
+        vg.setInputCloud(acc_ptr);
+        vg.setLeafSize(voxel_m, voxel_m, voxel_m);
+        vg.filter(*out);
+    } else {
+        *out = acc;
+    }
+    return out->empty() ? nullptr : out;
+}
+
+/** 在 map 下选与 ref_pos_map 最近的关键帧索引，用于子图 fallback 合并中心（提高与对侧锚点重叠处点云密度） */
+int pickSubmapMergeCenterNearMapPosition(const SubMap::Ptr& sm, const Eigen::Vector3d& ref_pos_map) {
+    if (!sm || sm->keyframes.empty()) return 0;
+    int best = static_cast<int>(sm->keyframes.size()) - 1;
+    double best_d2 = 1e300;
+    for (int j = 0; j < static_cast<int>(sm->keyframes.size()); ++j) {
+        const auto& kf = sm->keyframes[j];
+        if (!kf) continue;
+        if (!kf->T_map_b_optimized.matrix().allFinite()) continue;
+        const Eigen::Vector3d p = kf->T_map_b_optimized.translation();
+        if (!p.allFinite()) continue;
+        const double d2 = (p - ref_pos_map).squaredNorm();
+        if (d2 < best_d2) {
+            best_d2 = d2;
+            best = j;
+        }
+    }
+    return best;
 }
 
 }  // namespace
@@ -131,6 +234,24 @@ LoopDetector::LoopDetector() {
     teaser_min_safe_inliers_ = cfg.teaserMinSafeInliers();
     parallel_teaser_match_ = cfg.parallelTeaserMatch();
     min_accept_overlap_score_hard_ = cfg.loopMinAcceptOverlapScore();
+
+    teaser_fallback_register_enabled_ = cfg.teaserFallbackRegisterEnabled();
+    teaser_fallback_use_gicp_ = cfg.teaserFallbackRegisterUseGicp();
+    teaser_fallback_multi_kf_half_window_ = cfg.teaserFallbackRegisterMultiKfHalfWindow();
+    teaser_fallback_merge_voxel_m_ = cfg.teaserFallbackRegisterMergeVoxelM();
+    teaser_fallback_max_rmse_ = cfg.teaserFallbackRegisterMaxRmse();
+    teaser_fallback_max_iterations_ = cfg.teaserFallbackRegisterMaxIterations();
+    teaser_fallback_max_corr_dist_m_ = cfg.teaserFallbackRegisterMaxCorrespondenceDistanceM();
+    teaser_fallback_ndt_resolution_ = cfg.teaserFallbackRegisterNdtResolution();
+    teaser_fallback_ndt_step_size_ = cfg.teaserFallbackRegisterNdtStepSize();
+    teaser_fallback_max_pose_drift_trans_m_ = cfg.teaserFallbackRegisterMaxPoseDriftTransM();
+    teaser_fallback_max_pose_drift_rot_deg_ = cfg.teaserFallbackRegisterMaxPoseDriftRotDeg();
+    teaser_fallback_information_scale_factor_ = cfg.teaserFallbackRegisterInformationScaleFactor();
+    teaser_fallback_synthetic_inlier_ratio_ = cfg.teaserFallbackRegisterSyntheticInlierRatio();
+    teaser_fallback_submap_geo_merge_center_ = cfg.teaserFallbackRegisterSubmapGeoMergeCenter();
+    teaser_fallback_submap_weak_world_dist_m_ = cfg.teaserFallbackRegisterSubmapWeakWorldDistM();
+    teaser_fallback_submap_weak_refined_trans_near_m_ = cfg.teaserFallbackRegisterSubmapWeakRefinedTransNearM();
+    teaser_fallback_submap_weak_max_trans_angle_deg_ = cfg.teaserFallbackRegisterSubmapWeakMaxTransAngleDeg();
 }
 
 LoopDetector::~LoopDetector() { stop(); }
@@ -240,6 +361,25 @@ void LoopDetector::init(rclcpp::Node::SharedPtr node) {
     teaser_min_safe_inliers_ = cfg.teaserMinSafeInliers();
     parallel_teaser_match_ = cfg.parallelTeaserMatch();
     min_accept_overlap_score_hard_ = cfg.loopMinAcceptOverlapScore();
+
+    teaser_fallback_register_enabled_ = cfg.teaserFallbackRegisterEnabled();
+    teaser_fallback_use_gicp_ = cfg.teaserFallbackRegisterUseGicp();
+    teaser_fallback_multi_kf_half_window_ = cfg.teaserFallbackRegisterMultiKfHalfWindow();
+    teaser_fallback_merge_voxel_m_ = cfg.teaserFallbackRegisterMergeVoxelM();
+    teaser_fallback_max_rmse_ = cfg.teaserFallbackRegisterMaxRmse();
+    teaser_fallback_max_iterations_ = cfg.teaserFallbackRegisterMaxIterations();
+    teaser_fallback_max_corr_dist_m_ = cfg.teaserFallbackRegisterMaxCorrespondenceDistanceM();
+    teaser_fallback_ndt_resolution_ = cfg.teaserFallbackRegisterNdtResolution();
+    teaser_fallback_ndt_step_size_ = cfg.teaserFallbackRegisterNdtStepSize();
+    teaser_fallback_max_pose_drift_trans_m_ = cfg.teaserFallbackRegisterMaxPoseDriftTransM();
+    teaser_fallback_max_pose_drift_rot_deg_ = cfg.teaserFallbackRegisterMaxPoseDriftRotDeg();
+    teaser_fallback_information_scale_factor_ = cfg.teaserFallbackRegisterInformationScaleFactor();
+    teaser_fallback_synthetic_inlier_ratio_ = cfg.teaserFallbackRegisterSyntheticInlierRatio();
+    teaser_fallback_submap_geo_merge_center_ = cfg.teaserFallbackRegisterSubmapGeoMergeCenter();
+    teaser_fallback_submap_weak_world_dist_m_ = cfg.teaserFallbackRegisterSubmapWeakWorldDistM();
+    teaser_fallback_submap_weak_refined_trans_near_m_ = cfg.teaserFallbackRegisterSubmapWeakRefinedTransNearM();
+    teaser_fallback_submap_weak_max_trans_angle_deg_ = cfg.teaserFallbackRegisterSubmapWeakMaxTransAngleDeg();
+
     svd_temp_enable_after_fpfh_critical_ = 3;
     svd_temp_enable_budget_max_ = 24;
     svd_temp_enable_budget_left_ = 0;
@@ -249,6 +389,24 @@ void LoopDetector::init(rclcpp::Node::SharedPtr node) {
     RCLCPP_INFO(node->get_logger(),
         "[LoopDetector][CONFIG] TEASER applied from YAML: min_safe_inliers=%d min_inlier_ratio=%.2f max_rmse=%.2f (grep CONFIG 验证)",
         teaser_min_safe_inliers_, min_inlier_ratio_, max_rmse_);
+    RCLCPP_INFO(node->get_logger(),
+        "[LoopDetector][CONFIG] teaser_fallback_register: enabled=%d method=%s multi_kf_half_window=%d merge_voxel_m=%.3f "
+        "max_rmse=%.3f max_pose_drift_t=%.2fm drift_r=%.1fdeg info_scale=%.3f",
+        teaser_fallback_register_enabled_ ? 1 : 0,
+        teaser_fallback_use_gicp_ ? "gicp" : "ndt",
+        teaser_fallback_multi_kf_half_window_,
+        static_cast<double>(teaser_fallback_merge_voxel_m_),
+        teaser_fallback_max_rmse_,
+        teaser_fallback_max_pose_drift_trans_m_,
+        teaser_fallback_max_pose_drift_rot_deg_,
+        teaser_fallback_information_scale_factor_);
+    RCLCPP_INFO(node->get_logger(),
+        "[LoopDetector][CONFIG] teaser_fallback submap: geo_merge_center=%d weak_world_dist_m=%.2f weak_refined_near_m=%.2f "
+        "weak_max_trans_angle_deg=%.1f (0=angle off)",
+        teaser_fallback_submap_geo_merge_center_ ? 1 : 0,
+        teaser_fallback_submap_weak_world_dist_m_,
+        teaser_fallback_submap_weak_refined_trans_near_m_,
+        teaser_fallback_submap_weak_max_trans_angle_deg_);
     RCLCPP_INFO(node->get_logger(),
         "[LoopDetector][CONFIG] retrieve params from YAML: overlap_threshold=%.2f top_k=%d sc_dist_threshold=%.3f min_temporal_gap_s=%.1f (grep CONFIG 验证)",
         overlap_threshold_, top_k_, sc_dist_threshold_, min_temporal_gap_);
@@ -1150,6 +1308,7 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
         int inter_kf_skip_keyframe_gap = 0;
         int inter_kf_skip_odom_rel_rot_prefilter = 0;
         int inter_kf_reject_teaser_icp = 0;
+        int inter_kf_fallback_published = 0;
         bool any_garbage_rejected = false;
         float max_p90 = 0.0f;
         // 几何诊断：query 关键帧位姿（世界系）
@@ -1260,6 +1419,14 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
                         "[INTER_KF][TEASER][EXCEPTION] what=%s query_sm=%d q_kf_idx=%d tgt_sm=%d tgt_kf_idx=%d",
                         e.what(), task.query->id, task.query_kf_idx, kfc.submap_id, kfc.keyframe_idx);
                 }
+                if (auto lc_fb = tryTeaserFallbackInterKf_(task.query, task.query_kf_idx, target, kfc.keyframe_idx,
+                                                          query_kf, target_kf, kfc.score, T_tgt_src_odom, dist_world_m)) {
+                    publishLoopConstraint(lc_fb);
+                    loop_detected_count_++;
+                    inter_kf_published++;
+                    inter_kf_fallback_published++;
+                    for (auto& cb : loop_cbs_) { try { cb(lc_fb); } catch (...) {} }
+                }
                 continue;
             } catch (...) {
                 inter_kf_teaser_fail++;
@@ -1269,6 +1436,14 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
                     RCLCPP_WARN(node()->get_logger(),
                         "[INTER_KF][TEASER][EXCEPTION] unknown query_sm=%d q_kf_idx=%d tgt_sm=%d tgt_kf_idx=%d",
                         task.query->id, task.query_kf_idx, kfc.submap_id, kfc.keyframe_idx);
+                }
+                if (auto lc_fb = tryTeaserFallbackInterKf_(task.query, task.query_kf_idx, target, kfc.keyframe_idx,
+                                                          query_kf, target_kf, kfc.score, T_tgt_src_odom, dist_world_m)) {
+                    publishLoopConstraint(lc_fb);
+                    loop_detected_count_++;
+                    inter_kf_published++;
+                    inter_kf_fallback_published++;
+                    for (auto& cb : loop_cbs_) { try { cb(lc_fb); } catch (...) {} }
                 }
                 continue;
             }
@@ -1283,6 +1458,15 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
                     ALOG_WARN(MOD, "[INTER_KF][REJECT] sm_i={} sm_j={} geom_path=SVD_FALLBACK reason=svd_fallback_disabled",
                               kfc.submap_id, task.query->id);
                     inter_kf_teaser_fail++;
+                    if (auto lc_fb = tryTeaserFallbackInterKf_(task.query, task.query_kf_idx, target, kfc.keyframe_idx,
+                                                              query_kf, target_kf, kfc.score, T_tgt_src_odom,
+                                                              dist_world_m)) {
+                        publishLoopConstraint(lc_fb);
+                        loop_detected_count_++;
+                        inter_kf_published++;
+                        inter_kf_fallback_published++;
+                        for (auto& cb : loop_cbs_) { try { cb(lc_fb); } catch (...) {} }
+                    }
                     continue;
                 }
             }
@@ -1303,18 +1487,29 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
             }
             if (!res.success || res.inlier_ratio < min_inlier_ratio_ || res.rmse > max_rmse_) {
                 inter_kf_teaser_fail++;
-                // 逐候选量级大：默认 DEBUG；需要时提高日志级别或 grep INTER_KF SUMMARY
-                ALOG_DEBUG(MOD,
-                    "[INTER_KF][TEASER][REJECT] sm_j={} kf_j={} sm_i={} kf_i={} success={} inlier={:.4f} rmse={:.4f} "
-                    "need_inlier>={:.3f} need_rmse<={:.3f} geom_path={}",
+                // INFO：与 SUBMAP 路径对齐，便于 grep [INTER_KF][TEASER][FAIL] 定位根因（fpfh/几何路径/阈值）
+                ALOG_INFO(MOD,
+                    "[INTER_KF][TEASER][FAIL] sm_j={} kf_j={} sm_i={} kf_i={} success={} inlier={:.4f} rmse={:.4f} "
+                    "need_inlier>={:.3f} need_rmse<={:.3f} geom_path={} fpfh_garbage={} fpfh_p90_m={:.2f} corrs={}",
                     task.query->id, task.query_kf_idx, kfc.submap_id, kfc.keyframe_idx,
                     res.success ? 1 : 0, res.inlier_ratio, res.rmse, min_inlier_ratio_, max_rmse_,
-                    static_cast<int>(res.geom_path));
+                    static_cast<int>(res.geom_path), res.fpfh_garbage_rejected ? 1 : 0, res.fpfh_p90,
+                    res.num_correspondences);
                 if (node()) {
-                    RCLCPP_DEBUG(node()->get_logger(),
-                        "[INTER_KF][TEASER][REJECT] query_sm=%d q_kf=%d tgt_sm=%d tgt_kf_i=%d success=%d inlier=%.4f rmse=%.4f",
+                    RCLCPP_INFO(node()->get_logger(),
+                        "[INTER_KF][TEASER][FAIL] query_sm=%d q_kf=%d tgt_sm=%d tgt_kf_i=%d success=%d inlier=%.4f rmse=%.4f "
+                        "geom_path=%d fpfh_garbage=%d fpfh_p90=%.2f corrs=%d (grep TEASER_FALLBACK if fallback disabled)",
                         task.query->id, task.query_kf_idx, kfc.submap_id, kfc.keyframe_idx,
-                        res.success ? 1 : 0, res.inlier_ratio, res.rmse);
+                        res.success ? 1 : 0, res.inlier_ratio, res.rmse, static_cast<int>(res.geom_path),
+                        res.fpfh_garbage_rejected ? 1 : 0, res.fpfh_p90, res.num_correspondences);
+                }
+                if (auto lc_fb = tryTeaserFallbackInterKf_(task.query, task.query_kf_idx, target, kfc.keyframe_idx,
+                                                          query_kf, target_kf, kfc.score, T_tgt_src_odom, dist_world_m)) {
+                    publishLoopConstraint(lc_fb);
+                    loop_detected_count_++;
+                    inter_kf_published++;
+                    inter_kf_fallback_published++;
+                    for (auto& cb : loop_cbs_) { try { cb(lc_fb); } catch (...) {} }
                 }
                 continue;
             }
@@ -1426,6 +1621,15 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
                                         kfc.submap_id, kfc.keyframe_idx, task.query->id, task.query_kf_idx, d_icp_t,
                                         d_icp_r);
                         }
+                        if (auto lc_fb = tryTeaserFallbackInterKf_(task.query, task.query_kf_idx, target, kfc.keyframe_idx,
+                                                                  query_kf, target_kf, kfc.score, T_tgt_src_odom,
+                                                                  dist_world_m)) {
+                            publishLoopConstraint(lc_fb);
+                            loop_detected_count_++;
+                            inter_kf_published++;
+                            inter_kf_fallback_published++;
+                            for (auto& cb : loop_cbs_) { try { cb(lc_fb); } catch (...) {} }
+                        }
                         continue;
                     }
                     delta_loop = icp_res.T_refined;
@@ -1437,6 +1641,14 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
                 ALOG_DEBUG(MOD,
                            "[INTER_KF][REJECT] rmse_after_icp sm_i={} kf_i={} sm_j={} kf_j={} rmse={:.4f} max={:.3f}",
                            kfc.submap_id, kfc.keyframe_idx, task.query->id, task.query_kf_idx, rmse_loop, max_rmse_);
+                if (auto lc_fb = tryTeaserFallbackInterKf_(task.query, task.query_kf_idx, target, kfc.keyframe_idx,
+                                                          query_kf, target_kf, kfc.score, T_tgt_src_odom, dist_world_m)) {
+                    publishLoopConstraint(lc_fb);
+                    loop_detected_count_++;
+                    inter_kf_published++;
+                    inter_kf_fallback_published++;
+                    for (auto& cb : loop_cbs_) { try { cb(lc_fb); } catch (...) {} }
+                }
                 continue;
             }
             if (rejectBelowMinAcceptOverlapScore_(kfc.score, "INTER_KF")) {
@@ -1480,22 +1692,36 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
             inter_kf_published++;
             for (auto& cb : loop_cbs_) { try { cb(lc); } catch (...) {} }
         }
+        if (!teaser_fallback_register_enabled_ && inter_kf_teaser_fail > 0 && inter_kf_fallback_published == 0) {
+            ALOG_WARN(MOD,
+                "[INTER_KF][TEASER_FALLBACK][DIAG] query_id={} kf_j={} teaser_fail={} fallback_published={} "
+                "teaser_fallback_register_enabled=0 → TEASER 失败后未尝试 NDT/GICP (loop_closure.teaser_fallback_register.enabled)",
+                task.query->id, task.query_kf_idx, inter_kf_teaser_fail, inter_kf_fallback_published);
+            if (node()) {
+                RCLCPP_WARN(node()->get_logger(),
+                    "[INTER_KF][TEASER_FALLBACK][DIAG] query_id=%d kf_j=%d teaser_fail=%d enabled=0 → no NDT/GICP fallback",
+                    task.query->id, task.query_kf_idx, inter_kf_teaser_fail);
+            }
+        }
         ALOG_INFO(MOD,
             "[INTER_KF][SUMMARY] query_id={} kf_j={} candidates_kf={} tried={} skip_empty_tgt={} skip_kf_gap={} "
-            "skip_odom_rot_prefilter={} teaser_fail={} reject_teaser_icp={} reject_inconsistent={} reject_pose_anomaly={} published={} "
-            "(grep INTER_KF SUMMARY 闭环统计)",
+            "skip_odom_rot_prefilter={} teaser_fail={} reject_teaser_icp={} reject_inconsistent={} reject_pose_anomaly={} published={} fallback_published={} "
+            "teaser_fallback_register_enabled={} (grep INTER_KF SUMMARY)",
             task.query->id, task.query_kf_idx, static_cast<int>(task.candidates_kf.size()),
             inter_kf_tried, inter_kf_skip_empty_target_cloud, inter_kf_skip_keyframe_gap,
             inter_kf_skip_odom_rel_rot_prefilter, inter_kf_teaser_fail, inter_kf_reject_teaser_icp,
-            inter_kf_reject_inconsistent, inter_kf_reject_pose_anomaly, inter_kf_published);
+            inter_kf_reject_inconsistent, inter_kf_reject_pose_anomaly, inter_kf_published, inter_kf_fallback_published,
+            teaser_fallback_register_enabled_ ? 1 : 0);
         if (node()) {
             RCLCPP_INFO(node()->get_logger(),
                 "[INTER_KF][SUMMARY] query_id=%d kf_j=%d candidates_kf=%zu tried=%d skip_empty_tgt=%d skip_kf_gap=%d "
-                "skip_odom_rot_prefilter=%d teaser_fail=%d reject_teaser_icp=%d reject_inconsistent=%d reject_pose_anomaly=%d published=%d",
+                "skip_odom_rot_prefilter=%d teaser_fail=%d reject_teaser_icp=%d reject_inconsistent=%d reject_pose_anomaly=%d published=%d fallback_published=%d "
+                "teaser_fallback_register_enabled=%d",
                 task.query->id, task.query_kf_idx, task.candidates_kf.size(),
                 inter_kf_tried, inter_kf_skip_empty_target_cloud, inter_kf_skip_keyframe_gap,
                 inter_kf_skip_odom_rel_rot_prefilter, inter_kf_teaser_fail, inter_kf_reject_teaser_icp,
-                inter_kf_reject_inconsistent, inter_kf_reject_pose_anomaly, inter_kf_published);
+                inter_kf_reject_inconsistent, inter_kf_reject_pose_anomaly, inter_kf_published, inter_kf_fallback_published,
+                teaser_fallback_register_enabled_ ? 1 : 0);
         }
         return;
     }
@@ -1602,6 +1828,7 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
         if (!works.empty()) {
             const size_t max_inflight = static_cast<size_t>(std::max(1, parallel_teaser_max_inflight_));
             IcpRefiner icp_par = makeLoopIcpRefiner();
+            int count_teaser_fallback_accept = 0;
             for (size_t batch_begin = 0; batch_begin < works.size(); batch_begin += max_inflight) {
                 const size_t batch_end = std::min(works.size(), batch_begin + max_inflight);
                 std::vector<size_t> work_indices;
@@ -1673,12 +1900,20 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
                 // 修复: 确保num_correspondences非负，避免负值导致的问题
                 int inliers_approx = static_cast<int>(std::round(teaser_res.inlier_ratio * std::max(0, std::max(0, teaser_res.num_correspondences))));
                 const char* reason_str = (teaser_res.success && teaser_res.inlier_ratio >= min_inlier_ratio_) ? "ok" : "teaser_fail_or_inlier_low";
-                ALOG_INFO(MOD, "[LOOP_COMPUTE] query_id={} target_id={} result=done success={} inliers≈{} corrs={} inlier_ratio={:.3f} rmse={:.4f} reason={} (parallel)",
+                ALOG_INFO(MOD,
+                          "[LOOP_COMPUTE] query_id={} target_id={} result=done success={} inliers≈{} corrs={} inlier_ratio={:.3f} rmse={:.4f} "
+                          "geom_path={} fpfh_garbage={} fpfh_p90_m={:.2f} reason={} (parallel)",
                           query->id, works[i].cand.submap_id, teaser_res.success, inliers_approx, teaser_res.num_correspondences,
-                          teaser_res.inlier_ratio, teaser_res.rmse, reason_str);
+                          teaser_res.inlier_ratio, teaser_res.rmse, static_cast<int>(teaser_res.geom_path),
+                          teaser_res.fpfh_garbage_rejected ? 1 : 0, teaser_res.fpfh_p90, reason_str);
                 if (node()) {
-                    RCLCPP_INFO(node()->get_logger(), "[LOOP_COMPUTE] query_id=%d target_id=%d success=%d inliers=%d corrs=%d inlier_ratio=%.3f reason=%s (parallel)",
-                                query->id, works[i].cand.submap_id, teaser_res.success ? 1 : 0, inliers_approx, teaser_res.num_correspondences, teaser_res.inlier_ratio, reason_str);
+                    RCLCPP_INFO(node()->get_logger(),
+                                "[LOOP_COMPUTE] query_id=%d target_id=%d success=%d inliers=%d corrs=%d inlier_ratio=%.3f rmse=%.4f "
+                                "geom_path=%d fpfh_garbage=%d fpfh_p90=%.2f reason=%s (parallel)",
+                                query->id, works[i].cand.submap_id, teaser_res.success ? 1 : 0, inliers_approx,
+                                teaser_res.num_correspondences, teaser_res.inlier_ratio, teaser_res.rmse,
+                                static_cast<int>(teaser_res.geom_path), teaser_res.fpfh_garbage_rejected ? 1 : 0,
+                                teaser_res.fpfh_p90, reason_str);
                 }
                 if (teaser_res.used_teaser) {
                     loop_teaser_geom_total_.fetch_add(1, std::memory_order_relaxed);
@@ -1690,6 +1925,17 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
                         loop_fallback_reject_total_.fetch_add(1, std::memory_order_relaxed);
                         ALOG_WARN(MOD, "[LOOP_FLOW] query_id={} target_id={} geom_path=SVD_FALLBACK reject=1 reason=svd_fallback_disabled (parallel)",
                                   query->id, works[i].cand.submap_id);
+                        const Pose3d T_fb = (works[i].target && query)
+                            ? works[i].target->pose_map_anchor_optimized.inverse() * query->pose_map_anchor_optimized
+                            : Pose3d::Identity();
+                        if (auto lc_fb = tryTeaserFallbackSubmapPair_(query, works[i].target, works[i].cand, T_fb,
+                                                                     "SUBMAP_PARALLEL_SVD_BLOCK")) {
+                            count_accepted++;
+                            count_teaser_fallback_accept++;
+                            publishLoopConstraint(lc_fb);
+                            loop_detected_count_++;
+                            for (auto& cb : loop_cbs_) cb(lc_fb);
+                        }
                         continue;
                     }
                 }
@@ -1701,6 +1947,17 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
                     if (node()) {
                         RCLCPP_INFO(node()->get_logger(), "[TEASER_REJECT] query_id=%d target_id=%d primary_reason=%s success=%d inlier_ratio=%.4f min_inlier_ratio=%.3f rmse=%.4f max_rmse=%.3f corrs=%d (分析: TEASER 返回 success=0 多为 insufficient_pts/corrs/solution_invalid；inlier_ratio 低可调 teaser.min_inlier_ratio 或改进重叠)",
                                     query->id, works[i].cand.submap_id, primary_reason, teaser_res.success ? 1 : 0, teaser_res.inlier_ratio, min_inlier_ratio_, teaser_res.rmse, max_rmse_, teaser_res.num_correspondences);
+                    }
+                    const Pose3d T_fb = (works[i].target && query)
+                        ? works[i].target->pose_map_anchor_optimized.inverse() * query->pose_map_anchor_optimized
+                        : Pose3d::Identity();
+                    if (auto lc_fb = tryTeaserFallbackSubmapPair_(query, works[i].target, works[i].cand, T_fb,
+                                                                 "SUBMAP_PARALLEL_TEASER_FAIL")) {
+                        count_accepted++;
+                        count_teaser_fallback_accept++;
+                        publishLoopConstraint(lc_fb);
+                        loop_detected_count_++;
+                        for (auto& cb : loop_cbs_) cb(lc_fb);
                     }
                     continue;
                 }
@@ -1728,6 +1985,17 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
                                             "[LOOP_REJECTED] query_id=%d target_id=%d teaser_icp_disagree dtrans=%.3f drot=%.2f (parallel)",
                                             query->id, target->id, d_icp_t, d_icp_r);
                             }
+                            const Pose3d T_fb = (target && query)
+                                ? target->pose_map_anchor_optimized.inverse() * query->pose_map_anchor_optimized
+                                : Pose3d::Identity();
+                            if (auto lc_fb = tryTeaserFallbackSubmapPair_(query, target, cand, T_fb,
+                                                                         "SUBMAP_PARALLEL_ICP_DISAGREE")) {
+                                count_accepted++;
+                                count_teaser_fallback_accept++;
+                                publishLoopConstraint(lc_fb);
+                                loop_detected_count_++;
+                                for (auto& cb : loop_cbs_) cb(lc_fb);
+                            }
                             continue;
                         }
                         final_T = icp_res.T_refined;
@@ -1741,6 +2009,17 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
                     if (node()) {
                         RCLCPP_INFO(node()->get_logger(), "[TEASER_REJECT] query_id=%d target_id=%d primary_reason=rmse_too_high rmse=%.4f max_rmse=%.4f (分析: 几何残差过大，可适当放宽 loop_closure.teaser.max_rmse_m 或检查点云重叠)",
                                     query->id, target->id, final_rmse, max_rmse_);
+                    }
+                    const Pose3d T_fb = (target && query)
+                        ? target->pose_map_anchor_optimized.inverse() * query->pose_map_anchor_optimized
+                        : Pose3d::Identity();
+                    if (auto lc_fb = tryTeaserFallbackSubmapPair_(query, target, cand, T_fb,
+                                                                 "SUBMAP_PARALLEL_RMSE_HIGH")) {
+                        count_accepted++;
+                        count_teaser_fallback_accept++;
+                        publishLoopConstraint(lc_fb);
+                        loop_detected_count_++;
+                        for (auto& cb : loop_cbs_) cb(lc_fb);
                     }
                     continue;
                 }
@@ -1780,11 +2059,41 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
                 for (auto& cb : loop_cbs_) cb(lc);
             }
             }
-            ALOG_INFO(MOD, "[TEASER_SUMMARY] query_id={} total_candidates={} reject_success_or_inlier={} reject_rmse={} reject_teaser_icp={} reject_exception={} accepted={} (若 accepted=0 则本 query 所有回环被 TEASER 拒绝，见上方 [TEASER_REJECT] primary_reason 或 grep LOOP_COMPUTE][TEASER] reason=)",
-                      query->id, static_cast<int>(works.size()), count_reject_success_or_inlier, count_reject_rmse, count_reject_teaser_icp, count_exception, count_accepted);
+            const int parallel_teaser_reject_events =
+                count_reject_success_or_inlier + count_reject_rmse + count_reject_teaser_icp + count_exception;
+            ALOG_INFO(MOD,
+                      "[TEASER_SUMMARY] query_id={} path=parallel total_candidates={} reject_success_or_inlier={} reject_rmse={} reject_teaser_icp={} reject_exception={} accepted={} teaser_fallback_accepted={} teaser_fallback_register_enabled={} (grep TEASER_SUMMARY)",
+                      query->id, static_cast<int>(works.size()), count_reject_success_or_inlier, count_reject_rmse,
+                      count_reject_teaser_icp, count_exception, count_accepted, count_teaser_fallback_accept,
+                      teaser_fallback_register_enabled_ ? 1 : 0);
             if (node()) {
-                RCLCPP_INFO(node()->get_logger(), "[TEASER_SUMMARY] query_id=%d total=%zu reject_success_or_inlier=%d reject_rmse=%d reject_teaser_icp=%d reject_exception=%d accepted=%d (分析回环全被拒: grep TEASER_REJECT)",
-                            query->id, works.size(), count_reject_success_or_inlier, count_reject_rmse, count_reject_teaser_icp, count_exception, count_accepted);
+                RCLCPP_INFO(node()->get_logger(),
+                            "[TEASER_SUMMARY] query_id=%d path=parallel total=%zu reject_inlier=%d reject_rmse=%d reject_icp=%d exc=%d accepted=%d fallback_acc=%d fallback_enabled=%d",
+                            query->id, works.size(), count_reject_success_or_inlier, count_reject_rmse,
+                            count_reject_teaser_icp, count_exception, count_accepted, count_teaser_fallback_accept,
+                            teaser_fallback_register_enabled_ ? 1 : 0);
+            }
+            if (!teaser_fallback_register_enabled_ && parallel_teaser_reject_events > 0 && count_teaser_fallback_accept == 0) {
+                ALOG_WARN(MOD,
+                          "[TEASER_FALLBACK][DIAG] query_id={} path=parallel teaser_reject_events={} fallback_accepted=0 "
+                          "teaser_fallback_register_enabled=0 → 未跑 NDT/GICP 兜底 (loop_closure.teaser_fallback_register.enabled)",
+                          query->id, parallel_teaser_reject_events);
+                if (node()) {
+                    RCLCPP_WARN(node()->get_logger(),
+                                "[TEASER_FALLBACK][DIAG] query_id=%d path=parallel reject_events=%d enabled=0",
+                                query->id, parallel_teaser_reject_events);
+                }
+            } else if (teaser_fallback_register_enabled_ && parallel_teaser_reject_events > 0 && count_teaser_fallback_accept == 0 &&
+                       count_accepted == 0) {
+                ALOG_INFO(MOD,
+                          "[TEASER_FALLBACK][DIAG] query_id={} path=parallel fallback_enabled=1 fallback_accepted=0 accepted=0 "
+                          "→ 兜底已开启但未接受 (grep TEASER_FALLBACK REJECT / RMSE / pose_drift)",
+                          query->id);
+                if (node()) {
+                    RCLCPP_INFO(node()->get_logger(),
+                                "[TEASER_FALLBACK][DIAG] query_id=%d path=parallel fallback enabled but accepted=0",
+                                query->id);
+                }
             }
             updateLoopHealthKpi(query->id, static_cast<int>(works.size()), count_accepted);
         } else {
@@ -1799,6 +2108,7 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
     count_reject_teaser_icp = 0;
     count_exception = 0;
     count_accepted = 0;
+    int count_teaser_fallback_accept = 0;
     for (const auto& cand : valid_candidates) {
         ALOG_DEBUG(MOD, "  Checking candidate SM#%d score=%.3f", cand.submap_id, cand.score);
         SubMap::Ptr target;
@@ -1870,6 +2180,13 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
                 RCLCPP_INFO(node()->get_logger(), "[TEASER_REJECT] query_id=%d target_id=%d primary_reason=exception what=%s",
                             query->id, target->id, e.what());
             }
+            if (auto lc_fb = tryTeaserFallbackSubmapPair_(query, target, cand, T_submap_init, "SUBMAP_SERIAL_EXCEPTION")) {
+                count_accepted++;
+                count_teaser_fallback_accept++;
+                publishLoopConstraint(lc_fb);
+                loop_detected_count_++;
+                for (auto& cb : loop_cbs_) cb(lc_fb);
+            }
             continue;
         } catch (...) {
             count_exception++;
@@ -1881,6 +2198,13 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
                 RCLCPP_INFO(node()->get_logger(), "[TEASER_REJECT] query_id=%d target_id=%d primary_reason=exception_unknown",
                             query->id, target->id);
             }
+            if (auto lc_fb = tryTeaserFallbackSubmapPair_(query, target, cand, T_submap_init, "SUBMAP_SERIAL_EXCEPTION")) {
+                count_accepted++;
+                count_teaser_fallback_accept++;
+                publishLoopConstraint(lc_fb);
+                loop_detected_count_++;
+                for (auto& cb : loop_cbs_) cb(lc_fb);
+            }
             continue;
         }
         double teaser_ms = std::chrono::duration<double, std::milli>(
@@ -1888,13 +2212,19 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
         // 修复: 确保num_correspondences非负，避免负值导致的问题
         int inliers_approx = static_cast<int>(std::round(teaser_res.inlier_ratio * std::max(0, std::max(0, teaser_res.num_correspondences))));
         const char* reason_str = (teaser_res.success && teaser_res.inlier_ratio >= min_inlier_ratio_) ? "ok" : "teaser_fail_or_inlier_low";
-        ALOG_INFO(MOD, "[LOOP_COMPUTE] query_id={} target_id={} result=done success={} inliers≈{} corrs={} inlier_ratio={:.3f} rmse={:.4f} reason={} ms={:.1f} (精准优化: 若 inliers<10 可调 safe_min; 若 ratio 低可调 FPFH/voxel)",
+        ALOG_INFO(MOD,
+                  "[LOOP_COMPUTE] query_id={} target_id={} result=done success={} inliers≈{} corrs={} inlier_ratio={:.3f} rmse={:.4f} "
+                  "geom_path={} fpfh_garbage={} fpfh_p90_m={:.2f} reason={} ms={:.1f} (serial/submap)",
                   query->id, target->id, teaser_res.success, inliers_approx, teaser_res.num_correspondences,
-                  teaser_res.inlier_ratio, teaser_res.rmse, reason_str, teaser_ms);
+                  teaser_res.inlier_ratio, teaser_res.rmse, static_cast<int>(teaser_res.geom_path),
+                  teaser_res.fpfh_garbage_rejected ? 1 : 0, teaser_res.fpfh_p90, reason_str, teaser_ms);
         if (node()) {
-            RCLCPP_INFO(node()->get_logger(), "[LOOP_COMPUTE] query_id=%d target_id=%d success=%d inliers=%d corrs=%d inlier_ratio=%.3f rmse=%.4f reason=%s",
+            RCLCPP_INFO(node()->get_logger(),
+                        "[LOOP_COMPUTE] query_id=%d target_id=%d success=%d inliers=%d corrs=%d inlier_ratio=%.3f rmse=%.4f "
+                        "geom_path=%d fpfh_garbage=%d fpfh_p90=%.2f reason=%s",
                         query->id, target->id, teaser_res.success ? 1 : 0, inliers_approx, teaser_res.num_correspondences,
-                        teaser_res.inlier_ratio, teaser_res.rmse, reason_str);
+                        teaser_res.inlier_ratio, teaser_res.rmse, static_cast<int>(teaser_res.geom_path),
+                        teaser_res.fpfh_garbage_rejected ? 1 : 0, teaser_res.fpfh_p90, reason_str);
         }
         if (teaser_res.used_teaser) {
             loop_teaser_geom_total_.fetch_add(1, std::memory_order_relaxed);
@@ -1906,6 +2236,13 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
                 loop_fallback_reject_total_.fetch_add(1, std::memory_order_relaxed);
                 ALOG_WARN(MOD, "[LOOP_FLOW] query_id={} target_id={} geom_path=SVD_FALLBACK reject=1 reason=svd_fallback_disabled",
                           query->id, target->id);
+                if (auto lc_fb = tryTeaserFallbackSubmapPair_(query, target, cand, T_submap_init, "SUBMAP_SERIAL_SVD_BLOCK")) {
+                    count_accepted++;
+                    count_teaser_fallback_accept++;
+                    publishLoopConstraint(lc_fb);
+                    loop_detected_count_++;
+                    for (auto& cb : loop_cbs_) cb(lc_fb);
+                }
                 continue;
             }
         }
@@ -1920,6 +2257,13 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
             if (node()) {
                 RCLCPP_INFO(node()->get_logger(), "[TEASER_REJECT] query_id=%d target_id=%d primary_reason=%s success=%d inlier_ratio=%.4f min_inlier_ratio=%.3f rmse=%.4f max_rmse=%.3f corrs=%d (分析: success=0 见 [LOOP_COMPUTE][TEASER] reason=insufficient_pts/corrs/solution_invalid；inlier 低可调 teaser.min_inlier_ratio)",
                             query->id, target->id, primary_reason, teaser_res.success ? 1 : 0, teaser_res.inlier_ratio, min_inlier_ratio_, teaser_res.rmse, max_rmse_, teaser_res.num_correspondences);
+            }
+            if (auto lc_fb = tryTeaserFallbackSubmapPair_(query, target, cand, T_submap_init, "SUBMAP_SERIAL_TEASER_FAIL")) {
+                count_accepted++;
+                count_teaser_fallback_accept++;
+                publishLoopConstraint(lc_fb);
+                loop_detected_count_++;
+                for (auto& cb : loop_cbs_) cb(lc_fb);
             }
             continue;
         }
@@ -1947,6 +2291,14 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
                                     "[LOOP_REJECTED] query_id=%d target_id=%d teaser_icp_disagree dtrans=%.3f drot=%.2f",
                                     query->id, target->id, d_icp_t, d_icp_r);
                     }
+                    if (auto lc_fb = tryTeaserFallbackSubmapPair_(query, target, cand, T_submap_init,
+                                                                 "SUBMAP_SERIAL_ICP_DISAGREE")) {
+                        count_accepted++;
+                        count_teaser_fallback_accept++;
+                        publishLoopConstraint(lc_fb);
+                        loop_detected_count_++;
+                        for (auto& cb : loop_cbs_) cb(lc_fb);
+                    }
                     continue;
                 }
                 final_T = icp_res.T_refined;
@@ -1961,6 +2313,13 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
             if (node()) {
                 RCLCPP_INFO(node()->get_logger(), "[TEASER_REJECT] query_id=%d target_id=%d primary_reason=rmse_too_high rmse=%.4f max_rmse=%.4f (分析: 几何残差过大，可放宽 loop_closure.teaser.max_rmse_m)",
                             query->id, target->id, final_rmse, max_rmse_);
+            }
+            if (auto lc_fb = tryTeaserFallbackSubmapPair_(query, target, cand, T_submap_init, "SUBMAP_SERIAL_RMSE_HIGH")) {
+                count_accepted++;
+                count_teaser_fallback_accept++;
+                publishLoopConstraint(lc_fb);
+                loop_detected_count_++;
+                for (auto& cb : loop_cbs_) cb(lc_fb);
             }
             continue;
         }
@@ -2011,11 +2370,41 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
         for (auto& cb : loop_cbs_) cb(lc);
     }
 
-    ALOG_INFO(MOD, "[TEASER_SUMMARY] query_id={} total_candidates={} reject_success_or_inlier={} reject_rmse={} reject_teaser_icp={} reject_exception={} accepted={} (若 accepted=0 则本 query 所有回环被 TEASER 拒绝，见 [TEASER_REJECT] primary_reason 或 grep LOOP_COMPUTE][TEASER] reason=)",
-              query->id, static_cast<int>(valid_candidates.size()), count_reject_success_or_inlier, count_reject_rmse, count_reject_teaser_icp, count_exception, count_accepted);
+    const int serial_teaser_reject_events =
+        count_reject_success_or_inlier + count_reject_rmse + count_reject_teaser_icp + count_exception;
+    ALOG_INFO(MOD,
+              "[TEASER_SUMMARY] query_id={} path=serial total_candidates={} reject_success_or_inlier={} reject_rmse={} reject_teaser_icp={} reject_exception={} accepted={} teaser_fallback_accepted={} teaser_fallback_register_enabled={} (grep TEASER_SUMMARY)",
+              query->id, static_cast<int>(valid_candidates.size()), count_reject_success_or_inlier, count_reject_rmse,
+              count_reject_teaser_icp, count_exception, count_accepted, count_teaser_fallback_accept,
+              teaser_fallback_register_enabled_ ? 1 : 0);
     if (node()) {
-        RCLCPP_INFO(node()->get_logger(), "[TEASER_SUMMARY] query_id=%d total=%zu reject_success_or_inlier=%d reject_rmse=%d reject_teaser_icp=%d reject_exception=%d accepted=%d (分析回环全被拒: grep TEASER_REJECT)",
-                    query->id, valid_candidates.size(), count_reject_success_or_inlier, count_reject_rmse, count_reject_teaser_icp, count_exception, count_accepted);
+        RCLCPP_INFO(node()->get_logger(),
+                    "[TEASER_SUMMARY] query_id=%d path=serial total=%zu reject_inlier=%d reject_rmse=%d reject_icp=%d exc=%d accepted=%d fallback_acc=%d fallback_enabled=%d",
+                    query->id, valid_candidates.size(), count_reject_success_or_inlier, count_reject_rmse,
+                    count_reject_teaser_icp, count_exception, count_accepted, count_teaser_fallback_accept,
+                    teaser_fallback_register_enabled_ ? 1 : 0);
+    }
+    if (!teaser_fallback_register_enabled_ && serial_teaser_reject_events > 0 && count_teaser_fallback_accept == 0) {
+        ALOG_WARN(MOD,
+                  "[TEASER_FALLBACK][DIAG] query_id={} path=serial teaser_reject_events={} fallback_accepted=0 "
+                  "teaser_fallback_register_enabled=0 → 未跑 NDT/GICP 兜底 (loop_closure.teaser_fallback_register.enabled)",
+                  query->id, serial_teaser_reject_events);
+        if (node()) {
+            RCLCPP_WARN(node()->get_logger(),
+                        "[TEASER_FALLBACK][DIAG] query_id=%d path=serial reject_events=%d enabled=0",
+                        query->id, serial_teaser_reject_events);
+        }
+    } else if (teaser_fallback_register_enabled_ && serial_teaser_reject_events > 0 && count_teaser_fallback_accept == 0 &&
+               count_accepted == 0) {
+        ALOG_INFO(MOD,
+                  "[TEASER_FALLBACK][DIAG] query_id={} path=serial fallback_enabled=1 fallback_accepted=0 accepted=0 "
+                  "→ 兜底已开启但未接受 (grep TEASER_FALLBACK REJECT)",
+                  query->id);
+        if (node()) {
+            RCLCPP_INFO(node()->get_logger(),
+                        "[TEASER_FALLBACK][DIAG] query_id=%d path=serial fallback enabled but accepted=0",
+                        query->id);
+        }
     }
     updateLoopHealthKpi(query->id, static_cast<int>(valid_candidates.size()), count_accepted);
 }
@@ -2100,6 +2489,372 @@ void LoopDetector::applyLoopInformationMargins_(Mat66d& information, float inlie
     if (static_cast<double>(inlier_ratio) >= static_cast<double>(min_inlier_ratio_) + constraint_inlier_soft_margin_)
         return;
     information *= constraint_low_trust_information_scale_;
+}
+
+IcpRefiner LoopDetector::makeTeaserFallbackIcpRefiner_() const {
+    IcpRefiner::Config c;
+    c.method = teaser_fallback_use_gicp_ ? ICPMethod::GICP : ICPMethod::NDT;
+    c.max_iterations = teaser_fallback_max_iterations_;
+    c.max_correspondence_distance = teaser_fallback_max_corr_dist_m_;
+    c.ndt_resolution = teaser_fallback_ndt_resolution_;
+    c.ndt_step_size = teaser_fallback_ndt_step_size_;
+    c.gicp_correspondence_radius = teaser_fallback_max_corr_dist_m_;
+    c.validate_result = false;
+    c.preprocess_downsample = false;
+    c.downsample_before_refine = false;
+    c.preprocess_sor = false;
+    c.semantic_icp_enabled = false;
+    c.transformation_epsilon = 1e-8;
+    c.euclidean_fitness_epsilon = 1e-8;
+    return IcpRefiner(c);
+}
+
+bool LoopDetector::teaserFallbackPoseDriftOk_(const Pose3d& T_init, const Pose3d& T_final, double& out_dtrans_m,
+                                              double& out_drot_deg) const {
+    const Pose3d d = T_init.inverse() * T_final;
+    out_dtrans_m = d.translation().norm();
+    out_drot_deg = Eigen::AngleAxisd(d.linear()).angle() * 180.0 / M_PI;
+    if (teaser_fallback_max_pose_drift_trans_m_ <= 0.0 && teaser_fallback_max_pose_drift_rot_deg_ <= 0.0) return true;
+    const bool bad_t =
+        teaser_fallback_max_pose_drift_trans_m_ > 0.0 && out_dtrans_m > teaser_fallback_max_pose_drift_trans_m_;
+    const bool bad_r =
+        teaser_fallback_max_pose_drift_rot_deg_ > 0.0 && out_drot_deg > teaser_fallback_max_pose_drift_rot_deg_;
+    return !bad_t && !bad_r;
+}
+
+bool LoopDetector::submapFallbackWeakConsistencyOk_(const SubMap::Ptr& query, const SubMap::Ptr& target,
+                                                    const Pose3d& T_submap_init, const Pose3d& T_refined,
+                                                    const char* stage_tag) const {
+    if (!query || !target) return false;
+    if (teaser_fallback_submap_weak_world_dist_m_ > 0.0) {
+        const Eigen::Vector3d pq = query->pose_map_anchor_optimized.translation();
+        const Eigen::Vector3d pt = target->pose_map_anchor_optimized.translation();
+        if (pq.allFinite() && pt.allFinite()) {
+            const double dist_anchor_m = (pq - pt).norm();
+            const double t_reg = T_refined.translation().norm();
+            if (dist_anchor_m > teaser_fallback_submap_weak_world_dist_m_ &&
+                t_reg < teaser_fallback_submap_weak_refined_trans_near_m_) {
+                ALOG_WARN(MOD,
+                          "[TEASER_FALLBACK][REJECT] submap weak world/inconsistent q={} t={} stage={} "
+                          "dist_map_anchor={:.2f}m reg_trans_norm={:.3f}m (cf inter_kf odom_far/teaser_near)",
+                          query->id, target->id, stage_tag ? stage_tag : "?", dist_anchor_m, t_reg);
+                if (node()) {
+                    RCLCPP_WARN(node()->get_logger(),
+                                "[TEASER_FALLBACK][REJECT] submap weak world inconsistent q=%d t=%d dist=%.2fm reg_t=%.3fm",
+                                query->id, target->id, dist_anchor_m, t_reg);
+                }
+                return false;
+            }
+        }
+    }
+    if (teaser_fallback_submap_weak_max_trans_angle_deg_ > 0.0 &&
+        teaser_fallback_submap_weak_max_trans_angle_deg_ < 179.99) {
+        const Eigen::Vector3d a = T_submap_init.translation();
+        const Eigen::Vector3d b = T_refined.translation();
+        const double na = a.norm();
+        const double nb = b.norm();
+        constexpr double kMinInit = 0.8;
+        constexpr double kMinRef = 0.25;
+        if (na > kMinInit && nb > kMinRef) {
+            const double c = a.dot(b) / (na * nb);
+            const double c_min = std::cos(teaser_fallback_submap_weak_max_trans_angle_deg_ * M_PI / 180.0);
+            if (c < c_min) {
+                const double angle_deg = std::acos(std::max(-1.0, std::min(1.0, c))) * 180.0 / M_PI;
+                ALOG_WARN(MOD,
+                          "[TEASER_FALLBACK][REJECT] submap weak trans_angle q={} t={} stage={} "
+                          "angle_deg={:.1f} max_cfg={:.1f} cos={:.3f}",
+                          query->id, target->id, stage_tag ? stage_tag : "?", angle_deg,
+                          teaser_fallback_submap_weak_max_trans_angle_deg_, c);
+                if (node()) {
+                    RCLCPP_WARN(node()->get_logger(),
+                                "[TEASER_FALLBACK][REJECT] submap weak trans_angle q=%d t=%d angle=%.1fdeg max=%.1f",
+                                query->id, target->id, angle_deg,
+                                teaser_fallback_submap_weak_max_trans_angle_deg_);
+                }
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+LoopConstraint::Ptr LoopDetector::tryTeaserFallbackSubmapPair_(const SubMap::Ptr& query, const SubMap::Ptr& target,
+                                                             const OverlapTransformerInfer::Candidate& cand,
+                                                             const Pose3d& T_submap_init,
+                                                             const char* stage_tag) const {
+    if (!teaser_fallback_register_enabled_ || !query || !target) return nullptr;
+    const int half_w = teaser_fallback_multi_kf_half_window_;
+    const float voxel_m = teaser_fallback_merge_voxel_m_;
+    int cq = 0;
+    int ct = 0;
+    if (teaser_fallback_submap_geo_merge_center_) {
+        const Eigen::Vector3d ref_for_query = target->pose_map_anchor_optimized.translation();
+        const Eigen::Vector3d ref_for_target = query->pose_map_anchor_optimized.translation();
+        if (ref_for_query.allFinite() && ref_for_target.allFinite()) {
+            cq = pickSubmapMergeCenterNearMapPosition(query, ref_for_query);
+            ct = pickSubmapMergeCenterNearMapPosition(target, ref_for_target);
+        } else {
+            cq = query->keyframes.empty() ? 0 : static_cast<int>(query->keyframes.size()) - 1;
+            ct = target->keyframes.empty() ? 0 : static_cast<int>(target->keyframes.size()) - 1;
+        }
+    } else {
+        cq = query->keyframes.empty() ? 0 : static_cast<int>(query->keyframes.size()) - 1;
+        ct = target->keyframes.empty() ? 0 : static_cast<int>(target->keyframes.size()) - 1;
+    }
+    CloudXYZIPtr q_merged = mergeKeyframeCloudsInSubmapFrame(query, cq, half_w, voxel_m);
+    CloudXYZIPtr t_merged = mergeKeyframeCloudsInSubmapFrame(target, ct, half_w, voxel_m);
+    if (!q_merged) q_merged = copyCloudIfAny(query->downsampled_cloud);
+    if (!t_merged) t_merged = copyCloudIfAny(target->downsampled_cloud);
+    if (!q_merged || !t_merged || q_merged->empty() || t_merged->empty()) {
+        ALOG_DEBUG(MOD, "[TEASER_FALLBACK] skip submap q={} t={} reason=empty_cloud stage={}", query->id, target->id,
+                   stage_tag ? stage_tag : "?");
+        return nullptr;
+    }
+    const IcpRefiner ref = makeTeaserFallbackIcpRefiner_();
+    const IcpRefiner::Result icp_res = ref.refine(q_merged, t_merged, T_submap_init);
+    if (!icp_res.converged) {
+        ALOG_INFO(MOD, "[TEASER_FALLBACK][REJECT] submap q={} t={} stage={} reason=not_converged rmse={:.4f}",
+                  query->id, target->id, stage_tag ? stage_tag : "?", icp_res.rmse);
+        return nullptr;
+    }
+    if (icp_res.rmse > teaser_fallback_max_rmse_) {
+        ALOG_INFO(MOD, "[TEASER_FALLBACK][REJECT] submap q={} t={} stage={} reason=rmse rmse={:.4f} max={:.4f}",
+                  query->id, target->id, stage_tag ? stage_tag : "?", icp_res.rmse, teaser_fallback_max_rmse_);
+        return nullptr;
+    }
+    double dtrans = 0.0;
+    double drot = 0.0;
+    if (!teaserFallbackPoseDriftOk_(T_submap_init, icp_res.T_refined, dtrans, drot)) {
+        ALOG_INFO(MOD,
+                  "[TEASER_FALLBACK][REJECT] submap q={} t={} stage={} reason=pose_drift dtrans={:.3f}m drot={:.2f}deg",
+                  query->id, target->id, stage_tag ? stage_tag : "?", dtrans, drot);
+        return nullptr;
+    }
+    if (!submapFallbackWeakConsistencyOk_(query, target, T_submap_init, icp_res.T_refined, stage_tag)) return nullptr;
+    if (rejectBelowMinAcceptOverlapScore_(cand.score, stage_tag)) return nullptr;
+
+    auto lc = std::make_shared<LoopConstraint>();
+    lc->submap_i = target->id;
+    lc->submap_j = query->id;
+    lc->session_i = target->session_id;
+    lc->session_j = query->session_id;
+    lc->delta_T = icp_res.T_refined;
+    lc->overlap_score = cand.score;
+    lc->inlier_ratio = teaser_fallback_synthetic_inlier_ratio_;
+    lc->rmse = static_cast<float>(icp_res.rmse);
+    lc->is_inter_session = (query->session_id != target->session_id);
+    lc->status = LoopStatus::ACCEPTED;
+    double info_scale =
+        100.0 * static_cast<double>(lc->inlier_ratio) / (static_cast<double>(lc->rmse) + 0.01);
+    info_scale *= teaser_fallback_information_scale_factor_;
+    info_scale = std::min(info_scale, 2e4);
+    Mat66d information = Mat66d::Identity();
+    information.block<3, 3>(0, 0) *= info_scale * 0.5;
+    information.block<3, 3>(3, 3) *= info_scale;
+    applyLoopInformationMargins_(information, lc->inlier_ratio);
+    lc->information = information;
+    ALOG_INFO(MOD,
+              "[TEASER_FALLBACK][ACCEPT] submap q={} t={} stage={} method={} rmse={:.4f} dtrans={:.3f}m drot={:.2f}deg "
+              "pts_q={} pts_t={} merge_cq={} merge_ct={} geo_center={}",
+              query->id, target->id, stage_tag ? stage_tag : "?", teaser_fallback_use_gicp_ ? "gicp" : "ndt",
+              icp_res.rmse, dtrans, drot, q_merged->size(), t_merged->size(), cq, ct,
+              teaser_fallback_submap_geo_merge_center_ ? 1 : 0);
+    return lc;
+}
+
+LoopConstraint::Ptr LoopDetector::tryTeaserFallbackInterKf_(const SubMap::Ptr& query, int query_kf_idx,
+                                                           const SubMap::Ptr& target, int target_kf_idx,
+                                                           const KeyFrame::Ptr& query_kf, const KeyFrame::Ptr& target_kf,
+                                                           float cand_score, const Pose3d& T_tgt_src_odom,
+                                                           double dist_world_m) const {
+    if (!teaser_fallback_register_enabled_ || !query || !target || !query_kf || !target_kf) return nullptr;
+    const int half_w = teaser_fallback_multi_kf_half_window_;
+    const float voxel_m = teaser_fallback_merge_voxel_m_;
+    CloudXYZIPtr q_merged = mergeKeyframeCloudsInBodyOfCenter(query, query_kf_idx, half_w, voxel_m);
+    CloudXYZIPtr t_merged = mergeKeyframeCloudsInBodyOfCenter(target, target_kf_idx, half_w, voxel_m);
+    if (!q_merged && query_kf_idx >= 0 && query_kf_idx < static_cast<int>(query->keyframe_clouds_ds.size()))
+        q_merged = copyCloudIfAny(query->keyframe_clouds_ds[query_kf_idx]);
+    if (!t_merged && target_kf_idx >= 0 && target_kf_idx < static_cast<int>(target->keyframe_clouds_ds.size()))
+        t_merged = copyCloudIfAny(target->keyframe_clouds_ds[target_kf_idx]);
+    if (!q_merged || !t_merged || q_merged->empty() || t_merged->empty()) return nullptr;
+
+    const IcpRefiner ref = makeTeaserFallbackIcpRefiner_();
+    const IcpRefiner::Result icp_res = ref.refine(q_merged, t_merged, T_tgt_src_odom);
+    if (!icp_res.converged || icp_res.rmse > teaser_fallback_max_rmse_) {
+        ALOG_INFO(MOD,
+                  "[TEASER_FALLBACK][REJECT] inter_kf sm_j={} kf_j={} sm_i={} kf_i={} reason={} rmse={:.4f} max={:.4f}",
+                  query->id, query_kf_idx, target->id, target_kf_idx,
+                  !icp_res.converged ? "not_converged" : "rmse", icp_res.rmse, teaser_fallback_max_rmse_);
+        return nullptr;
+    }
+    double dtrans = 0.0;
+    double drot = 0.0;
+    if (!teaserFallbackPoseDriftOk_(T_tgt_src_odom, icp_res.T_refined, dtrans, drot)) {
+        ALOG_INFO(MOD,
+                  "[TEASER_FALLBACK][REJECT] inter_kf sm_j={} kf_j={} sm_i={} kf_i={} reason=pose_drift dtrans={:.3f} "
+                  "drot={:.2f}deg",
+                  query->id, query_kf_idx, target->id, target_kf_idx, dtrans, drot);
+        return nullptr;
+    }
+
+    constexpr double kInterOdomFarThresh = 5.0;
+    constexpr double kInterTeaserNearThresh = 1.0;
+    const double reg_trans_m = icp_res.T_refined.translation().norm();
+    if (dist_world_m > kInterOdomFarThresh && reg_trans_m < kInterTeaserNearThresh) {
+        ALOG_WARN(MOD,
+                  "[TEASER_FALLBACK][REJECT] inter_kf odom_reg_inconsistent sm_j={} sm_i={} dist_world={:.1f}m "
+                  "reg_trans={:.3f}m",
+                  query->id, target->id, dist_world_m, reg_trans_m);
+        return nullptr;
+    }
+
+    const double max_trans_diff = pose_consistency_max_trans_m_;
+    const double max_rot_diff_deg_cfg = pose_consistency_max_rot_deg_;
+    if (max_trans_diff > 0.0 || max_rot_diff_deg_cfg > 0.0) {
+        const double trans_diff_m =
+            (icp_res.T_refined.translation() - T_tgt_src_odom.translation()).norm();
+        const Eigen::Matrix3d R_reg = icp_res.T_refined.linear();
+        const Eigen::Matrix3d R_odom = T_tgt_src_odom.linear();
+        const Eigen::Matrix3d R_diff = R_reg * R_odom.transpose();
+        const double trace_r = R_diff.trace();
+        const double angle_rad = std::acos(std::max(-1.0, std::min(1.0, (trace_r - 1.0) * 0.5)));
+        const double rot_diff_deg = angle_rad * 180.0 / M_PI;
+        const bool trans_anomaly = (max_trans_diff > 0.0 && trans_diff_m > max_trans_diff);
+        const bool rot_anomaly = (max_rot_diff_deg_cfg > 0.0 && rot_diff_deg > max_rot_diff_deg_cfg);
+        if (trans_anomaly || rot_anomaly) {
+            ALOG_WARN(MOD,
+                      "[TEASER_FALLBACK][REJECT] inter_kf pose_consistency sm_j={} kf_j={} sm_i={} kf_i={} "
+                      "trans_diff={:.3f}m rot_diff={:.2f}deg",
+                      query->id, query_kf_idx, target->id, target_kf_idx, trans_diff_m, rot_diff_deg);
+            return nullptr;
+        }
+    }
+
+    if (rejectBelowMinAcceptOverlapScore_(cand_score, "INTER_KF_FALLBACK")) return nullptr;
+
+    auto lc = std::make_shared<LoopConstraint>();
+    lc->submap_i = target->id;
+    lc->submap_j = query->id;
+    lc->keyframe_i = target_kf_idx;
+    lc->keyframe_j = query_kf_idx;
+    lc->keyframe_global_id_i = static_cast<int>(target_kf->id);
+    lc->keyframe_global_id_j = static_cast<int>(query_kf->id);
+    lc->session_i = target->session_id;
+    lc->session_j = query->session_id;
+    lc->delta_T = icp_res.T_refined;
+    lc->overlap_score = cand_score;
+    lc->inlier_ratio = teaser_fallback_synthetic_inlier_ratio_;
+    lc->rmse = static_cast<float>(icp_res.rmse);
+    lc->status = LoopStatus::ACCEPTED;
+    double info_scale =
+        100.0 * static_cast<double>(lc->inlier_ratio) / (static_cast<double>(lc->rmse) + 0.01);
+    info_scale *= teaser_fallback_information_scale_factor_;
+    info_scale = std::min(info_scale, 2e4);
+    Mat66d information = Mat66d::Identity();
+    information.block<3, 3>(0, 0) *= info_scale * 0.5;
+    information.block<3, 3>(3, 3) *= info_scale;
+    applyLoopInformationMargins_(information, lc->inlier_ratio);
+    lc->information = information;
+
+    ALOG_INFO(MOD,
+              "[TEASER_FALLBACK][ACCEPT] inter_kf sm_j={} kf_j={} sm_i={} kf_i={} method={} rmse={:.4f} dtrans={:.3f}m "
+              "drot={:.2f}deg",
+              query->id, query_kf_idx, target->id, target_kf_idx, teaser_fallback_use_gicp_ ? "gicp" : "ndt",
+              icp_res.rmse, dtrans, drot);
+    return lc;
+}
+
+LoopConstraint::Ptr LoopDetector::tryTeaserFallbackIntra_(const SubMap::Ptr& submap, int query_keyframe_idx,
+                                                         int cand_keyframe_idx, float similarity,
+                                                         const Pose3d& T_kf_init, const KeyFrame::Ptr& query_kf,
+                                                         const KeyFrame::Ptr& cand_kf) const {
+    if (!teaser_fallback_register_enabled_ || !submap || !query_kf || !cand_kf) return nullptr;
+    const int half_w = teaser_fallback_multi_kf_half_window_;
+    const float voxel_m = teaser_fallback_merge_voxel_m_;
+    CloudXYZIPtr q_merged = mergeKeyframeCloudsInBodyOfCenter(submap, query_keyframe_idx, half_w, voxel_m);
+    CloudXYZIPtr t_merged = mergeKeyframeCloudsInBodyOfCenter(submap, cand_keyframe_idx, half_w, voxel_m);
+    if (!q_merged && query_keyframe_idx >= 0 &&
+        query_keyframe_idx < static_cast<int>(submap->keyframe_clouds_ds.size()))
+        q_merged = copyCloudIfAny(submap->keyframe_clouds_ds[query_keyframe_idx]);
+    if (!t_merged && cand_keyframe_idx >= 0 && cand_keyframe_idx < static_cast<int>(submap->keyframe_clouds_ds.size()))
+        t_merged = copyCloudIfAny(submap->keyframe_clouds_ds[cand_keyframe_idx]);
+    if (!q_merged || !t_merged || q_merged->empty() || t_merged->empty()) return nullptr;
+
+    const Pose3d T_tgt_src_odom = cand_kf->T_odom_b.inverse() * query_kf->T_odom_b;
+
+    const IcpRefiner ref = makeTeaserFallbackIcpRefiner_();
+    const IcpRefiner::Result icp_res = ref.refine(q_merged, t_merged, T_kf_init);
+    if (!icp_res.converged || icp_res.rmse > teaser_fallback_max_rmse_) {
+        ALOG_INFO(MOD,
+                  "[TEASER_FALLBACK][REJECT] intra sm={} q_idx={} c_idx={} reason={} rmse={:.4f} max={:.4f}",
+                  submap->id, query_keyframe_idx, cand_keyframe_idx, !icp_res.converged ? "not_converged" : "rmse",
+                  icp_res.rmse, teaser_fallback_max_rmse_);
+        return nullptr;
+    }
+    double dtrans = 0.0;
+    double drot = 0.0;
+    if (!teaserFallbackPoseDriftOk_(T_kf_init, icp_res.T_refined, dtrans, drot)) {
+        ALOG_INFO(MOD,
+                  "[TEASER_FALLBACK][REJECT] intra sm={} q_idx={} c_idx={} reason=init_drift dtrans={:.3f}m drot={:.2f}deg",
+                  submap->id, query_keyframe_idx, cand_keyframe_idx, dtrans, drot);
+        return nullptr;
+    }
+
+    const double max_trans_diff = pose_consistency_max_trans_m_;
+    const double max_rot_diff_deg_cfg = pose_consistency_max_rot_deg_;
+    if (max_trans_diff > 0.0 || max_rot_diff_deg_cfg > 0.0) {
+        const double trans_diff_m =
+            (icp_res.T_refined.translation() - T_tgt_src_odom.translation()).norm();
+        const Eigen::Matrix3d R_reg = icp_res.T_refined.linear();
+        const Eigen::Matrix3d R_odom = T_tgt_src_odom.linear();
+        const Eigen::Matrix3d R_diff = R_reg * R_odom.transpose();
+        const double trace_r = R_diff.trace();
+        const double angle_rad = std::acos(std::max(-1.0, std::min(1.0, (trace_r - 1.0) * 0.5)));
+        const double rot_diff_deg = angle_rad * 180.0 / M_PI;
+        const bool trans_anomaly = (max_trans_diff > 0.0 && trans_diff_m > max_trans_diff);
+        const bool rot_anomaly = (max_rot_diff_deg_cfg > 0.0 && rot_diff_deg > max_rot_diff_deg_cfg);
+        if (trans_anomaly || rot_anomaly) {
+            ALOG_WARN(MOD,
+                      "[TEASER_FALLBACK][REJECT] intra pose_consistency sm={} q_idx={} c_idx={} trans_diff={:.3f}m "
+                      "rot_diff={:.2f}deg",
+                      submap->id, query_keyframe_idx, cand_keyframe_idx, trans_diff_m, rot_diff_deg);
+            return nullptr;
+        }
+    }
+
+    if (rejectBelowMinAcceptOverlapScore_(similarity, "INTRA_LOOP_FALLBACK")) return nullptr;
+
+    auto lc = std::make_shared<LoopConstraint>();
+    lc->submap_i = submap->id;
+    lc->submap_j = submap->id;
+    lc->session_i = submap->session_id;
+    lc->session_j = submap->session_id;
+    lc->keyframe_i = cand_keyframe_idx;
+    lc->keyframe_j = query_keyframe_idx;
+    lc->keyframe_global_id_i = static_cast<int>(cand_kf->id);
+    lc->keyframe_global_id_j = static_cast<int>(query_kf->id);
+    lc->overlap_score = similarity;
+    lc->inlier_ratio = teaser_fallback_synthetic_inlier_ratio_;
+    lc->rmse = static_cast<float>(icp_res.rmse);
+    lc->delta_T = icp_res.T_refined;
+    lc->status = LoopStatus::ACCEPTED;
+
+    double info_scale =
+        100.0 * static_cast<double>(lc->inlier_ratio) / (static_cast<double>(lc->rmse) + 0.01);
+    info_scale *= teaser_fallback_information_scale_factor_;
+    info_scale = std::min(info_scale, 2e4);
+    Mat66d information = Mat66d::Identity();
+    information.block<3, 3>(0, 0) *= info_scale * 0.5;
+    information.block<3, 3>(3, 3) *= info_scale;
+    applyLoopInformationMargins_(information, lc->inlier_ratio);
+    lc->information = information;
+
+    ALOG_INFO(MOD,
+              "[TEASER_FALLBACK][ACCEPT] intra sm={} kf_cand={} kf_query={} method={} rmse={:.4f} dtrans={:.3f}m "
+              "drot={:.2f}deg",
+              submap->id, cand_keyframe_idx, query_keyframe_idx, teaser_fallback_use_gicp_ ? "gicp" : "ndt",
+              icp_res.rmse, dtrans, drot);
+    return lc;
 }
 
 void LoopDetector::publishLoopConstraint(const LoopConstraint::Ptr& lc) {
@@ -2587,6 +3342,7 @@ std::vector<LoopConstraint::Ptr> LoopDetector::detectIntraSubmapLoop(
     int teaser_rejected_rmse = 0;
     int teaser_rejected_pose_anomaly = 0;
     int teaser_invoked = 0;  // 本帧已调用 TEASER 次数，超过上限则停止（避免 10s+ 卡住）
+    int intra_teaser_fallback_accepted = 0;
 
     for (int i = 0; i < query_keyframe_idx; ++i) {
         if (intra_submap_max_teaser_candidates_ > 0 && teaser_invoked >= intra_submap_max_teaser_candidates_) {
@@ -2721,28 +3477,62 @@ std::vector<LoopConstraint::Ptr> LoopDetector::detectIntraSubmapLoop(
                 "[INTRA_LOOP][EXCEPTION] TEASER_EXCEPTION: query_idx={} cand_idx={} exception='{}'",
                 query_keyframe_idx, i, e.what());
             teaser_failed++;
+            if (auto lc_fb = tryTeaserFallbackIntra_(submap, query_keyframe_idx, i, similarity, T_kf_init, query_kf,
+                                                     cand_kf)) {
+                results.push_back(lc_fb);
+                publishLoopConstraint(lc_fb);
+                for (auto& cb : loop_cbs_) {
+                    try {
+                        cb(lc_fb);
+                    } catch (const std::exception& ex) {
+                        ALOG_ERROR(MOD, "[INTRA_LOOP][CALLBACK] exception: {}", ex.what());
+                    }
+                }
+                loop_detected_count_++;
+                intra_teaser_fallback_accepted++;
+            }
             continue;
         } catch (...) {
             ALOG_ERROR(MOD,
                 "[INTRA_LOOP][EXCEPTION] TEASER_UNKNOWN_EXCEPTION: query_idx={} cand_idx={}",
                 query_keyframe_idx, i);
             teaser_failed++;
+            if (auto lc_fb = tryTeaserFallbackIntra_(submap, query_keyframe_idx, i, similarity, T_kf_init, query_kf,
+                                                     cand_kf)) {
+                results.push_back(lc_fb);
+                publishLoopConstraint(lc_fb);
+                for (auto& cb : loop_cbs_) {
+                    try {
+                        cb(lc_fb);
+                    } catch (const std::exception& ex) {
+                        ALOG_ERROR(MOD, "[INTRA_LOOP][CALLBACK] exception: {}", ex.what());
+                    }
+                }
+                loop_detected_count_++;
+                intra_teaser_fallback_accepted++;
+            }
             continue;
         }
 
-        if (!teaser_success) {
+        if (!teaser_success || !teaser_res.success) {
             teaser_failed++;
             ALOG_WARN(MOD,
-                "[INTRA_LOOP][TEASER] FAILED_RETURN: query_idx={} cand_idx={} success=false (SKIP)",
-                query_keyframe_idx, i);
-            continue;
-        }
-
-        if (!teaser_res.success) {
-            teaser_failed++;
-            ALOG_WARN(MOD,
-                "[INTRA_LOOP][TEASER] INVALID_RESULT: query_idx={} cand_idx={} is_valid=false (SKIP)",
-                query_keyframe_idx, i);
+                "[INTRA_LOOP][TEASER] FAILED_OR_INVALID: query_idx={} cand_idx={} teaser_success={} res.success={} (try fallback)",
+                query_keyframe_idx, i, teaser_success ? 1 : 0, teaser_res.success ? 1 : 0);
+            if (auto lc_fb = tryTeaserFallbackIntra_(submap, query_keyframe_idx, i, similarity, T_kf_init, query_kf,
+                                                     cand_kf)) {
+                results.push_back(lc_fb);
+                publishLoopConstraint(lc_fb);
+                for (auto& cb : loop_cbs_) {
+                    try {
+                        cb(lc_fb);
+                    } catch (const std::exception& ex) {
+                        ALOG_ERROR(MOD, "[INTRA_LOOP][CALLBACK] exception: {}", ex.what());
+                    }
+                }
+                loop_detected_count_++;
+                intra_teaser_fallback_accepted++;
+            }
             continue;
         }
 
@@ -2755,6 +3545,20 @@ std::vector<LoopConstraint::Ptr> LoopDetector::detectIntraSubmapLoop(
                 submap->id, query_keyframe_idx, i, teaser_res.inlier_ratio,
                 static_cast<int>(teaser_res.inlier_ratio * std::max(0, teaser_res.num_correspondences)),
                 teaser_res.num_correspondences, min_inlier_ratio_);
+            if (auto lc_fb = tryTeaserFallbackIntra_(submap, query_keyframe_idx, i, similarity, T_kf_init, query_kf,
+                                                     cand_kf)) {
+                results.push_back(lc_fb);
+                publishLoopConstraint(lc_fb);
+                for (auto& cb : loop_cbs_) {
+                    try {
+                        cb(lc_fb);
+                    } catch (const std::exception& ex) {
+                        ALOG_ERROR(MOD, "[INTRA_LOOP][CALLBACK] exception: {}", ex.what());
+                    }
+                }
+                loop_detected_count_++;
+                intra_teaser_fallback_accepted++;
+            }
             continue;
         }
 
@@ -2765,6 +3569,20 @@ std::vector<LoopConstraint::Ptr> LoopDetector::detectIntraSubmapLoop(
                 "[INTRA_LOOP][TEASER] REJECT_RMSE: submap_id={} query_idx={} cand_idx={} "
                 "rmse={:.4f} > max_rmse={:.3f} (SKIP)",
                 submap->id, query_keyframe_idx, i, teaser_res.rmse, max_rmse_);
+            if (auto lc_fb = tryTeaserFallbackIntra_(submap, query_keyframe_idx, i, similarity, T_kf_init, query_kf,
+                                                     cand_kf)) {
+                results.push_back(lc_fb);
+                publishLoopConstraint(lc_fb);
+                for (auto& cb : loop_cbs_) {
+                    try {
+                        cb(lc_fb);
+                    } catch (const std::exception& ex) {
+                        ALOG_ERROR(MOD, "[INTRA_LOOP][CALLBACK] exception: {}", ex.what());
+                    }
+                }
+                loop_detected_count_++;
+                intra_teaser_fallback_accepted++;
+            }
             continue;
         }
 
@@ -2934,20 +3752,31 @@ std::vector<LoopConstraint::Ptr> LoopDetector::detectIntraSubmapLoop(
         "candidates_found={} "
         "filtered: null={} temporal={} index={} dist={} desc={} empty_cloud={} "
         "teaser_invoked={} teaser_failed={} reject_inlier={} reject_rmse={} reject_pose_anomaly={} "
-        "FINAL_detected={}",
+        "teaser_fallback_accepted={} teaser_fallback_register_enabled={} FINAL_detected={}",
         submap->id, query_keyframe_idx, submap->keyframes.size(),
         candidates_found,
         null_cand_skipped, temporal_filtered, index_filtered, distance_filtered, desc_filtered, empty_cloud_skipped,
         teaser_invoked, teaser_failed, teaser_rejected_inlier, teaser_rejected_rmse, teaser_rejected_pose_anomaly,
-        results.size());
+        intra_teaser_fallback_accepted, teaser_fallback_register_enabled_ ? 1 : 0, results.size());
     if (node()) {
         RCLCPP_INFO(node()->get_logger(),
             "[INTRA_LOOP][SUMMARY] submap_id=%d query_kf_idx=%d history_kf=%zu candidates_found=%d "
-            "filtered: temporal=%d index=%d dist=%d desc=%d teaser_invoked=%d failed=%d reject_inlier=%d reject_rmse=%d reject_pose_anomaly=%d FINAL_detected=%zu (grep INTRA_LOOP)",
+            "filtered: temporal=%d index=%d dist=%d desc=%d teaser_invoked=%d failed=%d reject_inlier=%d reject_rmse=%d reject_pose_anomaly=%d teaser_fallback_accepted=%d fallback_enabled=%d FINAL_detected=%zu (grep INTRA_LOOP)",
             submap->id, query_keyframe_idx, submap->keyframes.size(), candidates_found,
             temporal_filtered, index_filtered, distance_filtered, desc_filtered,
             teaser_invoked, teaser_failed, teaser_rejected_inlier, teaser_rejected_rmse, teaser_rejected_pose_anomaly,
-            static_cast<size_t>(results.size()));
+            intra_teaser_fallback_accepted, teaser_fallback_register_enabled_ ? 1 : 0, static_cast<size_t>(results.size()));
+    }
+    if (!teaser_fallback_register_enabled_ && teaser_failed > 0 && intra_teaser_fallback_accepted == 0 && results.empty()) {
+        ALOG_WARN(MOD,
+            "[INTRA_LOOP][TEASER_FALLBACK][DIAG] submap_id={} query_kf_idx={} teaser_failed={} fallback_enabled=0 "
+            "→ 子图内 TEASER 失败后未尝试 NDT/GICP (loop_closure.teaser_fallback_register.enabled)",
+            submap->id, query_keyframe_idx, teaser_failed);
+        if (node()) {
+            RCLCPP_WARN(node()->get_logger(),
+                        "[INTRA_LOOP][TEASER_FALLBACK][DIAG] submap_id=%d q_kf=%d teaser_failed=%d fallback disabled",
+                        submap->id, query_keyframe_idx, teaser_failed);
+        }
     }
 
     return results;

@@ -54,7 +54,7 @@ public:
                     }
                 }
             } else if (ev.type == MapUpdateEvent::ChangeType::KEYFRAME_ADDED) {
-                // 用于子图内回环（如果需要实时触发）
+                // 子图内回环：MapRegistry::addKeyFrame 在发布本事件后投递 IntraLoopTaskEvent（见 map_registry.cpp）。
             }
         });
 
