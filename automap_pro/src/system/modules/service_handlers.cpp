@@ -3,6 +3,7 @@
 #include "automap_pro/core/health_monitor.h"
 #include "automap_pro/core/protocol_contract.h" // 🏛️ [架构加固] 引入协议契约
 
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
@@ -11,6 +12,10 @@
 namespace automap_pro {
 
 namespace fs = std::filesystem;
+
+namespace {
+std::atomic<uint64_t> g_trigger_optimize_seq{0};
+}
 
 void AutoMapSystem::handleSaveMap(
     const std::shared_ptr<automap_pro::srv::SaveMap::Request> req,
@@ -64,11 +69,36 @@ void AutoMapSystem::handleTriggerOptimize(
     std::shared_ptr<automap_pro::srv::TriggerOptimize::Response> res)
 {
     if (!v3_context_) return;
-    
+
+    auto reg = v3_context_->mapRegistry();
+    if (!reg) return;
+
+    const double ts = now().seconds();
+    const uint64_t seq = g_trigger_optimize_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+    uint64_t eid = (seq << 24) ^ static_cast<uint64_t>(std::max(0.0, ts) * 1e6);
+    if (eid == 0) {
+        eid = 1;
+    }
+
     v3::GraphTaskEvent ev;
     ev.task.type = OptTaskItem::Type::FORCE_UPDATE;
+    ev.meta.event_id = eid;
+    ev.meta.idempotency_key = eid;
+    ev.meta.producer_seq = seq;
+    ev.meta.session_id = reg->getSessionId();
+    ev.meta.ref_version = reg->getVersion();
+    ev.meta.ref_epoch = reg->getAlignmentEpoch();
+    ev.meta.source_ts = ts;
+    ev.meta.publish_ts = ts;
+    ev.meta.producer = "AutoMapSystem";
+    ev.meta.route_tag = "service";
+    if (!ev.isValid()) {
+        RCLCPP_ERROR(get_logger(), "[AutoMapSystem] TriggerOptimize: GraphTaskEvent failed EventMeta contract");
+        res->success = false;
+        return;
+    }
     v3_context_->eventBus()->publish(ev);
-    
+
     res->success = true;
     res->elapsed_seconds = 0.0;
     res->nodes_updated = 0;
@@ -147,7 +177,30 @@ void AutoMapSystem::handleFinishMapping(
         v3::SystemQuiesceRequestEvent quiesce_ev;
         quiesce_ev.enable = true;
         quiesce_ev.reason = "FinishMappingRequest";
-        v3_context_->eventBus()->publish(quiesce_ev);
+        if (auto reg = v3_context_->mapRegistry()) {
+            const double ts = now().seconds();
+            const uint64_t seq = g_trigger_optimize_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+            uint64_t eid = (seq << 24) ^ static_cast<uint64_t>(std::max(0.0, ts) * 1e6);
+            if (eid == 0) {
+                eid = 1;
+            }
+            quiesce_ev.meta.event_id = eid;
+            quiesce_ev.meta.idempotency_key = eid;
+            quiesce_ev.meta.producer_seq = seq;
+            quiesce_ev.meta.session_id = reg->getSessionId();
+            quiesce_ev.meta.ref_version = reg->getVersion();
+            quiesce_ev.meta.ref_epoch = reg->getAlignmentEpoch();
+            quiesce_ev.meta.source_ts = ts;
+            quiesce_ev.meta.publish_ts = ts;
+            quiesce_ev.meta.producer = "AutoMapSystem";
+            quiesce_ev.meta.route_tag = "quiesce";
+        }
+        if (quiesce_ev.isValid()) {
+            v3_context_->eventBus()->publish(quiesce_ev);
+        } else {
+            RCLCPP_ERROR(get_logger(),
+                "[AutoMapSystem] Finish mapping: skip QUIESCE publish (missing MapRegistry / invalid EventMeta)");
+        }
 
         int wait_count = 0;
         while (!v3_context_->isAllIdle() && wait_count < 600) { // 最多等 10 分钟 (600 * 1s)

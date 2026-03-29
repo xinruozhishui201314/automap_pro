@@ -59,6 +59,26 @@ void flattenYamlParams(const YAML::Node& node, const std::string& prefix, std::v
         }
     } catch (...) {}
 }
+
+Eigen::Vector3d readVector3d(const YAML::Node& cfg, const std::string& key, double dx, double dy, double dz) {
+    try {
+        YAML::Node node = cfg;
+        std::istringstream ss(key);
+        std::string token;
+        bool found = true;
+        while (std::getline(ss, token, '.')) {
+            if (!node.IsMap() || !node[token].IsDefined() || node[token].IsNull()) {
+                found = false;
+                break;
+            }
+            node = node[token];
+        }
+        if (found && node.IsSequence() && node.size() >= 3) {
+            return Eigen::Vector3d(node[0].as<double>(), node[1].as<double>(), node[2].as<double>());
+        }
+    } catch (...) {}
+    return Eigen::Vector3d(dx, dy, dz);
+}
 }  // namespace
 
 void ConfigManager::load(const std::string& yaml_path) {
@@ -535,6 +555,27 @@ void ConfigManager::load(const std::string& yaml_path) {
                 check("quality_threshold_hdop", gps_quality_threshold_hdop_, "quality_threshold_hdop");
                 check("align_min_distance_m", gps_align_min_distance_m_, "align_min_distance_m");
                 check("keyframe_match_window_s", gps_keyframe_match_window_s_, "keyframe_match_window_s");
+
+                // GPS 杆臂：在 load() 单线程阶段写入缓存；运行时 gpsLeverArmImu() 只读缓存，避免并发读 YAML::Node 与别名导致 HBA 读到零杆臂
+                try {
+                    YAML::Node la = gps_node["lever_arm_imu"];
+                    if (la.IsDefined() && !la.IsNull() && la.IsSequence() && la.size() >= 3) {
+                        gps_lever_arm_imu_cached_ = Eigen::Vector3d(
+                            la[0].as<double>(), la[1].as<double>(), la[2].as<double>());
+                        if (gps_lever_arm_imu_cached_.norm() > 1e-12) {
+                            gps_lever_arm_imu_cached_valid_ = true;
+                        }
+                    }
+                } catch (...) {}
+                if (!gps_lever_arm_imu_cached_valid_) {
+                    try {
+                        Eigen::Vector3d v = readVector3d(YAML::Clone(cfg_), "gps.lever_arm_imu", 0.0, 0.0, 0.0);
+                        if (v.norm() > 1e-12) {
+                            gps_lever_arm_imu_cached_ = v;
+                            gps_lever_arm_imu_cached_valid_ = true;
+                        }
+                    } catch (...) {}
+                }
             } else {
                 RCLCPP_WARN(rclcpp::get_logger("automap_system"),
                     "[ConfigManager][GPS_CONFIG_DUMP] No 'gps' section in config; using defaults (gps_cached_=false).");
@@ -544,6 +585,20 @@ void ConfigManager::load(const std::string& yaml_path) {
             RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
                 "[ConfigManager][GPS_CONFIG_DUMP] Failed to load GPS config: %s", e.what());
             throw;
+        }
+        if (!gps_lever_arm_imu_cached_valid_) {
+            try {
+                Eigen::Vector3d v = readVector3d(YAML::Clone(cfg_), "gps.lever_arm_imu", 0.0, 0.0, 0.0);
+                if (v.norm() > 1e-12) {
+                    gps_lever_arm_imu_cached_ = v;
+                    gps_lever_arm_imu_cached_valid_ = true;
+                }
+            } catch (...) {}
+        }
+        if (gps_lever_arm_imu_cached_valid_) {
+            RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                "[ConfigManager][GPS_LEVER_ARM_CACHE] lever_arm_imu cached for runtime/HBA: [%.4f, %.4f, %.4f] m",
+                gps_lever_arm_imu_cached_.x(), gps_lever_arm_imu_cached_.y(), gps_lever_arm_imu_cached_.z());
         }
         // ========== GPS 配置缓存结束 ==========
 
@@ -590,6 +645,26 @@ void ConfigManager::load(const std::string& yaml_path) {
                 perf_parallel_voxel_downsample_, perf_parallel_teaser_match_, perf_parallel_teaser_max_inflight_);
         } catch (...) {
             RCLCPP_WARN(rclcpp::get_logger("automap_system"), "[ConfigManager][PERF_CACHE] preload failed, using defaults");
+        }
+
+        try {
+            viz_sync_global_map_build_ = get<bool>("visualization.sync_global_map_build", false);
+            viz_global_map_ros2_transient_local_ =
+                get<bool>("visualization.global_map_ros2_transient_local", true);
+            viz_log_pose_jump_detail_ = get<bool>("visualization.log_pose_jump_detail", false);
+            viz_suppress_optimize_driven_global_map_ =
+                get<bool>("visualization.suppress_optimize_driven_global_map", false);
+            RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                "[ConfigManager][VIZ_CACHE] sync_global_map_build=%d global_map_transient_local=%d "
+                "log_pose_jump_detail=%d suppress_optimize_driven_gmap=%d -> effective_async_global_map=%d",
+                viz_sync_global_map_build_ ? 1 : 0,
+                viz_global_map_ros2_transient_local_ ? 1 : 0,
+                viz_log_pose_jump_detail_ ? 1 : 0,
+                viz_suppress_optimize_driven_global_map_ ? 1 : 0,
+                globalMapBuildAsync() ? 1 : 0);
+        } catch (const std::exception& e) {
+            RCLCPP_WARN(rclcpp::get_logger("automap_system"),
+                "[ConfigManager][VIZ_CACHE] preload failed: %s (using defaults)", e.what());
         }
 
         // ========== [ConfigManager][CONFIG_GET_DIAG] get() 与 raw/cache 对比，便于精准定位 key 解析问题 ==========
@@ -713,9 +788,26 @@ void ConfigManager::load(const std::string& yaml_path) {
                 Eigen::Vector3d la = gpsLeverArmImu();
                 RCLCPP_INFO(L, "[ConfigManager][CONFIG_READ_BACK] gps.lever_arm_imu=[%.4f, %.4f, %.4f] (HBA GPS antenna vs IMU, m)",
                     la.x(), la.y(), la.z());
+                // run_20260329_091053：早期 load 路径未把杆臂写入缓存，HBA init 时 gpsLeverArmImu()=0 且 yaml=gps_section_missing，
+                // 与 READ_BACK 非零并存。此处将 READ_BACK 与 getter 一致的结果钉入缓存，保证 HBA/GPS 几何同源。
+                if (la.norm() > 1e-12) {
+                    gps_lever_arm_imu_cached_ = la;
+                    gps_lever_arm_imu_cached_valid_ = true;
+                    RCLCPP_INFO(L,
+                        "[ConfigManager][GPS_LEVER_ARM_CACHE] pinned at CONFIG_READ_BACK for HBA/runtime: [%.4f, %.4f, %.4f] m",
+                        la.x(), la.y(), la.z());
+                }
             }
             RCLCPP_INFO(L, "[ConfigManager][CONFIG_READ_BACK] performance.async_global_map_build=%s performance.async_isam2_update=%s",
                 get<bool>("performance.async_global_map_build", true) ? "true" : "false", get<bool>("performance.async_isam2_update", false) ? "true" : "false");
+            RCLCPP_INFO(L, "[ConfigManager][CONFIG_READ_BACK] visualization.sync_global_map_build=%s "
+                "visualization.global_map_ros2_transient_local=%s visualization.log_pose_jump_detail=%s "
+                "visualization.suppress_optimize_driven_global_map=%s effective_async_global_map=%s",
+                vizSyncGlobalMapBuild() ? "true" : "false",
+                vizGlobalMapRos2TransientLocal() ? "true" : "false",
+                vizLogPoseJumpDetail() ? "true" : "false",
+                vizSuppressOptimizeDrivenGlobalMap() ? "true" : "false",
+                globalMapBuildAsync() ? "true" : "false");
             RCLCPP_INFO(L, "[ConfigManager][CONFIG_READ_BACK] performance.parallel_teaser_match=%s performance.parallel_teaser_max_inflight=%d",
                 parallelTeaserMatch() ? "true" : "false", parallelTeaserMaxInflight());
             RCLCPP_INFO(L, "[ConfigManager][CONFIG_READ_BACK] =========================================== (file=%s)", yaml_path.c_str());
@@ -781,28 +873,6 @@ void ConfigManager::load(const std::string& yaml_path) {
         throw;
     }
 }
-
-namespace {
-Eigen::Vector3d readVector3d(const YAML::Node& cfg, const std::string& key, double dx, double dy, double dz) {
-    try {
-        YAML::Node node = cfg;
-        std::istringstream ss(key);
-        std::string token;
-        bool found = true;
-        while (std::getline(ss, token, '.')) {
-            if (!node.IsMap() || !node[token].IsDefined() || node[token].IsNull()) {
-                found = false;
-                break;
-            }
-            node = node[token];
-        }
-        if (found && node.IsSequence() && node.size() >= 3) {
-            return Eigen::Vector3d(node[0].as<double>(), node[1].as<double>(), node[2].as<double>());
-        }
-    } catch (...) {}
-    return Eigen::Vector3d(dx, dy, dz);
-}
-}  // namespace
 
 std::string ConfigManager::getSensorGpsTopicRaw() const {
     try {
@@ -933,7 +1003,54 @@ Eigen::Vector3d ConfigManager::gpsEnuOrigin() const {
 }
 
 Eigen::Vector3d ConfigManager::gpsLeverArmImu() const {
-    return readVector3d(cfg_, "gps.lever_arm_imu", 0.0, 0.0, 0.0);
+    if (gps_lever_arm_imu_cached_valid_) {
+        return gps_lever_arm_imu_cached_;
+    }
+    return readVector3d(YAML::Clone(cfg_), "gps.lever_arm_imu", 0.0, 0.0, 0.0);
+}
+
+std::string ConfigManager::debugGpsLeverArmImuYamlDiag() const {
+    try {
+        if (gps_lever_arm_imu_cached_valid_) {
+            return "cached_at_load_ok";
+        }
+        YAML::Node root = YAML::Clone(cfg_);
+        if (!root.IsDefined() || root.IsNull()) {
+            return "cfg_root_null";
+        }
+        if (!root.IsMap()) {
+            return "cfg_root_not_map";
+        }
+        const YAML::Node g = root["gps"];
+        if (!g.IsDefined() || g.IsNull()) {
+            return "gps_section_missing";
+        }
+        if (!g.IsMap()) {
+            return "gps_not_map";
+        }
+        const YAML::Node n = g["lever_arm_imu"];
+        if (!n.IsDefined()) {
+            return "lever_arm_imu_undefined";
+        }
+        if (n.IsNull()) {
+            return "lever_arm_imu_null";
+        }
+        if (n.IsScalar()) {
+            return "Scalar(readVector3d_will_default_zero)";
+        }
+        if (n.IsSequence()) {
+            return std::string("Sequence size=") + std::to_string(n.size()) +
+                   (n.size() >= 3 ? " ok_for_readVector3d" : " too_short_for_readVector3d");
+        }
+        if (n.IsMap()) {
+            return "Map(readVector3d_will_default_zero)";
+        }
+        return "unknown_yaml_node_kind";
+    } catch (const std::exception& e) {
+        return std::string("exception:") + e.what();
+    } catch (...) {
+        return "exception:unknown";
+    }
 }
 
 std::vector<std::string> ConfigManager::previousSessionDirs() const {

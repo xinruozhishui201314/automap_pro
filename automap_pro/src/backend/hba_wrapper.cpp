@@ -54,9 +54,9 @@ void HBAWrapper::addLoopFactor(const LoopConstraint::Ptr& lc) {
     // Level 2: submap loop
     Mat66d info = lc->information;
     level2_graph_.addLoopEdge(lc->submap_i, lc->submap_j, lc->delta_T, info);
-    // Level 1: keyframe loop (if keyframe ids available)
-    if (lc->keyframe_i >= 0 && lc->keyframe_j >= 0) {
-        level1_graph_.addLoopEdge(lc->keyframe_i, lc->keyframe_j, lc->delta_T, info);
+    // Level 1：与 iSAM2 一致，使用 KeyFrame::id（keyframe_global_id_*），禁止子图内下标
+    if (lc->keyframe_global_id_i >= 0 && lc->keyframe_global_id_j >= 0) {
+        level1_graph_.addLoopEdge(lc->keyframe_global_id_i, lc->keyframe_global_id_j, lc->delta_T, info);
     }
 
     // Trigger optimization

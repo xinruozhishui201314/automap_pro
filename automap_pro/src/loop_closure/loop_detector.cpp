@@ -1217,7 +1217,8 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
             *tgt_copy = *target_cloud;
             TeaserMatcher::Result res;
             try {
-                res = teaser_matcher_.match(query_cloud, tgt_copy, Pose3d::Identity());
+                // 粗匹配：源=query 车体系，目标=target 车体系，T_tgt_src = T_w_tgt^{-1} T_w_query
+                res = teaser_matcher_.match(query_cloud, tgt_copy, T_tgt_src_odom);
             } catch (const std::exception& e) {
                 inter_kf_teaser_fail++;
                 ALOG_WARN(MOD, "[INTER_KF][TEASER][EXCEPTION] std::exception what={} sm_j={} kf_j={} sm_i={} kf_i={}",
@@ -1582,10 +1583,15 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
                                old_peak, inflight_now, std::memory_order_relaxed)) {
                     }
                     work_indices.push_back(wi);
-                    futures.push_back(std::async(std::launch::async, [this, q, t]() {
+                    const Pose3d T_init_parallel =
+                        (works[wi].target && query)
+                            ? works[wi].target->pose_map_anchor_optimized.inverse() *
+                                  query->pose_map_anchor_optimized
+                            : Pose3d::Identity();
+                    futures.push_back(std::async(std::launch::async, [this, q, t, T_init_parallel]() {
                         const auto t0 = std::chrono::steady_clock::now();
                         try {
-                            auto res = teaser_matcher_.match(q, t, Pose3d::Identity());
+                            auto res = teaser_matcher_.match(q, t, T_init_parallel);
                             const auto cost_ms = std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(
                                                      std::chrono::steady_clock::now() - t0)
                                                      .count();
@@ -1779,6 +1785,11 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
         CloudXYZIPtr target_cloud = std::make_shared<CloudXYZI>();
         *target_cloud = *target_ref;
 
+        // 子图 downsampled 位于 map 锚点系（freeze 用 pose_map_anchor_optimized^{-1}*merged_map）
+        const Pose3d T_submap_init =
+            target ? target->pose_map_anchor_optimized.inverse() * query->pose_map_anchor_optimized
+                   : Pose3d::Identity();
+
         ALOG_DEBUG(MOD, "[tid={}] step=cand_geom query_id={} target_id={} target_pts={} score={:.3f}",
                    tid, query->id, target->id, target_cloud->size(), cand.score);
         ALOG_INFO(MOD, "[LOOP_COMPUTE] query_id={} target_id={} query_pts={} target_pts={} overlap_score={:.3f} (TEASER 计算开始，详见 LOOP_COMPUTE][TEASER])",
@@ -1795,7 +1806,7 @@ void LoopDetector::processMatchTask(const MatchTask& task) {
             teaser_res = teaser_matcher_.match(
                 query_cloud,
                 target_cloud,
-                Pose3d::Identity());
+                T_submap_init);
             ALOG_DEBUG(MOD, "[tid={}] step=match_returned query_id={} target_id={} success={}", 
                       tid, query->id, target->id, teaser_res.success);
         } catch (const std::exception& e) {
@@ -2610,11 +2621,12 @@ std::vector<LoopConstraint::Ptr> LoopDetector::detectIntraSubmapLoop(
             "query_pts={} cand_pts={} invoked={}",
             query_keyframe_idx, i, query_cloud->size(), cand_cloud->size(), teaser_invoked);
 
-        // TEASER++ 配准
+        // TEASER++ 配准（src=query 车体系，tgt=cand 车体系）
+        const Pose3d T_kf_init = cand_kf->T_odom_b.inverse() * query_kf->T_odom_b;
         TeaserMatcher::Result teaser_res;
         bool teaser_success = false;
         try {
-            teaser_res = teaser_matcher_.match(query_cloud, cand_cloud);
+            teaser_res = teaser_matcher_.match(query_cloud, cand_cloud, T_kf_init);
             teaser_success = teaser_res.success;
         } catch (const std::exception& e) {
             ALOG_ERROR(MOD,
@@ -2796,6 +2808,8 @@ std::vector<LoopConstraint::Ptr> LoopDetector::detectIntraSubmapLoop(
         lc->session_j = submap->session_id;
         lc->keyframe_i = i;
         lc->keyframe_j = query_keyframe_idx;
+        lc->keyframe_global_id_i = cand_kf ? static_cast<int>(cand_kf->id) : -1;
+        lc->keyframe_global_id_j = query_kf ? static_cast<int>(query_kf->id) : -1;
         lc->overlap_score = similarity;
         lc->inlier_ratio = teaser_res.inlier_ratio;
         lc->rmse = teaser_res.rmse;

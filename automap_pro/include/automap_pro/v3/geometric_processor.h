@@ -58,6 +58,16 @@ struct GeometricProcessorConfig {
         /// If true, merged multi-frame cloud overwrites PointXYZI::intensity with GeometricProcessor scan index
         /// (monotonic, same as [GEOMETRIC][FRAME] idx) so each point is traceable to its source sweep.
         bool tag_intensity_with_scan_seq = true;
+        /// Master: false = never write debug PCDs below (ignores save_merged_cloud_dir; avoids disk flood).
+        bool save_debug_pcd = true;
+        /// Non-empty directory for debug PCDs when save_debug_pcd is true.
+        std::string save_merged_cloud_dir;
+        /// Save every N geometric frames (1 = each time the save branch runs).
+        int save_merged_cloud_every_n = 1;
+        /// Save accumulate() merged body cloud (tag accum_body) when save_debug_pcd && dir non-empty.
+        bool save_accum_body_pcd = true;
+        /// Save cloud passed to classifyPrimitives (after 2nd Patchwork + optional ROI; tag prim_input); same dir/every_n.
+        bool save_primitive_input_cloud = false;
     } accumulator;
     struct {
         bool enabled = true;

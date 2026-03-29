@@ -16,6 +16,7 @@
 #include <mutex>
 #include <shared_mutex>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <functional>
 #include <thread>
@@ -99,8 +100,11 @@ public:
     // ── KeyFrame 级别因子（与 HBA 对齐，增强 GPS 约束） ────────────────────
 
     /** 添加 keyframe 节点（KF 级别，与 HBA 的 level1 对齐）。
-     * @param is_first_kf_of_submap 若为 true 则强制添加 Prior，避免新子图首帧无约束导致 IndeterminantLinearSystemException */
-    void addKeyFrameNode(int kf_id, const Pose3d& init_pose, bool fixed = false, bool is_first_kf_of_submap = false);
+     * @param is_first_kf_of_submap 若为 true 则强制添加 Prior，避免新子图首帧无约束导致 IndeterminantLinearSystemException
+     * @param submap_id_for_sm_kf_anchor 该关键帧所属子图 ID（与 KeyFrame::submap_id 一致）。用于 Between(SM(sm),KF(首帧))；
+     *        不得使用 kf_id/MAX_KF_PER_SUBMAP（全局 kf id 递增时恒为 0）。传 -1 表示不登记锚点（仅兼容旧路径）。 */
+    void addKeyFrameNode(int kf_id, const Pose3d& init_pose, bool fixed = false,
+                         bool is_first_kf_of_submap = false, int submap_id_for_sm_kf_anchor = -1);
 
     /** 添加 keyframe 间的里程计因子 */
     void addOdomFactorBetweenKeyframes(int from, int to, const Pose3d& rel, const Mat66d& info_matrix);
@@ -356,6 +360,13 @@ private:
     /** 判断 Key 是否已经“着陆”（在 isam2 内部或已在 pending 中） */
     bool isGroundedInternal(gtsam::Key key) const;
 
+    /** 在 SM 与首关键帧之间添加 Identity Between（每子图至多一条）；调用方须已持 rw_mutex_ */
+    void tryLinkSubmapAnchorKeyFrame_(int sm_id, int anchor_kf_id);
+    /** 子图 id -> 该子图首关键帧全局 id（用于 SM 节点晚于 KF 入图时补链） */
+    std::unordered_map<int, int> submap_anchor_kf_id_;
+    /** 已为 Between(SM,KF) 锚定过的子图 id */
+    std::unordered_set<int> submap_sm_kf_anchor_linked_;
+
     // ── P0 异步优化队列与工作线程 ─────────────────────────────────────────
     // 🔧 V2 修复：删除内部 opt_thread_，GTSAM 写入由外部 opt_worker_thread_ 独占
     /*
@@ -378,6 +389,16 @@ private:
     gtsam::noiseModel::Base::shared_ptr infoToNoise(const Mat66d& info) const;
     /** 从信息矩阵对角线构造 Diagonal 噪声，避免 Gaussian::Covariance 在 linearize 路径 double free */
     gtsam::noiseModel::Diagonal::shared_ptr infoToNoiseDiagonal(const Mat66d& info) const;
+
+    // ── 🏛️ [架构加固] 内部无锁版本，用于 transformHistoryAndRebuild 等复合操作 ──
+    void resetInternal();
+    void addKeyFrameNodeInternal(int kf_id, const Pose3d& pose, bool fixed, bool is_first_kf_of_submap, int sm_anchor);
+    void addSubMapNodeInternal(int id, const Pose3d& pose, bool fixed);
+    void addOdomFactorBetweenKeyframesInternal(int from, int to, const Pose3d& rel, const Mat66d& info_matrix);
+    void addLoopFactorInternal(int from, int to, const Pose3d& rel, const Mat66d& info_matrix);
+    void addLoopFactorDeferredInternal(int from, int to, const Pose3d& rel, const Mat66d& info_matrix);
+    void addOdomFactorInternal(int from, int to, const Pose3d& rel, const Mat66d& info_matrix);
+
     OptimizationResult commitAndUpdate();
     void notifyPoseUpdate(const OptimizationResult& res);
     double computeCylinderResidualUnsafe_(int kf_id, const CylinderFactorItemKF& factor) const;

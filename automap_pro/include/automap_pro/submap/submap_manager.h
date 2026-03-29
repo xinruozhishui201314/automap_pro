@@ -49,19 +49,30 @@ public:
      * 子图锚定位姿更新（由 iSAM2 优化后回调）
      * 同时更新子图内所有关键帧的 T_map_b_optimized
      */
-    void updateSubmapPose(int submap_id, const Pose3d& new_pose, PoseFrame pose_frame);
+    void updateSubmapPose(int submap_id, const Pose3d& new_pose, PoseFrame pose_frame, uint64_t alignment_epoch = 0);
 
     /** 批量更新子图位姿（来自 iSAM2 优化结果），比逐个调用 updateSubmapPose 更高效，且支持版本号一致性 */
-    void batchUpdateSubmapPoses(const std::unordered_map<int, Pose3d>& updates, uint64_t version, PoseFrame pose_frame);
+    void batchUpdateSubmapPoses(const std::unordered_map<int, Pose3d>& updates, uint64_t version, PoseFrame pose_frame, uint64_t alignment_epoch = 0);
 
     /** 🏛️ [架构加固] 批量更新关键帧绝对位姿（SSoT 语义网关应用） */
-    void batchUpdateKeyFramePoses(const std::unordered_map<uint64_t, Pose3d>& updates, uint64_t version, PoseFrame pose_frame);
+    void batchUpdateKeyFramePoses(const std::unordered_map<uint64_t, Pose3d>& updates, uint64_t version, PoseFrame pose_frame, uint64_t alignment_epoch = 0);
 
     /** 批量更新子图位姿（来自 HBA 结果） */
     void updateAllFromHBA(const HBAResult& result);
 
     /** HBA 完成后重建 merged_cloud（使用优化后的位姿） */
     void rebuildMergedCloudFromOptimizedPoses();
+
+    /**
+     * GPS 对齐成功后：将仍为 ODOM 语义的关键帧升为 MAP（T_map_b = T_map_odom * T_odom_b），
+     * 重同步各子图 pose_map_anchor_optimized 与 T_submap_kf，清空全局图缓存并按 T_map_b_optimized 重建 merged_cloud。
+     * 与 IncrementalOptimizer::transformHistoryAndRebuild 及 MappingModule 新建 KF 升级路径一致；
+     * 应在 freezeSubmap 之前调用，避免冻结后仍携带对齐前世界系的 merged_cloud。
+     */
+    void applyGpsMapOriginToOdomKeyframes(const Eigen::Matrix3d& R_enu_to_map,
+                                          const Eigen::Vector3d& t_enu_to_map,
+                                          uint64_t map_version,
+                                          uint64_t alignment_epoch = 0);
 
     /**
      * 启动新会话（增量建图）
@@ -99,10 +110,13 @@ public:
     // ── 全局点云构建 ──────────────────────────────────────────────────────
 
     /** 构建全局合并点云（使用优化后位姿） */
-    CloudXYZIPtr buildGlobalMap(float voxel_size = 0.2f) const;
+    CloudXYZIPtr buildGlobalMap(float voxel_size = 0.2f, uint64_t alignment_epoch_limit = 0) const;
     
     /** 异步构建全局点云（返回 future，调用方可异步等待） */
-    std::future<CloudXYZIPtr> buildGlobalMapAsync(float voxel_size = 0.2f) const;
+    std::future<CloudXYZIPtr> buildGlobalMapAsync(float voxel_size = 0.2f, uint64_t alignment_epoch_limit = 0) const;
+
+    /** 使全局图体素缓存失效；终局 save 前或需强制全量重算时调用（HBA 写回内在持锁路径内直接清空缓存）。 */
+    void invalidateGlobalMapCache() const;
 
     /** 更新子图的 GPS 重力中心 */
     void updateGPSGravityCenter(const KeyFrame::Ptr& kf);
@@ -300,7 +314,8 @@ private:
         const std::vector<SubMap::Ptr>& submaps_copy,
         float voxel_size,
         const std::vector<Pose3d>* poses_snapshot = nullptr,
-        uint64_t build_id = 0) const;
+        uint64_t build_id = 0,
+        uint64_t alignment_epoch_limit = 0) const;
 
     /**
      * 从 (cloud, pose) 快照构建全局图，不访问 SubMap/KeyFrame，供异步 buildGlobalMapAsync 使用以消除与后端的并发访问导致的 SIGSEGV。

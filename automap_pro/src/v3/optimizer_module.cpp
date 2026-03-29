@@ -6,6 +6,7 @@
 #include "automap_pro/v3/map_registry.h"
 #include <algorithm>
 #include <atomic>
+#include <limits>
 #include <vector>
 
 namespace {
@@ -135,6 +136,7 @@ OptimizerModule::OptimizerModule(EventBus::Ptr event_bus, MapRegistry::Ptr map_r
             delta_ev.meta.producer_seq = delta_ev.meta.event_id;
             delta_ev.meta.ref_version = map_registry_->getVersion();
             delta_ev.meta.ref_epoch = source_alignment_epoch;
+            delta_ev.meta.session_id = map_registry_->getSessionId();
             delta_ev.meta.source_ts = publish_ts;
             delta_ev.meta.publish_ts = publish_ts;
             delta_ev.meta.producer = "OptimizerModule";
@@ -188,6 +190,11 @@ OptimizerModule::OptimizerModule(EventBus::Ptr event_bus, MapRegistry::Ptr map_r
 
     onEvent<GraphTaskEvent>([this](const GraphTaskEvent& ev) {
         if (!running_.load()) return;
+        if (!ev.isValid()) {
+            RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000,
+                "[V3][CONTRACT] OptimizerModule: drop GraphTaskEvent with invalid EventMeta");
+            return;
+        }
         std::lock_guard<std::mutex> lock(task_mutex_);
         task_queue_.push_back(ev.task);
         cv_.notify_one();
@@ -429,14 +436,32 @@ void OptimizerModule::processGPSBatchKF(const OptTaskItem& task) {
 void OptimizerModule::processKeyframeCreate(const OptTaskItem& task) {
     if (!task.keyframe) return;
     auto kf = task.keyframe;
+    if (kf->id > static_cast<uint64_t>(std::numeric_limits<int>::max())) {
+        RCLCPP_ERROR(node_->get_logger(),
+            "[V3][CONTRACT] processKeyframeCreate reject: kf_id=%lu exceeds int max (GTSAM KF symbol); skip addKeyFrameNode",
+            static_cast<unsigned long>(kf->id));
+        return;
+    }
     RCLCPP_INFO(node_->get_logger(),
-        "[V3][CONTRACT] processKeyframeCreate kf_id=%lu pose_frame=%d use_pose=T_odom_b gps_aligned=%d has_gps=%d",
+        "[V3][CONTRACT] processKeyframeCreate kf_id=%lu pose_frame=%d initial_guess=%s gps_aligned=%d has_gps=%d",
         static_cast<unsigned long>(kf->id), static_cast<int>(kf->pose_frame),
+        (kf->pose_frame == PoseFrame::MAP) ? "T_map_b_optimized" : "T_odom_b",
         task.gps_aligned ? 1 : 0, kf->has_valid_gps ? 1 : 0);
     
     // 1. 添加关键帧节点
-    bool is_first_kf_of_submap = (kf->id % MAX_KF_PER_SUBMAP == 0);
-    optimizer_.addKeyFrameNode(kf->id, kf->T_odom_b, false, is_first_kf_of_submap);
+    bool is_first_kf_of_submap = (kf->index_in_submap == 0);
+    const int sm_anchor = kf->submap_id;
+    if (is_first_kf_of_submap && sm_anchor < 0) {
+        RCLCPP_WARN(node_->get_logger(),
+            "[V3][CONTRACT] first KF of submap but submap_id<0: kf_id=%lu — SM–KF anchor skipped "
+            "(ensure sm_manager_.addKeyFrame runs before KEYFRAME_CREATE)",
+            static_cast<unsigned long>(kf->id));
+    }
+    // 🏛️ [架构加固] 必须使用 T_map_b_optimized 作为初始值。
+    // 如果已对齐，T_map_b_optimized 已在 MappingModule 中由 T_odom_b 升级到 MAP 系；
+    // 如果未对齐，T_map_b_optimized 与 T_odom_b 等同。
+    // 若错误地始终使用 T_odom_b，当因子图已切换到 MAP 系时，新节点会产生巨大的初始位姿误差，导致优化后出现跳变。
+    optimizer_.addKeyFrameNode(static_cast<int>(kf->id), kf->T_map_b_optimized, false, is_first_kf_of_submap, sm_anchor);
     
     // 2. 里程计 Between 因子由 IncrementalOptimizer::addKeyFrameNode 统一添加。
     // 这里不再重复 add，避免同一 (prev, curr) 键值对被双重约束。

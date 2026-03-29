@@ -26,17 +26,17 @@ def _launch_nodes_with_system_config(context, *args, **kwargs):
     config_path = LaunchConfiguration("config").perform(context)
     pkg_share = get_package_share_directory("automap_pro")
     rviz_frontend_config = os.path.join(pkg_share, "rviz", "automap_frontend.rviz")
-    rviz_backend_config = os.path.join(pkg_share, "rviz", "automap_backend.rviz")
     if not os.path.isfile(rviz_frontend_config):
         rviz_frontend_config = os.path.join(pkg_share, "rviz", "automap.rviz")
-    if not os.path.isfile(rviz_backend_config):
-        rviz_backend_config = os.path.join(pkg_share, "rviz", "automap.rviz")
 
     # 从 system_config 生成各组件参数（launch 与 params_from_system_config 同目录）
     launch_dir = os.path.dirname(os.path.abspath(__file__))
     if launch_dir not in sys.path:
         sys.path.insert(0, launch_dir)
-    from rviz_utils import is_rviz2_installed
+    from rviz_utils import is_rviz2_installed, resolve_automap_backend_rviz_path
+    rb_cfg_arg = LaunchConfiguration("rviz_backend_config", default="").perform(context).strip()
+    rb_profile = LaunchConfiguration("rviz_backend_profile", default="default").perform(context).strip()
+    rviz_backend_config = resolve_automap_backend_rviz_path(pkg_share, rb_cfg_arg, rb_profile)
     try:
         from params_from_system_config import (
             load_system_config,
@@ -205,6 +205,14 @@ def generate_launch_description():
         "use_rviz", default_value="true",
         description="Whether to start RViz",
     )
+    rviz_backend_config_arg = DeclareLaunchArgument(
+        "rviz_backend_config", default_value="",
+        description="Override backend RViz config path (empty = use rviz_backend_profile or automap_backend.rviz)",
+    )
+    rviz_backend_profile_arg = DeclareLaunchArgument(
+        "rviz_backend_profile", default_value="default",
+        description="Backend RViz preset: default | keyframes_only",
+    )
     use_external_frontend_arg = DeclareLaunchArgument(
         "use_external_frontend", default_value="true",
         description="true=use verified fast_livo node (modular); false=use internal FastLIVO2Wrapper (ESIKF)",
@@ -243,6 +251,8 @@ def generate_launch_description():
         config_arg,
         output_dir_arg,
         use_rviz_arg,
+        rviz_backend_config_arg,
+        rviz_backend_profile_arg,
         use_external_frontend_arg,
         use_external_overlap_arg,
         use_hba_arg,

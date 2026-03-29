@@ -3,12 +3,70 @@
 #include "automap_pro/core/metrics.h"
 #include <rclcpp/rclcpp.hpp>
 #include <filesystem>
+#include <cmath>
 #include <limits>
 #include <chrono>
 
 namespace fs = std::filesystem;
 
 namespace automap_pro::v3 {
+
+void MapRegistry::setSessionId(uint64_t id) {
+    std::lock_guard<std::mutex> gps_lk(gps_state_mutex_);
+    const uint64_t old = session_id_.load(std::memory_order_relaxed);
+    if (old != 0 && old != id) {
+        PoseSnapshot::SessionAlignment sa;
+        sa.aligned = gps_aligned_.load(std::memory_order_relaxed);
+        sa.T_map_odom = Pose3d::Identity();
+        sa.T_map_odom.linear() = R_enu_to_map_;
+        sa.T_map_odom.translation() = t_enu_to_map_;
+        session_alignments_history_[old] = std::move(sa);
+    }
+    session_id_.store(id, std::memory_order_relaxed);
+    // 锁序：gps_state_mutex_ 先于 snapshot_mutex_
+    std::lock_guard<std::mutex> snap_lk(snapshot_mutex_);
+    auto new_snap = std::make_shared<PoseSnapshot>(*current_snapshot_);
+    new_snap->active_session_id = id;
+    new_snap->session_alignments = session_alignments_history_;
+    const uint64_t version = ++next_version_;
+    new_snap->version = version;
+    current_snapshot_ = new_snap;
+    current_version_.store(version);
+}
+
+uint64_t MapRegistry::setGPSAligned(bool aligned, const Eigen::Matrix3d& R, const Eigen::Vector3d& t,
+                                    double rmse) {
+    std::lock_guard<std::mutex> gps_lk(gps_state_mutex_);
+    gps_aligned_.store(aligned);
+    R_enu_to_map_ = R;
+    t_enu_to_map_ = t;
+    gps_rmse_ = rmse;
+    alignment_epoch_.fetch_add(1, std::memory_order_relaxed);
+    const uint64_t current_epoch = alignment_epoch_.load(std::memory_order_relaxed);
+    const uint64_t sid = session_id_.load(std::memory_order_relaxed);
+    if (sid != 0) {
+        PoseSnapshot::SessionAlignment sa;
+        sa.aligned = aligned;
+        sa.T_map_odom = Pose3d::Identity();
+        sa.T_map_odom.linear() = R;
+        sa.T_map_odom.translation() = t;
+        session_alignments_history_[sid] = std::move(sa);
+    }
+    std::lock_guard<std::mutex> snap_lk(snapshot_mutex_);
+    auto new_snap = std::make_shared<PoseSnapshot>(*current_snapshot_);
+    new_snap->gps_aligned = aligned;
+    new_snap->R_enu_to_map = R;
+    new_snap->t_enu_to_map = t;
+    new_snap->gps_rmse = rmse;
+    new_snap->alignment_epoch = current_epoch;
+    new_snap->active_session_id = sid;
+    new_snap->session_alignments = session_alignments_history_;
+    const uint64_t version = ++next_version_;
+    new_snap->version = version;
+    current_snapshot_ = new_snap;
+    current_version_.store(version);
+    return version;
+}
 
 void MapRegistry::addKeyFrame(KeyFrame::Ptr kf) {
     if (!kf) return;
@@ -33,6 +91,7 @@ void MapRegistry::addKeyFrame(KeyFrame::Ptr kf) {
         kf->has_valid_gps ? 1 : 0);
     {
         std::lock_guard<std::mutex> lock(kf_mutex_);
+        kf->alignment_epoch = alignment_epoch_.load(std::memory_order_relaxed); // 🏛️ 初始化对齐纪元
         keyframes_[kf->id] = kf;
         keyframes_count_ = keyframes_.size();
     }
@@ -68,6 +127,45 @@ KeyFrame::Ptr MapRegistry::getKeyFrameByTimestamp(double timestamp, double toler
     return best;
 }
 
+KeyFrame::Ptr MapRegistry::getKeyFrameByTimestampPreferPrior(double timestamp, double tolerance_s,
+                                                             uint64_t session_id) const {
+    std::lock_guard<std::mutex> lock(kf_mutex_);
+    KeyFrame::Ptr best_prior = nullptr;
+    double best_prior_ts = -std::numeric_limits<double>::infinity();
+    for (const auto& [id, kf] : keyframes_) {
+        (void)id;
+        if (!kf) continue;
+        if (session_id != 0 && kf->session_id != session_id) {
+            continue;
+        }
+        if (kf->timestamp <= timestamp) {
+            const double gap = timestamp - kf->timestamp;
+            if (gap <= tolerance_s && kf->timestamp > best_prior_ts) {
+                best_prior = kf;
+                best_prior_ts = kf->timestamp;
+            }
+        }
+    }
+    if (best_prior) {
+        return best_prior;
+    }
+    KeyFrame::Ptr best = nullptr;
+    double best_dt = std::numeric_limits<double>::infinity();
+    for (const auto& [id, kf] : keyframes_) {
+        (void)id;
+        if (!kf) continue;
+        if (session_id != 0 && kf->session_id != session_id) {
+            continue;
+        }
+        const double dt = std::abs(kf->timestamp - timestamp);
+        if (dt <= tolerance_s && dt < best_dt) {
+            best = kf;
+            best_dt = dt;
+        }
+    }
+    return best;
+}
+
 KeyFrame::Ptr MapRegistry::getLatestKeyFrameByTimestamp() const {
     std::lock_guard<std::mutex> lock(kf_mutex_);
     KeyFrame::Ptr best;
@@ -81,6 +179,49 @@ KeyFrame::Ptr MapRegistry::getLatestKeyFrameByTimestamp() const {
         }
     }
     return best;
+}
+
+KeyFrame::Ptr MapRegistry::getAnchorKeyFrameForEventTime(double event_timestamp, uint64_t session_id) const {
+    std::lock_guard<std::mutex> lock(kf_mutex_);
+    KeyFrame::Ptr best_prior;
+    double best_prior_ts = -std::numeric_limits<double>::infinity();
+    KeyFrame::Ptr best_future;
+    double best_future_ts = std::numeric_limits<double>::infinity();
+    for (const auto& [id, kf] : keyframes_) {
+        (void)id;
+        if (!kf) continue;
+        
+        // 🏛️ [架构契约] 必须严格匹配 session_id，禁止跨段寻锚
+        if (session_id != 0 && kf->session_id != session_id) {
+            continue;
+        }
+
+        if (kf->timestamp <= event_timestamp) {
+            if (kf->timestamp > best_prior_ts) {
+                best_prior_ts = kf->timestamp;
+                best_prior = kf;
+            }
+        } else if (kf->timestamp < best_future_ts) {
+            best_future_ts = kf->timestamp;
+            best_future = kf;
+        }
+    }
+    if (best_prior) {
+        return best_prior;
+    }
+    return best_future;
+}
+
+double MapRegistry::getLatestKeyFrameTimestamp() const {
+    std::lock_guard<std::mutex> lock(kf_mutex_);
+    double best_ts = -std::numeric_limits<double>::infinity();
+    for (const auto& [id, kf] : keyframes_) {
+        (void)id;
+        if (kf && std::isfinite(kf->timestamp) && kf->timestamp > best_ts) {
+            best_ts = kf->timestamp;
+        }
+    }
+    return best_ts;
 }
 
 std::vector<KeyFrame::Ptr> MapRegistry::getAllKeyFrames() const {
@@ -234,6 +375,7 @@ uint64_t MapRegistry::updatePoses(const std::unordered_map<int, Pose3d>& sm_upda
             if (it != submaps_.end()) {
                 it->second->pose_map_anchor_optimized = pose;
                 it->second->pose_frame = pose_frame; // 🏛️ [架构加固] 尊重优化器报告的坐标系语义
+                it->second->alignment_epoch = expected_epoch; // 🏛️ [关键修复] 更新对齐纪元
                 affected_sm_ids.push_back(id);
             }
         }
@@ -243,6 +385,7 @@ uint64_t MapRegistry::updatePoses(const std::unordered_map<int, Pose3d>& sm_upda
             if (it != keyframes_.end()) {
                 it->second->T_map_b_optimized = pose;
                 it->second->pose_frame = pose_frame; // 🏛️ [架构加固] 尊重优化器报告的坐标系语义
+                it->second->alignment_epoch = expected_epoch; // 🏛️ [关键修复] 更新对齐纪元
                 affected_kf_ids.push_back(static_cast<int>(id));
             }
         }
@@ -261,12 +404,14 @@ uint64_t MapRegistry::updatePoses(const std::unordered_map<int, Pose3d>& sm_upda
         for (const auto& [id, pose] : sm_updates) new_snapshot->submap_poses[id] = pose;
         for (const auto& [id, pose] : kf_updates) new_snapshot->keyframe_poses[id] = pose;
 
-        // 继承 GPS 状态
+        // 继承 GPS 状态 + V1 多会话对齐历史
         new_snapshot->gps_aligned = gps_aligned_.load();
         new_snapshot->R_enu_to_map = R_enu_to_map_;
         new_snapshot->t_enu_to_map = t_enu_to_map_;
         new_snapshot->gps_rmse = gps_rmse_;
         new_snapshot->alignment_epoch = expected_epoch;
+        new_snapshot->active_session_id = session_id_.load(std::memory_order_relaxed);
+        new_snapshot->session_alignments = session_alignments_history_;
 
         // 3. 原子切换快照
         {
@@ -278,9 +423,20 @@ uint64_t MapRegistry::updatePoses(const std::unordered_map<int, Pose3d>& sm_upda
     current_version_.store(version);
 
     RCLCPP_INFO(rclcpp::get_logger("automap_pro"),
-        "[V3][POSE_DIAG] MapRegistry version %lu update: sm_cnt=%zu kf_cnt=%zu | GPS_aligned=%d T_map_odom=[%.2f,%.2f,%.2f]",
+        "[V3][POSE_DIAG] MapRegistry version %lu update: affected_sm_cnt=%zu affected_kf_cnt=%zu | GPS_aligned=%d T_map_odom=[%.2f,%.2f,%.2f]",
         static_cast<unsigned long>(version), affected_sm_ids.size(), affected_kf_ids.size(),
         gps_aligned_.load() ? 1 : 0, t_enu_to_map_.x(), t_enu_to_map_.y(), t_enu_to_map_.z());
+    RCLCPP_DEBUG(
+        rclcpp::get_logger("automap_pro"),
+        "[V3][REGISTRY_CHAIN] updatePoses commit ver=%lu src=%s epoch=%lu sm_up=%zu kf_up=%zu "
+        "snap_kf_entries=%zu batch_hash=%lu (grep REGISTRY_CHAIN; 开 DEBUG 可见)",
+        static_cast<unsigned long>(version),
+        source_module.c_str(),
+        static_cast<unsigned long>(expected_epoch),
+        sm_updates.size(),
+        kf_updates.size(),
+        new_snapshot->keyframe_poses.size(),
+        static_cast<unsigned long>(batch_hash));
 
     // 发布位姿图优化结果事件（用于同步各模块内部缓存，如 VisualizationModule）
     OptimizationResultEvent result_ev;
@@ -304,6 +460,7 @@ uint64_t MapRegistry::updatePoses(const std::unordered_map<int, Pose3d>& sm_upda
     result_ev.meta.publish_ts = publish_ts;
     result_ev.meta.producer = source_module;
     result_ev.meta.route_tag = "legacy";
+    result_ev.meta.session_id = getSessionId();
     event_bus_->publish(result_ev);
 
     // 发布地图变更事件

@@ -179,6 +179,10 @@ public:
     bool        useComposableNode()  const { return get<bool>("frontend.use_composable_node", true); }
     /** 前端发布的点云坐标系：body=雷达/body 系，需用 T_w_b 变换到世界；world=camera_init/世界系（fast_livo 默认），需先转 body 再建图，否则会双重变换导致全局图错乱 */
     std::string frontendCloudFrame() const { return get<std::string>("frontend.cloud_frame", "world"); }
+    /** 扫描滑动窗口（FastLIVO2Adapter / V3 FrontEnd 叠加）；至少为 1 */
+    int frontendSweepAccumulationFrames() const {
+        return std::max(1, get<int>("frontend.sweep_accumulation_frames", 20));
+    }
     
     // ── 动态点过滤（DUFOMap 风格在线模块）────────────────────────────
     bool   dynamicFilterEnabled() const { return get<bool>("dynamic_filter.enabled", false); }
@@ -357,6 +361,8 @@ public:
      * 未配置或全零时 HBA 可回退 legacy `sensor_config/gps_imu_extrinsic.yaml`。
      */
     Eigen::Vector3d gpsLeverArmImu() const;
+    /** 诊断：`gps.lever_arm_imu` 在已加载 YAML 中的形态（与 readVector3d 是否吃到 sequence 对齐）。仅 init/排障使用。 */
+    std::string debugGpsLeverArmImuYamlDiag() const;
 
     // ── 【优化】GPS动态协方差和异常值检测参数 ─────────────────────────────
     bool   gpsEnableDynamicCov() const { return get<bool>("gps.enable_dynamic_cov", true); }
@@ -667,6 +673,21 @@ public:
 
     // ── 性能优化（performance.*）────────────────────────────────────────────
     bool asyncGlobalMapBuild() const { return perf_async_global_map_build_; }
+    /**
+     * 全局图 buildGlobalMap 是否走异步线程：performance.async_global_map_build 为 true 且未启用 visualization.sync_global_map_build。
+     * RViz 一致性优先时应为 false（同步构图，且在 HBA 路径下于 rebuildMergedCloud 之后立即执行）。
+     */
+    bool globalMapBuildAsync() const {
+        return perf_async_global_map_build_ && !viz_sync_global_map_build_;
+    }
+    /** visualization.sync_global_map_build：强制同步全局图构建（覆盖 performance.async_global_map_build） */
+    bool vizSyncGlobalMapBuild() const { return viz_sync_global_map_build_; }
+    /** visualization.global_map_ros2_transient_local：/automap/global_map 使用 TransientLocal，便于 RViz 重连与 QoS 对齐 */
+    bool vizGlobalMapRos2TransientLocal() const { return viz_global_map_ros2_transient_local_; }
+    /** visualization.log_pose_jump_detail：FrontendPoseAdjust 时额外打平移范数与旋转角（度） */
+    bool vizLogPoseJumpDetail() const { return viz_log_pose_jump_detail_; }
+    /** visualization.suppress_optimize_driven_global_map：禁止 applyOptimizedPoses 内「优化计数」触发的全局图请求（仅保留按帧周期等其它入口） */
+    bool vizSuppressOptimizeDrivenGlobalMap() const { return viz_suppress_optimize_driven_global_map_; }
     bool asyncIsam2Update() const { return perf_async_isam2_update_; }
     bool parallelVoxelDownsample() const { return perf_parallel_voxel_downsample_; }
     bool parallelTeaserMatch() const { return perf_parallel_teaser_match_; }
@@ -862,6 +883,25 @@ public:
     bool   semanticGeometricAccumulatorTagIntensityWithScanSeq() const {
         return get<bool>("semantic.geometric.accumulator.tag_intensity_with_scan_seq", true);
     }
+    /// false: disable all geometric debug PCD writes (save_merged_cloud_dir ignored).
+    bool semanticGeometricAccumulatorSaveDebugPcd() const {
+        return get<bool>("semantic.geometric.accumulator.save_debug_pcd", true);
+    }
+    /// Directory for debug PCD dumps when save_debug_pcd is true and non-empty.
+    std::string semanticGeometricAccumulatorSaveMergedCloudDir() const {
+        return get<std::string>("semantic.geometric.accumulator.save_merged_cloud_dir", "");
+    }
+    int semanticGeometricAccumulatorSaveMergedCloudEveryN() const {
+        int v = get<int>("semantic.geometric.accumulator.save_merged_cloud_every_n", 1);
+        return std::max(1, std::min(100000, v));
+    }
+    /// Save merged multi-frame body cloud (accum_body) when save_debug_pcd and dir set.
+    bool semanticGeometricAccumulatorSaveAccumBodyPcd() const {
+        return get<bool>("semantic.geometric.accumulator.save_accum_body_pcd", true);
+    }
+    bool semanticGeometricAccumulatorSavePrimitiveInputCloud() const {
+        return get<bool>("semantic.geometric.accumulator.save_primitive_input_cloud", false);
+    }
     // Primitive Classifier (Zhou22ral)
     bool   semanticGeometricPrimitiveClassifierEnabled() const { return get<bool>("semantic.geometric.primitive_classifier.enabled", true); }
     double semanticGeometricPrimitiveClassifierLinearityThresh() const { return get<double>("semantic.geometric.primitive_classifier.linearity_threshold", 0.7); }
@@ -1010,6 +1050,19 @@ public:
     int semanticGeometricMaxLinesPerCluster() const {
         int v = get<int>("semantic.geometric.max_lines_per_cluster", 2);
         return std::max(1, std::min(8, v));
+    }
+    /** geometric_only：LINE 的 range_view_label∈{1,3}（立面启发）时不走树干链；默认 true。 */
+    bool semanticGeometricTrunkChainSkipRvWallLabel() const {
+        return get<bool>("semantic.geometric.trunk_chain_skip_rv_wall_label", true);
+    }
+    bool semanticGeometricSparseTrunkConnectivityRecallEnable() const {
+        return get<bool>("semantic.geometric.sparse_trunk_connectivity_recall_enable", true);
+    }
+    int semanticGeometricSparseTrunkConnectivityMinPerLayer() const {
+        return get<int>("semantic.geometric.sparse_trunk_connectivity_min_per_layer", 2);
+    }
+    double semanticGeometricSparseTrunkConnectivityCanopyRadiusM() const {
+        return get<double>("semantic.geometric.sparse_trunk_connectivity_canopy_radius_m", 2.5);
     }
     /** <=0: use legacy max(0.4, 2*max_tree_radius+0.2) in SemanticProcessor. */
     double semanticGeometricOnlyFrameMergeMaxXyM() const {
@@ -1520,6 +1573,10 @@ public:
 private:
     // 性能参数缓存（避免运行时访问 YAML::Node 导致多线程崩溃）
     bool perf_async_global_map_build_{true};
+    bool viz_sync_global_map_build_{false};
+    bool viz_global_map_ros2_transient_local_{true};
+    bool viz_log_pose_jump_detail_{false};
+    bool viz_suppress_optimize_driven_global_map_{false};
     bool perf_async_isam2_update_{false};
     bool perf_parallel_voxel_downsample_{true};
     bool perf_parallel_teaser_match_{true};
@@ -1537,6 +1594,9 @@ private:
 
     /** load() 时一次性读取的 GPS 配置缓存，避免重复解析 YAML 与默认值不一致 */
     bool gps_cached_{false};
+    /** load() 时从 gps.lever_arm_imu 钉死；gpsLeverArmImu() 优先返回，供 HBA 与 iSAM2 几何同源（避免运行时读 cfg_ 不一致读零） */
+    bool gps_lever_arm_imu_cached_valid_{false};
+    Eigen::Vector3d gps_lever_arm_imu_cached_{0.0, 0.0, 0.0};
     int    gps_align_min_points_{50};
     double gps_align_min_distance_m_{30.0};
     double gps_quality_threshold_hdop_{2.0};

@@ -50,6 +50,7 @@ public:
             event.meta.publish_ts = node_->now().seconds();
             event.meta.producer = "GPSModule";
             event.meta.route_tag = "legacy";
+            event.meta.session_id = map_registry_->getSessionId();
 
             if (event.isValid()) {
                 RCLCPP_DEBUG(node_->get_logger(),

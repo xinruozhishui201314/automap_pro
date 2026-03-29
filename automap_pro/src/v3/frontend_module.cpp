@@ -4,12 +4,14 @@
 #include "automap_pro/core/logger.h"
 #include "automap_pro/core/metrics.h"
 #include "automap_pro/core/utils.h"
+#include <pcl/common/transforms.h>
 #include <pcl_conversions/pcl_conversions.h>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
 #include <ctime>
+#include <vector>
 
 namespace automap_pro::v3 {
 namespace {
@@ -96,6 +98,12 @@ FrontEndModule::FrontEndModule(EventBus::Ptr event_bus, MapRegistry::Ptr map_reg
     RCLCPP_INFO(node_->get_logger(),
                 "[PIPELINE][FE] ctor OK LivoBridge+FrameProcessor ingress_max=%zu frame_max=%zu gps=%s topic=%s",
                 max_ingress_q, max_frame_q, gps_enabled ? "on" : "off", gps_topic.c_str());
+
+    max_sweep_buffer_size_ = cfg.frontendSweepAccumulationFrames();
+    RCLCPP_INFO(node_->get_logger(),
+                "[PIPELINE][FE] sweep_accumulation_frames=%d (V3: merge sweeps into SyncedFrameEvent when >1; "
+                "aligns KF/LSK cloud with FastLIVO2Adapter semantics)",
+                max_sweep_buffer_size_);
 
     // 🏛️ [架构契约] Cascading Backpressure (级联背压响应)
     onEvent<BackpressureWarningEvent>([this](const BackpressureWarningEvent& ev) {
@@ -203,8 +211,9 @@ void FrontEndModule::run() {
         if (!kf_ts_valid) {
             kf_info_fallback_invalid_total_.fetch_add(1, std::memory_order_relaxed);
             // 兜底：当 kf_info 话题缺失或迟到时，尝试按帧时间从 MapRegistry 恢复关键帧提示，避免语义链路长期 kf_ts=0。
-            auto kf_hint = map_registry_->getKeyFrameByTimestamp(
-                f.ts, ConfigManager::instance().semanticKeyframeTimeToleranceS());
+            auto kf_hint = map_registry_->getKeyFrameByTimestampPreferPrior(
+                f.ts, ConfigManager::instance().semanticKeyframeTimeToleranceS(),
+                map_registry_->getSessionId());
             if (kf_hint && std::isfinite(kf_hint->timestamp) && kf_hint->timestamp > 0.0) {
                 kfinfo_copy.timestamp = kf_hint->timestamp;
                 kfinfo_copy.cloud_valid = true;
@@ -242,10 +251,53 @@ void FrontEndModule::run() {
             static_cast<unsigned long long>(g_gps_cache_get_no_neighbor_total.load(std::memory_order_relaxed)),
             static_cast<unsigned long long>(g_gps_cache_get_reject_invalid_total.load(std::memory_order_relaxed)));
 
+        CloudXYZIPtr sync_cloud = f.cloud;
+        CloudXYZIPtr sync_cloud_ds = f.cloud_ds;
+        if (max_sweep_buffer_size_ > 1 && f.cloud && !f.cloud->empty()) {
+            std::vector<SweepBufferEntry> snaps;
+            {
+                std::lock_guard<std::mutex> lk(sweep_buffer_mutex_);
+                snaps.assign(sweep_buffer_.begin(), sweep_buffer_.end());
+            }
+            if (!snaps.empty()) {
+                const std::string cf = ConfigManager::instance().frontendCloudFrame();
+                CloudXYZIPtr merged = mergeSweepsToEventCloud(pose, snaps, cf);
+                if (merged && !merged->empty()) {
+                    sync_cloud = merged;
+                    float ds_res = static_cast<float>(ConfigManager::instance().submapMatchRes());
+                    if (ds_res <= 0.f) {
+                        ds_res = 0.5f;
+                    }
+                    bool timed_out = false;
+                    sync_cloud_ds =
+                        utils::voxelDownsampleWithTimeout(sync_cloud, ds_res, 5000, &timed_out);
+                    if (!sync_cloud_ds || sync_cloud_ds->empty()) {
+                        sync_cloud_ds = sync_cloud;
+                    }
+                    if (timed_out) {
+                        RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000,
+                            "[PIPELINE][FE][SWEEP_MERGE] voxel downsample timeout merged_pts=%zu",
+                            static_cast<unsigned long>(sync_cloud->size()));
+                    }
+                    const uint64_t d = sweep_merge_diag_total_.fetch_add(1, std::memory_order_relaxed) + 1;
+                    if (d <= 5u || (d % 200u) == 0u) {
+                        RCLCPP_INFO(node_->get_logger(),
+                            "[PIPELINE][FE][SWEEP_MERGE] diag#%lu snaps=%zu pts_single=%zu pts_merged=%zu ds=%zu frame=%s",
+                            static_cast<unsigned long>(d),
+                            static_cast<unsigned long>(snaps.size()),
+                            static_cast<unsigned long>(f.cloud->size()),
+                            static_cast<unsigned long>(sync_cloud->size()),
+                            sync_cloud_ds ? static_cast<unsigned long>(sync_cloud_ds->size()) : 0ul,
+                            cf.c_str());
+                    }
+                }
+            }
+        }
+
         SyncedFrameEvent event;
         event.timestamp = f.ts;
-        event.cloud = f.cloud;
-        event.cloud_ds = f.cloud_ds;
+        event.cloud = sync_cloud;
+        event.cloud_ds = sync_cloud_ds;
         event.T_odom_b = pose;
         event.covariance = cov;
         event.kf_info = kfinfo_copy;
@@ -257,6 +309,7 @@ void FrontEndModule::run() {
         event.ref_alignment_epoch = map_registry_->getAlignmentEpoch();
         const uint64_t seq = event_seq_.fetch_add(1, std::memory_order_relaxed) + 1;
         event.meta.event_id = makeEventId(event.timestamp, seq);
+        event.meta.session_id = map_registry_->getSessionId(); // 🏛️ [架构加固] 注入当前会话 ID
         event.meta.idempotency_key = event.meta.event_id;
         event.meta.producer_seq = seq;
         event.meta.ref_version = event.ref_map_version;
@@ -270,15 +323,23 @@ void FrontEndModule::run() {
             if (event.isValid()) {
             event_bus_->publish(event);
             const auto published = synced_publish_total_.fetch_add(1, std::memory_order_relaxed) + 1;
+            const double odom_t_norm = event.T_odom_b.translation().norm();
             RCLCPP_INFO_THROTTLE(node_->get_logger(), *node_->get_clock(), 2000,
-                "[CHAIN][B2 FE->SEM] publish_synced=%lu ts=%.3f kf_source=%s kf_valid=%d kf_dt=%.3f pts=%zu pose_src=%s cloud_in=%lu kf_recv=%lu",
+                "[CHAIN][B2 FE->MAP] publish_synced=%lu ts=%.3f cloud_frame=%s pose_frame=%d "
+                "ref_map_ver=%lu ref_align_ep=%lu T_odom_t_norm=%.3f pts=%zu pose_src=%s kf_source=%s kf_valid=%d kf_dt=%.3f "
+                "cloud_in_total=%lu kf_recv_total=%lu (grep CHAIN; SyncedFrame->VIZ/Mapping)",
                 static_cast<unsigned long>(published),
                 event.timestamp,
+                event.cloud_frame.c_str(),
+                static_cast<int>(event.pose_frame),
+                static_cast<unsigned long>(event.ref_map_version),
+                static_cast<unsigned long>(event.ref_alignment_epoch),
+                odom_t_norm,
+                event.cloud ? event.cloud->size() : 0,
+                pose_source,
                 kf_source,
                 kf_ts_valid ? 1 : 0,
                 kf_dt,
-                event.cloud ? event.cloud->size() : 0,
-                pose_source,
                 static_cast<unsigned long>(cloud_recv_total_.load(std::memory_order_relaxed)),
                 static_cast<unsigned long>(kf_info_recv_total_.load(std::memory_order_relaxed)));
             RCLCPP_DEBUG_THROTTLE(node_->get_logger(), *node_->get_clock(), 2000,
@@ -327,6 +388,7 @@ void FrontEndModule::onCloud(double ts, const CloudXYZIPtr& cloud) {
     event_bus_->publish(ev);
 
     frame_processor_.pushFrame(ts, cloud);
+    sweepBufferAdd(ts, cloud);
     RCLCPP_INFO_THROTTLE(node_->get_logger(), *node_->get_clock(), 2000,
         "[CHAIN][B1 LIVO->FE] cloud_in=%lu pushed=1 ts=%.3f pts=%zu kfinfo_in=%lu last_kf_valid_ts=%.3f",
         static_cast<unsigned long>(cloud_total),
@@ -593,6 +655,65 @@ bool FrontEndModule::kfinfoCacheGet(double ts, LivoKeyFrameInfo& out_info) {
         "[SEMANTIC][FrontEnd][KFINFO_CACHE] miss reason=no_leq ts_req=%.3f window=[%.3f,%.3f] size=%zu",
         ts, oldest_ts, newest, kfinfo_cache_.size());
     return false;
+}
+
+void FrontEndModule::sweepBufferAdd(double ts, const CloudXYZIPtr& cloud) {
+    if (max_sweep_buffer_size_ <= 1) {
+        return;
+    }
+    if (!cloud || cloud->empty()) {
+        return;
+    }
+    Pose3d sweep_pose = Pose3d::Identity();
+    Mat66d sweep_cov = Mat66d::Identity() * 1e-4;
+    if (!odomCacheGet(ts, sweep_pose, sweep_cov)) {
+        std::lock_guard<std::mutex> lk(data_mutex_);
+        constexpr double kMaxSkewS = 1.5;
+        if (last_odom_ts_ >= 0.0 && std::abs(ts - last_odom_ts_) <= kMaxSkewS) {
+            sweep_pose = last_odom_pose_;
+        } else {
+            return;
+        }
+    }
+    std::lock_guard<std::mutex> lk(sweep_buffer_mutex_);
+    sweep_buffer_.push_back({ts, cloud, sweep_pose});
+    while (sweep_buffer_.size() > static_cast<size_t>(max_sweep_buffer_size_)) {
+        sweep_buffer_.pop_front();
+    }
+}
+
+CloudXYZIPtr FrontEndModule::mergeSweepsToEventCloud(
+    const Pose3d& T_curr_odom_b,
+    const std::vector<SweepBufferEntry>& snaps,
+    const std::string& cloud_frame) {
+    CloudXYZIPtr acc_body(new CloudXYZI());
+    const Pose3d T_inv = T_curr_odom_b.inverse();
+    for (const auto& e : snaps) {
+        if (!e.cloud || e.cloud->empty()) {
+            continue;
+        }
+        CloudXYZIPtr transformed(new CloudXYZI());
+        if (cloud_frame == "world") {
+            pcl::transformPointCloud(*e.cloud, *transformed, T_inv.matrix().cast<float>());
+        } else {
+            const Pose3d T_rel = T_inv * e.T_odom_b;
+            pcl::transformPointCloud(*e.cloud, *transformed, T_rel.matrix().cast<float>());
+        }
+        *acc_body += *transformed;
+    }
+    if (acc_body->empty()) {
+        return nullptr;
+    }
+    acc_body->width = static_cast<uint32_t>(acc_body->size());
+    acc_body->height = 1;
+    if (cloud_frame == "world") {
+        CloudXYZIPtr world_cloud(new CloudXYZI());
+        pcl::transformPointCloud(*acc_body, *world_cloud, T_curr_odom_b.matrix().cast<float>());
+        world_cloud->width = static_cast<uint32_t>(world_cloud->size());
+        world_cloud->height = 1;
+        return world_cloud;
+    }
+    return acc_body;
 }
 
 } // namespace automap_pro::v3

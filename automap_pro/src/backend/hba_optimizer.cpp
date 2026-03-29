@@ -143,13 +143,37 @@ void HBAOptimizer::init() {
         if (cfg_loaded) cfg_lever_arm = cfg.gpsLeverArmImu();
     } catch (...) {
     }
+    // 与 [ConfigManager][CONFIG_READ_BACK] gps.lever_arm_imu 对照：同 run 内钉死 isLoaded / YAML 节点形态 / getter 返回值
+    {
+        const Eigen::Vector3d la_now = cfg.gpsLeverArmImu();
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[HBA][GPS_LEVER_ARM_DIAG] isLoaded=%d cfg_path=%s gpsLeverArmImu()=[%.4f,%.4f,%.4f] yaml=%s",
+            cfg.isLoaded() ? 1 : 0,
+            cfg_path.c_str(),
+            la_now.x(), la_now.y(), la_now.z(),
+            cfg.debugGpsLeverArmImuYamlDiag().c_str());
+    }
+    Eigen::Vector3d lever_arm_before_resolve = Eigen::Vector3d::Zero();
+    try {
+        lever_arm_before_resolve = cfg.gpsLeverArmImu();
+    } catch (...) {}
     resolveGpsLeverArmForHba(lever_arm_);
+    const char* lever_arm_source = "zero";
+    if (lever_arm_.norm() > 1e-12) {
+        if (lever_arm_before_resolve.norm() > 1e-12 &&
+            (lever_arm_ - lever_arm_before_resolve).norm() < 1e-9) {
+            lever_arm_source = "config_gpsLeverArmImu_cached";
+        } else {
+            lever_arm_source = "extrinsic_yaml_fallback";
+        }
+    }
     if (lever_arm_.norm() > 1e-12) {
         RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-            "[HBA] GPS lever arm resolved=[%.4f, %.4f, %.4f] m (cfg_loaded=%d cfg_path=%s cfg_gps_lever_arm=[%.4f, %.4f, %.4f])",
+            "[HBA] GPS lever arm resolved=[%.4f, %.4f, %.4f] m source=%s (cfg_loaded=%d cfg_path=%s pre_resolve_gpsLeverArmImu=[%.4f, %.4f, %.4f])",
             lever_arm_.x(), lever_arm_.y(), lever_arm_.z(),
+            lever_arm_source,
             cfg_loaded ? 1 : 0, cfg_path.c_str(),
-            cfg_lever_arm.x(), cfg_lever_arm.y(), cfg_lever_arm.z());
+            lever_arm_before_resolve.x(), lever_arm_before_resolve.y(), lever_arm_before_resolve.z());
     } else {
         RCLCPP_WARN(rclcpp::get_logger("automap_system"),
             "[HBA] GPS lever arm is zero (cfg_loaded=%d cfg_path=%s cfg_gps_lever_arm=[%.4f, %.4f, %.4f]). "
@@ -816,6 +840,9 @@ HBAResult HBAOptimizer::runGTSAMFallback(const PendingTask& task) {
                  task.keyframes.size(), task.loops.size(), task.enable_gps ? 1 : 0);
     HBAResult result;
     result.success = false;
+    // 必须与 runHBA 入口一致：否则 MappingModule 回调里 source_alignment_epoch==0 会整包丢弃，
+    // MapRegistry 得不到 HBA 写回，与 iSAM2 增量轨迹并存 → 轨迹/点云语义分裂（重影）。见 full.log Drop HBA result by alignment_epoch mismatch。
+    result.alignment_epoch_snapshot = task.alignment_epoch_snapshot;
     if (task.keyframes.empty()) {
         BACKEND_STEP("step=HBA_runGTSAMFallback_skip reason=no_keyframes");
         RCLCPP_ERROR(rclcpp::get_logger("automap_system"),

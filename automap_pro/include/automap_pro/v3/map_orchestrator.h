@@ -21,12 +21,12 @@ protected:
     void run() override;
 
 private:
-    enum class ItemType : uint8_t { SYNCED, OPT, GPS_ALIGN, SEMANTIC };
     struct Item {
-        ItemType type = ItemType::SYNCED;
+        std::string event_name;
         EventMeta meta;
     };
 
+    void enqueueObserved(const char* event_name, const EventMeta& meta);
     void observeMeta(const char* event_name, const EventMeta& meta);
     void maybePublishAdvice(const char* event_name, const EventMeta& meta, const char* reason, bool takeover);
 

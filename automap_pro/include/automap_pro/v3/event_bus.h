@@ -39,7 +39,9 @@ public:
     }
 
     /**
-     * @brief 异步订阅（回调在独立线程执行，不阻塞 publish）
+     * @brief 异步订阅（每事件 spawn 一线程并 detach，不阻塞 publish）
+     * @note 不保证同类型事件的回调执行顺序；需严格 FIFO / 与 Registry 因果序时，应使用 subscribe + 模块内队列，
+     *       由单 worker 顺序处理（参见 VisualizationModule）。
      */
     template <typename TEvent>
     void subscribeAsync(std::function<void(const TEvent&)> handler) {

@@ -218,6 +218,15 @@ public:
             int max_frames = 24;
             /// 多帧累加点云：将 intensity 写为几何处理扫描序号（与日志 idx 一致），用于追溯点到哪帧
             bool tag_intensity_with_scan_seq = true;
+            /// false：不写几何调试用 PCD（总开关，忽略 save_merged_cloud_dir）
+            bool save_debug_pcd = true;
+            /// 调试输出目录（仅当 save_debug_pcd=true 且非空时生效）
+            std::string save_merged_cloud_dir;
+            int save_merged_cloud_every_n = 1;
+            /// true：写多帧叠加 accum_body PCD
+            bool save_accum_body_pcd = true;
+            /// true：写进入 classifyPrimitives 前的 prim_input PCD
+            bool save_primitive_input_cloud = false;
         } accumulator;
         struct {
             bool enabled = true;
@@ -267,6 +276,12 @@ public:
             float fusion_rv_boost_scale = 0.35f;
         } range_view;
         int max_lines_per_cluster = 2;
+        /// geometric_only：range_view_label 为立面启发（1=梯度墙，3=ONNX 墙）的 LINE 不进入树干圆柱链，减少墙误成树。整云回退（label=0）仍走树链。
+        bool trunk_chain_skip_rv_wall_label = true;
+        /// geometric_only：针对极稀疏场景，启用“地-干-冠”三层强连通性召回，降低对点数和锥度的要求。
+        bool sparse_trunk_connectivity_recall_enable = true;
+        int sparse_trunk_connectivity_min_per_layer = 2;
+        float sparse_trunk_connectivity_canopy_radius_m = 2.5f;
         /// geometric_only: merge nearby trunk fits in the same frame (body frame). 0 = auto legacy formula.
         struct {
             float max_xy_m = 0.f;

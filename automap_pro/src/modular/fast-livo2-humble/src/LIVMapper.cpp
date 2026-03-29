@@ -238,7 +238,9 @@ LIVMapper::~LIVMapper() {
   if (mapping_thread_.joinable()) {
     mapping_thread_.join();
   }
-  savePCD();
+  // savePCD() 已在 mapping_thread_fn 退出时调用；run() 在 spin 返回后会 join 该线程。
+  // 此处再调用会导致对同一点云二次写盘与 PCL/shared_ptr 析构竞态，离线结束 SIGINT 后
+  // 易出现 __libc_free / PointCloud 析构 SIGSEGV（见 full.log fast_livo backtrace）。
 }
 
 void LIVMapper::readParameters(rclcpp::Node::SharedPtr &node)

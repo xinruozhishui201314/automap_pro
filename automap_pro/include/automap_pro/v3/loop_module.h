@@ -27,7 +27,19 @@ public:
         loop_detector_.registerLoopCallback([this](const LoopConstraint::Ptr& lc) {
             LoopConstraintEvent ev;
             ev.constraint = lc;
-            event_bus_->publish(ev);
+            ev.meta.event_id = loop_event_seq_.fetch_add(1, std::memory_order_relaxed) + 1;
+            ev.meta.idempotency_key = ev.meta.event_id;
+            ev.meta.producer_seq = ev.meta.event_id;
+            ev.meta.ref_version = map_registry_->getVersion();
+            ev.meta.ref_epoch = map_registry_->getAlignmentEpoch();
+            ev.meta.source_ts = node_->now().seconds();
+            ev.meta.publish_ts = ev.meta.source_ts;
+            ev.meta.producer = "LoopModule";
+            ev.meta.session_id = map_registry_->getSessionId();
+            ev.meta.route_tag = "legacy";
+            if (ev.isValid()) {
+                event_bus_->publish(ev);
+            }
         });
 
         // 订阅地图变更事件
@@ -107,7 +119,19 @@ protected:
                 for (auto& lc : loops) {
                     LoopConstraintEvent ev;
                     ev.constraint = lc;
-                    event_bus_->publish(ev);
+                    ev.meta.event_id = loop_event_seq_.fetch_add(1, std::memory_order_relaxed) + 1;
+                    ev.meta.idempotency_key = ev.meta.event_id;
+                    ev.meta.producer_seq = ev.meta.event_id;
+                    ev.meta.ref_version = map_registry_->getVersion();
+                    ev.meta.ref_epoch = map_registry_->getAlignmentEpoch();
+                    ev.meta.source_ts = node_->now().seconds();
+                    ev.meta.publish_ts = ev.meta.source_ts;
+                    ev.meta.producer = "LoopModule";
+                    ev.meta.session_id = map_registry_->getSessionId();
+                    ev.meta.route_tag = "legacy";
+                    if (ev.isValid()) {
+                        event_bus_->publish(ev);
+                    }
                 }
             }
         }
@@ -121,6 +145,7 @@ private:
     std::deque<IntraLoopTaskEvent> intra_tasks_;
     std::mutex queue_mutex_;
     std::mutex intra_mutex_;
+    std::atomic<uint64_t> loop_event_seq_{0};
 };
 
 } // namespace automap_pro::v3

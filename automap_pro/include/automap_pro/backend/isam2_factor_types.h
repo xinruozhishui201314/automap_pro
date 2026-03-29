@@ -272,7 +272,26 @@ struct KeyFrameData {
     Pose3d pose;
     bool fixed;
     bool is_first_kf_of_submap;
+    /** 与 KeyFrame::submap_id 一致；用于 Between(SM(sm), KF(anchor))，-1 表示未知（旧数据或跳过锚定） */
+    int submap_id = -1;
 };
+
+/**
+ * 按入图时间顺序为 KeyFrameData 补全 submap_id（仅当 submap_id<0）。
+ * 规则：遇 is_first_kf_of_submap 则子图序号 +1，随后帧继承当前序号。
+ * 用于旧会话历史或缺失字段的 GPS 重建 / transformHistoryAndRebuild。
+ */
+inline void inferMissingSubmapIdsInKeyFrameHistory(std::vector<KeyFrameData>& rows) {
+    int cur_sm = -1;
+    for (auto& d : rows) {
+        if (d.is_first_kf_of_submap) {
+            cur_sm++;
+        }
+        if (d.submap_id < 0 && cur_sm >= 0) {
+            d.submap_id = cur_sm;
+        }
+    }
+}
 
 /**
  * 关键帧间里程计因子结构体

@@ -72,11 +72,13 @@ public:
 
     /** 发布优化后轨迹；若 snapshot 中有位姿，则使用 snapshot，否则回退到关键帧内部位姿 */
     void publishOptimizedPath(const std::vector<SubMap::Ptr>& submaps,
-                             const PoseSnapshot::Ptr& snapshot);
+                             const PoseSnapshot::Ptr& snapshot,
+                             uint64_t alignment_epoch_limit = 0);
 
     /** 发布关键帧位姿数组 */
     void publishKeyframePoses(const std::vector<KeyFrame::Ptr>& keyframes,
-                             const PoseSnapshot::Ptr& snapshot);
+                             const PoseSnapshot::Ptr& snapshot,
+                             uint64_t alignment_epoch_limit = 0);
 
     /**
      * 发布 GPS 轨迹 Path：/automap/gps_raw_path（原始）、/automap/gps_aligned_path（对齐后）。

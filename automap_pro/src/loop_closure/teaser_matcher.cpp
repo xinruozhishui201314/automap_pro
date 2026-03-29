@@ -145,7 +145,7 @@ CloudXYZIPtr TeaserMatcher::preprocess(const CloudXYZIPtr& cloud) const {
 TeaserMatcher::Result TeaserMatcher::match(
     const CloudXYZIPtr& src_cloud,
     const CloudXYZIPtr& tgt_cloud,
-    const Pose3d& /*initial_guess*/) const
+    const Pose3d& initial_guess) const
 {
     // 首次 match 时打印实际使用的参数到 ROS 日志，便于 full.log 验证 YAML 是否生效
     static std::once_flag once_verify;
@@ -187,6 +187,23 @@ TeaserMatcher::Result TeaserMatcher::match(
         }
         ALOG_INFO(MOD, "[tid={}] step=preprocess_tgt_done tgt_out_ptr={} tgt_pts={} use_count={}",
                  tid, static_cast<const void*>(tgt.get()), tgt->size(), tgt.use_count());
+
+        // 粗匹配初值 T_tgt_src：将源点云预变换到目标系，使 FPFH/TEASER/SVD 在近似重叠坐标系下工作；输出时 T_tgt_src = T_est * T_init
+        const bool init_finite = initial_guess.matrix().allFinite();
+        const bool use_pose_init =
+            init_finite &&
+            !initial_guess.matrix().isApprox(Eigen::Matrix4d::Identity(), 1e-12);
+        if (use_pose_init) {
+            CloudXYZIPtr src_warped = std::make_shared<CloudXYZI>();
+            src_warped->reserve(src->size());
+            Eigen::Affine3f Ttf;
+            Ttf.matrix() = initial_guess.matrix().cast<float>();
+            pcl::transformPointCloud(*src, *src_warped, Ttf);
+            src = src_warped;
+            ALOG_INFO(MOD,
+                      "[tid={}] step=pose_init_warp src prealigned to tgt (T_tgt_src init): trans_norm={:.3f}m",
+                      tid, initial_guess.translation().norm());
+        }
 
         // === 检查最少点数要求 ===
         if (src->size() < 30 || tgt->size() < 30) {
@@ -365,6 +382,9 @@ TeaserMatcher::Result TeaserMatcher::match(
             runSvdRegistration(src, tgt, corrs, result, max_rmse_);
             result.used_teaser = false;
             result.geom_path = TeaserMatcher::GeomPath::SVD_FALLBACK;
+            if (use_pose_init) {
+                result.T_tgt_src = result.T_tgt_src * initial_guess;
+            }
             ALOG_INFO(MOD, "[tid={}] step=svd_fallback_done rmse={:.3f}m success={}", tid, result.rmse, result.success);
         } catch (const std::exception& e) {
             ALOG_ERROR(MOD, "[tid={}] step=svd_fallback_exception msg={}", tid, e.what());
@@ -517,6 +537,9 @@ TeaserMatcher::Result TeaserMatcher::match(
         result.T_tgt_src.translation() = solution.translation;
 
         if (result.inlier_ratio < min_inlier_ratio_) {
+            if (use_pose_init) {
+                result.T_tgt_src = result.T_tgt_src * initial_guess;
+            }
             ALOG_INFO(MOD, "[LOOP_COMPUTE][TEASER] teaser_fail reason=inlier_ratio_low inliers={} ratio={:.3f} min_ratio={}", inliers, result.inlier_ratio, min_inlier_ratio_);
             ALOG_WARN(MOD, "[tid={}] step=teaser_inlier_rejected inlier_ratio={:.2f} < thresh={}", tid, result.inlier_ratio, min_inlier_ratio_);
             ALOG_INFO(MOD, "[TRACE] step=loop_match result=fail reason=inlier_ratio_low tid={} inlier_ratio={:.3f} min={}", tid, result.inlier_ratio, min_inlier_ratio_);
@@ -557,6 +580,9 @@ TeaserMatcher::Result TeaserMatcher::match(
             ALOG_INFO(MOD, "[tid={}] step=teaser_rmse_final cnt={} rmse={:.3f}m success={}", 
                      tid, cnt, result.rmse, result.success);
         }
+        if (use_pose_init) {
+            result.T_tgt_src = result.T_tgt_src * initial_guess;
+        }
         // 【V4 优化】不再 release；已通过 pre-filter 拦截垃圾输入
         if (inliers < 10) {
             ALOG_WARN(MOD, "[tid={}] [SAFEGUARD] success path inliers={} < 10, resetting solver",
@@ -596,6 +622,9 @@ TeaserMatcher::Result TeaserMatcher::match(
         runSvdRegistration(src, tgt, corrs, result, max_rmse_);
         result.used_teaser = false;
         result.geom_path = TeaserMatcher::GeomPath::SVD_FALLBACK;
+        if (use_pose_init) {
+            result.T_tgt_src = result.T_tgt_src * initial_guess;
+        }
         ALOG_INFO(MOD, "[tid={}] step=svd_done rmse={:.3f}m success={}", tid, result.rmse, result.success);
     } catch (const std::exception& e) {
         ALOG_ERROR(MOD, "[tid={}] step=svd_exception msg={}", tid, e.what());

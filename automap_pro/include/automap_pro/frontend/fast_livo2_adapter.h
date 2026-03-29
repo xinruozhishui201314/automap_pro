@@ -44,6 +44,15 @@ private:
     Pose3d odometryToPose(const nav_msgs::msg::Odometry::SharedPtr msg) const;
     CloudXYZIPtr cloudMsgToPcl(const sensor_msgs::msg::PointCloud2::SharedPtr msg) const;
 
+    /** 🏛️ [无损增密方案] 缓存每一帧原始雷达扫描及其对应的位姿，用于关键帧触发时生成稠密局部地图 */
+    struct RawSweep {
+        double timestamp;
+        CloudXYZIPtr cloud;
+        Pose3d T_odom_b;
+    };
+    void addSweepToBuffer(double ts, const CloudXYZIPtr& cloud, const Pose3d& pose);
+    CloudXYZIPtr accumulateSweeps(const Pose3d& T_curr_kf);
+
     rclcpp::Node::SharedPtr node_;
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_sub_;
@@ -59,6 +68,10 @@ private:
     bool initialized_ = false;
     Pose3d last_odom_pose_;
     double last_odom_time_ = -1e9;
+    
+    std::deque<RawSweep> sweep_buffer_; // 高频扫描缓冲区
+    int max_sweep_buffer_size_ = 20;    // 默认缓存最近 20 帧高频扫描（约 1-2 秒数据）
+
     CloudXYZIPtr last_cloud_;   // 与 last_odom_time_ 对齐，用于关键帧
     double cloud_ds_res_ = 0.2;
     uint64_t session_id_ = 0;

@@ -44,6 +44,8 @@ private:
     // 🏛️ 生产级命令处理 (Command Handlers)
     void handleSaveMap(const SaveMapRequestEvent& ev);
     void handleGlobalMapBuild(const GlobalMapBuildRequestEvent& ev);
+    /** 发布 GlobalMapBuildResultEvent 并紧跟 MapUpdateEvent(GLOBAL_MAP_REBUILT)，保证 RViz 点云与轨迹刷新顺序一致 */
+    void publishGlobalMapResultAndTriggerVizSync(const CloudXYZIPtr& global);
 
     // GPS 对齐状态处理
     void updateGPSAlignment(const GPSAlignedEvent& ev);
@@ -59,9 +61,14 @@ private:
      * @brief 🏛️ [架构加固] 统一位姿应用网关
      * 处理坐标系补偿 (ODOM -> MAP) 并分发到各个管理器
      */
-    bool applyOptimizedPoses(const std::unordered_map<int, Pose3d>& sm_poses, 
-                             const std::unordered_map<uint64_t, Pose3d>& kf_poses, 
-                             PoseFrame frame, uint64_t version);
+    /**
+     * @param skip_optimize_driven_global_map_request 为 true 时不触发「优化驱动」的全局图构建请求（由调用方在 HBA rebuild 后同步构图）。
+     */
+    bool applyOptimizedPoses(const std::unordered_map<int, Pose3d>& sm_poses,
+                             const std::unordered_map<uint64_t, Pose3d>& kf_poses,
+                             PoseFrame frame, uint64_t version,
+                             uint64_t alignment_epoch = 0,
+                             bool skip_optimize_driven_global_map_request = false);
     bool shouldAcceptOptimizationEvent(const OptimizationResultEvent& ev);
     bool shouldAcceptOptimizationDelta(const OptimizationDeltaEvent& ev) const;
 

@@ -52,7 +52,7 @@ void AutoMapSystem::publishGlobalMap() {
     
     v3::GlobalMapBuildRequestEvent ev;
     ev.voxel_size = map_voxel_size_;
-    ev.async = ConfigManager::instance().asyncGlobalMapBuild();
+    ev.async = ConfigManager::instance().globalMapBuildAsync();
     v3_context_->eventBus()->publish(ev);
     
     // 注意：结果将通过 GlobalMapBuildResultEvent 返回，AutoMapSystem 需要订阅它

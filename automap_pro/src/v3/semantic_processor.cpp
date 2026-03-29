@@ -627,6 +627,7 @@ SparseTrunkColumnEval evalSparseTrunkColumnForLine(
         s_ground_opt.value_or(std::isfinite(support_min_along_up) ? support_min_along_up : p0.dot(up));
 
     const double r_col = std::max(0.05, static_cast<double>(cfg.sparse_trunk_column_radius_m));
+    const double r_canopy = std::max(r_col, static_cast<double>(cfg.sparse_trunk_connectivity_canopy_radius_m));
     const double h_upper_lo =
         std::min(static_cast<double>(cfg.sparse_trunk_upper_rel_z_min_m),
                  static_cast<double>(cfg.sparse_trunk_upper_rel_z_max_m));
@@ -640,16 +641,34 @@ SparseTrunkColumnEval evalSparseTrunkColumnForLine(
     double h_min_p = std::numeric_limits<double>::infinity();
     double h_max_p = -std::numeric_limits<double>::infinity();
 
+    // 🏛️ [Advanced Research] 用于三层连通性分析的辅助计数（兼顾树冠发散特征）
+    int n_root_count = 0;
+    int n_stem_count = 0;
+    int n_canopy_count = 0;
+
     for (const auto& np : nonground->points) {
         if (!std::isfinite(np.x) || !std::isfinite(np.y) || !std::isfinite(np.z)) {
             continue;
         }
         const Eigen::Vector3d p(static_cast<double>(np.x), static_cast<double>(np.y), static_cast<double>(np.z));
         const double d_line = distPointToLineBody(p, p0, dir);
+        const double h = p.dot(up) - s_ground;
+
+        // 三层连通性判定：冠层判定从 1.5m 开始（兼顾低矮枝叶），并使用更大的搜索半径 r_canopy
+        if (cfg.sparse_trunk_connectivity_recall_enable) {
+            if (h < 0.5) {
+                if (d_line <= r_col) ++n_root_count;
+            } else if (h < 1.5) {
+                if (d_line <= r_col) ++n_stem_count;
+            } else if (h < 15.0) {
+                if (d_line <= r_canopy) ++n_canopy_count;
+            }
+        }
+
+        // 维持原有 col 集合（仅窄径点），用于圆柱拟合和锥度校验，保证拟合不被树冠噪点带偏
         if (d_line > r_col) {
             continue;
         }
-        const double h = p.dot(up) - s_ground;
         if (h < -0.35) {
             continue;
         }
@@ -661,10 +680,17 @@ SparseTrunkColumnEval evalSparseTrunkColumnForLine(
         h_max_p = std::max(h_max_p, h);
     }
 
+    if (log_column_stages || cfg.diag_trunk_chain_log) {
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[SEMANTIC][TRUNK_COLUMN][DETAIL] ts=%.3f line_idx=%d step=connectivity "
+            "root=%d stem=%d canopy=%d radii=[r_col:%.2f, r_canopy:%.2f] s_ground=%.2f",
+            log_ts, log_line_idx, n_root_count, n_stem_count, n_canopy_count, r_col, r_canopy, s_ground);
+    }
+
     out.n_column = col.size();
     out.h_min = h_min_p;
     out.h_max = h_max_p;
-    if (col.empty()) {
+    if (col.empty() && !cfg.sparse_trunk_connectivity_recall_enable) {
         out.reject_reason = "empty_column";
         log_reject("collect", "empty_column");
         return out;
@@ -736,12 +762,12 @@ SparseTrunkColumnEval evalSparseTrunkColumnForLine(
     }
 
     const double s_min_ext = static_cast<double>(cfg.sparse_trunk_structural_min_extent_m);
-    if (out.vertical_extent_m < s_min_ext) {
+    if (out.vertical_extent_m < s_min_ext && !cfg.sparse_trunk_connectivity_recall_enable) {
         out.reject_reason = "extent";
         log_reject("structural", "extent");
         return out;
     }
-    if (static_cast<int>(out.n_column) < cfg.sparse_trunk_structural_min_column_points) {
+    if (static_cast<int>(out.n_column) < cfg.sparse_trunk_structural_min_column_points && !cfg.sparse_trunk_connectivity_recall_enable) {
         out.reject_reason = "structural_column_pts";
         log_reject("structural", "column_pts");
         return out;
@@ -772,11 +798,7 @@ SparseTrunkColumnEval evalSparseTrunkColumnForLine(
     }
 
     const size_t n_foliage_window = foliage.size();
-    if (static_cast<int>(n_foliage_window) < cfg.sparse_trunk_structural_min_foliage_points) {
-        out.reject_reason = "structural_foliage";
-        log_reject("structural", "foliage_pts");
-        return out;
-    }
+    bool foliage_pts_ok = static_cast<int>(n_foliage_window) >= cfg.sparse_trunk_structural_min_foliage_points;
 
     const bool taper_ok = sparseTrunkRadialTaperOk(
         col,
@@ -787,98 +809,97 @@ SparseTrunkColumnEval evalSparseTrunkColumnForLine(
         static_cast<double>(cfg.sparse_trunk_structural_taper_max_rel_z_m),
         static_cast<double>(cfg.sparse_trunk_structural_taper_min_ratio),
         cfg.sparse_trunk_structural_taper_min_column_pts);
-    if (!taper_ok) {
-        out.reject_reason = "structural_taper";
-        log_reject("structural", "taper");
+
+    // 🏛 : 改进后的连通性召回：地/干窄搜(r_col)，1.5m以上冠层广搜(r_canopy)
+    bool connectivity_recall = false;
+    if (cfg.sparse_trunk_connectivity_recall_enable) {
+        const int min_p = cfg.sparse_trunk_connectivity_min_per_layer;
+        // 冠层（1.5m以上）通常点云极多且发散，要求其点数显著高于树干层（建议 3-5 倍于 min_p）
+        if (n_root_count >= min_p && n_stem_count >= min_p && n_canopy_count >= (min_p * 3)) {
+            connectivity_recall = true;
+        }
+    }
+
+    if (taper_ok || (foliage_pts_ok && connectivity_recall)) {
+        // 环境点密度检查（Ambient Check）仍保留，防止在墙边搜到大量 canopy 点导致误触发
+        bool ambient_check_ok = true;
+        std::string ambient_reject_detail;
+        if (cfg.sparse_trunk_structural_ambient_check_enable && cfg.sparse_trunk_structural_ambient_max_points > 0) {
+            const double z_pad = static_cast<double>(cfg.sparse_trunk_structural_ambient_rel_z_pad_m);
+            const double h_a_lo = std::max(0.0, h_min_p - z_pad);
+            const double h_a_hi = h_max_p + z_pad;
+            const double r_in = r_col + static_cast<double>(cfg.sparse_trunk_structural_ambient_inner_margin_m);
+            double r_out = static_cast<double>(cfg.sparse_trunk_structural_ambient_outer_radius_m);
+            if (!(r_out > r_in + 0.05)) {
+                r_out = r_in + 0.25;
+            }
+            size_t n_ambient = 0;
+            for (const auto& np : nonground->points) {
+                if (!std::isfinite(np.x) || !std::isfinite(np.y) || !std::isfinite(np.z)) {
+                    continue;
+                }
+                const Eigen::Vector3d p(static_cast<double>(np.x), static_cast<double>(np.y), static_cast<double>(np.z));
+                const double d_line = distPointToLineBody(p, p0, dir);
+                if (d_line <= r_in || d_line > r_out) {
+                    continue;
+                }
+                const double h = p.dot(up) - s_ground;
+                if (h < h_a_lo || h > h_a_hi) {
+                    continue;
+                }
+                ++n_ambient;
+            }
+            if (static_cast<int>(n_ambient) > cfg.sparse_trunk_structural_ambient_max_points) {
+                ambient_check_ok = false;
+                if (log_column_stages || cfg.diag_trunk_chain_log) {
+                    std::ostringstream oss;
+                    oss << "n_ambient=" << n_ambient << " > max=" << cfg.sparse_trunk_structural_ambient_max_points;
+                    ambient_reject_detail = oss.str();
+                }
+            }
+        }
+
+        if (!ambient_check_ok) {
+            out.reject_reason = "structural_ambient";
+            if (!ambient_reject_detail.empty()) out.reject_reason += " (" + ambient_reject_detail + ")";
+            log_reject("structural", out.reject_reason.c_str());
+            return out;
+        }
+        out.used_structural_evidence = true;
+        if (connectivity_recall && !taper_ok) {
+            out.reject_reason = "connectivity_recall_win";
+            if (log_column_stages || cfg.diag_trunk_chain_log) {
+                RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                    "[SEMANTIC][TRUNK_COLUMN] ts=%.3f line_idx=%d step=RECALL_WIN reason=connectivity_survived_low_taper",
+                    log_ts, log_line_idx);
+            }
+        }
+
+        // 合并树干点和树冠点，确保地标点云完整
+        const int fol_cap = cfg.sparse_trunk_structural_merge_foliage_max_points;
+        if (static_cast<int>(foliage.size()) > fol_cap) {
+            std::vector<pcl::PointXYZI> sub;
+            sub.reserve(static_cast<size_t>(fol_cap));
+            const size_t step = std::max<size_t>(1, foliage.size() / static_cast<size_t>(fol_cap));
+            for (size_t i = 0; i < foliage.size() && static_cast<int>(sub.size()) < fol_cap; i += step) {
+                sub.push_back(foliage[i]);
+            }
+            foliage.swap(sub);
+        }
+        const int merge_max = std::max(200, cfg.sparse_trunk_max_fit_points);
+        std::vector<pcl::PointXYZI> merged = mergeTrunkBandAndColumnDedup(col, foliage, 0.08f, merge_max);
+
+        finalize_pass(std::move(merged));
         return out;
     }
 
-    if (cfg.sparse_trunk_structural_ambient_check_enable && cfg.sparse_trunk_structural_ambient_max_points > 0) {
-        const double z_pad = static_cast<double>(cfg.sparse_trunk_structural_ambient_rel_z_pad_m);
-        const double h_a_lo = std::max(0.0, h_min_p - z_pad);
-        const double h_a_hi = h_max_p + z_pad;
-        const double r_in = r_col + static_cast<double>(cfg.sparse_trunk_structural_ambient_inner_margin_m);
-        double r_out = static_cast<double>(cfg.sparse_trunk_structural_ambient_outer_radius_m);
-        if (!(r_out > r_in + 0.05)) {
-            r_out = r_in + 0.25;
-        }
-        size_t n_ambient = 0;
-        for (const auto& np : nonground->points) {
-            if (!std::isfinite(np.x) || !std::isfinite(np.y) || !std::isfinite(np.z)) {
-                continue;
-            }
-            const Eigen::Vector3d p(static_cast<double>(np.x), static_cast<double>(np.y), static_cast<double>(np.z));
-            const double d_line = distPointToLineBody(p, p0, dir);
-            if (d_line <= r_in || d_line > r_out) {
-                continue;
-            }
-            const double h = p.dot(up) - s_ground;
-            if (h < h_a_lo || h > h_a_hi) {
-                continue;
-            }
-            ++n_ambient;
-        }
-        if (static_cast<int>(n_ambient) > cfg.sparse_trunk_structural_ambient_max_points) {
-            out.reject_reason = "structural_ambient_density";
-            if (log_column_stages) {
-                RCLCPP_INFO(
-                    rclcpp::get_logger("automap_system"),
-                    "[SEMANTIC][TRUNK_COLUMN] ts=%.3f line_idx=%d step=structural reject=ambient_density "
-                    "n_ambient=%zu max=%d r_in=%.2f r_out=%.2f h_band=[%.2f,%.2f]",
-                    log_ts,
-                    log_line_idx,
-                    n_ambient,
-                    cfg.sparse_trunk_structural_ambient_max_points,
-                    r_in,
-                    r_out,
-                    h_a_lo,
-                    h_a_hi);
-            } else {
-                log_reject("structural", "ambient_density");
-            }
-            return out;
-        }
-        if (log_column_stages) {
-            RCLCPP_INFO(
-                rclcpp::get_logger("automap_system"),
-                "[SEMANTIC][TRUNK_COLUMN] ts=%.3f line_idx=%d step=structural_ambient_ok n_ambient=%zu max=%d",
-                log_ts,
-                log_line_idx,
-                n_ambient,
-                cfg.sparse_trunk_structural_ambient_max_points);
-        }
+    out.reject_reason = "structural_taper_or_connectivity";
+    if (log_column_stages || cfg.diag_trunk_chain_log) {
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[SEMANTIC][TRUNK_COLUMN][REJECT] ts=%.3f line_idx=%d taper_ok=%d conn_ok=%d fol_ok=%d reason=structural_failed",
+            log_ts, log_line_idx, taper_ok ? 1 : 0, connectivity_recall ? 1 : 0, foliage_pts_ok ? 1 : 0);
     }
-
-    const int fol_cap = cfg.sparse_trunk_structural_merge_foliage_max_points;
-    if (static_cast<int>(foliage.size()) > fol_cap) {
-        std::vector<pcl::PointXYZI> sub;
-        sub.reserve(static_cast<size_t>(fol_cap));
-        const size_t step = std::max<size_t>(1, foliage.size() / static_cast<size_t>(fol_cap));
-        for (size_t i = 0; i < foliage.size() && static_cast<int>(sub.size()) < fol_cap; i += step) {
-            sub.push_back(foliage[i]);
-        }
-        foliage.swap(sub);
-    }
-
-    const int merge_max = std::max(200, cfg.sparse_trunk_max_fit_points);
-    std::vector<pcl::PointXYZI> merged = mergeTrunkBandAndColumnDedup(col, foliage, 0.08f, merge_max);
-
-    out.used_structural_evidence = true;
-    finalize_pass(std::move(merged));
-    if (log_column_stages) {
-        RCLCPP_INFO(
-            rclcpp::get_logger("automap_system"),
-            "[SEMANTIC][TRUNK_COLUMN] ts=%.3f line_idx=%d step=structural_pass samples=%zu n_col=%zu n_up=%zu "
-            "extent_m=%.2f foliage_window=%zu r_fol=%.2f",
-            log_ts,
-            log_line_idx,
-            out.samples.size(),
-            out.n_column,
-            out.n_upper,
-            out.vertical_extent_m,
-            n_foliage_window,
-            r_fol);
-    }
+    log_reject("structural", "taper_or_connectivity");
     return out;
 }
 
@@ -1458,6 +1479,11 @@ SemanticProcessor::SemanticProcessor(const Config& config) : config_(config) {
             geo_cfg.accumulator.enabled = config_.accumulator.enabled;
             geo_cfg.accumulator.max_frames = config_.accumulator.max_frames;
             geo_cfg.accumulator.tag_intensity_with_scan_seq = config_.accumulator.tag_intensity_with_scan_seq;
+            geo_cfg.accumulator.save_debug_pcd = config_.accumulator.save_debug_pcd;
+            geo_cfg.accumulator.save_merged_cloud_dir = config_.accumulator.save_merged_cloud_dir;
+            geo_cfg.accumulator.save_merged_cloud_every_n = config_.accumulator.save_merged_cloud_every_n;
+            geo_cfg.accumulator.save_accum_body_pcd = config_.accumulator.save_accum_body_pcd;
+            geo_cfg.accumulator.save_primitive_input_cloud = config_.accumulator.save_primitive_input_cloud;
             geo_cfg.primitive_classifier.enabled = config_.primitive_classifier.enabled;
             geo_cfg.primitive_classifier.linearity_threshold = config_.primitive_classifier.linearity_threshold;
             geo_cfg.primitive_classifier.planarity_threshold = config_.primitive_classifier.planarity_threshold;
@@ -1592,10 +1618,11 @@ SemanticProcessor::SemanticProcessor(const Config& config) : config_(config) {
             config_.diag_trunk_chain_log ? 1 : 0);
         RCLCPP_INFO(rclcpp::get_logger("automap_system"),
             "[SEMANTIC][Processor][INIT_DIAG] geometric_tree_recall euclidean_cluster(tol=%.3f min_pts=%d max_pts=%d) "
-            "max_lines_per_cluster=%d geometric_only_frame_merge(xy=%.3f use_explicit_xy=%d z=%.3f use_explicit_z=%d "
+            "max_lines_per_cluster=%d skip_trunk_rv_wall_line=%d geometric_only_frame_merge(xy=%.3f use_explicit_xy=%d z=%.3f use_explicit_z=%d "
             "axis_deg=%.1f use_explicit_axis=%d) note='xy/z/axis<=0 uses legacy auto'",
             config_.euclidean_cluster.tolerance_m, config_.euclidean_cluster.min_points, config_.euclidean_cluster.max_points,
             config_.max_lines_per_cluster,
+            config_.trunk_chain_skip_rv_wall_label ? 1 : 0,
             config_.geometric_only_frame_merge.max_xy_m, config_.geometric_only_frame_merge.max_xy_m > 0.f ? 1 : 0,
             config_.geometric_only_frame_merge.max_z_m, config_.geometric_only_frame_merge.max_z_m > 0.f ? 1 : 0,
             config_.geometric_only_frame_merge.max_axis_angle_deg,
@@ -2740,6 +2767,7 @@ SemanticProcessor::ProcessResult SemanticProcessor::process(const CloudXYZIConst
             size_t sparse_trunk_structural_direct_accepted = 0;
             size_t sparse_trunk_fit_recovered = 0;
             size_t sparse_trunk_fallback_accepted = 0;
+            size_t skipped_trunk_rv_wall_line = 0;
             int trunk_line_idx = -1;
             for (const auto& prim : geo_result.primitives) {
                 if (prim.type == GeometricResult::Primitive::Type::PLANE) {
@@ -2806,6 +2834,17 @@ SemanticProcessor::ProcessResult SemanticProcessor::process(const CloudXYZIConst
                     plane->id = allocateLandmarkId();
                     result.plane_landmarks.push_back(plane);
                 } else if (prim.type == GeometricResult::Primitive::Type::LINE) {
+                    // 立面启发（与 geometric_processor.h 注释一致）：不将此类 LINE 当作 tree 候选。
+                    if (config_.trunk_chain_skip_rv_wall_label &&
+                        (prim.range_view_label == 1u || prim.range_view_label == 3u)) {
+                        ++skipped_trunk_rv_wall_line;
+                        if (config_.diag_trunk_chain_log || geoDebugEnabled(config_)) {
+                            RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                                "[SEMANTIC][TRUNK_CHAIN] ts=%.3f line_idx=%d step=skip_wall_label label=%u",
+                                ts, trunk_line_idx + 1, prim.range_view_label);
+                        }
+                        continue;
+                    }
                     ++trunk_line_idx;
                     std::vector<pcl::PointXYZI> line_points;
                     if (prim.points) {
@@ -2993,7 +3032,7 @@ SemanticProcessor::ProcessResult SemanticProcessor::process(const CloudXYZIConst
                 RCLCPP_INFO(rclcpp::get_logger("automap_system"),
                     "[GEOMETRIC][SEM_PROCESSOR] step=geometric_only_done ts=%.3f trees=%zu planes=%zu geo_ground_pts=%zu "
                     "mask_ground_px=%zu ground_class=%d "
-                    "merged_duplicates=%zu rejected_line_fit=%zu rejected_line_tilt=%zu rejected_line_low_conf=%zu rejected_line_trunk_near_ego=%zu "
+                    "merged_duplicates=%zu skipped_trunk_rv_wall_line=%zu rejected_line_fit=%zu rejected_line_tilt=%zu rejected_line_low_conf=%zu rejected_line_trunk_near_ego=%zu "
                     "sparse_col_gate=%zu sparse_structural=%zu sparse_structural_direct=%zu "
                     "sparse_col_recovered=%zu sparse_col_fallback=%zu shaft_candidates=%zu shaft_accepted=%zu labeled_pts=%zu",
                     ts,
@@ -3003,6 +3042,7 @@ SemanticProcessor::ProcessResult SemanticProcessor::process(const CloudXYZIConst
                     mask_ground_paint_px,
                     static_cast<int>(ground_paint_u8_done),
                     merged_duplicate_trees,
+                    skipped_trunk_rv_wall_line,
                     rejected_line_cylinder_fit,
                     rejected_line_tilt,
                     rejected_line_low_confidence,

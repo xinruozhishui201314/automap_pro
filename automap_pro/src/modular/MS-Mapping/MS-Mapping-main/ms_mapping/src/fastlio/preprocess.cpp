@@ -1300,9 +1300,11 @@ void Preprocess::give_feature(pcl::PointCloud<PointType> &pl,
         return;
     }
     uint head = 0;
-
-    while (types[head].range < blind) {
+    while (head < static_cast<uint>(plsize) && types[head].range < blind) {
         head++;
+    }
+    if (head >= static_cast<uint>(plsize)) {
+        return;
     }
 
     // Surf

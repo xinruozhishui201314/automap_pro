@@ -246,6 +246,29 @@ IncrementalOptimizer::~IncrementalOptimizer() {
     RCLCPP_INFO(rclcpp::get_logger("automap_system"), "[IncrementalOptimizer][SHUTDOWN] destructor done");
 }
 
+void IncrementalOptimizer::tryLinkSubmapAnchorKeyFrame_(int sm_id, int anchor_kf_id) {
+    if (sm_id < 0 || anchor_kf_id < 0) {
+        return;
+    }
+    if (submap_sm_kf_anchor_linked_.count(sm_id)) {
+        return;
+    }
+    if (!node_exists_.count(sm_id)) {
+        return;
+    }
+    if (!keyframe_node_exists_.count(anchor_kf_id)) {
+        return;
+    }
+    auto anchor_noise = gtsam::noiseModel::Diagonal::Variances(prior_var6_);
+    staged_factors_.add(gtsam::BetweenFactor<gtsam::Pose3>(
+        SM(sm_id), KF(anchor_kf_id), gtsam::Pose3::Identity(), anchor_noise));
+    factor_count_++;
+    submap_sm_kf_anchor_linked_.insert(sm_id);
+    RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+        "[IncrementalOptimizer][BACKEND][LINK] tryLinkSubmapAnchorKeyFrame_: SM(%d) <-> anchor KF(%d) Identity Between added",
+        sm_id, anchor_kf_id);
+}
+
 void IncrementalOptimizer::addSubMapNode(int sm_id, const Pose3d& init_pose, bool fixed) {
     BACKEND_STEP("step=addSubMapNode_enter sm_id=%d fixed=%d nodes_before=%d factor_count=%d",
         sm_id, fixed ? 1 : 0, node_count_, factor_count_);
@@ -292,6 +315,8 @@ void IncrementalOptimizer::addSubMapNode(int sm_id, const Pose3d& init_pose, boo
             params.cacheLinearizedFactors = true;
             isam2_ = gtsam::ISAM2(params);
             node_exists_.clear();
+            submap_anchor_kf_id_.clear();
+            submap_sm_kf_anchor_linked_.clear();
             node_count_ = 0;
             factor_count_ = 0;
             has_prior_ = false;
@@ -335,17 +360,9 @@ void IncrementalOptimizer::addSubMapNode(int sm_id, const Pose3d& init_pose, boo
         CONSTRAINT_LOG("step=prior_submap sm_id=%d result=ok factor_count=%d", sm_id, factor_count_);
     }
 
-    // 🔧 修复孤立节点：确保子图节点 SM(sm_id) 总是链接到它的首个关键帧 KF(sm_id * MAX_KF_PER_SUBMAP)
-    // 即使不是首个 Prior，也要有 BetweenFactor 链接到已有的关键帧节点，避免 IndeterminantLinearSystemException
-    int anchor_kf_id = sm_id * MAX_KF_PER_SUBMAP;
-    if (keyframe_node_exists_.count(anchor_kf_id)) {
-        auto anchor_noise = gtsam::noiseModel::Diagonal::Variances(prior_var6_);
-        staged_factors_.add(gtsam::BetweenFactor<gtsam::Pose3>(
-            SM(sm_id), KF(anchor_kf_id), gtsam::Pose3::Identity(), anchor_noise));
-        factor_count_++;
-        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-            "[IncrementalOptimizer][BACKEND][LINK] addSubMapNode: Linked SM(%d) to existing anchor KF(%d)",
-            sm_id, anchor_kf_id);
+    // 使用真实首关键帧全局 id（由 addKeyFrameNode 登记），禁止 sm_id*MAX_KF_PER_SUBMAP（全局 kf id 递增时永不命中）
+    if (submap_anchor_kf_id_.count(sm_id)) {
+        tryLinkSubmapAnchorKeyFrame_(sm_id, submap_anchor_kf_id_[sm_id]);
     }
 
     // 🏛️ [架构加固] 触发事务提交检查
@@ -716,10 +733,20 @@ OptimizationResult IncrementalOptimizer::addLoopFactor(
 
 OptimizationResult IncrementalOptimizer::addLoopFactor(const LoopConstraint::Ptr& lc) {
     if (!lc) return OptimizationResult{};
+    // 关键帧级回环：图节点键与 addKeyFrameNode(kf->id) 一致，必须用 KeyFrame::id（经 keyframe_global_id_* 传递），
+    // 禁止 submap*MAX+index（与全局递增 kf->id 不一致，多子图下会错连或 node_not_in_graph）。
     if (lc->keyframe_i >= 0 && lc->keyframe_j >= 0) {
-        const int node_i = lc->submap_i * MAX_KF_PER_SUBMAP + lc->keyframe_i;
-        const int node_j = lc->submap_j * MAX_KF_PER_SUBMAP + lc->keyframe_j;
-        return addLoopFactorBetweenKeyframes(node_i, node_j, lc->delta_T, lc->information);
+        if (lc->keyframe_global_id_i < 0 || lc->keyframe_global_id_j < 0) {
+            CONSTRAINT_LOG("step=loop_inter_kf result=skip reason=missing_keyframe_global_id sub_i=%d sub_j=%d kf_idx_i=%d kf_idx_j=%d",
+                           lc->submap_i, lc->submap_j, lc->keyframe_i, lc->keyframe_j);
+            RCLCPP_WARN(rclcpp::get_logger("automap_system"),
+                        "[IncrementalOptimizer][BACKEND][LOOP] skip keyframe loop: missing keyframe_global_id (need KF graph id), "
+                        "sub_i=%d sub_j=%d kf_idx_i=%d kf_idx_j=%d",
+                        lc->submap_i, lc->submap_j, lc->keyframe_i, lc->keyframe_j);
+            return OptimizationResult{};
+        }
+        return addLoopFactorBetweenKeyframes(
+            lc->keyframe_global_id_i, lc->keyframe_global_id_j, lc->delta_T, lc->information);
     }
     return addLoopFactor(lc->submap_i, lc->submap_j, lc->delta_T, lc->information);
 }
@@ -1167,7 +1194,8 @@ int IncrementalOptimizer::flushPendingGPSFactorsInternal() {
 
 // ── KeyFrame 级别因子实现 ───────────────────────────────────────────────
 
-void IncrementalOptimizer::addKeyFrameNode(int kf_id, const Pose3d& init_pose, bool fixed, bool is_first_kf_of_submap) {
+void IncrementalOptimizer::addKeyFrameNode(int kf_id, const Pose3d& init_pose, bool fixed, bool is_first_kf_of_submap,
+                                           int submap_id_for_sm_kf_anchor) {
     // 🔧 DEBUG: 记录锁等待开始
     auto lock_start = std::chrono::steady_clock::now();
     std::unique_lock<std::shared_mutex> lk(rw_mutex_);
@@ -1260,6 +1288,7 @@ void IncrementalOptimizer::addKeyFrameNode(int kf_id, const Pose3d& init_pose, b
         d.pose = init_pose;
         d.fixed = fixed;
         d.is_first_kf_of_submap = is_first_kf_of_submap;
+        d.submap_id = submap_id_for_sm_kf_anchor;
         history_keyframe_data_.push_back(d);
     }
 
@@ -1282,19 +1311,17 @@ void IncrementalOptimizer::addKeyFrameNode(int kf_id, const Pose3d& init_pose, b
     // 🔧 修复: 第一个 keyframe 必须添加 Prior 因子，避免孤立节点引发 IndeterminantLinearSystemException
     // - fixed: 外部显式指定（如回环修正后的重锚定）
     // - !has_prior_: 整个 session 的第一帧（之后所有帧通过 Between 链连接）
-    // 🔧 [核心修复] 建立 's' 节点 (Submap) 与 'x' 节点 (KeyFrame) 的连接：
-    // 通过 BetweenFactor 将子图锚点与子图节点关联，解决 iSAM2 因子图不连通导致的漂移与重影问题。
-    // 🔧 增强：只要是该子图的首帧，就尝试建立连接（无论 sm 节点还是 kf 节点谁先到达）
-    int sm_id = kf_id / MAX_KF_PER_SUBMAP;
-    if (is_first_kf_of_submap && node_exists_.count(sm_id)) {
-        gtsam::noiseModel::Diagonal::shared_ptr anchor_noise = 
-            gtsam::noiseModel::Diagonal::Variances(prior_var6_);
-        staged_factors_.add(gtsam::BetweenFactor<gtsam::Pose3>(
-            SM(sm_id), KF(kf_id), gtsam::Pose3::Identity(), anchor_noise));
-        factor_count_++;
-        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-            "[IncrementalOptimizer][BACKEND][LINK] addKeyFrameNode: Linked existing SM(%d) to anchor KF(%d)",
-            sm_id, kf_id);
+    // 🔧 [核心修复] SM–首KF Identity：必须用 KeyFrame::submap_id（调用方传入），禁止 kf_id/MAX_KF_PER_SUBMAP
+    // （全局 kf id 0,1,2… 时整除恒为 0，会把所有子图首帧错误锚到 SM(0)）。
+    if (is_first_kf_of_submap && submap_id_for_sm_kf_anchor >= 0) {
+        submap_anchor_kf_id_[submap_id_for_sm_kf_anchor] = kf_id;
+        tryLinkSubmapAnchorKeyFrame_(submap_id_for_sm_kf_anchor, kf_id);
+        if (!submap_sm_kf_anchor_linked_.count(submap_id_for_sm_kf_anchor)) {
+            RCLCPP_DEBUG(rclcpp::get_logger("automap_system"),
+                "[IncrementalOptimizer][BACKEND][LINK] SM–KF anchor deferred: sm_id=%d anchor_kf_id=%d "
+                "(SM 尚未入图属预期；冻结子图发布 SUBMAP_NODE 时将补 Between；grep tryLinkSubmapAnchorKeyFrame_)",
+                submap_id_for_sm_kf_anchor, kf_id);
+        }
     }
 
     bool need_prior = fixed || !has_prior_;
@@ -2739,12 +2766,10 @@ OptimizationResult IncrementalOptimizer::commitAndUpdate() {
         // 不可恢复的异常：清理 pending 状态，避免死亡螺旋
         // 可恢复的异常：保留 pending 状态，下次重试
         std::string exc_msg = e.what();
-        bool is_unrecoverable = false;
         if (exc_msg.find("IndeterminantLinearSystemException") != std::string::npos ||
             exc_msg.find("key already exists") != std::string::npos ||
             exc_msg.find("InvalidNoise") != std::string::npos ||
             exc_msg.find("Unable to factor") != std::string::npos) {
-            is_unrecoverable = true;
             RCLCPP_WARN(rclcpp::get_logger("automap_system"),
                 "[IncrementalOptimizer][DIAG] Unrecoverable exception detected, clearing pending state to avoid death spiral");
             std::vector<int> kf_ids_in_pending;
@@ -3040,6 +3065,18 @@ void IncrementalOptimizer::rebuildAfterGPSAlign(const std::vector<SubmapData>& s
                                                 const std::vector<LoopFactorItemKF>& kf_loop_factors) {
     std::unique_lock<std::shared_mutex> lk(rw_mutex_);
     if (!prior_noise_) return;
+
+    std::vector<KeyFrameData> kf_work = keyframe_data;
+    const size_t missing_before = std::count_if(kf_work.begin(), kf_work.end(),
+        [](const KeyFrameData& d) { return d.submap_id < 0; });
+    inferMissingSubmapIdsInKeyFrameHistory(kf_work);
+    if (missing_before > 0) {
+        const size_t still_missing = std::count_if(kf_work.begin(), kf_work.end(),
+            [](const KeyFrameData& d) { return d.submap_id < 0; });
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[IncrementalOptimizer][BACKEND][REBUILD] inferMissingSubmapIds: kf_total=%zu had_submap_id_missing=%zu still_missing=%zu",
+            kf_work.size(), missing_before, still_missing);
+    }
     gtsam::ISAM2Params params;
     params.relinearizeThreshold = isam2_relin_thresh_;
     params.relinearizeSkip = isam2_relin_skip_;
@@ -3059,6 +3096,8 @@ void IncrementalOptimizer::rebuildAfterGPSAlign(const std::vector<SubmapData>& s
     factor_count_ = 0;
     has_prior_ = false;
     current_pose_frame_ = PoseFrame::MAP; // 🏛️ [架构加固] 重建后因子图语义切换为 MAP
+    submap_anchor_kf_id_.clear();
+    submap_sm_kf_anchor_linked_.clear();
 
     // 1. 恢复子图节点
     for (const auto& d : submap_data) {
@@ -3075,8 +3114,8 @@ void IncrementalOptimizer::rebuildAfterGPSAlign(const std::vector<SubmapData>& s
         }
     }
 
-    // 2. 恢复关键帧节点
-    for (const auto& d : keyframe_data) {
+    // 2. 恢复关键帧节点（kf_work 已补全 submap_id，供 SM–KF 锚定）
+    for (const auto& d : kf_work) {
         keyframe_node_exists_[d.id] = true;
         // 🏛️ [架构加固] 事务性插入：先进入 staging
         staged_values_.insert(KF(d.id), toPose3(d.pose));
@@ -3089,13 +3128,16 @@ void IncrementalOptimizer::rebuildAfterGPSAlign(const std::vector<SubmapData>& s
             factor_count_++;
         }
 
-        // 🔧 [核心修复] 在重建过程中同样建立 's' 与 'x' 节点的连接，确保 GPS 对齐后的全局一致性。
-        int sm_id = d.id / MAX_KF_PER_SUBMAP;
-        if (d.is_first_kf_of_submap && node_exists_.count(sm_id)) {
+        // SM–首KF：使用 submap_id（显式或 inferMissingSubmapIdsInKeyFrameHistory 推断）
+        const int sm_anchor = d.submap_id;
+        if (d.is_first_kf_of_submap && sm_anchor >= 0 && node_exists_.count(sm_anchor)) {
             auto anchor_noise = gtsam::noiseModel::Diagonal::Variances(prior_var6_);
             staged_factors_.add(gtsam::BetweenFactor<gtsam::Pose3>(
-                SM(sm_id), KF(d.id), gtsam::Pose3::Identity(), anchor_noise));
+                SM(sm_anchor), KF(d.id), gtsam::Pose3::Identity(), anchor_noise));
             factor_count_++;
+            // 与增量路径一致，避免后续 tryLink 重复添加 Identity Between
+            submap_anchor_kf_id_[sm_anchor] = d.id;
+            submap_sm_kf_anchor_linked_.insert(sm_anchor);
         }
     }
 
@@ -3140,7 +3182,7 @@ void IncrementalOptimizer::rebuildAfterGPSAlign(const std::vector<SubmapData>& s
         history_submap_data_ = submap_data;
         history_odom_factors_ = odom_factors;
         history_loop_factors_ = std::move(loop_filtered);
-        history_keyframe_data_ = keyframe_data;
+        history_keyframe_data_ = std::move(kf_work);
         history_kf_odom_factors_ = kf_odom_factors;
         history_kf_loop_factors_ = std::move(kf_loop_filtered);
     }
@@ -3193,29 +3235,16 @@ void IncrementalOptimizer::reset() {
         "[IncrementalOptimizer][BACKEND][RESET] optimization_in_progress=0 (grep BACKEND RESET 定位 reset 调用)");
 
     std::unique_lock<std::shared_mutex> lk(rw_mutex_);
-    gtsam::ISAM2Params params;
-    params.relinearizeThreshold = isam2_relin_thresh_;
-    params.relinearizeSkip      = isam2_relin_skip_;
-    isam2_ = gtsam::ISAM2(params);
-    pending_graph_.resize(0);
-    pending_values_.clear();
-    current_estimate_.clear();
-    node_exists_.clear();
-    keyframe_node_exists_.clear();
-    pending_odom_factors_submap_.clear();
-    keyframe_count_ = 0;
-    last_keyframe_id_ = -1;
-    pending_gps_factors_.clear();
-    pending_gps_factors_kf_.clear();
-    node_count_ = 0;
-    factor_count_ = 0;
-    has_prior_ = false;
+    resetInternal();
 }
 
 void IncrementalOptimizer::transformHistoryAndRebuild(const Pose3d& T_map_odom) {
     RCLCPP_INFO(rclcpp::get_logger("automap_system"),
         "[IncrementalOptimizer][BACKEND][REBUILD] transformHistoryAndRebuild ENTER: t=[%.2f, %.2f, %.2f]",
         T_map_odom.translation().x(), T_map_odom.translation().y(), T_map_odom.translation().z());
+
+    // 🏛️ [架构加固] 重建期间独占写锁，防止并发 addNode 导致状态撕裂
+    std::unique_lock<std::shared_mutex> lk(rw_mutex_);
 
     std::vector<SubmapData> old_submaps;
     std::vector<OdomFactorItem> old_odom;
@@ -3239,50 +3268,60 @@ void IncrementalOptimizer::transformHistoryAndRebuild(const Pose3d& T_map_odom) 
         history_loop_factors_.clear();
         history_keyframe_data_.clear();
         history_kf_odom_factors_.clear();
-        history_kf_loop_factors_.clear();
+        history_loop_factors_.clear();
     }
 
-    // 重置 iSAM2 状态
-    reset();
+    inferMissingSubmapIdsInKeyFrameHistory(old_kf_data);
+
+    // 重置 iSAM2 状态（已在重置前持有 rw_mutex_，resetInternal 不加锁）
+    resetInternal(); 
 
     // 🏛️ [对齐逻辑] 对历史数据应用 T_map_odom 转换并重新入图
     // 1. 恢复关键帧节点
     for (auto& kf : old_kf_data) {
         kf.pose = T_map_odom * kf.pose;
-        addKeyFrameNode(kf.id, kf.pose, kf.fixed, kf.is_first_kf_of_submap);
+        addKeyFrameNodeInternal(kf.id, kf.pose, kf.fixed, kf.is_first_kf_of_submap, kf.submap_id);
     }
 
     // 2. 恢复关键帧里程计因子
     for (const auto& f : old_kf_odom) {
-        addOdomFactorBetweenKeyframes(f.from_id, f.to_id, f.rel_pose, f.info_matrix);
+        addOdomFactorBetweenKeyframesInternal(f.from_id, f.to_id, f.rel_pose, f.info_matrix);
     }
 
     // 3. 恢复关键帧回环因子
     for (const auto& f : old_kf_loop) {
-        addLoopFactorDeferred(f.from_id, f.to_id, f.rel_pose, f.info_matrix);
+        addLoopFactorDeferredInternal(f.from_id, f.to_id, f.rel_pose, f.info_matrix);
     }
 
     // 4. 恢复子图节点
     for (auto& sm : old_submaps) {
         sm.pose = T_map_odom * sm.pose;
-        addSubMapNode(sm.id, sm.pose, sm.is_fixed);
+        addSubMapNodeInternal(sm.id, sm.pose, sm.is_fixed);
     }
 
     // 5. 恢复子图里程计因子
     for (const auto& f : old_odom) {
-        addOdomFactor(f.from_id, f.to_id, f.rel_pose, f.info_matrix);
+        addOdomFactorInternal(f.from_id, f.to_id, f.rel_pose, f.info_matrix);
     }
 
     // 6. 恢复子图回环因子
     for (const auto& f : old_loop) {
-        addLoopFactor(f.from_id, f.to_id, f.rel_pose, f.info_matrix);
+        addLoopFactorInternal(f.from_id, f.to_id, f.rel_pose, f.info_matrix);
     }
 
+    // 🏛️ [架构加固] 标注坐标系已升级为 MAP
+    current_pose_frame_ = PoseFrame::MAP;
+
     // 提交所有恢复的因子
-    commitAndUpdate();
+    OptimizationResult res = commitAndUpdate();
+    
+    // 🏛️ [关键修复] 重建后必须显式通知所有观察者（MappingModule 等），
+    // 否则由于历史帧位姿已全量突变，下游模块若不即时同步将导致严重的重影。
+    lk.unlock(); // 释放锁后再回调，防止死锁
+    notifyPoseUpdate(res);
 
     RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-        "[IncrementalOptimizer][BACKEND][REBUILD] transformHistoryAndRebuild DONE: factors=%d nodes=%d",
+        "[IncrementalOptimizer][BACKEND][REBUILD] transformHistoryAndRebuild DONE: factors=%d nodes=%d (grep REBUILD DONE)",
         factor_count_, node_count_);
 }
 
@@ -3312,6 +3351,8 @@ void IncrementalOptimizer::clearForShutdown() {
     last_keyframe_id_ = -1;
     pending_gps_factors_.clear();
     pending_gps_factors_kf_.clear();
+    submap_anchor_kf_id_.clear();
+    submap_sm_kf_anchor_linked_.clear();
     RCLCPP_DEBUG(rclcpp::get_logger("automap_system"), "[IncrementalOptimizer][SHUTDOWN] graph/values cleared");
 
     isam2_ = gtsam::ISAM2(params);
@@ -3568,6 +3609,8 @@ void IncrementalOptimizer::resetForRecovery() {
     keyframe_count_ = 0;
     last_keyframe_id_ = -1;
     pending_gps_factors_kf_.clear();
+    submap_anchor_kf_id_.clear();
+    submap_sm_kf_anchor_linked_.clear();
     MetricsRegistry::instance().setGauge(metrics::ISAM2_PENDING_GPS_KF, 0.0);
 
     // 重置健康状态
@@ -3659,6 +3702,151 @@ bool IncrementalOptimizer::isGroundedInternal(gtsam::Key key) const {
     }
     
     return false;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// [架构加固] 内部无锁版本，用于 transformHistoryAndRebuild 等复合事务操作
+// ─────────────────────────────────────────────────────────────────────────────
+
+void IncrementalOptimizer::resetInternal() {
+    gtsam::ISAM2Params params;
+    params.relinearizeThreshold = isam2_relin_thresh_;
+    params.relinearizeSkip = isam2_relin_skip_;
+    params.enableRelinearization = isam2_enable_relin_;
+    params.factorization = gtsam::ISAM2Params::QR;
+    params.cacheLinearizedFactors = false;
+
+    isam2_ = gtsam::ISAM2(params);
+    pending_graph_.resize(0);
+    pending_values_.clear();
+    staged_factors_.resize(0);
+    staged_values_.clear();
+    current_estimate_.clear();
+    node_exists_.clear();
+    keyframe_node_exists_.clear();
+    submap_anchor_kf_id_.clear();
+    submap_sm_kf_anchor_linked_.clear();
+    node_count_ = 0;
+    factor_count_ = 0;
+    keyframe_count_ = 0;
+    last_keyframe_id_ = -1;
+    has_prior_ = false;
+    current_pose_frame_ = PoseFrame::ODOM;
+    RCLCPP_INFO(rclcpp::get_logger("automap_system"), "[IncrementalOptimizer][BACKEND] resetInternal done");
+}
+
+void IncrementalOptimizer::addKeyFrameNodeInternal(int kf_id, const Pose3d& pose, bool fixed, bool is_first_kf_of_submap, int sm_anchor) {
+    if (!prior_noise_ || keyframe_node_exists_.count(kf_id) || pending_values_.exists(KF(kf_id)) || current_estimate_.exists(KF(kf_id))) return;
+    if (!pose.matrix().allFinite()) return;
+
+    keyframe_node_exists_[kf_id] = true;
+    keyframe_count_++;
+    staged_values_.insert(KF(kf_id), toPose3(pose));
+
+    {
+        std::lock_guard<std::mutex> hlk(history_mutex_);
+        KeyFrameData d; d.id = kf_id; d.pose = pose; d.fixed = fixed; 
+        d.is_first_kf_of_submap = is_first_kf_of_submap; d.submap_id = sm_anchor;
+        history_keyframe_data_.push_back(d);
+    }
+
+    if (!has_prior_ || fixed) {
+        staged_factors_.add(gtsam::PriorFactor<gtsam::Pose3>(KF(kf_id), toPose3(pose), gtsam::noiseModel::Diagonal::Variances(prior_var6_)));
+        factor_count_++;
+        has_prior_ = true;
+    }
+
+    if (last_keyframe_id_ >= 0 && !is_first_kf_of_submap) {
+        Pose3d rel = last_keyframe_pose_.inverse() * pose;
+        addOdomFactorBetweenKeyframesInternal(last_keyframe_id_, kf_id, rel, Mat66d::Identity() * 100.0);
+    }
+
+    if (is_first_kf_of_submap && sm_anchor >= 0) {
+        submap_anchor_kf_id_[sm_anchor] = kf_id;
+        tryLinkSubmapAnchorKeyFrame_(sm_anchor, kf_id);
+    }
+
+    last_keyframe_id_ = kf_id;
+    last_keyframe_pose_ = pose;
+    tryMoveStagedToPendingInternal();
+}
+
+void IncrementalOptimizer::addSubMapNodeInternal(int id, const Pose3d& pose, bool fixed) {
+    if (!prior_noise_ || node_exists_.count(id) || pending_values_.exists(SM(id)) || current_estimate_.exists(SM(id))) return;
+    if (!pose.matrix().allFinite()) return;
+
+    node_exists_[id] = true;
+    staged_values_.insert(SM(id), toPose3(pose));
+    node_count_++;
+
+    if (fixed || !has_prior_) {
+        staged_factors_.add(gtsam::PriorFactor<gtsam::Pose3>(SM(id), toPose3(pose), gtsam::noiseModel::Diagonal::Variances(prior_var6_)));
+        factor_count_++;
+        has_prior_ = true;
+    }
+
+    if (submap_anchor_kf_id_.count(id)) {
+        tryLinkSubmapAnchorKeyFrame_(id, submap_anchor_kf_id_[id]);
+    }
+
+    {
+        std::lock_guard<std::mutex> hlk(history_mutex_);
+        SubmapData d; d.id = id; d.pose = pose; d.is_fixed = fixed;
+        history_submap_data_.push_back(d);
+    }
+    tryMoveStagedToPendingInternal();
+}
+
+void IncrementalOptimizer::addOdomFactorBetweenKeyframesInternal(int from, int to, const Pose3d& rel, const Mat66d& info_matrix) {
+    if (!prior_noise_ || !keyframe_node_exists_.count(from) || !keyframe_node_exists_.count(to)) return;
+    staged_factors_.add(gtsam::BetweenFactor<gtsam::Pose3>(KF(from), KF(to), toPose3(rel), infoToNoiseDiagonal(info_matrix)));
+    factor_count_++;
+    {
+        std::lock_guard<std::mutex> hlk(history_mutex_);
+        OdomFactorItemKF item; item.from_id = from; item.to_id = to; item.rel_pose = rel; item.info_matrix = info_matrix;
+        history_kf_odom_factors_.push_back(item);
+    }
+    tryMoveStagedToPendingInternal();
+}
+
+void IncrementalOptimizer::addLoopFactorDeferredInternal(int from, int to, const Pose3d& rel, const Mat66d& info_matrix) {
+    if (!prior_noise_ || !keyframe_node_exists_.count(from) || !keyframe_node_exists_.count(to)) return;
+    staged_factors_.add(gtsam::BetweenFactor<gtsam::Pose3>(KF(from), KF(to), toPose3(rel), infoToNoiseDiagonal(info_matrix)));
+    factor_count_++;
+    {
+        std::lock_guard<std::mutex> hlk(history_mutex_);
+        LoopFactorItemKF item; item.from_id = from; item.to_id = to; item.rel_pose = rel; item.info_matrix = info_matrix;
+        history_kf_loop_factors_.push_back(item);
+    }
+    tryMoveStagedToPendingInternal();
+}
+
+void IncrementalOptimizer::addOdomFactorInternal(int from, int to, const Pose3d& rel, const Mat66d& info_matrix) {
+    if (!prior_noise_) return;
+    if (!node_exists_.count(from) || !node_exists_.count(to)) {
+        pending_odom_factors_submap_.push_back({from, to, rel, info_matrix});
+        return;
+    }
+    staged_factors_.add(gtsam::BetweenFactor<gtsam::Pose3>(SM(from), SM(to), toPose3(rel), infoToNoiseDiagonal(info_matrix)));
+    factor_count_++;
+    {
+        std::lock_guard<std::mutex> hlk(history_mutex_);
+        OdomFactorItem item; item.from_id = from; item.to_id = to; item.rel_pose = rel; item.info_matrix = info_matrix;
+        history_odom_factors_.push_back(item);
+    }
+    tryMoveStagedToPendingInternal();
+}
+
+void IncrementalOptimizer::addLoopFactorInternal(int from, int to, const Pose3d& rel, const Mat66d& info_matrix) {
+    if (!prior_noise_ || !node_exists_.count(from) || !node_exists_.count(to)) return;
+    staged_factors_.add(gtsam::BetweenFactor<gtsam::Pose3>(SM(from), SM(to), toPose3(rel), infoToNoiseDiagonal(info_matrix)));
+    factor_count_++;
+    {
+        std::lock_guard<std::mutex> hlk(history_mutex_);
+        LoopFactorItem item; item.from_id = from; item.to_id = to; item.rel_pose = rel; item.info_matrix = info_matrix;
+        history_loop_factors_.push_back(item);
+    }
+    tryMoveStagedToPendingInternal();
 }
 
 } // namespace automap_pro

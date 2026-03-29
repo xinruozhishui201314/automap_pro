@@ -2,6 +2,7 @@
 #include <patchworkpp/patchworkpp.hpp>
 #include <Eigen/Geometry>
 #include <pcl/common/transforms.h>
+#include <pcl/io/pcd_io.h>
 #include <pcl/segmentation/extract_clusters.h>
 #include <pcl/features/normal_3d.h>
 #include <pcl/filters/voxel_grid.h>
@@ -11,7 +12,9 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstdio>
 #include <cstdint>
+#include <filesystem>
 #include <limits>
 #include <string>
 #include <opencv2/core.hpp>
@@ -44,6 +47,60 @@ bool geoDebugEnabled(const GeometricProcessorConfig& cfg) {
 rclcpp::Clock& geoThrottleClock() {
     static rclcpp::Clock clock(RCL_SYSTEM_TIME);
     return clock;
+}
+
+/// Debug dump: merged multi-frame body cloud or primitive-classifier input (current body frame, binary compressed PCD).
+void maybeSaveGeoSemanticDebugPcd(const GeometricProcessorConfig& cfg,
+                                  uint64_t frame_idx,
+                                  double ts,
+                                  const pcl::PointCloud<pcl::PointXYZI>::ConstPtr& cloud,
+                                  const char* tag) {
+    if (!cfg.accumulator.save_debug_pcd) {
+        return;
+    }
+    const std::string& dir = cfg.accumulator.save_merged_cloud_dir;
+    if (dir.empty() || !cloud || cloud->empty() || !tag) {
+        return;
+    }
+    const int every_n = std::max(1, std::min(100000, cfg.accumulator.save_merged_cloud_every_n));
+    if ((frame_idx % static_cast<uint64_t>(every_n)) != 0u) {
+        return;
+    }
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    if (ec) {
+        RCLCPP_WARN_THROTTLE(rclcpp::get_logger("automap_system"),
+            geoThrottleClock(),
+            10000,
+            "[GEOMETRIC][SAVE_ACCUM] mkdir failed path=%s msg=%s",
+            dir.c_str(),
+            ec.message().c_str());
+        return;
+    }
+    char fname[384];
+    std::snprintf(fname,
+        sizeof(fname),
+        "geo_sem_%s_idx%lu_ts%.6f_pts%zu.pcd",
+        tag,
+        static_cast<unsigned long>(frame_idx),
+        ts,
+        cloud->size());
+    const fs::path out_path = fs::path(dir) / fname;
+    const int rc = pcl::io::savePCDFileBinaryCompressed(out_path.string(), *cloud);
+    if (rc != 0) {
+        RCLCPP_WARN(rclcpp::get_logger("automap_system"),
+            "[GEOMETRIC][SAVE_ACCUM] save failed rc=%d path=%s",
+            rc,
+            out_path.string().c_str());
+        return;
+    }
+    RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+        "[GEOMETRIC][SAVE_ACCUM] wrote %s pts=%zu tag=%s every_n=%d",
+        out_path.string().c_str(),
+        cloud->size(),
+        tag,
+        every_n);
 }
 
 /** Patchwork++ 中 sensor_height 为正，且 RNR 使用 z < -sensor_height - 0.8，即默认假设车体系 z 向上、路面在传感器下方（z 为负）。 */
@@ -901,7 +958,7 @@ GeometricProcessor::GeometricProcessor(const GeometricProcessorConfig& config)
         RCLCPP_INFO(rclcpp::get_logger("automap_system"),
             "[GEOMETRIC][INIT] log(level=%s detail=%d) patchwork(sensor_height=%.2f auto_height=%d xy=[%.1f,%.1f] pct=%.2f ema_a=%.2f z/r_max=%.2f "
             "odom_gravity=%d up_axis=%d level_pw=%d num_iter=%d th_dist=%.3f max_range=%.1f) "
-            "accumulator(enabled=%d max_frames=%d tag_scan_intensity=%d) primitive_roi(en=%d R=%.1f rmin=%.1f rmax=%.1f vx=%.3f) "
+            "accumulator(enabled=%d max_frames=%d tag_scan_intensity=%d dbg_pcd=%d save_dir=%d every_n=%d accum_body=%d prim_in=%d) primitive_roi(en=%d R=%.1f rmin=%.1f rmax=%.1f vx=%.3f) "
             "range_view(en=%d mode=%s img=%dx%d grad_th=%.3f dilate=%d onnx_in=%dx%d fb_full=%d fusion=%.2f) "
             "primitive_classifier(enabled=%d lin_th=%.3f pla_th=%.3f) "
             "wall_ransac(enabled=%d dist=%.3f min_inliers=%d line(dist=%.3f,min=%d) plane(dist=%.3f,min=%d) tilt_deg=%.1f) "
@@ -920,6 +977,11 @@ GeometricProcessor::GeometricProcessor(const GeometricProcessorConfig& config)
             config_.patchwork.num_iter, config_.patchwork.th_dist, config_.patchwork.max_range,
             config_.accumulator.enabled ? 1 : 0, config_.accumulator.max_frames,
             config_.accumulator.tag_intensity_with_scan_seq ? 1 : 0,
+            config_.accumulator.save_debug_pcd ? 1 : 0,
+            (!config_.accumulator.save_merged_cloud_dir.empty() && config_.accumulator.save_debug_pcd) ? 1 : 0,
+            config_.accumulator.save_merged_cloud_every_n,
+            config_.accumulator.save_accum_body_pcd ? 1 : 0,
+            config_.accumulator.save_primitive_input_cloud ? 1 : 0,
             config_.primitive_roi.enabled ? 1 : 0,
             config_.primitive_roi.body_xy_radius_m,
             config_.primitive_roi.ring_min_xy_m,
@@ -1211,6 +1273,9 @@ GeometricResult GeometricProcessor::process(double ts, const pcl::PointCloud<pcl
         if (accumulator_ && config_.accumulator.max_frames > 1) {
             proc_cloud = accumulator_->accumulate(T_odom_b);
             if (proc_cloud && !proc_cloud->empty()) {
+                if (config_.accumulator.save_accum_body_pcd) {
+                    maybeSaveGeoSemanticDebugPcd(config_, frame_idx, ts, proc_cloud, "accum_body");
+                }
                 const size_t acc_merge_pts = proc_cloud->size();
                 pcl::PointCloud<pcl::PointXYZI>::Ptr acc_input = proc_cloud;
                 pcl::PointCloud<pcl::PointXYZI>::Ptr acc_leveled;
@@ -1303,6 +1368,9 @@ GeometricResult GeometricProcessor::process(double ts, const pcl::PointCloud<pcl
             }
         }
 
+        if (config_.accumulator.save_primitive_input_cloud) {
+            maybeSaveGeoSemanticDebugPcd(config_, frame_idx, ts, proc_cloud, "prim_input");
+        }
         classifyPrimitives(proc_cloud, result.primitives, result.gravity_up_body, frame_idx);
     } else if (geoInfoEnabled(config_)) {
         RCLCPP_INFO_THROTTLE(

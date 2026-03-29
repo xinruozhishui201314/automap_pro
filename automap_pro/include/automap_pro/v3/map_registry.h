@@ -27,6 +27,7 @@ enum class ProcessingState : uint8_t {
 
 struct EventMeta {
     uint64_t event_id = 0;
+    uint64_t session_id = 0;    // 🏛️ [架构契约] 显式标注所属会话，用于离线回放多段数据时的隔离
     uint64_t idempotency_key = 0;
     uint64_t producer_seq = 0;
     uint64_t ref_version = 0;
@@ -38,6 +39,8 @@ struct EventMeta {
 
     bool isValid() const {
         if (event_id == 0 || idempotency_key == 0 || producer_seq == 0) return false;
+        // 🏛️ [P0 稳定性修复] 必须显式校验 session_id，防止跨段回放时逻辑混乱
+        if (session_id == 0) return false;
         if (ref_epoch == 0) return false;
         if (!std::isfinite(source_ts) || !std::isfinite(publish_ts)) return false;
         if (producer.empty()) return false;
@@ -84,12 +87,32 @@ public:
     
     void addKeyFrame(KeyFrame::Ptr kf);
     KeyFrame::Ptr getKeyFrame(int id) const;
-    /** 根据时间戳近邻查找关键帧；在容差内返回最接近项，无时返回 nullptr */
+    /** 根据时间戳近邻查找关键帧；在容差内返回 |Δt| 最小项，无时返回 nullptr */
     KeyFrame::Ptr getKeyFrameByTimestamp(double timestamp, double tolerance_s = 1e-4) const;
-    /** 时间戳最大的关键帧（用于与当前帧点云对齐到最新优化位姿链）；无时返回 nullptr */
+    /**
+     * 语义/数据挂接推荐：优先取 kf.timestamp ≤ timestamp 且 (timestamp − kf.timestamp) ≤ tolerance 的**最近**关键帧，
+     * 避免晚到事件在宽容差下挂到「下一帧」KF。若无满足条件的 prior（事件早于首帧或超前过多），则退化为
+     * getKeyFrameByTimestamp 的 |Δt| 最小策略。
+     * @param session_id 非 0 时仅匹配该会话关键帧，禁止跨 session 挂接（多段回放/多会话地图）。
+     */
+    KeyFrame::Ptr getKeyFrameByTimestampPreferPrior(double timestamp, double tolerance_s = 1e-4,
+                                                    uint64_t session_id = 0) const;
+    /** 时间戳最大的关键帧；无时返回 nullptr */
     KeyFrame::Ptr getLatestKeyFrameByTimestamp() const;
+    /**
+     * 可视化/当前帧链式校正用的锚点：优先取 ts<=event_timestamp 的最新关键帧（与 ev.T_odom_b 同属「已过去」时间线）；
+     * 🏛️ [架构加固] 必须匹配 session_id，防止离线回放多段数据时跨段寻锚导致的瞬移跳变。
+     */
+    KeyFrame::Ptr getAnchorKeyFrameForEventTime(double event_timestamp, uint64_t session_id) const;
+    /** 已注册关键帧中的最大 timestamp；无关键帧返回 -inf（用于诊断 VIZ 与 Mapping 时序滞后） */
+    double getLatestKeyFrameTimestamp() const;
     std::vector<KeyFrame::Ptr> getAllKeyFrames() const;
     size_t keyframeCount() const { return keyframes_count_.load(); }
+
+    // --- 会话管理 ---
+    uint64_t getSessionId() const { return session_id_.load(); }
+    /** 切换会话前将当前 GPS 对齐写入 history，并刷新快照中的 session_alignments（V1 多会话）。 */
+    void setSessionId(uint64_t id);
 
     // --- SubMap 管理 ---
 
@@ -129,31 +152,8 @@ public:
     void loadSession(const std::string& session_dir, uint64_t session_id);
 
     // --- GPS 状态 ---
-    uint64_t setGPSAligned(bool aligned, const Eigen::Matrix3d& R = Eigen::Matrix3d::Identity(), 
-                       const Eigen::Vector3d& t = Eigen::Vector3d::Zero(), double rmse = 0.0) {
-        std::lock_guard<std::mutex> lk(gps_state_mutex_);
-        gps_aligned_.store(aligned);
-        R_enu_to_map_ = R;
-        t_enu_to_map_ = t;
-        gps_rmse_ = rmse;
-        alignment_epoch_.fetch_add(1, std::memory_order_relaxed);
-        const uint64_t current_epoch = alignment_epoch_.load(std::memory_order_relaxed);
-
-        // 🏛️ 同步更新快照
-        std::lock_guard<std::mutex> snap_lk(snapshot_mutex_);
-        auto new_snap = std::make_shared<PoseSnapshot>(*current_snapshot_);
-        new_snap->gps_aligned = aligned;
-        new_snap->R_enu_to_map = R;
-        new_snap->t_enu_to_map = t;
-        new_snap->gps_rmse = rmse;
-        new_snap->alignment_epoch = current_epoch;
-        
-        uint64_t version = ++next_version_;
-        new_snap->version = version;
-        current_snapshot_ = new_snap;
-        current_version_.store(version);
-        return version;
-    }
+    uint64_t setGPSAligned(bool aligned, const Eigen::Matrix3d& R = Eigen::Matrix3d::Identity(),
+                           const Eigen::Vector3d& t = Eigen::Vector3d::Zero(), double rmse = 0.0);
     bool isGPSAligned() const { return gps_aligned_.load(); }
     void getGPSTransform(Eigen::Matrix3d& R, Eigen::Vector3d& t) const {
         std::lock_guard<std::mutex> lk(gps_state_mutex_);
@@ -222,6 +222,10 @@ private:
     // GPS 原点
     std::atomic<bool> gps_origin_set_{false};
     double origin_lat_ = 0.0, origin_lon_ = 0.0, origin_alt_ = 0.0;
+
+    std::atomic<uint64_t> session_id_{0};
+    /** 🏛️ [V1] 持久化所有会话的对齐信息，跨快照共享 */
+    std::unordered_map<uint64_t, PoseSnapshot::SessionAlignment> session_alignments_history_;
 };
 
 // --- 事件定义 (Events) ---
@@ -232,7 +236,9 @@ struct MapUpdateEvent {
         KEYFRAME_ADDED,
         SUBMAP_ADDED,
         POSES_OPTIMIZED,
-        CONSTRAINT_ADDED
+        CONSTRAINT_ADDED,
+        /** SubMapManager::buildGlobalMap* 成功且已发布 GlobalMapBuildResultEvent 之后触发，强制 RViz 轨迹/关键帧与刚发布的全局点云同一 Registry 快照对齐 */
+        GLOBAL_MAP_REBUILT
     } type;
     std::vector<int> affected_ids;
 };
@@ -276,6 +282,11 @@ struct GPSFactorEvent {
 
 struct LoopConstraintEvent {
     LoopConstraint::Ptr constraint;
+    EventMeta meta;
+
+    bool isValid() const {
+        return constraint != nullptr && meta.isValid();
+    }
 };
 
 struct IntraLoopTaskEvent {
@@ -414,6 +425,13 @@ struct SemanticCloudEvent {
     CloudXYZIConstPtr labeled_cloud; // intensity 字段存储 label
     std::string frame_id = "body";
     EventMeta meta;
+
+    bool isValid() const {
+        if (!std::isfinite(timestamp)) return false;
+        if (!labeled_cloud || labeled_cloud->empty()) return false;
+        if (frame_id != "body" && frame_id != "world") return false;
+        return meta.isValid();
+    }
 };
 
 /**
@@ -426,6 +444,15 @@ struct SemanticTrunkVizEvent {
     CloudXYZIPtr pre_cluster_body;
     CloudXYZIPtr post_cluster_body;
     EventMeta meta;
+
+    bool isValid() const {
+        if (!std::isfinite(timestamp)) return false;
+        if (frame_id != "body" && frame_id != "world") return false;
+        const bool has_pts = (pre_cluster_body && !pre_cluster_body->empty()) ||
+                             (post_cluster_body && !post_cluster_body->empty());
+        if (!has_pts) return false;
+        return meta.isValid();
+    }
 };
 
 enum class FilterFallbackReason : uint8_t {
@@ -518,6 +545,8 @@ struct GraphTaskEvent {
     OptTaskItem task;
     EventMeta meta;
     ProcessingState processing_state = ProcessingState::NORMAL;
+
+    bool isValid() const { return meta.isValid(); }
 };
 
 /**
@@ -557,6 +586,7 @@ struct SaveMapRequestEvent {
 struct GlobalMapBuildRequestEvent {
     float voxel_size;
     bool async = true;
+    uint64_t alignment_epoch_limit = 0; // 0 means no filter
 };
 
 struct GlobalMapBuildResultEvent {
@@ -573,6 +603,9 @@ struct SystemQuiesceRequestEvent {
     bool enable = true;
     std::string reason = "manual";
     EventMeta meta;
+
+    /** 静默请求须带完备 meta，供 Orchestrator 审计；无 Registry 时不要发布裸事件。 */
+    bool isValid() const { return meta.isValid(); }
 };
 
 /**
@@ -585,6 +618,14 @@ struct BackpressureWarningEvent {
     bool critical = false;
     ProcessingState processing_state = ProcessingState::DEGRADED;
     EventMeta meta;
+
+    bool isValid() const {
+        if (module_name.empty()) return false;
+        if (!std::isfinite(queue_usage_ratio) || queue_usage_ratio < 0.0f || queue_usage_ratio > 1.0f) {
+            return false;
+        }
+        return meta.isValid();
+    }
 };
 
 struct ModuleStatus {

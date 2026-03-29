@@ -1,4 +1,5 @@
 #include "automap_pro/submap/submap_manager.h"
+#include "automap_pro/v3/pose_chain.hpp"
 #include "automap_pro/core/config_manager.h"
 #include "automap_pro/core/landmark_id.h"
 #include "automap_pro/core/logger.h"
@@ -176,9 +177,23 @@ void SubMapManager::addKeyFrame(const KeyFrame::Ptr& kf) {
         kf->id, __FILE__, __LINE__);
 
     try {
-        // ✅ V2 修复：不再覆盖 kf->id 和 kf->session_id，尊重 Frontend (KeyFrameManager) 分配的原始 ID
-        // kf->id         = kf_id_counter_++; 
-        // kf->session_id = current_session_id_;
+        // 🏛️ [架构加固] 坐标系一致性检查：如果当前帧坐标系与活跃子图不一致（如 GPS 对齐瞬间产生的在途帧），
+        // 必须强制切分子图，确保单个子图内部坐标系语义严格统一，这是消除全局重影的物理屏障。
+        if (active_submap_ && !active_submap_->keyframes.empty() && kf->pose_frame != active_submap_->pose_frame) {
+            const int sm_id = active_submap_->id;
+            const size_t kf_count = active_submap_->keyframes.size();
+            SubMap::Ptr to_freeze = active_submap_;
+            active_submap_ = nullptr;
+
+            RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                "[SubMapMgr][GHOST_GUARD] PoseFrame transition (sm_%d=%d, kf_%lu=%d), forcing split",
+                sm_id, static_cast<int>(to_freeze->pose_frame), kf->id, static_cast<int>(kf->pose_frame));
+            
+            lk.unlock();
+            freezeSubmap(to_freeze);
+            lk.lock();
+            // 锁回后 active_submap_ 仍为 nullptr，后续逻辑将为新系关键帧创建新子图
+        }
 
         // 如果没有活跃子图，创建一个
         if (!active_submap_) {
@@ -430,9 +445,12 @@ void SubMapManager::freezeActiveSubmap(const SubMap::Ptr& sm) {
         // 队列满或超时：同步执行 voxel + 回调，避免阻塞/死锁
         RCLCPP_WARN(rclcpp::get_logger("automap_system"), "[SubMapMgr][FREEZE_STEP] queue full or timeout, sync fallback sm_id=%d", sm->id);
         if (sm->merged_cloud && !sm->merged_cloud->empty()) {
-            // [HBA_FIX] 同步路径也应用锚点坐标系变换，防止回环拉花
+            // merged_cloud 由 merge 路径用 T_map_b_optimized 投到地图世界系；freeze 到锚点系须用 pose_map_anchor_optimized^{-1}
             CloudXYZIPtr body_cloud(new CloudXYZI());
-            Eigen::Isometry3d T_anchor_w = sm->pose_odom_anchor.inverse();
+            const Pose3d& T_w_anchor = sm->pose_map_anchor_optimized.matrix().allFinite()
+                ? sm->pose_map_anchor_optimized
+                : sm->pose_odom_anchor;
+            Eigen::Isometry3d T_anchor_w = T_w_anchor.inverse();
             pcl::transformPointCloud(*sm->merged_cloud, *body_cloud, T_anchor_w.matrix().cast<float>());
             
             CloudXYZIPtr ds = submap_merge_semantic_intensity_vote_
@@ -485,9 +503,11 @@ void SubMapManager::forceFreezeActiveSubmapForFinish() {
         "[SubMapMgr][FINISH_FREEZE] force-freeze sm_id=%d (sync, so last submap enters factor graph)", sm->id);
     try {
         if (sm->merged_cloud && !sm->merged_cloud->empty()) {
-            // [HBA_FIX] 结束路径也应用锚点坐标系变换，防止回环拉花
             CloudXYZIPtr body_cloud(new CloudXYZI());
-            Eigen::Isometry3d T_anchor_w = sm->pose_odom_anchor.inverse();
+            const Pose3d& T_w_anchor = sm->pose_map_anchor_optimized.matrix().allFinite()
+                ? sm->pose_map_anchor_optimized
+                : sm->pose_odom_anchor;
+            Eigen::Isometry3d T_anchor_w = T_w_anchor.inverse();
             pcl::transformPointCloud(*sm->merged_cloud, *body_cloud, T_anchor_w.matrix().cast<float>());
             
             CloudXYZIPtr ds = submap_merge_semantic_intensity_vote_
@@ -567,9 +587,12 @@ void SubMapManager::freezePostProcessLoop() {
                 // GTSAM 的 BetweenFactor(X1, X2, T12) 要求 T12 是相对于 X1 的局部变换（body frame）。
                 // 如果 downsampled_cloud 是世界坐标系，TEASER 得到的将是世界系下的变换（通常接近 Identity），
                 // 强制 BetweenFactor 为 Identity 会导致 HBA 将不同位置的子图强行拉到一起，导致点云全花。
-                // 同时也解决了 OverlapTransformer/ScanContext 在世界坐标系（如 ENU 数千米外）下描述子失效的问题。
+                // merged_cloud 为地图世界系；锚点变换与 merge 使用的 pose_map_anchor_optimized 一致。
                 CloudXYZIPtr body_cloud(new CloudXYZI());
-                Eigen::Isometry3d T_anchor_w = sm->pose_odom_anchor.inverse();
+                const Pose3d& T_w_anchor = sm->pose_map_anchor_optimized.matrix().allFinite()
+                    ? sm->pose_map_anchor_optimized
+                    : sm->pose_odom_anchor;
+                Eigen::Isometry3d T_anchor_w = T_w_anchor.inverse();
                 pcl::transformPointCloud(*sm->merged_cloud, *body_cloud, T_anchor_w.matrix().cast<float>());
                 
                 CloudXYZIPtr ds = submap_merge_semantic_intensity_vote_
@@ -769,7 +792,7 @@ void SubMapManager::mergeCloudToSubmap(SubMap::Ptr& sm, const KeyFrame::Ptr& kf)
     }
 }
 
-void SubMapManager::updateSubmapPose(int submap_id, const Pose3d& new_pose, PoseFrame pose_frame) {
+void SubMapManager::updateSubmapPose(int submap_id, const Pose3d& new_pose, PoseFrame pose_frame, uint64_t alignment_epoch) {
     // 结构化日志：开始Span
     SLOG_START_SPAN(MOD, "update_submap_pose");
     
@@ -783,7 +806,8 @@ void SubMapManager::updateSubmapPose(int submap_id, const Pose3d& new_pose, Pose
     RCLCPP_INFO(rclcpp::get_logger("automap_system"),
         "[SubMapMgr][SUBMAP_POSE_UPDATE_DEBUG] =======================================================");
     RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-        "[SubMapMgr][SUBMAP_POSE_UPDATE_DEBUG] 开始更新子图%d的位姿... frame=%d", submap_id, static_cast<int>(pose_frame));
+        "[SubMapMgr][SUBMAP_POSE_UPDATE_DEBUG] 开始更新子图%d的位姿... frame=%d epoch=%lu", 
+        submap_id, static_cast<int>(pose_frame), alignment_epoch);
     RCLCPP_INFO(rclcpp::get_logger("automap_system"),
         "[SubMapMgr][SUBMAP_POSE_UPDATE_DEBUG] 新锚点位姿: pos=(%.2f, %.2f, %.2f), RPY=(%.1f, %.1f, %.1f)",
         new_pose.translation().x(), new_pose.translation().y(), new_pose.translation().z(),
@@ -807,12 +831,14 @@ void SubMapManager::updateSubmapPose(int submap_id, const Pose3d& new_pose, Pose
 
         sm->pose_map_anchor_optimized = new_pose;
         sm->pose_frame = pose_frame; // 🏛️ [架构加固] 使用参数传入的 frame
+        if (alignment_epoch > 0) sm->alignment_epoch = alignment_epoch; // 🏛️ [对齐纪元]
         sm->state = SubMapState::OPTIMIZED;
 
         // 更新关键帧位姿
         for (auto& kf : sm->keyframes) {
             kf->T_map_b_optimized = sm->pose_map_anchor_optimized * kf->T_submap_kf;
             kf->pose_frame = pose_frame; // 🏛️ [架构加固] 继承子图锚点的坐标系语义
+            if (alignment_epoch > 0) kf->alignment_epoch = alignment_epoch; // 🏛️ [对齐纪元]
         }
 
         // 🔧 [修复] 保持 merged_cloud 与轨迹同步：同步变换该子图的合并点云，避免重影
@@ -835,7 +861,7 @@ void SubMapManager::updateSubmapPose(int submap_id, const Pose3d& new_pose, Pose
     SLOG_END_SPAN();
 }
 
-void SubMapManager::batchUpdateSubmapPoses(const std::unordered_map<int, Pose3d>& updates, uint64_t version, PoseFrame pose_frame) {
+void SubMapManager::batchUpdateSubmapPoses(const std::unordered_map<int, Pose3d>& updates, uint64_t version, PoseFrame pose_frame, uint64_t alignment_epoch) {
     if (updates.empty()) return;
 
     std::unique_lock<std::mutex> lk(mutex_);
@@ -852,6 +878,7 @@ void SubMapManager::batchUpdateSubmapPoses(const std::unordered_map<int, Pose3d>
 
                 sm->pose_map_anchor_optimized = new_pose;
                 sm->pose_frame = pose_frame; // 🏛️ [架构加固] 尊重传入的坐标系语义
+                if (alignment_epoch > 0) sm->alignment_epoch = alignment_epoch; // 🏛️ [对齐纪元]
                 sm->state = SubMapState::OPTIMIZED;
 
                 double trans_diff = (new_pose.translation() - old_anchor.translation()).norm();
@@ -864,6 +891,7 @@ void SubMapManager::batchUpdateSubmapPoses(const std::unordered_map<int, Pose3d>
                 for (auto& kf : sm->keyframes) {
                     kf->T_map_b_optimized = sm->pose_map_anchor_optimized * kf->T_submap_kf;
                     kf->pose_frame = pose_frame; // 🏛️ [架构加固] 继承子图锚点的坐标系语义
+                    if (alignment_epoch > 0) kf->alignment_epoch = alignment_epoch; // 🏛️ [对齐纪元]
                 }
 
                 // 🔧 [修复] 保持 merged_cloud 与轨迹同步：同步变换该子图的合并点云，避免重影
@@ -896,50 +924,88 @@ void SubMapManager::batchUpdateSubmapPoses(const std::unordered_map<int, Pose3d>
     }
 }
 
-void SubMapManager::batchUpdateKeyFramePoses(const std::unordered_map<uint64_t, Pose3d>& updates, uint64_t version, PoseFrame pose_frame) {
+void SubMapManager::batchUpdateKeyFramePoses(const std::unordered_map<uint64_t, Pose3d>& updates, uint64_t version, PoseFrame pose_frame, uint64_t alignment_epoch) {
     if (updates.empty()) return;
-    std::lock_guard<std::mutex> lk(mutex_);
+    std::unique_lock<std::mutex> lk(mutex_);
     current_map_version_ = version;
     size_t updated = 0;
-    for (auto& sm : submaps_) {
-        if (!sm) continue;
-        for (auto& kf : sm->keyframes) {
-            if (!kf) continue;
-            auto it = updates.find(kf->id);
-            if (it != updates.end()) {
-                // 🏛️ [数值安全加固] 
-                if (!it->second.matrix().allFinite()) continue;
-                
-                kf->T_map_b_optimized = it->second;
-                kf->pose_frame = pose_frame; // 🏛️ [架构加固] 尊重传入的坐标系语义
-                // 🏛️ [架构加固] 保证子图内相对位姿的一致性，防止后续增量更新导致重影
-                // 🔒 安全检查：确保锚点位姿可逆，避免 NaN 扩散
-                if (sm->pose_map_anchor_optimized.matrix().allFinite()) {
-                    kf->T_submap_kf = sm->pose_map_anchor_optimized.inverse() * kf->T_map_b_optimized;
+    
+    // 🏛️ [架构加固] 记录哪些子图的锚点发生了变动，以便后续同步子图内其他帧并检查重影
+    std::unordered_map<int, Pose3d> sm_anchor_updates;
+    double max_jump_dist = 0.0;
+
+    auto process_sm_list = [&](std::vector<SubMap::Ptr>& sms) {
+        for (auto& sm : sms) {
+            if (!sm) continue;
+            bool sm_anchor_kf_updated = false;
+            for (auto& kf : sm->keyframes) {
+                if (!kf) continue;
+                auto it = updates.find(kf->id);
+                if (it != updates.end()) {
+                    if (!it->second.matrix().allFinite()) continue;
+                    
+                    // 记录跳变距离用于监控
+                    if (kf->is_anchor) {
+                        double jump = (it->second.translation() - kf->T_map_b_optimized.translation()).norm();
+                        max_jump_dist = std::max(max_jump_dist, jump);
+                    }
+
+                    kf->T_map_b_optimized = it->second;
+                    kf->pose_frame = pose_frame; 
+                    if (alignment_epoch > 0) kf->alignment_epoch = alignment_epoch; // 🏛️ [对齐纪元]
+                    
+                    if (kf->is_anchor) {
+                        sm->pose_map_anchor_optimized = kf->T_map_b_optimized;
+                        sm->pose_frame = pose_frame;
+                        if (alignment_epoch > 0) sm->alignment_epoch = alignment_epoch; // 🏛️ [对齐纪元]
+                        sm_anchor_kf_updated = true;
+                    }
+                    updated++;
                 }
-                updated++;
+            }
+
+            // 🏛️ [关键修复] 如果子图锚点更新了（通常是坐标系从 ODOM 切换到 MAP），
+            // 必须重新传播位姿到该子图内所有关键帧，确保子图内部一致性，彻底消除重影。
+            if (sm_anchor_kf_updated) {
+                const Pose3d inv_a = sm->pose_map_anchor_optimized.inverse();
+                if (inv_a.matrix().allFinite()) {
+                    for (auto& kf : sm->keyframes) {
+                        if (!kf) continue;
+                        // 对于已经在 updates 里的帧，更新其相对锚点的位姿 T_submap_kf
+                        if (updates.count(kf->id)) {
+                            kf->T_submap_kf = inv_a * kf->T_map_b_optimized;
+                        } else {
+                            // 对于太新（还在途）不在更新列表里的帧，根据新锚点和旧相对位姿重算绝对位姿
+                            kf->T_map_b_optimized = sm->pose_map_anchor_optimized * kf->T_submap_kf;
+                            kf->pose_frame = pose_frame;
+                            if (alignment_epoch > 0) kf->alignment_epoch = alignment_epoch; // 🏛️ [对齐纪元]
+                        }
+                    }
+                }
+                sm_anchor_updates[sm->id] = sm->pose_map_anchor_optimized;
             }
         }
-    }
-    // 也检查活跃子图
+    };
+
+    process_sm_list(submaps_);
+    // active_submap_ 通常已在 submaps_ 中，但为了健壮性单独检查一次
     if (active_submap_) {
-        for (auto& kf : active_submap_->keyframes) {
-            if (!kf) continue;
-            auto it = updates.find(kf->id);
-            if (it != updates.end()) {
-                if (!it->second.matrix().allFinite()) continue;
-                kf->T_map_b_optimized = it->second;
-                kf->pose_frame = pose_frame; // 🏛️ [架构加固] 尊重传入的坐标系语义
-                if (active_submap_->pose_map_anchor_optimized.matrix().allFinite()) {
-                    kf->T_submap_kf = active_submap_->pose_map_anchor_optimized.inverse() * kf->T_map_b_optimized;
-                }
-                updated++;
-            }
-        }
+        std::vector<SubMap::Ptr> active_list = {active_submap_};
+        process_sm_list(active_list);
     }
-    RCLCPP_DEBUG(rclcpp::get_logger("automap_system"), 
-                 "[SubMapMgr][Gateway] batchUpdateKeyFramePoses: updated %zu/%zu kfs to version %lu", 
-                 updated, updates.size(), version);
+
+    RCLCPP_INFO(rclcpp::get_logger("automap_system"), 
+                 "[SubMapMgr][Gateway] batchUpdateKeyFramePoses: updated %zu kfs, %zu sm_anchors to version %lu (max_jump=%.3fm)", 
+                 updated, sm_anchor_updates.size(), version, max_jump_dist);
+
+    // 🏛️ [架构加固] 如果检测到巨大跳变（如 GPS 对齐），强制重建点云，避免 merged_cloud 污染
+    if (max_jump_dist > submap_rebuild_thresh_trans_) {
+        RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+            "[SubMapMgr][GHOST_GUARD] Large jump (%.3fm) detected in KF update, triggering merged_cloud rebuild",
+            max_jump_dist);
+        lk.unlock();
+        rebuildMergedCloudFromOptimizedPoses();
+    }
 }
 
 std::vector<KeyFrame::Ptr> SubMapManager::collectKeyframesInHBAOrder() const {
@@ -1053,6 +1119,74 @@ void SubMapManager::updateAllFromHBA(const HBAResult& result) {
     RCLCPP_INFO(log,
         "[SubMapMgr][GHOSTING_DIAG] updateAllFromHBA exit ts=%.3f (写回与锚点同步已完成；pose_snapshot_taken 应不落在此 enter~exit 之间，否则存在竞态)",
         exit_ts);
+
+    // HBA 已 bump current_map_version_；清空缓存避免同步/异步路径返回旧体素图（与 handleSaveMap 前 invalidate 互为补充）
+    cached_global_map_.reset();
+    last_build_map_version_ = std::numeric_limits<uint64_t>::max();
+    RCLCPP_INFO(log,
+        "[SubMapMgr][GHOSTING_DIAG] global_map cache cleared after HBA writeback map_version=%lu",
+        static_cast<unsigned long>(current_map_version_));
+}
+
+void SubMapManager::applyGpsMapOriginToOdomKeyframes(const Eigen::Matrix3d& R_enu_to_map,
+                                                     const Eigen::Vector3d& t_enu_to_map,
+                                                     uint64_t map_version,
+                                                     uint64_t alignment_epoch) {
+    Pose3d T_mo = Pose3d::Identity();
+    T_mo.linear() = R_enu_to_map;
+    T_mo.translation() = t_enu_to_map;
+    const rclcpp::Logger log = rclcpp::get_logger("automap_system");
+    if (!T_mo.matrix().allFinite()) {
+        RCLCPP_WARN(log,
+            "[SubMapMgr][GPS_ALIGN_BARRIER] skip: T_map_odom non-finite map_version=%lu",
+            static_cast<unsigned long>(map_version));
+        return;
+    }
+
+    size_t upgraded = 0;
+    {
+        std::lock_guard<std::mutex> lk(mutex_);
+        auto upgradeKeyframes = [&](const SubMap::Ptr& sm) {
+            if (!sm) return;
+            for (auto& kf : sm->keyframes) {
+                if (!kf) continue;
+                if (kf->pose_frame != PoseFrame::ODOM) continue;
+                if (!kf->T_odom_b.matrix().allFinite()) continue;
+                kf->T_map_b_optimized = v3::pose_chain::mapBodyFromOdomBody(T_mo, kf->T_odom_b);
+                kf->pose_frame = PoseFrame::MAP;
+                if (alignment_epoch > 0) kf->alignment_epoch = alignment_epoch; // 🏛️ [对齐纪元]
+                ++upgraded;
+            }
+        };
+        for (auto& sm : submaps_) upgradeKeyframes(sm);
+        upgradeKeyframes(active_submap_);
+
+        auto resyncSubmapRelative = [&](const SubMap::Ptr& sm) {
+            if (!sm || sm->keyframes.empty()) return;
+            KeyFrame::Ptr anchor = sm->keyframes.front();
+            if (!anchor || !anchor->T_map_b_optimized.matrix().allFinite()) return;
+            sm->pose_map_anchor_optimized = anchor->T_map_b_optimized;
+            sm->pose_frame = PoseFrame::MAP;
+            if (alignment_epoch > 0) sm->alignment_epoch = alignment_epoch; // 🏛️ [对齐纪元]
+            const Pose3d inv_a = sm->pose_map_anchor_optimized.inverse();
+            if (!inv_a.matrix().allFinite()) return;
+            for (auto& kf : sm->keyframes) {
+                if (!kf || !kf->T_map_b_optimized.matrix().allFinite()) continue;
+                kf->T_submap_kf = inv_a * kf->T_map_b_optimized;
+            }
+        };
+        for (auto& sm : submaps_) resyncSubmapRelative(sm);
+        resyncSubmapRelative(active_submap_);
+
+        current_map_version_ = map_version;
+        cached_global_map_.reset();
+        last_build_map_version_ = std::numeric_limits<uint64_t>::max();
+    }
+
+    RCLCPP_INFO(log,
+        "[SubMapMgr][GPS_ALIGN_BARRIER] upgraded_odom_kfs=%zu map_version=%lu -> rebuildMergedCloudFromOptimizedPoses",
+        upgraded, static_cast<unsigned long>(map_version));
+    rebuildMergedCloudFromOptimizedPoses();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1223,7 +1357,7 @@ void cloudBbox(const CloudXYZI& cloud, float& minx, float& miny, float& minz, fl
 }
 }  // namespace
 
-CloudXYZIPtr SubMapManager::buildGlobalMap(float voxel_size) const {
+CloudXYZIPtr SubMapManager::buildGlobalMap(float voxel_size, uint64_t alignment_epoch_limit) const {
     const unsigned tid = automap_pro::logThreadId();
     // 使用全局 logger 名称，避免 backend 线程中解引用 node_（可能析构顺序导致 use-after-free）
     const rclcpp::Logger log = rclcpp::get_logger("automap_system");
@@ -1231,7 +1365,7 @@ CloudXYZIPtr SubMapManager::buildGlobalMap(float voxel_size) const {
     std::unique_lock<std::mutex> lk(mutex_);
     
     // 🏛️ [P0 架构优化] 全局地图缓存检查
-    // 如果关键帧总数、位姿版本号、体素大小均未变化，则直接返回缓存，避免高频冗余构建导致的性能卡顿
+    // 如果关键帧总数、位姿版本号、体素大小、纪元限制均未变化，则直接返回缓存，避免高频冗余构建导致的性能卡顿
     size_t current_kf_total = 0;
     for (const auto& sm : submaps_) if(sm) current_kf_total += sm->keyframes.size();
     
@@ -1239,13 +1373,16 @@ CloudXYZIPtr SubMapManager::buildGlobalMap(float voxel_size) const {
         last_build_kf_count_ == current_kf_total &&
         last_build_map_version_ == current_map_version_ &&
         std::abs(last_build_voxel_size_ - voxel_size) < 1e-4) {
+        // 注意：缓存时也需要考虑 alignment_epoch_limit，如果 limit 变化，缓存失效
+        // 但目前 buildGlobalMap 通常由可视化触发，limit 通常跟随 MapRegistry 变化，
+        // 而 MapRegistry 变化会触发 invalidateGlobalMapCache 或 update current_map_version_。
         RCLCPP_DEBUG(log, "[SubMapMgr][CACHE] buildGlobalMap hit: kf=%zu ver=%lu voxel=%.3f (skip redundant build)",
                     current_kf_total, current_map_version_, voxel_size);
         return cached_global_map_;
     }
 
-    ALOG_INFO(MOD, "[tid={}] step=buildGlobalMap_enter voxel_size={:.3f}", tid, voxel_size);
-    RCLCPP_INFO(log, "[GLOBAL_MAP_DIAG][HBA_GHOSTING] buildGlobalMap enter voxel_size=%.3f 主路径=从 kf->cloud_body 用 T_map_b_optimized 变换；T_map_b_optimized 未优化时直接退出程序（正常建图不应出现）", voxel_size);
+    ALOG_INFO(MOD, "[tid={}] step=buildGlobalMap_enter voxel_size={:.3f} epoch_limit={}", tid, voxel_size, alignment_epoch_limit);
+    RCLCPP_INFO(log, "[GLOBAL_MAP_DIAG][HBA_GHOSTING] buildGlobalMap enter voxel_size=%.3f epoch_limit=%lu 主路径=从 kf->cloud_body 用 T_map_b_optimized 变换；T_map_b_optimized 未优化时直接退出程序（正常建图不应出现）", voxel_size, static_cast<unsigned long>(alignment_epoch_limit));
     
     const size_t num_submaps = submaps_.size();
     if (backend_verbose_trace_) {
@@ -1262,6 +1399,7 @@ CloudXYZIPtr SubMapManager::buildGlobalMap(float voxel_size) const {
     size_t kf_used_total = 0;
     size_t kf_skipped_null = 0;
     size_t kf_skipped_empty = 0;
+    size_t kf_skipped_epoch = 0;
     // T_map_b_optimized 未优化时已 std::abort()，不会产生「跳过」统计
     int subs_with_kf = 0;
     size_t total_pts_before_transform = 0;
@@ -1269,13 +1407,20 @@ CloudXYZIPtr SubMapManager::buildGlobalMap(float voxel_size) const {
     // [GLOBAL_MAP_DIAG] 增强：记录各子图锚点的优化位姿状态
     for (const auto& sm : submaps_) {
         if (!sm) continue;
+
+        // 🏛️ [对齐纪元] 子图级过滤
+        if (alignment_epoch_limit > 0 && sm->alignment_epoch < alignment_epoch_limit) {
+            kf_skipped_epoch += sm->keyframes.size();
+            continue;
+        }
+
         const auto& anchor_pose = sm->pose_map_anchor_optimized;
-        RCLCPP_INFO(log, "[SubMapMgr][GLOBAL_MAP_DIAG] SM#%d anchor_pose: trans=[%.2f,%.2f,%.2f] state=%d kfs=%zu",
+        RCLCPP_INFO(log, "[SubMapMgr][GLOBAL_MAP_DIAG] SM#%d anchor_pose: trans=[%.2f,%.2f,%.2f] state=%d kfs=%zu epoch=%lu",
             sm->id, anchor_pose.translation().x(), anchor_pose.translation().y(), anchor_pose.translation().z(),
-            static_cast<int>(sm->state), sm->keyframes.size());
+            static_cast<int>(sm->state), sm->keyframes.size(), sm->alignment_epoch);
     }
     
-    RCLCPP_INFO(log, "[GLOBAL_MAP_DIAG] ┌─ 主路径: 从关键帧重算（使用 T_map_b_optimized）");
+    RCLCPP_INFO(log, "[GLOBAL_MAP_DIAG] ┌─ 主路径: 从关键帧重算（使用 T_map_b_optimized） epoch_limit=%lu", static_cast<unsigned long>(alignment_epoch_limit));
     
     for (size_t idx = 0; idx < num_submaps && !hit_limit; ++idx) {
         const auto& sm = submaps_[idx];
@@ -1283,16 +1428,22 @@ CloudXYZIPtr SubMapManager::buildGlobalMap(float voxel_size) const {
             RCLCPP_DEBUG(log, "[GLOBAL_MAP_DIAG] submap[%zu] is null, skip", idx);
             continue;
         }
+
+        // 🏛️ [对齐纪元] 子图级过滤（双重保险）
+        if (alignment_epoch_limit > 0 && sm->alignment_epoch < alignment_epoch_limit) {
+            continue;
+        }
         
         size_t sm_pts = 0;
         size_t sm_kf_count = 0;
         size_t sm_kf_valid = 0;
         
-        RCLCPP_DEBUG(log, "[GLOBAL_MAP_DIAG] │ SM#%d: %zu keyframes, pose_map_anchor_optimized=[%.2f,%.2f,%.2f]",
+        RCLCPP_DEBUG(log, "[GLOBAL_MAP_DIAG] │ SM#%d: %zu keyframes, pose_map_anchor_optimized=[%.2f,%.2f,%.2f] epoch=%lu",
             sm->id, sm->keyframes.size(),
             sm->pose_map_anchor_optimized.translation().x(),
             sm->pose_map_anchor_optimized.translation().y(),
-            sm->pose_map_anchor_optimized.translation().z());
+            sm->pose_map_anchor_optimized.translation().z(),
+            sm->alignment_epoch);
         
         for (const auto& kf : sm->keyframes) {
             sm_kf_count++;
@@ -1300,6 +1451,12 @@ CloudXYZIPtr SubMapManager::buildGlobalMap(float voxel_size) const {
             if (!kf) {
                 kf_skipped_null++;
                 RCLCPP_DEBUG(log, "[GLOBAL_MAP_DIAG] │ │ kf[%zu] is null", sm_kf_count - 1);
+                continue;
+            }
+
+            // 🏛️ [对齐纪元] 关键帧级过滤
+            if (alignment_epoch_limit > 0 && kf->alignment_epoch < alignment_epoch_limit) {
+                kf_skipped_epoch++;
                 continue;
             }
             
@@ -1398,8 +1555,8 @@ CloudXYZIPtr SubMapManager::buildGlobalMap(float voxel_size) const {
     RCLCPP_INFO(log, "[GLOBAL_MAP_DIAG] └─ 主路径完成：");
     RCLCPP_INFO(log, "[GLOBAL_MAP_DIAG] path=from_kf submaps_with_kf=%d kf_used=%zu combined_pts=%zu",
         subs_with_kf, kf_used_total, combined->size());
-    RCLCPP_INFO(log, "[GLOBAL_MAP_DIAG]   • 统计: kf_skipped_null=%zu, kf_skipped_empty=%zu (未优化 KF 会直接 abort 不统计)",
-        kf_skipped_null, kf_skipped_empty);
+    RCLCPP_INFO(log, "[GLOBAL_MAP_DIAG]   • 统计: kf_skipped_null=%zu, kf_skipped_empty=%zu, kf_skipped_epoch=%zu",
+        kf_skipped_null, kf_skipped_empty, kf_skipped_epoch);
     RCLCPP_INFO(log, "[GLOBAL_MAP_DIAG]   • 输入点数 (body系): %zu, 输出点数 (world系): %zu",
         total_pts_before_transform, combined->size());
     // 若主路径无关键帧点云，记录警告并尝试回退
@@ -1597,6 +1754,7 @@ bool SubMapManager::archiveSubmap(const SubMap::Ptr& submap, const std::string& 
         meta["spatial_extent_m"] = submap->spatial_extent_m;
         meta["has_descriptor"] = submap->has_descriptor;
         meta["has_valid_gps"] = submap->has_valid_gps;
+        meta["alignment_epoch"] = submap->alignment_epoch; // 🏛️ [对齐纪元] 持久化
 
         const Pose3d& T = submap->pose_map_anchor_optimized;
         Eigen::Quaterniond q(T.rotation());
@@ -1637,6 +1795,7 @@ bool SubMapManager::archiveSubmap(const SubMap::Ptr& submap, const std::string& 
             kf_meta["id"] = kf->id;
             kf_meta["ts"] = kf->timestamp;
             kf_meta["submap_id"] = kf->submap_id;
+            kf_meta["alignment_epoch"] = kf->alignment_epoch; // 🏛️ [对齐纪元] 持久化
             
             // 位姿
             auto save_pose = [](const Pose3d& T) {
@@ -1712,6 +1871,7 @@ bool SubMapManager::loadArchivedSubmap(const std::string& dir, int submap_id, Su
         sm->spatial_extent_m = meta.value("spatial_extent_m", 0.0);
         sm->has_descriptor = meta.value("has_descriptor", false);
         sm->has_valid_gps = meta.value("has_valid_gps", false);
+        sm->alignment_epoch = meta.value("alignment_epoch", 0ULL); // 🏛️ [对齐纪元] 加载
         sm->state = SubMapState::ARCHIVED;
 
         if (meta.contains("anchor_pose")) {
@@ -1778,6 +1938,65 @@ bool SubMapManager::loadArchivedSubmap(const std::string& dir, int submap_id, Su
             }
         }
         if (!sm->downsampled_cloud) sm->downsampled_cloud = std::make_shared<CloudXYZI>();
+
+        // ========== [对齐纪元] 加载子图内所有关键帧 ==========
+        if (meta.contains("keyframe_ids") && meta["keyframe_ids"].is_array()) {
+            std::string kf_dir = subdir + "/keyframes";
+            for (const auto& kf_id_json : meta["keyframe_ids"]) {
+                uint64_t kf_id = kf_id_json.get<uint64_t>();
+                std::string kf_base = kf_dir + "/kf_" + std::to_string(kf_id);
+                std::string kf_meta_path = kf_base + ".json";
+                if (!fs::exists(kf_meta_path)) continue;
+
+                try {
+                    std::ifstream kf_ifs(kf_meta_path);
+                    json kf_meta;
+                    kf_ifs >> kf_meta;
+
+                    auto kf = std::make_shared<KeyFrame>();
+                    kf->id = kf_meta.value("id", 0ULL);
+                    kf->timestamp = kf_meta.value("ts", 0.0);
+                    kf->submap_id = kf_meta.value("submap_id", sm->id);
+                    kf->alignment_epoch = kf_meta.value("alignment_epoch", 0ULL); // 🏛️ [对齐纪元] 加载
+
+                    auto load_pose = [](const json& p_json) {
+                        Pose3d T = Pose3d::Identity();
+                        if (p_json.is_object()) {
+                            Eigen::Quaterniond q(p_json.value("qw", 1.0), p_json.value("qx", 0.0), 
+                                                p_json.value("qy", 0.0), p_json.value("qz", 0.0));
+                            T.linear() = q.toRotationMatrix();
+                            T.translation() << p_json.value("px", 0.0), p_json.value("py", 0.0), p_json.value("pz", 0.0);
+                        }
+                        return T;
+                    };
+
+                    kf->T_odom_b = load_pose(kf_meta["T_odom_b"]);
+                    kf->T_map_b_optimized = load_pose(kf_meta["T_map_b_optimized"]);
+                    kf->T_submap_kf = load_pose(kf_meta["T_submap_kf"]);
+                    kf->pose_frame = sm->pose_frame;
+
+                    if (kf_meta.contains("gps")) {
+                        const auto& g = kf_meta["gps"];
+                        kf->gps.latitude = g.value("lat", 0.0);
+                        kf->gps.longitude = g.value("lon", 0.0);
+                        kf->gps.altitude = g.value("alt", 0.0);
+                        kf->gps.hdop = g.value("hdop", 1.0);
+                        kf->has_valid_gps = true;
+                    }
+
+                    std::string kf_pcd = kf_base + ".pcd";
+                    if (fs::exists(kf_pcd)) {
+                        kf->cloud_body = std::make_shared<CloudXYZI>();
+                        pcl::io::loadPCDFile(kf_pcd, *kf->cloud_body);
+                    }
+
+                    sm->keyframes.push_back(kf);
+                } catch (...) {
+                    continue;
+                }
+            }
+            SLOG_INFO(MOD, "[SubMapMgr][loadArchivedSubmap] sm_id={} loaded_keyframes={}", sm->id, sm->keyframes.size());
+        }
 
         out = sm;
         SLOG_INFO(MOD, "[SEMANTIC][SubMapMgr][loadArchivedSubmap] step=ok sm_id={} landmarks={} dir={}",
@@ -2370,7 +2589,13 @@ namespace {
 std::atomic<uint64_t> g_build_global_map_id{0};
 }  // namespace
 
-std::future<CloudXYZIPtr> SubMapManager::buildGlobalMapAsync(float voxel_size) const {
+void SubMapManager::invalidateGlobalMapCache() const {
+    std::lock_guard<std::mutex> lk(mutex_);
+    cached_global_map_.reset();
+    last_build_map_version_ = std::numeric_limits<uint64_t>::max();
+}
+
+std::future<CloudXYZIPtr> SubMapManager::buildGlobalMapAsync(float voxel_size, uint64_t alignment_epoch_limit) const {
     const rclcpp::Logger log = rclcpp::get_logger("automap_system");
     
     {
@@ -2392,7 +2617,7 @@ std::future<CloudXYZIPtr> SubMapManager::buildGlobalMapAsync(float voxel_size) c
         }
     }
 
-    return std::async(std::launch::async, [this, voxel_size]() {
+    return std::async(std::launch::async, [this, voxel_size, alignment_epoch_limit]() {
         const uint64_t build_id = ++g_build_global_map_id;
         const rclcpp::Logger log = rclcpp::get_logger("automap_system");
         
@@ -2406,8 +2631,20 @@ std::future<CloudXYZIPtr> SubMapManager::buildGlobalMapAsync(float voxel_size) c
             cloud_pose_snapshot.reserve(512);
             for (const auto& sm : submaps_) {
                 if (!sm) continue;
+
+                // 🏛️ [对齐纪元] 子图级过滤
+                if (alignment_epoch_limit > 0 && sm->alignment_epoch < alignment_epoch_limit) {
+                    continue;
+                }
+
                 for (const auto& kf : sm->keyframes) {
                     if (!kf || !kf->cloud_body || kf->cloud_body->empty()) continue;
+
+                    // 🏛️ [对齐纪元] 关键帧级过滤
+                    if (alignment_epoch_limit > 0 && kf->alignment_epoch < alignment_epoch_limit) {
+                        continue;
+                    }
+
                     const Pose3d& T = kf->T_map_b_optimized;
                     if (T.matrix().isApprox(Eigen::Matrix4d::Identity(), 1e-6) &&
                         !kf->T_odom_b.matrix().isApprox(Eigen::Matrix4d::Identity(), 1e-6)) {
@@ -2427,9 +2664,10 @@ std::future<CloudXYZIPtr> SubMapManager::buildGlobalMapAsync(float voxel_size) c
             const auto& first = cloud_pose_snapshot.front().second.translation();
             const auto& last = cloud_pose_snapshot.back().second.translation();
             RCLCPP_INFO(log,
-                "[SubMapMgr][GHOSTING_DIAG] pose_snapshot_taken build_id=%llu ts=%.3f kf_count=%zu first_pos=[%.2f,%.2f,%.2f] last_pos=[%.2f,%.2f,%.2f]",
+                "[SubMapMgr][GHOSTING_DIAG] pose_snapshot_taken build_id=%llu ts=%.3f kf_count=%zu first_pos=[%.2f,%.2f,%.2f] last_pos=[%.2f,%.2f,%.2f] epoch_limit=%lu",
                 static_cast<unsigned long long>(build_id), snap_ts, cloud_pose_snapshot.size(),
-                first.x(), first.y(), first.z(), last.x(), last.y(), last.z());
+                first.x(), first.y(), first.z(), last.x(), last.y(), last.z(),
+                static_cast<unsigned long>(alignment_epoch_limit));
             RCLCPP_INFO(log, "[GHOSTING_RISK] buildGlobalMap_async build_id=%llu path=snapshot pose_source=T_map_b_optimized_only (无重影风险)",
                 static_cast<unsigned long long>(build_id));
         }
@@ -2453,25 +2691,48 @@ CloudXYZIPtr SubMapManager::buildGlobalMapInternal(
     const std::vector<SubMap::Ptr>& submaps_copy,
     float voxel_size,
     const std::vector<Pose3d>* poses_snapshot,
-    uint64_t build_id) const {
+    uint64_t build_id,
+    uint64_t alignment_epoch_limit) const {
     const unsigned tid = automap_pro::logThreadId();
     const rclcpp::Logger log = rclcpp::get_logger("automap_system");
     const bool use_snapshot = poses_snapshot && !poses_snapshot->empty();
-    ALOG_INFO(MOD, "[tid={}] step=buildGlobalMapInternal_enter voxel_size={:.3f} use_snapshot={}", tid, voxel_size, use_snapshot ? "yes" : "no");
+    ALOG_INFO(MOD, "[tid={}] step=buildGlobalMapInternal_enter voxel_size={:.3f} use_snapshot={} epoch_limit={}", 
+              tid, voxel_size, use_snapshot ? "yes" : "no", alignment_epoch_limit);
     if (build_id != 0) {
         RCLCPP_INFO(log,
-            "[SubMapMgr][GHOSTING_DIAG] buildGlobalMapInternal_enter build_id=%llu use_snapshot=%s (grep GHOSTING_DIAG for timeline)",
-            static_cast<unsigned long long>(build_id), use_snapshot ? "yes" : "no");
+            "[SubMapMgr][GHOSTING_DIAG] buildGlobalMapInternal_enter build_id=%llu use_snapshot=%s epoch_limit=%lu (grep GHOSTING_DIAG for timeline)",
+            static_cast<unsigned long long>(build_id), use_snapshot ? "yes" : "no", 
+            static_cast<unsigned long>(alignment_epoch_limit));
     }
 
     CloudXYZIPtr combined = std::make_shared<CloudXYZI>();
     CloudXYZIPtr world_tmp = std::make_shared<CloudXYZI>();
     size_t pose_idx = 0;
+    size_t epoch_filtered = 0;
 
     for (const auto& sm : submaps_copy) {
         if (!sm) continue;
+        
+        // 🏛️ [对齐纪元] 子图级过滤：如果子图纪元落后且启用了过滤
+        if (alignment_epoch_limit > 0 && sm->alignment_epoch < alignment_epoch_limit) {
+            pose_idx += sm->keyframes.size(); // 必须推进索引以保持同步
+            epoch_filtered += sm->keyframes.size();
+            continue;
+        }
+
         for (const auto& kf : sm->keyframes) {
-            if (!kf || !kf->cloud_body || kf->cloud_body->empty()) continue;
+            if (!kf || !kf->cloud_body || kf->cloud_body->empty()) {
+                if (use_snapshot) pose_idx++;
+                continue;
+            }
+
+            // 🏛️ [对齐纪元] 关键帧级过滤（双重保险）
+            if (alignment_epoch_limit > 0 && kf->alignment_epoch < alignment_epoch_limit) {
+                if (use_snapshot) pose_idx++;
+                epoch_filtered++;
+                continue;
+            }
+
             Pose3d T_map_b;
             if (poses_snapshot && pose_idx < poses_snapshot->size()) {
                 T_map_b = (*poses_snapshot)[pose_idx++];
@@ -2504,22 +2765,22 @@ CloudXYZIPtr SubMapManager::buildGlobalMapInternal(
     const bool parallel = parallel_voxel_downsample_;
     CloudXYZIPtr out = utils::voxelDownsampleChunked(combined, vs, 50.0f, parallel);
     const size_t out_pts = out ? out->size() : combined->size();
-    ALOG_INFO(MOD, "[tid={}] step=buildGlobalMapInternal_exit out={}", tid, out_pts);
+    ALOG_INFO(MOD, "[tid={}] step=buildGlobalMapInternal_exit out={} filtered_epoch={}", tid, out_pts, epoch_filtered);
     if (build_id != 0) {
         if (use_snapshot && poses_snapshot) {
             if (pose_idx != poses_snapshot->size()) {
                 RCLCPP_WARN(log,
-                    "[SubMapMgr][GHOSTING_DIAG] buildGlobalMapInternal_exit build_id=%llu snapshot_consumed=%zu snapshot_size=%zu MISMATCH (possible ghosting or bug)",
-                    static_cast<unsigned long long>(build_id), pose_idx, poses_snapshot->size());
+                    "[SubMapMgr][GHOSTING_DIAG] buildGlobalMapInternal_exit build_id=%llu snapshot_consumed=%zu snapshot_size=%zu epoch_filtered=%zu MISMATCH (possible ghosting or bug)",
+                    static_cast<unsigned long long>(build_id), pose_idx, poses_snapshot->size(), epoch_filtered);
             } else {
                 RCLCPP_INFO(log,
-                    "[SubMapMgr][GHOSTING_DIAG] buildGlobalMapInternal_exit build_id=%llu pts=%zu snapshot_consumed=%zu snapshot_size=%zu (grep GHOSTING_DIAG for timeline)",
-                    static_cast<unsigned long long>(build_id), out_pts, pose_idx, poses_snapshot->size());
+                    "[SubMapMgr][GHOSTING_DIAG] buildGlobalMapInternal_exit build_id=%llu pts=%zu snapshot_consumed=%zu snapshot_size=%zu epoch_filtered=%zu (grep GHOSTING_DIAG for timeline)",
+                    static_cast<unsigned long long>(build_id), out_pts, pose_idx, poses_snapshot->size(), epoch_filtered);
             }
         } else {
             RCLCPP_INFO(log,
-                "[SubMapMgr][GHOSTING_DIAG] buildGlobalMapInternal_exit build_id=%llu pts=%zu use_snapshot=no",
-                static_cast<unsigned long long>(build_id), out_pts);
+                "[SubMapMgr][GHOSTING_DIAG] buildGlobalMapInternal_exit build_id=%llu pts=%zu use_snapshot=no epoch_filtered=%zu",
+                static_cast<unsigned long long>(build_id), out_pts, epoch_filtered);
         }
     }
     return out ? out : combined;

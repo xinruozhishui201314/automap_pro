@@ -2,6 +2,8 @@
 #include "automap_pro/core/config_manager.h"
 
 #include <chrono>
+#include <deque>
+#include <string>
 
 namespace automap_pro::v3 {
 namespace {
@@ -10,29 +12,36 @@ double nowSteadySec() {
 }
 }  // namespace
 
+void MapOrchestrator::enqueueObserved(const char* event_name, const EventMeta& meta) {
+    std::lock_guard<std::mutex> lk(queue_mutex_);
+    queue_.push_back({std::string(event_name), meta});
+    cv_.notify_one();
+}
+
 MapOrchestrator::MapOrchestrator(EventBus::Ptr event_bus, MapRegistry::Ptr map_registry, rclcpp::Node::SharedPtr node)
     : ModuleBase("MapOrchestrator", event_bus, map_registry), node_(node) {
     takeover_enabled_ = ConfigManager::instance().orchestratorTakeoverEnabled();
-    onEvent<SyncedFrameEvent>([this](const SyncedFrameEvent& ev) {
-        std::lock_guard<std::mutex> lk(queue_mutex_);
-        queue_.push_back({ItemType::SYNCED, ev.meta});
-        cv_.notify_one();
-    });
-    onEvent<OptimizationResultEvent>([this](const OptimizationResultEvent& ev) {
-        std::lock_guard<std::mutex> lk(queue_mutex_);
-        queue_.push_back({ItemType::OPT, ev.meta});
-        cv_.notify_one();
-    });
-    onEvent<GPSAlignedEvent>([this](const GPSAlignedEvent& ev) {
-        std::lock_guard<std::mutex> lk(queue_mutex_);
-        queue_.push_back({ItemType::GPS_ALIGN, ev.meta});
-        cv_.notify_one();
-    });
-    onEvent<SemanticLandmarkEvent>([this](const SemanticLandmarkEvent& ev) {
-        std::lock_guard<std::mutex> lk(queue_mutex_);
-        queue_.push_back({ItemType::SEMANTIC, ev.meta});
-        cv_.notify_one();
-    });
+
+    // 全量带 EventMeta 的生产事件观测（不含 RouteAdviceEvent：本模块自产，避免自激）。
+    onEvent<SyncedFrameEvent>([this](const SyncedFrameEvent& ev) { enqueueObserved("SyncedFrameEvent", ev.meta); });
+    onEvent<FilteredFrameEventRequiredDs>(
+        [this](const FilteredFrameEventRequiredDs& ev) { enqueueObserved("FilteredFrameEventRequiredDs", ev.meta); });
+    onEvent<OptimizationResultEvent>(
+        [this](const OptimizationResultEvent& ev) { enqueueObserved("OptimizationResultEvent", ev.meta); });
+    onEvent<OptimizationDeltaEvent>(
+        [this](const OptimizationDeltaEvent& ev) { enqueueObserved("OptimizationDeltaEvent", ev.meta); });
+    onEvent<GPSAlignedEvent>([this](const GPSAlignedEvent& ev) { enqueueObserved("GPSAlignedEvent", ev.meta); });
+    onEvent<SemanticLandmarkEvent>(
+        [this](const SemanticLandmarkEvent& ev) { enqueueObserved("SemanticLandmarkEvent", ev.meta); });
+    onEvent<SemanticCloudEvent>([this](const SemanticCloudEvent& ev) { enqueueObserved("SemanticCloudEvent", ev.meta); });
+    onEvent<SemanticTrunkVizEvent>(
+        [this](const SemanticTrunkVizEvent& ev) { enqueueObserved("SemanticTrunkVizEvent", ev.meta); });
+    onEvent<GraphTaskEvent>([this](const GraphTaskEvent& ev) { enqueueObserved("GraphTaskEvent", ev.meta); });
+    onEvent<SemanticInputEvent>([this](const SemanticInputEvent& ev) { enqueueObserved("SemanticInputEvent", ev.meta); });
+    onEvent<BackpressureWarningEvent>(
+        [this](const BackpressureWarningEvent& ev) { enqueueObserved("BackpressureWarningEvent", ev.meta); });
+    onEvent<SystemQuiesceRequestEvent>(
+        [this](const SystemQuiesceRequestEvent& ev) { enqueueObserved("SystemQuiesceRequestEvent", ev.meta); });
 }
 
 bool MapOrchestrator::isIdle() const {
@@ -53,22 +62,18 @@ void MapOrchestrator::run() {
     while (running_) {
         try {
             updateHeartbeat();
-            Item item;
+            std::deque<Item> drained;
             {
                 std::unique_lock<std::mutex> lk(queue_mutex_);
                 cv_.wait_for(lk, std::chrono::milliseconds(100), [this] { return !running_ || !queue_.empty(); });
                 if (!running_) break;
                 if (queue_.empty()) continue;
-                item = queue_.front();
-                queue_.pop_front();
+                drained.swap(queue_);
             }
 
-            const char* name = "unknown";
-            if (item.type == ItemType::SYNCED) name = "SyncedFrameEvent";
-            else if (item.type == ItemType::OPT) name = "OptimizationResultEvent";
-            else if (item.type == ItemType::GPS_ALIGN) name = "GPSAlignedEvent";
-            else if (item.type == ItemType::SEMANTIC) name = "SemanticLandmarkEvent";
-            observeMeta(name, item.meta);
+            for (const auto& item : drained) {
+                observeMeta(item.event_name.c_str(), item.meta);
+            }
             size_t q_size = 0;
             {
                 std::lock_guard<std::mutex> lk(queue_mutex_);
@@ -132,6 +137,7 @@ void MapOrchestrator::maybePublishAdvice(
     advice.meta.producer_seq = advice.meta.event_id;
     advice.meta.ref_version = map_registry_->getVersion();
     advice.meta.ref_epoch = map_registry_->getAlignmentEpoch();
+    advice.meta.session_id = map_registry_->getSessionId();
     advice.meta.source_ts = nowSteadySec();
     advice.meta.publish_ts = advice.meta.source_ts;
     advice.meta.producer = "MapOrchestrator";
@@ -145,4 +151,3 @@ void MapOrchestrator::maybePublishAdvice(
 }
 
 }  // namespace automap_pro::v3
-

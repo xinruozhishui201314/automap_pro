@@ -271,7 +271,13 @@ void AutoMapSystem::deferredSetupModules() {
 
 void AutoMapSystem::setupPublishers() {
     status_pub_ = create_publisher<automap_pro::msg::MappingStatusMsg>("/automap/status", 10);
-    global_map_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(protocol::topics::GLOBAL_MAP, 1);
+    rclcpp::QoS gmap_qos(rclcpp::KeepLast(5));
+    gmap_qos.reliable();
+    if (ConfigManager::instance().vizGlobalMapRos2TransientLocal()) {
+        gmap_qos.durability(rclcpp::DurabilityPolicy::TransientLocal);
+    }
+    global_map_pub_ =
+        create_publisher<sensor_msgs::msg::PointCloud2>(protocol::topics::GLOBAL_MAP, gmap_qos);
     ready_pub_ = create_publisher<std_msgs::msg::Bool>(
         "/automap/ready", rclcpp::QoS(1).transient_local().reliable());
     RCLCPP_INFO(get_logger(), "[PIPELINE][SYS] step=05 publishers: /automap/status /automap/ready %s", protocol::topics::GLOBAL_MAP);

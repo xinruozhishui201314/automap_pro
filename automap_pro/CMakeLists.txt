@@ -946,6 +946,19 @@ else()
 endif()
 
 # ──────────────────────────────────────────────────────────
+# 单元测试（pose_chain 共享变换内核契约）
+# ──────────────────────────────────────────────────────────
+if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(v3_pose_chain_test test/v3_pose_chain_test.cpp)
+  if(TARGET v3_pose_chain_test)
+    target_include_directories(v3_pose_chain_test PRIVATE ${AUTOMAP_INCLUDE_DIRS})
+    ament_target_dependencies(v3_pose_chain_test)
+    target_link_libraries(v3_pose_chain_test Eigen3::Eigen)
+  endif()
+endif()
+
+# ──────────────────────────────────────────────────────────
 # 安装规则
 # ──────────────────────────────────────────────────────────
 install(TARGETS

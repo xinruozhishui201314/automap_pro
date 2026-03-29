@@ -19,9 +19,12 @@ void FastLIVO2Adapter::init(rclcpp::Node::SharedPtr node) {
     node_ = node;
     const auto& cfg = ConfigManager::instance();
 
-    std::string odom_topic  = cfg.externalFastLivoOdomTopic();
-    std::string cloud_topic = cfg.externalFastLivoCloudTopic();
-    cloud_ds_res_ = cfg.cloudDownsampleResolution();
+    std::string odom_topic  = cfg.fastLivoOdomTopic();
+    std::string cloud_topic = cfg.fastLivoCloudTopic();
+    // 🔍 修复: 使用 submapMatchRes 作为默认降采样分辨率，或直接设为 0.0
+    cloud_ds_res_ = 0.1; 
+    
+    max_sweep_buffer_size_ = cfg.frontendSweepAccumulationFrames();
 
     odom_sub_ = node->create_subscription<nav_msgs::msg::Odometry>(
         odom_topic, 10, std::bind(&FastLIVO2Adapter::onOdometry, this, std::placeholders::_1));
@@ -101,7 +104,15 @@ void FastLIVO2Adapter::onOdometry(const nav_msgs::msg::Odometry::SharedPtr msg) 
     CloudXYZIPtr cloud_ds   = nullptr;
     {
         std::lock_guard<std::mutex> lk(state_mutex_);
-        if (last_cloud_ && !last_cloud_->empty()) {
+        // 🏛️ [无损增密] 优先使用累加器生成的稠密局部点云
+        CloudXYZIPtr dense_cloud = accumulateSweeps(pose);
+        if (dense_cloud && !dense_cloud->empty()) {
+            cloud_body = dense_cloud;
+            // 🏛️ [逻辑加固] 创建关键帧后清空缓冲区，防止同一帧点云被重复计入多个关键帧
+            sweep_buffer_.clear(); 
+            RCLCPP_DEBUG(node_->get_logger(), "[FastLIVO2Adapter] Created KF with DENSE cloud: pts=%zu", cloud_body->size());
+        } else if (last_cloud_ && !last_cloud_->empty()) {
+            // 回退逻辑：如果累加器为空，使用最后一帧原始扫描
             const std::string& cf = ConfigManager::instance().frontendCloudFrame();
             CloudXYZIPtr src = last_cloud_;
             if (cf == "world") {
@@ -111,15 +122,11 @@ void FastLIVO2Adapter::onOdometry(const nav_msgs::msg::Odometry::SharedPtr msg) 
                 body_from_world->width = static_cast<uint32_t>(body_from_world->size());
                 body_from_world->height = 1;
                 src = body_from_world;
-                RCLCPP_INFO_THROTTLE(
-                    node_->get_logger(),
-                    *node_->get_clock(),
-                    5000,
-                    "[FastLIVO2Adapter][KF][COORD] frontend.cloud_frame=world: applied T_odom_b^-1 to registered cloud -> "
-                    "kf.cloud_body pts=%zu (Patchwork/semantic geometric expect lidar BODY frame)",
-                    src->size());
             }
             cloud_body = src;
+        }
+        
+        if (cloud_body) {
             cloud_ds = utils::voxelDownsample(cloud_body, cloud_ds_res_);
         }
     }
@@ -135,8 +142,55 @@ void FastLIVO2Adapter::onCloudRegistered(const sensor_msgs::msg::PointCloud2::Sh
     cloud_count_++;
     CloudXYZIPtr cloud = cloudMsgToPcl(msg);
     if (!cloud || cloud->empty()) return;
+    
     std::lock_guard<std::mutex> lk(state_mutex_);
     last_cloud_ = cloud;
+    
+    // 🏛️ [无损增密] 将每一帧原始扫描存入缓冲区，并关联当前最接近的里程计位姿
+    if (last_odom_time_ > 0) {
+        addSweepToBuffer(last_odom_time_, cloud, last_odom_pose_);
+    }
+}
+
+void FastLIVO2Adapter::addSweepToBuffer(double ts, const CloudXYZIPtr& cloud, const Pose3d& pose) {
+    // 缓冲区管理：FIFO
+    sweep_buffer_.push_back({ts, cloud, pose});
+    while (sweep_buffer_.size() > static_cast<size_t>(max_sweep_buffer_size_)) {
+        sweep_buffer_.pop_front();
+    }
+}
+
+CloudXYZIPtr FastLIVO2Adapter::accumulateSweeps(const Pose3d& T_curr_kf) {
+    if (sweep_buffer_.empty()) return nullptr;
+
+    CloudXYZIPtr accumulated(new CloudXYZI());
+    const Pose3d T_curr_inv = T_curr_kf.inverse();
+    const std::string& cf = ConfigManager::instance().frontendCloudFrame();
+
+    for (const auto& sweep : sweep_buffer_) {
+        CloudXYZIPtr transformed(new CloudXYZI());
+        
+        // 坐标系转换逻辑：
+        // 1. 如果源云是 world 系 (fast-livo 默认)，则需要 T_curr_kf^-1 * p_world 转到当前 body
+        // 2. 如果源云是 body 系，则需要 T_curr_kf^-1 * T_sweep_odom * p_body 转到当前 body
+        if (cf == "world") {
+            pcl::transformPointCloud(*(sweep.cloud), *transformed, T_curr_inv.matrix().cast<float>());
+        } else {
+            Pose3d T_rel = T_curr_inv * sweep.T_odom_b;
+            pcl::transformPointCloud(*(sweep.cloud), *transformed, T_rel.matrix().cast<float>());
+        }
+        
+        *accumulated += *transformed;
+    }
+    
+    // 保持 header 一致，以满足下游对时间戳的需求
+    if (!accumulated->empty()) {
+        accumulated->header = sweep_buffer_.back().cloud->header;
+        accumulated->width = static_cast<uint32_t>(accumulated->size());
+        accumulated->height = 1;
+    }
+    
+    return accumulated;
 }
 
 Pose3d FastLIVO2Adapter::odometryToPose(const nav_msgs::msg::Odometry::SharedPtr msg) const {

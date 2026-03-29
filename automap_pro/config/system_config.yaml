@@ -86,6 +86,13 @@ performance:
   parallel_teaser_match: true    # 多候选 TEASER 匹配并行（std::async）
   max_optimization_queue_size: 64 # iSAM2 异步队列上限，满则丢弃新任务
 
+# 后端可视化：sync_global_map_build=true 时强制同步构图，且 HBA 后在 rebuildMergedCloud 之后立即 build（覆盖 performance.async_global_map_build）
+visualization:
+  sync_global_map_build: false
+  global_map_ros2_transient_local: true
+  log_pose_jump_detail: false
+  suppress_optimize_driven_global_map: false
+
 # ┌─────────────────────────────────────────────────────────────────────────────
 # 二、前端参数
 # └─────────────────────────────────────────────────────────────────────────────
@@ -115,6 +122,8 @@ frontend:
   odom_topic:    "/aft_mapped_to_init"
   cloud_topic:   "/cloud_registered"
   kf_info_topic: "/fast_livo/keyframe_info"
+  # 🏛️ [无损增密] 前端扫描级滑动窗口大小。
+  sweep_accumulation_frames: 15
 
 # ── 2.3 关键帧选取 ───────────────────────────────────────────────────────────
 keyframe:
@@ -448,6 +457,7 @@ semantic:
     enabled: true
     log_level: info
     max_lines_per_cluster: 3
+    trunk_chain_skip_rv_wall_label: true
     euclidean_cluster:
       tolerance_m: 0.38
       min_points: 12
@@ -458,6 +468,14 @@ semantic:
       enabled: true
       # 几何辨识前叠加最近 N 帧到当前车体；稀疏雷达宜 24~48，过大则 Patchwork/聚类耗时与内存上升
       max_frames: 32
+      # false：不写 geo_sem_*.pcd（总开关；true 时需 save_merged_cloud_dir 非空才会落盘）
+      save_debug_pcd: false
+      save_merged_cloud_dir: ""
+      save_merged_cloud_every_n: 1
+      # true：写多帧叠加 accum_body（仅 save_debug_pcd=true 且目录非空）
+      save_accum_body_pcd: true
+      # true：写基元输入 prim_input（二次 Patchwork + ROI 后）
+      save_primitive_input_cloud: false
     wall_ransac:
       enabled: true
       line_distance_threshold: 0.11

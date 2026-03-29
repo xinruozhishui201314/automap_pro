@@ -4,6 +4,7 @@
 #include "automap_pro/core/metrics.h"
 #include "automap_pro/core/opt_task_types.h"
 #include "automap_pro/v3/map_registry.h"
+#include "automap_pro/v3/pose_chain.hpp"
 #include "automap_pro/v3/semantic_backend_gates.h"
 #include "automap_pro/core/data_types.h"
 #include <algorithm>
@@ -17,6 +18,7 @@
 #include <future>
 #include <pcl/common/transforms.h>
 #include <pcl/io/pcd_io.h>
+#include <Eigen/Geometry>
 
 namespace fs = std::filesystem;
 
@@ -89,6 +91,7 @@ MappingModule::MappingModule(EventBus::Ptr event_bus, MapRegistry::Ptr map_regis
     semantic_timestamp_match_tolerance_s_ = mapping_cfg.semantic_timestamp_match_tolerance_s;
 
     current_session_id_ = static_cast<uint64_t>(std::chrono::system_clock::now().time_since_epoch().count());
+    map_registry_->setSessionId(current_session_id_);
     processed_alignment_epoch_.store(map_registry_->getAlignmentEpoch());
 
     RCLCPP_INFO(node_->get_logger(), "[PIPELINE][MAP] ctor step=SubMapManager::init");
@@ -232,7 +235,12 @@ MappingModule::MappingModule(EventBus::Ptr event_bus, MapRegistry::Ptr map_regis
                 warn.meta.source_ts = ev.timestamp;
                 warn.meta.publish_ts = node_->now().seconds();
                 warn.meta.producer = "MappingModule";
-                event_bus_->publish(warn);
+                warn.meta.session_id =
+                    ev.meta.session_id != 0 ? ev.meta.session_id : map_registry_->getSessionId();
+                warn.meta.route_tag = "legacy";
+                if (warn.isValid()) {
+                    event_bus_->publish(warn);
+                }
             } else if (frame_queue_.size() > max_frame_queue_size_ * 0.8) {
                 BackpressureWarningEvent warn;
                 warn.module_name = name_;
@@ -246,7 +254,12 @@ MappingModule::MappingModule(EventBus::Ptr event_bus, MapRegistry::Ptr map_regis
                 warn.meta.source_ts = ev.timestamp;
                 warn.meta.publish_ts = node_->now().seconds();
                 warn.meta.producer = "MappingModule";
-                event_bus_->publish(warn);
+                warn.meta.session_id =
+                    ev.meta.session_id != 0 ? ev.meta.session_id : map_registry_->getSessionId();
+                warn.meta.route_tag = "legacy";
+                if (warn.isValid()) {
+                    event_bus_->publish(warn);
+                }
             }
             frame_queue_.push_back(ev);
         }
@@ -327,9 +340,10 @@ MappingModule::MappingModule(EventBus::Ptr event_bus, MapRegistry::Ptr map_regis
         this->quiesce(ev.enable);
     });
 
+    // Orchestrator 对任意观测事件（含 Semantic*、OptimizationDelta、FilteredFrame 等）均可发 RouteAdvice；
+    // takeover 语义统一由本 latch 驱动 GraphTask/SemanticInput 的 route_tag 与 legacy 优化应用路径。
     onEvent<RouteAdviceEvent>([this](const RouteAdviceEvent& ev) {
         if (!ev.meta.isValid()) return;
-        if (ev.event_type != "SyncedFrameEvent" && ev.event_type != "OptimizationResultEvent") return;
         route_advice_recv_total_.fetch_add(1, std::memory_order_relaxed);
         route_takeover_enabled_.store(ev.takeover_enabled, std::memory_order_relaxed);
         RCLCPP_INFO_THROTTLE(node_->get_logger(), *node_->get_clock(), 2000,
@@ -365,12 +379,18 @@ MappingModule::MappingModule(EventBus::Ptr event_bus, MapRegistry::Ptr map_regis
     // 语义点云（intensity=类别 id）挂到关键帧，供回环 ICP 加权（与 SemanticLandmarkEvent 独立到达）
     onEvent<SemanticCloudEvent>([this](const SemanticCloudEvent& ev) {
         if (!running_.load()) return;
-        if (!ev.labeled_cloud || ev.labeled_cloud->empty()) return;
+        if (!ev.isValid()) {
+            RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000,
+                "[V3][CONTRACT] Reject invalid SemanticCloudEvent ts=%.3f", ev.timestamp);
+            return;
+        }
         const auto& cfg = ConfigManager::instance();
         const double tol = cfg.semanticTimestampMatchToleranceS();
-        KeyFrame::Ptr kf = map_registry_->getKeyFrameByTimestamp(ev.timestamp, tol);
+        const uint64_t sid =
+            ev.meta.session_id != 0 ? ev.meta.session_id : map_registry_->getSessionId();
+        KeyFrame::Ptr kf = map_registry_->getKeyFrameByTimestampPreferPrior(ev.timestamp, tol, sid);
         if (!kf && std::isfinite(ev.timestamp) && ev.timestamp > 0.0) {
-            kf = map_registry_->getKeyFrameByTimestamp(ev.timestamp, std::min(0.5, tol * 2.0));
+            kf = map_registry_->getKeyFrameByTimestampPreferPrior(ev.timestamp, std::min(0.5, tol * 2.0), sid);
         }
         if (!kf) {
             RCLCPP_DEBUG_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000,
@@ -516,13 +536,18 @@ void MappingModule::run() {
                     semantic_landmark_queue_.pop_front();
                     has_sem = true;
                 } else if (!frame_queue_.empty()) {
-                // 🏛️ [修复] 确定性因果序屏障：检查地图版本与对齐世代是否已在 Mapping 模块本地处理完成
+                // 🏛️ [修复] 确定性因果序屏障：版本须 reg 已追上；对齐世代须 target_epoch <= local_epoch。
+                // 禁止 target_epoch == local_epoch 的严格相等：GPS 对齐后 processed_alignment_epoch_ 先升级，
+                // 队列里仍大量 ref_alignment_epoch 为对齐前值的帧（见 full.log Barrier TIMEOUT target_epoch=1 current_epoch=2），
+                // 会导致整段帧 5s 超时丢弃、Registry 长时间无新 KF、当前云 bypass 与 optimized_path 剧烈脱节。
+                // target_epoch < current_epoch：事件标签过时，几何仍为 LIO odom，processFrame 按当前 gps_aligned_ 升 MAP 即可消费。
+                // target_epoch > current_epoch：须先处理 GPS 等使 local_epoch 追上（队列优先 gps_event_queue_）。
                     const uint64_t target_version = frame_queue_.front().ref_map_version;
                     const uint64_t target_epoch = frame_queue_.front().ref_alignment_epoch;
                     const uint64_t registry_version = map_registry_->getVersion();
                     const uint64_t current_epoch = processed_alignment_epoch_.load();
-                    
-                    if (target_epoch == current_epoch && target_version <= registry_version) {
+
+                    if (target_version <= registry_version && target_epoch <= current_epoch) {
                         event = frame_queue_.front();
                         frame_queue_.pop_front();
                         has_frame = true;
@@ -544,7 +569,8 @@ void MappingModule::run() {
                         } else {
                             // 地图版本尚未追上，本轮循环跳过处理新帧，等待优化结果入队并处理
                             RCLCPP_DEBUG_THROTTLE(node_->get_logger(), *node_->get_clock(), 1000,
-                                "[V3][MappingModule] Frame blocked by LOCAL barrier: frame_ref=%lu registry_version=%lu frame_epoch=%lu local_epoch=%lu (waiting...)",
+                                "[V3][MappingModule] Frame blocked: ref_v=%lu reg_v=%lu ref_ep=%lu local_ep=%lu "
+                                "(dequeue when ref_v<=reg_v && ref_ep<=local_ep)",
                                 target_version, registry_version, target_epoch, current_epoch);
                         }
                     }
@@ -769,24 +795,28 @@ void MappingModule::processFrame(const FilteredFrameEventRequiredDs& event) {
     }
     kf->livo_info = event.kf_info;
     kf->pose_frame = event.pose_frame; // 🏛️ [架构契约] 继承来源语义
+    kf->alignment_epoch = event.ref_alignment_epoch; // 🏛️ [对齐纪元] 继承事件纪元
 
-    // 应用 GPS 对齐变换
-    bool aligned = gps_aligned_.load();
+    // 应用 GPS 对齐变换 (🏛️ [架构加固] R/t 偏移与其对齐状态原子性快照，避免锁外读导致的脏读)
     Eigen::Matrix3d R_snapshot = Eigen::Matrix3d::Identity();
     Eigen::Vector3d t_snapshot = Eigen::Vector3d::Zero();
-    if (aligned) {
-        {
-            std::lock_guard<std::mutex> lk(gps_transform_mutex_);
+    bool aligned = false;
+    {
+        std::lock_guard<std::mutex> lk(gps_transform_mutex_);
+        aligned = gps_aligned_.load();
+        if (aligned) {
             R_snapshot = gps_transform_R_;
             t_snapshot = gps_transform_t_;
         }
+    }
 
+    if (aligned) {
         // 🏛️ [契约核校] 仅当输入为 ODOM 时才需要进行 Map 补偿转换
         if (kf->pose_frame == PoseFrame::ODOM) {
-            Pose3d T = Pose3d::Identity();
-            T.linear() = R_snapshot * kf->T_odom_b.linear();
-            T.translation() = R_snapshot * kf->T_odom_b.translation() + t_snapshot;
-            kf->T_map_b_optimized = T;
+            Pose3d T_mo = Pose3d::Identity();
+            T_mo.linear() = R_snapshot;
+            T_mo.translation() = t_snapshot;
+            kf->T_map_b_optimized = pose_chain::mapBodyFromOdomBody(T_mo, kf->T_odom_b);
             kf->pose_frame = PoseFrame::MAP; // 🏛️ [架构加固] 标注语义已提升为 MAP
 
             RCLCPP_INFO_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000,
@@ -799,14 +829,17 @@ void MappingModule::processFrame(const FilteredFrameEventRequiredDs& event) {
     // 注册到 MapRegistry（先完成 pose 数据语义升级再发布，避免并发读到半更新状态）
     map_registry_->addKeyFrame(kf);
 
+    // 必须先写入 SubMapManager，使 kf->submap_id / index_in_submap 就绪，再投递 KEYFRAME_CREATE；
+    // 否则 IncrementalOptimizer 无法做 Between(SM(sm), KF(首帧)) 的正确锚定。
+    sm_manager_.addKeyFrame(kf);
+
     bool has_prev_kf = (prev_kf != nullptr);
     int prev_kf_id = has_prev_kf ? static_cast<int>(prev_kf->id) : -1;
 
-    // 发布任务（灰度迁移：GraphTaskEvent <-> SemanticInputEvent 可双路）
-    const auto& cfg = ConfigManager::instance();
-    const bool use_independent_semantic_input = cfg.semanticInputUseIndependentEvent();
-    const bool dual_write_graph_task = cfg.semanticInputDualWriteGraphTask();
-    if (!use_independent_semantic_input || dual_write_graph_task) {
+    // OptimizerModule 仅订阅 GraphTaskEvent：必须每帧发布 KEYFRAME_CREATE，不可因「独立语义输入」而关闭，
+    // 否则 iSAM2 收不到 addKeyFrameNode（曾导致因子图与子图位姿脱节）。
+    // 语义侧另走 SemanticInputEvent；若同时开启 semanticInputAcceptGraphTask 与 AcceptIndependentEvent，可能双路同一 KF，需配置只开其一入语义。
+    {
         GraphTaskEvent task_ev;
         task_ev.task.type = OptTaskItem::Type::KEYFRAME_CREATE;
         task_ev.task.keyframe = kf;
@@ -819,6 +852,8 @@ void MappingModule::processFrame(const FilteredFrameEventRequiredDs& event) {
         publishGraphTaskEvent(task_ev, kf->timestamp);
     }
 
+    const auto& cfg = ConfigManager::instance();
+    const bool use_independent_semantic_input = cfg.semanticInputUseIndependentEvent();
     if (use_independent_semantic_input) {
         SemanticInputEvent sem_in_ev;
         sem_in_ev.timestamp = kf->timestamp;
@@ -830,12 +865,18 @@ void MappingModule::processFrame(const FilteredFrameEventRequiredDs& event) {
         sem_in_ev.meta.producer_seq = seq;
         sem_in_ev.meta.ref_version = map_registry_->getVersion();
         sem_in_ev.meta.ref_epoch = map_registry_->getAlignmentEpoch();
+        sem_in_ev.meta.session_id = map_registry_->getSessionId();
         sem_in_ev.meta.source_ts = kf->timestamp;
         sem_in_ev.meta.publish_ts = now_ts;
         sem_in_ev.meta.producer = "MappingModule";
         sem_in_ev.meta.route_tag = route_takeover_enabled_.load(std::memory_order_relaxed) ? "orchestrated" : "legacy";
         sem_in_ev.processing_state = quiescing_.load() ? ProcessingState::DEGRADED : ProcessingState::NORMAL;
-        event_bus_->publish(sem_in_ev);
+        if (!sem_in_ev.isValid()) {
+            RCLCPP_ERROR_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000,
+                "[V3][CONTRACT] Drop invalid SemanticInputEvent kf_id=%lu", static_cast<unsigned long>(kf->id));
+        } else {
+            event_bus_->publish(sem_in_ev);
+        }
     }
     const uint64_t trace_id = semanticTraceId(kf->id, kf->timestamp);
     size_t frame_q_size = 0;
@@ -854,9 +895,6 @@ void MappingModule::processFrame(const FilteredFrameEventRequiredDs& event) {
         cloud_ds ? cloud_ds->size() : 0,
         frame_q_size,
         sem_q_size);
-    
-    // 同步到 submap_manager
-    sm_manager_.addKeyFrame(kf);
 
     // 🏛️ [P1 稳定性修复] 检查是否有延迟到达的语义地标，现在 KeyFrame 已经分配了 submap_id
     SemanticLandmarkEvent deferred_ev;
@@ -909,7 +947,7 @@ void MappingModule::processFrame(const FilteredFrameEventRequiredDs& event) {
         
         GlobalMapBuildRequestEvent build_ev;
         build_ev.voxel_size = ConfigManager::instance().mapVoxelSize();
-        build_ev.async = ConfigManager::instance().asyncGlobalMapBuild();
+        build_ev.async = ConfigManager::instance().globalMapBuildAsync();
         event_bus_->publish(build_ev);
     }
 }
@@ -989,10 +1027,13 @@ void MappingModule::updateGPSAlignment(const GPSAlignedEvent& ev) {
     }
     last_gps_event_seq_.store(ev.event_seq);
 
+    // GPSModule 携带的 alignment_epoch 是「发布瞬间」的 getAlignmentEpoch() 提示值（见 map_registry.h 注释），
+    // 与 MapRegistry 初始值均为 1。若用 <= 会把「首次成功对齐」误判为重复（1<=1）而丢弃，导致永不 setGPSAligned。
+    // 仅当事件的观测世代严格落后于本模块已处理的世代时才视为过期。
     const uint64_t local_epoch_before = processed_alignment_epoch_.load();
-    if (ev.alignment_epoch != 0 && ev.alignment_epoch <= local_epoch_before) {
+    if (ev.alignment_epoch != 0 && ev.alignment_epoch < local_epoch_before) {
         RCLCPP_WARN(node_->get_logger(),
-            "[V3][CONTRACT] Drop stale/duplicate GPSAlignedEvent: event_epoch=%lu local_epoch=%lu success=%d",
+            "[V3][CONTRACT] Drop stale GPSAlignedEvent: event_observed_epoch=%lu local_processed_epoch=%lu success=%d",
             static_cast<unsigned long>(ev.alignment_epoch),
             static_cast<unsigned long>(local_epoch_before),
             ev.success ? 1 : 0);
@@ -1049,6 +1090,18 @@ void MappingModule::updateGPSAlignment(const GPSAlignedEvent& ev) {
     RCLCPP_INFO(node_->get_logger(),
         "[V3][POSE_DIAG] MapRegistry version updated to %lu after GPS alignment (epoch=%lu, event_epoch=%lu)",
         version, static_cast<unsigned long>(new_epoch), static_cast<unsigned long>(ev.alignment_epoch));
+    {
+        const double t_norm = ev.t_enu_to_map.norm();
+        RCLCPP_INFO(node_->get_logger(),
+            "[V3][GPS_ALIGN_APPLIED] map_ver=%lu epoch=%lu rmse=%.3fm t_norm=%.3fm event_seq=%lu "
+            "t_enu_map=[%.3f,%.3f,%.3f] (grep 本行与 POSE_DRIFT 时间线对照可验证「对齐→可视化漂移」)",
+            static_cast<unsigned long>(version),
+            static_cast<unsigned long>(new_epoch),
+            ev.rmse,
+            t_norm,
+            static_cast<unsigned long>(ev.event_seq),
+            ev.t_enu_to_map.x(), ev.t_enu_to_map.y(), ev.t_enu_to_map.z());
+    }
 
     GPSAlignResult hba_align;
     hba_align.success = true;
@@ -1058,6 +1111,11 @@ void MappingModule::updateGPSAlignment(const GPSAlignedEvent& ev) {
     hba_optimizer_.setGPSAlignedState(hba_align);
     RCLCPP_INFO(node_->get_logger(),
         "[V3][POSE_DIAG] HBA GPS alignment state synchronized: rmse=%.3fm", ev.rmse);
+
+    // 🏛️ [GPS 对齐屏障] 历史关键帧仍为 ODOM 语义时，SubMapManager 内 T_map_b_optimized 曾与 T_odom_b 等同；
+    // 若不先升级并与 Optimizer transformHistory 一致，则 merged_cloud / buildGlobalMap 与新建 MAP 关键帧双轨并存。
+    // 必须在 freeze 前完成，使冻结路径上的 merged_cloud 与锚点已是 map 系。
+    sm_manager_.applyGpsMapOriginToOdomKeyframes(ev.R_enu_to_map, ev.t_enu_to_map, version, new_epoch);
 
     // 🏛️ [修复] 解决中途对齐导致的严重重影：对齐后立即冻结当前活跃子图
     // 确保对齐后的关键帧在新的坐标系下开启新子图，避免与对齐前（Odom系）的关键帧混在同一子图导致 T_submap_kf 剧变
@@ -1127,12 +1185,36 @@ void MappingModule::onPoseOptimized(const OptimizationResultEvent& ev) {
         static_cast<unsigned long>(ev.batch_hash));
     
     // 🏛️ [架构加固] 统一通过语义网关应用位姿
-    const bool applied = applyOptimizedPoses(ev.submap_poses, ev.keyframe_poses, ev.pose_frame, ev.version);
+    const bool sync_viz = ConfigManager::instance().vizSyncGlobalMapBuild();
+    const bool hba = (ev.source_module == "HBAOptimizer");
+    const bool applied =
+        applyOptimizedPoses(ev.submap_poses, ev.keyframe_poses, ev.pose_frame, ev.version,
+                            ev.alignment_epoch,
+                            sync_viz && hba);
     if (applied) {
         legacy_opt_apply_total_.fetch_add(1, std::memory_order_relaxed);
     }
-    if (applied && ev.source_module == "HBAOptimizer") {
+    if (applied && hba) {
         sm_manager_.rebuildMergedCloudFromOptimizedPoses();
+        if (sync_viz) {
+            const int interval =
+                std::max(1, ConfigManager::instance().backendPublishGlobalMapEveryNProcessed());
+            const int cnt = optimized_apply_count_.load(std::memory_order_relaxed);
+            if (cnt % interval == 0) {
+                GlobalMapBuildRequestEvent ge;
+                ge.voxel_size = ConfigManager::instance().mapVoxelSize();
+                ge.async = false;
+                handleGlobalMapBuild(ge);
+                RCLCPP_INFO(node_->get_logger(),
+                    "[V3][VIZ_SYNC] HBA: rebuildMergedCloud -> sync handleGlobalMapBuild "
+                    "optimized_apply_count=%d interval=%d (grep VIZ_SYNC)",
+                    cnt, interval);
+            } else {
+                RCLCPP_DEBUG(node_->get_logger(),
+                    "[V3][VIZ_SYNC] HBA: skip sync global map this round (throttle cnt=%d interval=%d)",
+                    cnt, interval);
+            }
+        }
     }
 }
 
@@ -1165,10 +1247,20 @@ void MappingModule::onPoseDelta(const OptimizationDeltaEvent& ev) {
     }
 }
 
-bool MappingModule::applyOptimizedPoses(const std::unordered_map<int, Pose3d>& sm_poses, 
-                                       const std::unordered_map<uint64_t, Pose3d>& kf_poses, 
-                                       PoseFrame frame, uint64_t version) {
+bool MappingModule::applyOptimizedPoses(const std::unordered_map<int, Pose3d>& sm_poses,
+                                       const std::unordered_map<uint64_t, Pose3d>& kf_poses,
+                                       PoseFrame frame, uint64_t version,
+                                       uint64_t alignment_epoch,
+                                       bool skip_optimize_driven_global_map_request) {
     const auto t0 = std::chrono::steady_clock::now();
+    RCLCPP_DEBUG(node_->get_logger(),
+        "[V3][APPLY_POSE_CHAIN] enter version=%lu pose_frame=%d epoch=%lu sm_poses=%zu kf_poses=%zu proc_map_ver=%lu (grep APPLY_POSE_CHAIN)",
+        static_cast<unsigned long>(version),
+        static_cast<int>(frame),
+        static_cast<unsigned long>(alignment_epoch),
+        sm_poses.size(),
+        kf_poses.size(),
+        static_cast<unsigned long>(processed_map_version_.load()));
     // 🏛️ [产品化加固] 状态守卫
     if (!running_.load()) return false;
 
@@ -1241,10 +1333,10 @@ bool MappingModule::applyOptimizedPoses(const std::unordered_map<int, Pose3d>& s
 
     // 2. 批量分发到位姿后端 (SubMapManager / MapRegistry)
     if (!sm_to_apply.empty()) {
-        sm_manager_.batchUpdateSubmapPoses(sm_to_apply, version, effective_frame);
+        sm_manager_.batchUpdateSubmapPoses(sm_to_apply, version, effective_frame, alignment_epoch);
     }
     if (!kf_to_apply.empty()) {
-        sm_manager_.batchUpdateKeyFramePoses(kf_to_apply, version, effective_frame);
+        sm_manager_.batchUpdateKeyFramePoses(kf_to_apply, version, effective_frame, alignment_epoch);
     }
 
     // 3. 屏障同步与子图隔离 (🏛️ [架构契约] 消除重影的核心逻辑)
@@ -1281,6 +1373,18 @@ bool MappingModule::applyOptimizedPoses(const std::unordered_map<int, Pose3d>& s
             RCLCPP_INFO(node_->get_logger(),
                 "[V3][GHOST_GUARD] Propagating pose jump to Frontend: delta_t=[%.2f,%.2f,%.2f]",
                 delta.translation().x(), delta.translation().y(), delta.translation().z());
+            if (ConfigManager::instance().vizLogPoseJumpDetail()) {
+                const double t_norm = delta.translation().norm();
+                const double rot_deg =
+                    Eigen::AngleAxisd(delta.linear()).angle() * (180.0 / M_PI);
+                RCLCPP_INFO(node_->get_logger(),
+                    "[V3][GHOST_GUARD][POSE_JUMP_DETAIL] delta_t_norm=%.4fm delta_rot_deg=%.2f "
+                    "from_ver=%lu to_ver=%lu kf_id=%lu",
+                    t_norm, rot_deg,
+                    static_cast<unsigned long>(adjust_ev.from_version),
+                    static_cast<unsigned long>(adjust_ev.to_version),
+                    static_cast<unsigned long>(latest_kf_id));
+            }
         }
     }
 
@@ -1288,20 +1392,30 @@ bool MappingModule::applyOptimizedPoses(const std::unordered_map<int, Pose3d>& s
     last_applied_version_ = version;
 
     // 5. 可视化同步（节流：避免每次优化都触发一次全局构图造成后端抖动）
-    const int optimize_interval = std::max(1, ConfigManager::instance().backendPublishGlobalMapEveryNProcessed());
+    // 计数始终前进，供 HBA 后 sync 路径与 suppress_optimize_driven 组合时节流仍正确。
+    const int optimize_interval =
+        std::max(1, ConfigManager::instance().backendPublishGlobalMapEveryNProcessed());
     const int optimized_count = ++optimized_apply_count_;
-    if (optimized_count % optimize_interval == 0) {
-        GlobalMapBuildRequestEvent build_ev;
-        build_ev.voxel_size = ConfigManager::instance().mapVoxelSize();
-        build_ev.async = ConfigManager::instance().asyncGlobalMapBuild();
-        event_bus_->publish(build_ev);
-        RCLCPP_INFO(node_->get_logger(),
-            "[V3][PERF] Trigger optimize-driven global map build: optimized_count=%d interval=%d version=%lu",
-            optimized_count, optimize_interval, static_cast<unsigned long>(version));
-    } else {
-        RCLCPP_DEBUG(node_->get_logger(),
-            "[V3][PERF] Skip optimize-triggered global map build (optimized_count=%d interval=%d)",
-            optimized_count, optimize_interval);
+    if (!ConfigManager::instance().vizSuppressOptimizeDrivenGlobalMap()) {
+        if (skip_optimize_driven_global_map_request) {
+            RCLCPP_DEBUG(node_->get_logger(),
+                "[V3][PERF] Skip optimize-driven global map publish (HBA sync viz builds after rebuild) "
+                "optimized_count=%d interval=%d",
+                optimized_count, optimize_interval);
+        } else if (optimized_count % optimize_interval == 0) {
+            GlobalMapBuildRequestEvent build_ev;
+            build_ev.voxel_size = ConfigManager::instance().mapVoxelSize();
+            build_ev.async = ConfigManager::instance().globalMapBuildAsync();
+            event_bus_->publish(build_ev);
+            RCLCPP_INFO(node_->get_logger(),
+                "[V3][PERF] Trigger optimize-driven global map build: optimized_count=%d interval=%d version=%lu async=%d",
+                optimized_count, optimize_interval, static_cast<unsigned long>(version),
+                build_ev.async ? 1 : 0);
+        } else {
+            RCLCPP_DEBUG(node_->get_logger(),
+                "[V3][PERF] Skip optimize-triggered global map build (optimized_count=%d interval=%d)",
+                optimized_count, optimize_interval);
+        }
     }
     const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - t0).count();
@@ -1415,7 +1529,9 @@ void MappingModule::handleSaveMap(const SaveMapRequestEvent& ev) {
     try {
         RCLCPP_INFO(node_->get_logger(), "[V3][MappingModule] Building final global map for saving...");
         float save_voxel_size = ConfigManager::instance().mapVoxelSize();
-        CloudXYZIPtr global_map = sm_manager_.buildGlobalMap(save_voxel_size);
+        uint64_t current_epoch = map_registry_->getAlignmentEpoch();
+        sm_manager_.invalidateGlobalMapCache();
+        CloudXYZIPtr global_map = sm_manager_.buildGlobalMap(save_voxel_size, current_epoch);
         if (global_map && !global_map->empty()) {
             std::string global_path = ev.output_dir + "/global_map_final.pcd";
             pcl::io::savePCDFileBinary(global_path, *global_map);
@@ -1432,27 +1548,43 @@ void MappingModule::handleSaveMap(const SaveMapRequestEvent& ev) {
     // ========================================================
 }
 
+void MappingModule::publishGlobalMapResultAndTriggerVizSync(const CloudXYZIPtr& global) {
+    if (!global || global->empty()) {
+        return;
+    }
+    // 先发布点云结果，再发 MapUpdate：EventBus 按类型分派，订阅 GlobalMapBuildResult 的节点（AutoMapSystem）
+    // 先于 MapUpdate 的处理器跑完，RViz 收到云后再由 VisualizationModule 因 GLOBAL_MAP_REBUILT 刷新轨迹，避免「云已换系/位姿而 path 仍旧」的窗口。
+    GlobalMapBuildResultEvent res;
+    res.global_map = global;
+    event_bus_->publish(res);
+    MapUpdateEvent mue;
+    mue.version = map_registry_->getVersion();
+    mue.type = MapUpdateEvent::ChangeType::GLOBAL_MAP_REBUILT;
+    event_bus_->publish(mue);
+}
+
 void MappingModule::handleGlobalMapBuild(const GlobalMapBuildRequestEvent& ev) {
     try {
+        uint64_t limit = ev.alignment_epoch_limit;
+        if (limit == 0) {
+            limit = map_registry_->getAlignmentEpoch();
+        }
+
         if (ev.async) {
             // 🏛️ [稳定性修复] 使用异步构建且不再通过 .get() 阻塞 MappingModule 线程 (解决 HUNG/ZOMBIE 问题)
             // 获取 future 后通过单独的辅助线程处理结果并发布事件，确保 MappingModule 心跳不中断
-            auto future = sm_manager_.buildGlobalMapAsync(ev.voxel_size);
+            auto future = sm_manager_.buildGlobalMapAsync(ev.voxel_size, limit);
             std::thread([this, f = std::move(future)]() mutable {
                 try {
                     auto global = f.get();
-                    GlobalMapBuildResultEvent res;
-                    res.global_map = global;
-                    event_bus_->publish(res);
+                    publishGlobalMapResultAndTriggerVizSync(global);
                 } catch (const std::exception& e) {
                     RCLCPP_ERROR(node_->get_logger(), "[V3][MappingModule][ASYNC_BUILD] Build failed: %s", e.what());
                 }
             }).detach();
         } else {
-            CloudXYZIPtr global = sm_manager_.buildGlobalMap(ev.voxel_size);
-            GlobalMapBuildResultEvent res;
-            res.global_map = global;
-            event_bus_->publish(res);
+            CloudXYZIPtr global = sm_manager_.buildGlobalMap(ev.voxel_size, limit);
+            publishGlobalMapResultAndTriggerVizSync(global);
         }
     } catch (const std::exception& e) {
         RCLCPP_ERROR(node_->get_logger(), "[V3][MappingModule] Global map build failed: %s", e.what());
@@ -1477,11 +1609,17 @@ void MappingModule::publishGraphTaskEvent(GraphTaskEvent& ev, double source_ts) 
     ev.meta.producer_seq = seq;
     ev.meta.ref_version = map_registry_->getVersion();
     ev.meta.ref_epoch = map_registry_->getAlignmentEpoch();
+    ev.meta.session_id = map_registry_->getSessionId();
     ev.meta.source_ts = std::isfinite(source_ts) ? source_ts : now_ts;
     ev.meta.publish_ts = now_ts;
     ev.meta.producer = "MappingModule";
     ev.meta.route_tag = route_takeover_enabled_.load(std::memory_order_relaxed) ? "orchestrated" : "legacy";
     ev.processing_state = quiescing_.load() ? ProcessingState::DEGRADED : ProcessingState::NORMAL;
+    if (!ev.isValid()) {
+        RCLCPP_ERROR_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000,
+            "[V3][CONTRACT] Drop invalid GraphTaskEvent (meta contract)");
+        return;
+    }
     event_bus_->publish(ev);
 }
 
@@ -1520,13 +1658,45 @@ void MappingModule::onSemanticLandmarks(const SemanticLandmarkEvent& ev) {
             warn.module_name = name_ + "_pending_semantic";
             warn.queue_usage_ratio = 1.0f;
             warn.critical = true;
-            event_bus_->publish(warn);
+            {
+                const uint64_t seq = graph_event_seq_.fetch_add(1, std::memory_order_relaxed) + 1;
+                const double pts = node_->now().seconds();
+                warn.meta.event_id = warn.meta.idempotency_key = makeEventId(pts, seq);
+                warn.meta.producer_seq = warn.meta.event_id;
+                warn.meta.session_id = pending_ev.meta.session_id != 0 ? pending_ev.meta.session_id
+                                                                      : map_registry_->getSessionId();
+                warn.meta.ref_version = map_registry_->getVersion();
+                warn.meta.ref_epoch = map_registry_->getAlignmentEpoch();
+                warn.meta.source_ts = pending_ev.timestamp;
+                warn.meta.publish_ts = pts;
+                warn.meta.producer = "MappingModule";
+                warn.meta.route_tag = "legacy";
+            }
+            if (warn.isValid()) {
+                event_bus_->publish(warn);
+            }
         } else if (pending_semantic_landmarks_.size() > max_pending_semantic_events_ * 0.8) {
             BackpressureWarningEvent warn;
             warn.module_name = name_ + "_pending_semantic";
             warn.queue_usage_ratio = static_cast<float>(pending_semantic_landmarks_.size()) / max_pending_semantic_events_;
             warn.critical = false;
-            event_bus_->publish(warn);
+            {
+                const uint64_t seq = graph_event_seq_.fetch_add(1, std::memory_order_relaxed) + 1;
+                const double pts = node_->now().seconds();
+                warn.meta.event_id = warn.meta.idempotency_key = makeEventId(pts, seq);
+                warn.meta.producer_seq = warn.meta.event_id;
+                warn.meta.session_id = pending_ev.meta.session_id != 0 ? pending_ev.meta.session_id
+                                                                       : map_registry_->getSessionId();
+                warn.meta.ref_version = map_registry_->getVersion();
+                warn.meta.ref_epoch = map_registry_->getAlignmentEpoch();
+                warn.meta.source_ts = pending_ev.timestamp;
+                warn.meta.publish_ts = pts;
+                warn.meta.producer = "MappingModule";
+                warn.meta.route_tag = "legacy";
+            }
+            if (warn.isValid()) {
+                event_bus_->publish(warn);
+            }
         }
         pending_semantic_landmarks_.push_back(pending_ev);
         RCLCPP_DEBUG(node_->get_logger(),
@@ -1545,18 +1715,42 @@ void MappingModule::onSemanticLandmarks(const SemanticLandmarkEvent& ev) {
             pending_ev.plane_landmarks.size());
     };
 
+    const uint64_t ev_session =
+        ev.meta.session_id != 0 ? ev.meta.session_id : map_registry_->getSessionId();
+
     // 1. 查找对应的关键帧（优先 keyframe_id_hint，其次 keyframe timestamp hint，再兜底语义事件时间戳）
     KeyFrame::Ptr kf = nullptr;
     if (ev.keyframe_id_hint != 0) {
         kf = map_registry_->getKeyFrame(static_cast<int>(ev.keyframe_id_hint));
+        if (kf && ev_session != 0 && kf->session_id != ev_session) {
+            RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000,
+                "[SEMANTIC][Mapping][onSemanticLandmarks] kf_hint_id=%lu session mismatch (kf_sess=%lu ev_sess=%lu), "
+                "ignore id hint",
+                static_cast<unsigned long>(ev.keyframe_id_hint),
+                static_cast<unsigned long>(kf->session_id),
+                static_cast<unsigned long>(ev_session));
+            kf = nullptr;
+        }
     }
     if (std::isfinite(ev.keyframe_timestamp_hint) && ev.keyframe_timestamp_hint > 0.0) {
         if (!kf || std::abs(kf->timestamp - ev.keyframe_timestamp_hint) > semantic_timestamp_match_tolerance_s_) {
-            kf = map_registry_->getKeyFrameByTimestamp(ev.keyframe_timestamp_hint, semantic_timestamp_match_tolerance_s_);
+            kf = map_registry_->getKeyFrameByTimestampPreferPrior(ev.keyframe_timestamp_hint,
+                                                                   semantic_timestamp_match_tolerance_s_,
+                                                                   ev_session);
+            if (!kf) {
+                kf = map_registry_->getKeyFrameByTimestampPreferPrior(
+                    ev.keyframe_timestamp_hint, std::min(0.5, semantic_timestamp_match_tolerance_s_ * 2.0),
+                    ev_session);
+            }
         }
     }
     if (!kf) {
-        kf = map_registry_->getKeyFrameByTimestamp(ev.timestamp, semantic_timestamp_match_tolerance_s_);
+        kf = map_registry_->getKeyFrameByTimestampPreferPrior(ev.timestamp, semantic_timestamp_match_tolerance_s_,
+                                                               ev_session);
+        if (!kf) {
+            kf = map_registry_->getKeyFrameByTimestampPreferPrior(
+                ev.timestamp, std::min(0.5, semantic_timestamp_match_tolerance_s_ * 2.0), ev_session);
+        }
     }
     if (!kf) {
         RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 2000,

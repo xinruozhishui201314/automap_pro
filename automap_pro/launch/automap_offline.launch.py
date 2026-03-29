@@ -313,6 +313,29 @@ def _launch_nodes_offline(context, *args, **kwargs):
                 _cfg["map"] = {}
             _cfg["map"]["frame_config_path"] = os.path.join(session_out, "map_frame.cfg")
 
+            # 钉死顶层 `gps:`：与原始 YAML 合并缺失键，避免 safe_dump/中间步骤导致补丁里丢杆臂，
+            # C++ 侧 cfg_["gps"] 异常与 HBA 零杆臂（见 run_20260329_091053 + ConfigManager 诊断）。
+            try:
+                _orig_full_for_gps = {}
+                with open(_orig_config_abs, "r", encoding="utf-8") as _ogps:
+                    _orig_full_for_gps = _yaml.safe_load(_ogps) or {}
+                _src_gps = _orig_full_for_gps.get("gps") if isinstance(_orig_full_for_gps.get("gps"), dict) else {}
+                if not isinstance(_cfg.get("gps"), dict):
+                    _cfg["gps"] = {}
+                _merged_gps = dict(_cfg["gps"])
+                for _gk, _gv in _src_gps.items():
+                    if _gk not in _merged_gps or _merged_gps[_gk] is None:
+                        _merged_gps[_gk] = _gv
+                _cfg["gps"] = _merged_gps
+                if _src_gps:
+                    sys.stderr.write(
+                        "{} [CONFIG][GPS] merged top-level gps: keys from source={}, keys in patched={}\n".format(
+                            _LP, len(_src_gps), len(_merged_gps))
+                    )
+                    sys.stderr.flush()
+            except Exception as _e_merge_gps:
+                _log_launch_exception("merge top-level gps from source config (offline)", _e_merge_gps)
+
             # Runtime hard guard (from run_automap precheck):
             # If NVRTC arch support is insufficient, force OT to CPU to avoid process aborts.
             _force_ot_cpu = str(os.environ.get("AUTOMAP_FORCE_OT_CPU", "")).strip().lower() in ("1", "true", "yes", "on")
@@ -401,23 +424,41 @@ def _launch_nodes_offline(context, *args, **kwargs):
                     pass
                 raise RuntimeError("offline patched config invalid after write: strict_mode=true but missing system.api_version (file={})".format(_patched_config))
 
+            # sensor.gps.enabled 时补丁必须含 gps.lever_arm_imu（长度>=3），否则 HBA/GPS 几何与主配置分裂。
+            _verify_sensor = _verify_cfg.get("sensor") if isinstance(_verify_cfg.get("sensor"), dict) else {}
+            _verify_sg = _verify_sensor.get("gps") if isinstance(_verify_sensor.get("gps"), dict) else {}
+            _verify_gps_on = str(_verify_sg.get("enabled", False)).strip().lower() in ("1", "true", "yes", "on")
+            if _verify_gps_on:
+                _v_gps = _verify_cfg.get("gps") if isinstance(_verify_cfg.get("gps"), dict) else None
+                _la = _v_gps.get("lever_arm_imu") if _v_gps else None
+                _la_ok = isinstance(_la, (list, tuple)) and len(_la) >= 3
+                if not _la_ok:
+                    raise RuntimeError(
+                        "offline patched config missing valid gps.lever_arm_imu (need sequence length>=3) while sensor.gps.enabled=true; "
+                        "HBA would use zero lever arm. file={}".format(_patched_config)
+                    )
+                sys.stderr.write(
+                    "{} [CONFIG][VERIFY] gps.lever_arm_imu OK in patched YAML (sensor.gps.enabled=true)\n".format(_LP)
+                )
+                sys.stderr.flush()
+
             config_path = _patched_config
             sys.stderr.write("{} [OUTPUT] AUTOMAP_SESSION_OUTPUT_DIR={}\n".format(_LP, session_out))
             sys.stderr.write("{} [CONFIG] offline patched config: {}\n".format(_LP, config_path))
             sys.stderr.flush()
         except Exception as e:
             _log_launch_exception("构建离线 run_* 会话输出目录/补丁配置", e)
-    # RViz 配置：前端 / 后端分两个窗口
+    # RViz 配置：前端 / 后端分两个窗口（LIO 仅前端；后端默认无 TF/current_cloud，见 rviz_backend_profile）
     rviz_frontend_config = os.path.join(pkg_share, "rviz", "automap_frontend.rviz")
-    rviz_backend_config = os.path.join(pkg_share, "rviz", "automap_backend.rviz")
     if not os.path.isfile(rviz_frontend_config):
         rviz_frontend_config = os.path.join(pkg_share, "rviz", "automap.rviz")
-    if not os.path.isfile(rviz_backend_config):
-        rviz_backend_config = os.path.join(pkg_share, "rviz", "automap.rviz")
     launch_dir = os.path.dirname(os.path.abspath(__file__))
     if launch_dir not in sys.path:
         sys.path.insert(0, launch_dir)
-    from rviz_utils import is_rviz2_installed
+    from rviz_utils import is_rviz2_installed, resolve_automap_backend_rviz_path
+    rb_cfg_arg = LaunchConfiguration("rviz_backend_config", default="").perform(context).strip()
+    rb_profile = LaunchConfiguration("rviz_backend_profile", default="default").perform(context).strip()
+    rviz_backend_config = resolve_automap_backend_rviz_path(pkg_share, rb_cfg_arg, rb_profile)
     ot_params = {"model_path": ""}
     fl2_params = {}
     hba_params = {}
@@ -748,13 +789,32 @@ def _log_bag_path(context, *args, **kwargs):
     sys.stderr.flush()
 
 
-def _handle_bag_play_exit(context, *args, **kwargs):
-    """仅在 bag 正常结束时触发 finish_mapping，避免空数据被误保存为成功运行。"""
-    event = kwargs.get("event")
+def _handle_bag_play_exit(event, context):
+    """
+    仅在 bag 正常结束时触发 finish_mapping，避免空数据被误保存为成功运行。
+
+    必须作为 OnProcessExit 的 on_exit **可调用对象**（签名 event, context），由 launch
+    传入 ProcessExited。若写成 on_exit=[OpaqueFunction(...)] 列表形式，launch 的
+    OnActionEventBase 只会返回子动作列表，**不会**把退出事件注入 OpaqueFunction 的 kwargs，
+    导致 returncode 恒为 None，误判为异常并跳过 finish_mapping（见 ros2/launch
+    event_handlers/on_action_event_base.py handle()）。
+    """
+    _ = context
     return_code = getattr(event, "returncode", None)
-    if return_code == 0:
-        sys.stderr.write("{} [BAG] bag play exited with code 0; trigger finish_mapping\n".format(_LP))
-        sys.stderr.flush()
+    # 0：ros2 bag play 正常播完。None：少数 launch/平台未填 returncode；仍触发收尾以免
+    # 「播完却跳过 finish_mapping」（主因已修：on_exit 必须用本可调用形式，勿用 OpaqueFunction 列表）。
+    if return_code == 0 or return_code is None:
+        if return_code is None:
+            sys.stderr.write(
+                "{} [BAG] [WARN] bag play ProcessExited.returncode is None; still trigger finish_mapping "
+                "(assume playback ended; if you get an empty map, check `ros2 bag play` exit code / launch version)\n".format(
+                    _LP
+                )
+            )
+            sys.stderr.flush()
+        else:
+            sys.stderr.write("{} [BAG] bag play exited with code 0; trigger finish_mapping\n".format(_LP))
+            sys.stderr.flush()
         return [ExecuteProcess(
             cmd=["bash", "-c", "sleep 5 && ros2 service call /automap/finish_mapping std_srvs/srv/Trigger '{}'"],
             output="screen",
@@ -811,6 +871,14 @@ def generate_launch_description():
             "use_rviz", default_value="true",
             description="Whether to start RViz",
         ),
+        DeclareLaunchArgument(
+            "rviz_backend_config", default_value="",
+            description="Override backend RViz config path (empty = use rviz_backend_profile or automap_backend.rviz)",
+        ),
+        DeclareLaunchArgument(
+            "rviz_backend_profile", default_value="default",
+            description="Backend RViz preset: default | keyframes_only (global map + optimized/GPS KF paths + keyframe_poses; TF/current_cloud off in that file)",
+        ),
         DeclareLaunchArgument("use_external_frontend", default_value="true", description="true=use verified fast_livo node (modular); false=use internal FastLIVO2Wrapper (ESIKF)"),
         DeclareLaunchArgument("use_external_overlap", default_value="true", description="Launch OverlapTransformer descriptor; true=使用 pretrained_overlap_transformer.pth.tar 做回环粗匹配"),
         DeclareLaunchArgument("use_hba", default_value="false", description="Launch standalone HBA node (reads pose.json at startup; offline 时默认 false 避免零位姿崩溃，优化由 automap_system 内 HBAOptimizer 负责)"),
@@ -825,7 +893,7 @@ def generate_launch_description():
         RegisterEventHandler(
             event_handler=OnProcessExit(
                 target_action=bag_play_action,
-                on_exit=[OpaqueFunction(function=_handle_bag_play_exit)],
+                on_exit=_handle_bag_play_exit,
             )
         ),
     ])

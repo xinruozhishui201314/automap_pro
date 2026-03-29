@@ -332,6 +332,16 @@ inline constexpr const char* FRAME_MISMATCH_TOTAL = "frame_mismatch_total";
 inline constexpr const char* DUPLICATE_OPTIMIZATION_EVENT_TOTAL = "duplicate_optimization_event_total";
 inline constexpr const char* UNKNOWN_FRAME_RESULT_TOTAL = "unknown_frame_result_total";
 inline constexpr const char* STALE_VERSION_DROP_TOTAL = "stale_version_drop_total";
+/** V3：SyncedFrame 可视化等待 Registry 屏障超时次数（与 waitRegistryBarrierForSyncedVisualization 一致） */
+inline constexpr const char* V3_VIZ_REGISTRY_BARRIER_TIMEOUT_TOTAL = "v3_viz_registry_barrier_timeout_total";
+/** V3：当前云链式与 GPS 直接对齐平移差超过 POSE_DRIFT 阈值次数 */
+inline constexpr const char* V3_VIZ_POSE_DRIFT_WARN_TOTAL = "v3_viz_pose_drift_warn_total";
+/** V3：publishEverything 聚合轨迹时 Registry 内存在多个 session_id（全局 T_map_odom 仅对单会话严格正确） */
+inline constexpr const char* V3_VIZ_MULTI_SESSION_AGGREGATE_TOTAL = "v3_viz_multi_session_aggregate_total";
+/** V3：最近一次「当前云 / 语义 world / 树干 world」链式/GPS 混合权重 blend_w，范围 [0,1]（多路径共享） */
+inline constexpr const char* V3_VIZ_LAST_CURRENT_CLOUD_BLEND_W = "v3_viz_last_current_cloud_blend_w";
+/** V3：上述路径链式 vs 直接 T_map_odom 平移差（米）分布 */
+inline constexpr const char* V3_VIZ_CURRENT_CLOUD_CHAIN_DRIFT_M = "v3_viz_current_cloud_chain_drift_m";
 
 } // namespace metrics
 
@@ -599,6 +609,17 @@ private:
         registerCounter(metrics::DUPLICATE_OPTIMIZATION_EVENT_TOTAL, "Duplicate optimization events dropped");
         registerCounter(metrics::UNKNOWN_FRAME_RESULT_TOTAL, "UNKNOWN frame optimization results dropped");
         registerCounter(metrics::STALE_VERSION_DROP_TOTAL, "Stale optimization events dropped");
+        registerCounter(metrics::V3_VIZ_REGISTRY_BARRIER_TIMEOUT_TOTAL,
+                        "V3 visualization registry barrier wait timeouts");
+        registerCounter(metrics::V3_VIZ_POSE_DRIFT_WARN_TOTAL,
+                        "V3 visualization POSE_DRIFT threshold crossings");
+        registerCounter(metrics::V3_VIZ_MULTI_SESSION_AGGREGATE_TOTAL,
+                        "V3 full-map publish with multiple keyframe sessions");
+        registerGauge(metrics::V3_VIZ_LAST_CURRENT_CLOUD_BLEND_W,
+                      "V3 last viz chain/GPS blend weight [0,1] (SyncedFrame + semantic/trunk world paths)");
+        registerHistogram(metrics::V3_VIZ_CURRENT_CLOUD_CHAIN_DRIFT_M,
+                          "V3 viz chain vs direct T_map_odom translation drift (m, multi-path)",
+                          {0.0, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0});
     }
 };
 

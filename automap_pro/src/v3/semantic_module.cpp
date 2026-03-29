@@ -327,6 +327,11 @@ SemanticModule::SemanticModule(EventBus::Ptr event_bus, MapRegistry::Ptr map_reg
     semantic_cfg_.accumulator.enabled = cfg.semanticGeometricAccumulatorEnabled();
     semantic_cfg_.accumulator.max_frames = cfg.semanticGeometricAccumulatorMaxFrames();
     semantic_cfg_.accumulator.tag_intensity_with_scan_seq = cfg.semanticGeometricAccumulatorTagIntensityWithScanSeq();
+    semantic_cfg_.accumulator.save_debug_pcd = cfg.semanticGeometricAccumulatorSaveDebugPcd();
+    semantic_cfg_.accumulator.save_merged_cloud_dir = cfg.semanticGeometricAccumulatorSaveMergedCloudDir();
+    semantic_cfg_.accumulator.save_merged_cloud_every_n = cfg.semanticGeometricAccumulatorSaveMergedCloudEveryN();
+    semantic_cfg_.accumulator.save_accum_body_pcd = cfg.semanticGeometricAccumulatorSaveAccumBodyPcd();
+    semantic_cfg_.accumulator.save_primitive_input_cloud = cfg.semanticGeometricAccumulatorSavePrimitiveInputCloud();
     semantic_cfg_.primitive_classifier.enabled = cfg.semanticGeometricPrimitiveClassifierEnabled();
     semantic_cfg_.primitive_classifier.linearity_threshold = static_cast<float>(cfg.semanticGeometricPrimitiveClassifierLinearityThresh());
     semantic_cfg_.primitive_classifier.planarity_threshold = static_cast<float>(cfg.semanticGeometricPrimitiveClassifierPlanarityThresh());
@@ -370,6 +375,10 @@ SemanticModule::SemanticModule(EventBus::Ptr event_bus, MapRegistry::Ptr map_reg
     semantic_cfg_.range_view.fusion_rv_boost_scale =
         static_cast<float>(cfg.semanticGeometricRangeViewFusionRvBoostScale());
     semantic_cfg_.max_lines_per_cluster = cfg.semanticGeometricMaxLinesPerCluster();
+    semantic_cfg_.trunk_chain_skip_rv_wall_label = cfg.semanticGeometricTrunkChainSkipRvWallLabel();
+    semantic_cfg_.sparse_trunk_connectivity_recall_enable = cfg.semanticGeometricSparseTrunkConnectivityRecallEnable();
+    semantic_cfg_.sparse_trunk_connectivity_min_per_layer = cfg.semanticGeometricSparseTrunkConnectivityMinPerLayer();
+    semantic_cfg_.sparse_trunk_connectivity_canopy_radius_m = static_cast<float>(cfg.semanticGeometricSparseTrunkConnectivityCanopyRadiusM());
     semantic_cfg_.geometric_only_frame_merge.max_xy_m = static_cast<float>(cfg.semanticGeometricOnlyFrameMergeMaxXyM());
     semantic_cfg_.geometric_only_frame_merge.max_z_m = static_cast<float>(cfg.semanticGeometricOnlyFrameMergeMaxZM());
     semantic_cfg_.geometric_only_frame_merge.max_axis_angle_deg =
@@ -690,6 +699,11 @@ SemanticModule::SemanticModule(EventBus::Ptr event_bus, MapRegistry::Ptr map_reg
     if (accept_independent_input) {
         onEvent<SemanticInputEvent>([this](const SemanticInputEvent& ev) { handleSemanticInputEvent(ev); });
     }
+    if (accept_graph_input && accept_independent_input) {
+        RCLCPP_WARN(node_->get_logger(),
+            "[SEMANTIC][Module][INPUT] accept_graph_task=1 and accept_independent_event=1: same KEYFRAME may be "
+            "delivered twice unless one path is disabled in config; prefer graph_task=0 when using only SemanticInputEvent");
+    }
     onEvent<SystemQuiesceRequestEvent>([this](const SystemQuiesceRequestEvent& ev) { this->quiesce(ev.enable); });
     RCLCPP_INFO(node_->get_logger(),
         "[SEMANTIC][Module][INPUT] accept_graph_task=%d accept_independent_event=%d",
@@ -833,6 +847,8 @@ void SemanticModule::handleKeyFrameInput(const KeyFrame::Ptr& kf, const char* so
     sem_ev.covariance = kf->covariance;
     sem_ev.pose_frame = PoseFrame::ODOM;
     sem_ev.cloud_frame = "body";
+    // ref_map_version：KeyFrame 未携带 registry 版本，保持默认 0（屏障仅依赖 alignment_epoch；FE 路径由 map_registry 写入）
+    sem_ev.ref_alignment_epoch = kf->alignment_epoch; // 🏛️ [对齐纪元] 透传
     RCLCPP_DEBUG_THROTTLE(node_->get_logger(), *node_->get_clock(), 10000,
         "[CHAIN][B2 KF->SEM][COORD] kf_id=%lu cloud_frame=body source=kf.cloud_body (FastLIVO path must store BODY after world->body when frontend.cloud_frame=world)",
         static_cast<unsigned long>(kf->id));
@@ -871,6 +887,11 @@ void SemanticModule::handleKeyFrameInput(const KeyFrame::Ptr& kf, const char* so
 
 void SemanticModule::handleGraphTaskEvent(const GraphTaskEvent& ev) {
     if (!running_.load()) return;
+    if (!ev.isValid()) {
+        RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), kSemanticLogThrottleMs,
+            "[CHAIN][B2 KF->SEM] action=reject reason=invalid_graph_task_event");
+        return;
+    }
     if (ev.task.type != OptTaskItem::Type::KEYFRAME_CREATE) return;
     handleKeyFrameInput(ev.task.keyframe, "graph_task");
 }
@@ -1175,6 +1196,9 @@ void SemanticModule::processTask(const SyncedFrameEvent& event, size_t worker_id
             trace_id);
     }
 
+    const uint64_t task_session =
+        event.meta.session_id != 0 ? event.meta.session_id : map_registry_->getSessionId();
+
     // 🏛️ [Fix] Always publish semantic cloud for visualization if available
     if (labeled_cloud && !labeled_cloud->empty()) {
         SemanticCloudEvent cloud_ev;
@@ -1183,9 +1207,21 @@ void SemanticModule::processTask(const SyncedFrameEvent& event, size_t worker_id
         cloud_ev.frame_id = publish_cloud_frame;
         const uint64_t seq = semantic_event_seq_.fetch_add(1, std::memory_order_relaxed) + 1;
         cloud_ev.meta.event_id = makeEventId(event.timestamp, seq);
+        cloud_ev.meta.session_id = task_session;
+        cloud_ev.meta.idempotency_key = cloud_ev.meta.event_id;
+        cloud_ev.meta.producer_seq = seq;
+        cloud_ev.meta.ref_version = event.ref_map_version;
+        cloud_ev.meta.ref_epoch = event.ref_alignment_epoch; // 🏛️ [对齐纪元] 继承输入纪元
+        cloud_ev.meta.source_ts = event.timestamp;
         cloud_ev.meta.producer = "SemanticModule";
         cloud_ev.meta.publish_ts = node_->now().seconds();
-        event_bus_->publish(cloud_ev);
+        cloud_ev.meta.route_tag = "legacy";
+        if (!cloud_ev.isValid()) {
+            RCLCPP_ERROR_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000,
+                "[V3][CONTRACT] SemanticCloudEvent meta/payload invalid, drop publish ts=%.3f", event.timestamp);
+        } else {
+            event_bus_->publish(cloud_ev);
+        }
         const int ground_cls = ConfigManager::instance().semanticGeometricGroundPaintClassId();
         size_t ground_labeled_pts = 0;
         for (const auto& p : labeled_cloud->points) {
@@ -1222,9 +1258,21 @@ void SemanticModule::processTask(const SyncedFrameEvent& event, size_t worker_id
         trunk_ev.post_cluster_body = trunk_post_body;
         const uint64_t seq = semantic_event_seq_.fetch_add(1, std::memory_order_relaxed) + 1;
         trunk_ev.meta.event_id = makeEventId(event.timestamp, seq);
+        trunk_ev.meta.session_id = task_session;
+        trunk_ev.meta.idempotency_key = trunk_ev.meta.event_id;
+        trunk_ev.meta.producer_seq = seq;
+        trunk_ev.meta.ref_version = event.ref_map_version;
+        trunk_ev.meta.ref_epoch = event.ref_alignment_epoch; // 🏛️ [对齐纪元] 继承输入纪元，确保生命周期一致性
+        trunk_ev.meta.source_ts = event.timestamp;
         trunk_ev.meta.producer = "SemanticModule";
         trunk_ev.meta.publish_ts = node_->now().seconds();
-        event_bus_->publish(trunk_ev);
+        trunk_ev.meta.route_tag = "legacy";
+        if (!trunk_ev.isValid()) {
+            RCLCPP_ERROR_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000,
+                "[V3][CONTRACT] SemanticTrunkVizEvent invalid, drop publish ts=%.3f", event.timestamp);
+        } else {
+            event_bus_->publish(trunk_ev);
+        }
         RCLCPP_DEBUG_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000,
             "[SEMANTIC][Module][STAGE_RESULT] stage=publish_trunk_viz trace=%lu ts=%.3f pre_pts=%zu post_pts=%zu",
             static_cast<unsigned long>(trace_id),
@@ -1250,7 +1298,12 @@ void SemanticModule::processTask(const SyncedFrameEvent& event, size_t worker_id
             res_ev.keyframe_timestamp_hint = event.kf_info.timestamp;
             if (std::isfinite(event.kf_info.timestamp) && event.kf_info.timestamp > 0.0) {
                 const double match_tol = ConfigManager::instance().semanticTimestampMatchToleranceS();
-                auto kf = map_registry_->getKeyFrameByTimestamp(event.kf_info.timestamp, match_tol);
+                auto kf = map_registry_->getKeyFrameByTimestampPreferPrior(event.kf_info.timestamp, match_tol,
+                                                                          task_session);
+                if (!kf) {
+                    kf = map_registry_->getKeyFrameByTimestampPreferPrior(
+                        event.kf_info.timestamp, std::min(0.5, match_tol * 2.0), task_session);
+                }
                 if (kf) {
                     res_ev.keyframe_id_hint = kf->id;
                 }
@@ -1259,10 +1312,11 @@ void SemanticModule::processTask(const SyncedFrameEvent& event, size_t worker_id
             res_ev.plane_landmarks = valid_planes;
             const uint64_t seq = semantic_event_seq_.fetch_add(1, std::memory_order_relaxed) + 1;
             res_ev.meta.event_id = makeEventId(event.timestamp, seq);
+            res_ev.meta.session_id = task_session;
             res_ev.meta.idempotency_key = res_ev.meta.event_id;
             res_ev.meta.producer_seq = seq;
-            res_ev.meta.ref_version = map_registry_->getVersion();
-            res_ev.meta.ref_epoch = map_registry_->getAlignmentEpoch();
+            res_ev.meta.ref_version = event.ref_map_version;
+            res_ev.meta.ref_epoch = event.ref_alignment_epoch; // 🏛️ [对齐纪元] 继承输入纪元，确保生命周期一致性
             res_ev.meta.source_ts = event.timestamp;
             res_ev.meta.publish_ts = node_->now().seconds();
             res_ev.meta.producer = "SemanticModule";
@@ -1270,39 +1324,45 @@ void SemanticModule::processTask(const SyncedFrameEvent& event, size_t worker_id
             res_ev.processing_state = semantic_degraded_.load(std::memory_order_relaxed)
                 ? ProcessingState::DEGRADED
                 : ProcessingState::NORMAL;
-            event_bus_->publish(res_ev);
-            sem_event_publish_total_.fetch_add(1, std::memory_order_relaxed);
-            RCLCPP_INFO_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000,
-                "[SEMANTIC][Module][STAGE_RESULT] stage=publish_landmarks result=published trace=%lu ts=%.3f valid_trees=%zu valid_planes=%zu event_id=%lu",
-                static_cast<unsigned long>(trace_id),
-                event.timestamp,
-                valid_trees.size(),
-                valid_planes.size(),
-                static_cast<unsigned long>(res_ev.meta.event_id));
-            RCLCPP_INFO_THROTTLE(node_->get_logger(), *node_->get_clock(), kSemanticLogThrottleMs,
-                "[CHAIN][B3 SEM->MAP] action=publish trace=%lu ts=%.3f trees=%zu planes=%zu kf_hint_ts=%.3f kf_hint_id=%lu total_publish=%lu",
-                static_cast<unsigned long>(trace_id),
-                event.timestamp,
-                valid_trees.size(),
-                valid_planes.size(),
-                res_ev.keyframe_timestamp_hint,
-                static_cast<unsigned long>(res_ev.keyframe_id_hint),
-                static_cast<unsigned long>(sem_event_publish_total_.load(std::memory_order_relaxed)));
-            if (force_b3_log) {
-                RCLCPP_INFO(node_->get_logger(),
-                    "[CHAIN][B3 SEM->MAP][FORCED] action=publish trace=%lu ts=%.3f trees=%zu planes=%zu cloud_published=%d total_publish=%lu forced_idx=%lu/5",
+            if (!res_ev.isValid()) {
+                RCLCPP_ERROR_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000,
+                    "[V3][CONTRACT] SemanticLandmarkEvent invalid after fill, drop publish ts=%.3f",
+                    event.timestamp);
+            } else {
+                event_bus_->publish(res_ev);
+                sem_event_publish_total_.fetch_add(1, std::memory_order_relaxed);
+                RCLCPP_INFO_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000,
+                    "[SEMANTIC][Module][STAGE_RESULT] stage=publish_landmarks result=published trace=%lu ts=%.3f valid_trees=%zu valid_planes=%zu event_id=%lu",
                     static_cast<unsigned long>(trace_id),
                     event.timestamp,
                     valid_trees.size(),
                     valid_planes.size(),
-                    (labeled_cloud && !labeled_cloud->empty()) ? 1 : 0,
-                    static_cast<unsigned long>(sem_event_publish_total_.load(std::memory_order_relaxed)),
-                    static_cast<unsigned long>(b3_forced_log_count_.load(std::memory_order_relaxed)));
-            }
+                    static_cast<unsigned long>(res_ev.meta.event_id));
+                RCLCPP_INFO_THROTTLE(node_->get_logger(), *node_->get_clock(), kSemanticLogThrottleMs,
+                    "[CHAIN][B3 SEM->MAP] action=publish trace=%lu ts=%.3f trees=%zu planes=%zu kf_hint_ts=%.3f kf_hint_id=%lu total_publish=%lu",
+                    static_cast<unsigned long>(trace_id),
+                    event.timestamp,
+                    valid_trees.size(),
+                    valid_planes.size(),
+                    res_ev.keyframe_timestamp_hint,
+                    static_cast<unsigned long>(res_ev.keyframe_id_hint),
+                    static_cast<unsigned long>(sem_event_publish_total_.load(std::memory_order_relaxed)));
+                if (force_b3_log) {
+                    RCLCPP_INFO(node_->get_logger(),
+                        "[CHAIN][B3 SEM->MAP][FORCED] action=publish trace=%lu ts=%.3f trees=%zu planes=%zu cloud_published=%d total_publish=%lu forced_idx=%lu/5",
+                        static_cast<unsigned long>(trace_id),
+                        event.timestamp,
+                        valid_trees.size(),
+                        valid_planes.size(),
+                        (labeled_cloud && !labeled_cloud->empty()) ? 1 : 0,
+                        static_cast<unsigned long>(sem_event_publish_total_.load(std::memory_order_relaxed)),
+                        static_cast<unsigned long>(b3_forced_log_count_.load(std::memory_order_relaxed)));
+                }
 
-            RCLCPP_INFO_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000,
-                "[SEMANTIC][Module][RUN] step=done ts=%.3f trees=%zu planes=%zu elapsed_ms=%.1f worker=%zu → published SemanticLandmarkEvent",
-                event.timestamp, valid_trees.size(), valid_planes.size(), elapsed_ms, worker_idx);
+                RCLCPP_INFO_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000,
+                    "[SEMANTIC][Module][RUN] step=done ts=%.3f trees=%zu planes=%zu elapsed_ms=%.1f worker=%zu → published SemanticLandmarkEvent",
+                    event.timestamp, valid_trees.size(), valid_planes.size(), elapsed_ms, worker_idx);
+            }
         } else {
             RCLCPP_INFO_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000,
                 "[SEMANTIC][Module][STAGE_RESULT] stage=publish_landmarks result=drop_all_invalid trace=%lu ts=%.3f raw_trees=%zu raw_planes=%zu",
@@ -1486,7 +1546,23 @@ void SemanticModule::tryRecoverFromDegradedState(double now_s) {
             warn.module_name = name_ + "_recovery_exhausted";
             warn.queue_usage_ratio = 1.0f;
             warn.critical = true;
-            event_bus_->publish(warn);
+            {
+                const uint64_t seq = semantic_event_seq_.fetch_add(1, std::memory_order_relaxed) + 1;
+                const double pts = node_->now().seconds();
+                warn.meta.event_id = makeEventId(pts, seq);
+                warn.meta.idempotency_key = warn.meta.event_id;
+                warn.meta.producer_seq = seq;
+                warn.meta.session_id = map_registry_->getSessionId();
+                warn.meta.ref_version = map_registry_->getVersion();
+                warn.meta.ref_epoch = map_registry_->getAlignmentEpoch();
+                warn.meta.source_ts = pts;
+                warn.meta.publish_ts = pts;
+                warn.meta.producer = "SemanticModule";
+                warn.meta.route_tag = "legacy";
+            }
+            if (warn.isValid()) {
+                event_bus_->publish(warn);
+            }
         }
         return;
     }

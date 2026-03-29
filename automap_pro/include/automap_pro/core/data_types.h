@@ -226,6 +226,7 @@ struct KeyFrame {
     Pose3d T_map_b_optimized  = Pose3d::Identity(); // 优化后位姿 (map 系)
     Pose3d T_submap_kf      = Pose3d::Identity(); // 相对于子图锚点的位姿 (submap 系)
     PoseFrame pose_frame    = PoseFrame::ODOM;    // 🏛️ [架构契约] 显式标注 T_map_b_optimized 所在的坐标系
+    uint64_t alignment_epoch = 0; // 🏛️ [对齐纪元] 标记该位姿所在的坐标系世代，用于过滤旧世界点云
     Mat66d covariance       = Mat66d::Identity() * 1e-4;
 
     // 点云（body系下）
@@ -262,7 +263,7 @@ enum class LoopStatus { PENDING, ACCEPTED, REJECTED };
 struct LoopConstraint {
     int      submap_i = -1, submap_j = -1;   // i:较旧(目标), j:较新(查询)
     int      keyframe_i = -1, keyframe_j = -1;
-    /** 关键帧全局 id（图中 KF 节点 id），用于子图间 keyframe 级回环入图；-1 表示未设置 */
+    /** 与 IncrementalOptimizer::addKeyFrameNode(kf->id) 一致（KeyFrame::id 的 int 形式）；关键帧级回环必填；-1 未设置 */
     int      keyframe_global_id_i = -1, keyframe_global_id_j = -1;
     uint64_t session_i = 0,  session_j = 0;
 
@@ -315,6 +316,7 @@ struct SubMap {
     Pose3d pose_odom_anchor        = Pose3d::Identity(); // 锚点在里程计系下的位姿
     Pose3d pose_map_anchor_optimized = Pose3d::Identity(); // 锚点在地图系下的位姿 (优化后)
     PoseFrame pose_frame           = PoseFrame::ODOM;    // 🏛️ [架构契约] 显式标注 pose_map_anchor_optimized 所在的坐标系
+    uint64_t alignment_epoch       = 0; // 🏛️ [对齐纪元] 标记该子图锚点所在的坐标系世代，用于过滤旧世界点云
 
     // 点云
     CloudXYZIPtr merged_cloud;       // 合并点云（世界系）
@@ -363,11 +365,22 @@ struct PoseSnapshot {
     std::unordered_map<int, Pose3d> submap_poses;
     std::unordered_map<uint64_t, Pose3d> keyframe_poses;
     
-    // GPS 对齐状态
+    // GPS 对齐状态 (当前活跃会话)
     bool gps_aligned = false;
+    uint64_t active_session_id = 0;
     Eigen::Matrix3d R_enu_to_map = Eigen::Matrix3d::Identity();
     Eigen::Vector3d t_enu_to_map = Eigen::Vector3d::Zero();
     double gps_rmse = 0.0;
+
+    /**
+     * 🏛️ [V1 多会话支持] 历史会话的 T_map_odom 快照
+     * 解决离线回放多段数据或加载旧地图时，不同 session_id 对应的 GPS 对齐基准不一致的问题。
+     */
+    struct SessionAlignment {
+        bool aligned = false;
+        Pose3d T_map_odom = Pose3d::Identity();
+    };
+    std::unordered_map<uint64_t, SessionAlignment> session_alignments;
 
     using Ptr = std::shared_ptr<const PoseSnapshot>;
 };
@@ -383,6 +396,7 @@ struct OptimizationResult {
     std::unordered_map<int, Pose3d> submap_poses;
     std::unordered_map<uint64_t, Pose3d> keyframe_poses;
     PoseFrame pose_frame = PoseFrame::UNKNOWN; // 🏛️ [架构加固] 显式标注位姿坐标系
+    uint64_t alignment_epoch = 0; // 🏛️ [对齐纪元] 该批次结果对应的世代
 
     bool isFinite() const {
         for (const auto& [id, pose] : submap_poses) if (!pose.matrix().allFinite()) return false;

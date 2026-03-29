@@ -123,6 +123,9 @@ void RvizPublisher::publishCurrentCloud(const CloudXYZIPtr& cloud) {
         msg.header.stamp    = node()->now();
         msg.header.frame_id = frame_id_;
         current_cloud_pub_->publish(msg);
+        RCLCPP_INFO_THROTTLE(node()->get_logger(), *node()->get_clock(), 3000,
+            "[VIZ_PUB][CURRENT_CLOUD] pts=%zu frame_id=%s topic=/automap/current_cloud (grep VIZ_PUB)",
+            cloud->size(), frame_id_.c_str());
     } catch (const std::exception& e) {
         RCLCPP_ERROR(node()->get_logger(), "[RvizPublisher] publishCurrentCloud failed: %s", e.what());
     }
@@ -136,6 +139,9 @@ void RvizPublisher::publishCurrentCloud(const CloudXYZIConstPtr& cloud) {
         msg.header.stamp    = node()->now();
         msg.header.frame_id = frame_id_;
         current_cloud_pub_->publish(msg);
+        RCLCPP_INFO_THROTTLE(node()->get_logger(), *node()->get_clock(), 3000,
+            "[VIZ_PUB][CURRENT_CLOUD] pts=%zu frame_id=%s topic=/automap/current_cloud (grep VIZ_PUB)",
+            cloud->size(), frame_id_.c_str());
     } catch (const std::exception& e) {
         RCLCPP_ERROR(node()->get_logger(), "[RvizPublisher] publishCurrentCloud failed: %s", e.what());
     }
@@ -251,18 +257,33 @@ void RvizPublisher::publishOdometryPath(const nav_msgs::msg::Path& path) {
 }
 
 void RvizPublisher::publishOptimizedPath(const std::vector<SubMap::Ptr>& submaps,
-                                         const PoseSnapshot::Ptr& snapshot) {
+                                         const PoseSnapshot::Ptr& snapshot,
+                                         uint64_t alignment_epoch_limit) {
     if (!node() || !opt_path_pub_) return;
     nav_msgs::msg::Path path;
     path.header.stamp    = node()->now();
     path.header.frame_id = frame_id_;
 
     std::vector<std::pair<double, Pose3d>> sorted_kfs;
+    size_t epoch_filtered = 0;
     for (const auto& sm : submaps) {
         if (!sm) continue;
+        
+        // 🏛️ [对齐纪元] 子图级过滤
+        if (alignment_epoch_limit > 0 && sm->alignment_epoch < alignment_epoch_limit) {
+            epoch_filtered += sm->keyframes.size();
+            continue;
+        }
+
         for (const auto& kf : sm->keyframes) {
             if (!kf) continue;
             
+            // 🏛️ [对齐纪元] 关键帧级过滤
+            if (alignment_epoch_limit > 0 && kf->alignment_epoch < alignment_epoch_limit) {
+                epoch_filtered++;
+                continue;
+            }
+
             Pose3d pose_opt = kf->T_map_b_optimized;
             if (snapshot) {
                 auto it = snapshot->keyframe_poses.find(kf->id);
@@ -285,8 +306,8 @@ void RvizPublisher::publishOptimizedPath(const std::vector<SubMap::Ptr>& submaps
         const auto& first_t = sorted_kfs.front().second.translation();
         const auto& last_t = sorted_kfs.back().second.translation();
         RCLCPP_INFO(node()->get_logger(),
-            "[GHOSTING_DIAG] optimized_path published version=%lu kf_count=%zu first_pos=[%.2f,%.2f,%.2f] last_pos=[%.2f,%.2f,%.2f] frame=slam_world_same_as_global_map",
-            snapshot ? snapshot->version : 0, sorted_kfs.size(), first_t.x(), first_t.y(), first_t.z(), last_t.x(), last_t.y(), last_t.z());
+            "[GHOSTING_DIAG] optimized_path published version=%lu kf_count=%zu filtered_epoch=%zu first_pos=[%.2f,%.2f,%.2f] last_pos=[%.2f,%.2f,%.2f] frame=slam_world_same_as_global_map",
+            snapshot ? snapshot->version : 0, sorted_kfs.size(), epoch_filtered, first_t.x(), first_t.y(), first_t.z(), last_t.x(), last_t.y(), last_t.z());
     }
 
     for (const auto& [ts, pose] : sorted_kfs) {
@@ -304,7 +325,8 @@ void RvizPublisher::publishOptimizedPath(const std::vector<SubMap::Ptr>& submaps
 }
 
 void RvizPublisher::publishKeyframePoses(const std::vector<KeyFrame::Ptr>& keyframes,
-                                         const PoseSnapshot::Ptr& snapshot) {
+                                         const PoseSnapshot::Ptr& snapshot,
+                                         uint64_t alignment_epoch_limit) {
     if (!node() || !kf_pose_array_pub_) return;
     geometry_msgs::msg::PoseArray msg;
     msg.header.stamp = node()->now();
@@ -312,8 +334,15 @@ void RvizPublisher::publishKeyframePoses(const std::vector<KeyFrame::Ptr>& keyfr
 
     Eigen::Vector3d first_t = Eigen::Vector3d::Zero(), last_t = Eigen::Vector3d::Zero();
     size_t valid_count = 0;
+    size_t epoch_filtered = 0;
     for (const auto& kf : keyframes) {
         if (!kf) continue;
+
+        // 🏛️ [对齐纪元] 关键帧级过滤
+        if (alignment_epoch_limit > 0 && kf->alignment_epoch < alignment_epoch_limit) {
+            epoch_filtered++;
+            continue;
+        }
         
         Pose3d pose_opt = kf->T_map_b_optimized;
         if (snapshot) {
@@ -336,8 +365,8 @@ void RvizPublisher::publishKeyframePoses(const std::vector<KeyFrame::Ptr>& keyfr
     }
     if (valid_count > 0) {
         RCLCPP_DEBUG(node()->get_logger(),
-            "[GHOSTING_DIAG] keyframe_poses published version=%lu kf_count=%zu first_pos=[%.2f,%.2f,%.2f] last_pos=[%.2f,%.2f,%.2f] frame=slam_world_same_as_global_map",
-            snapshot ? snapshot->version : 0, valid_count, first_t.x(), first_t.y(), first_t.z(), last_t.x(), last_t.y(), last_t.z());
+            "[GHOSTING_DIAG] keyframe_poses published version=%lu kf_count=%zu filtered_epoch=%zu first_pos=[%.2f,%.2f,%.2f] last_pos=[%.2f,%.2f,%.2f] frame=slam_world_same_as_global_map",
+            snapshot ? snapshot->version : 0, valid_count, epoch_filtered, first_t.x(), first_t.y(), first_t.z(), last_t.x(), last_t.y(), last_t.z());
     }
     kf_pose_array_pub_->publish(msg);
 }
