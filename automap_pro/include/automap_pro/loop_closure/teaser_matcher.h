@@ -55,6 +55,10 @@ private:
     int    min_safe_inliers_  = 10;  // TEASER 内点数低于此拒绝；弱重叠可配 min_safe_inliers 放宽
     /** FPFH 几何过滤距离上限 (m)，在 applyConfig() 中从 YAML 缓存；match() 内禁止调 ConfigManager（异步线程 SIGSEGV） */
     double fpfh_corr_max_dist_ = 10.0;
+    /** FPFH 法线估计半径 (m)；0=自动（voxel_size*2）；城市街道 VLP-32 建议 2.0 */
+    double fpfh_normal_radius_ = 0.0;
+    /** FPFH 特征计算半径 (m)；0=自动（normal_radius*2）；城市街道 VLP-32 建议 4.0 */
+    double fpfh_feature_radius_ = 0.0;
 
     CloudXYZIPtr preprocess(const CloudXYZIPtr& cloud) const;
 };

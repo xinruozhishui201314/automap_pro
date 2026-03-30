@@ -70,10 +70,21 @@ performance:
 
 # 后端 RViz / 全局图发布：与 HBA 写回、merged_cloud rebuild 对齐，减轻异步构图与轨迹错帧（grep VIZ_SYNC）
 visualization:
-  sync_global_map_build: true
+  # [BUG FIX] 关闭同步全局地图构建，启用异步模式，解决 MappingModule HUNG 问题。
+  # sync_global_map_build: true 会在 MappingModule 主循环中串行执行 buildGlobalMap
+  # （15M 点体素下采样约 2s），导致帧队列堆积、超时丢帧、轨迹断续跳变。
+  # 改为 false 后，performance.async_global_map_build=true 生效，构建在独立线程。
+  sync_global_map_build: false
   global_map_ros2_transient_local: true
   log_pose_jump_detail: true
   suppress_optimize_driven_global_map: false
+  # [BUG FIX] GPS 对齐后抑制 publishOptimizedPath 的轮数（缓解全轨迹一次性跳变冲击）
+  # GPS 对齐将全轨迹一次性旋转 ~18°，立即发布会导致 RVIZ 全路径瞬间跳变。
+  # suppress 期间跳过 path 发布，等待全局地图重建完成后再统一刷新，减轻视觉冲击。
+  # [P1 修复] 从 3 提高到 20：GPS 对齐后全局点云重建（rebuildMergedCloudFromOptimizedPoses）
+  # 需要约 1.5~2s，3 个周期（~3s）可能不够覆盖重建窗口，导致 RVIZ 先看到跳变轨迹而地图还是旧姿态。
+  # 20 个周期（~20s）充分覆盖重建完成，再统一刷新，避免视觉不一致跳变。
+  suppress_path_on_alignment_cycles: 20
 
 orchestrator:
   takeover_enabled: false
@@ -675,24 +686,31 @@ gps:
   altitude_variance_override:  1.0e6
   good_samples_needed:    8       # 降低（10→8），更容易触发对齐
   add_constraints_on_align: true
-  factor_interval_m:       3.0   # ⬇️ 降低（5.0→3.0），增加GPS因子密度
-  factor_weight:           0.8   # ⬆️ 提高权重（0.5→0.8），增强GPS约束
-  factor_quality_scale_excellent: 2.0
+  factor_interval_m:       5.0   # [P1 修复] 恢复 5.0m 间隔（配合代码层去重，避免密集因子压缩轨迹）
+  # [P1 修复] GPS 权重大幅降低（0.8→0.25）：M2DGR HDOP~10（σ≈40m），GPS 约束本身极弱，
+  # 高权重会让每次 HBA 优化后 GPS 因子将各历史帧微幅拉向不准确坐标，
+  # 造成连续小幅轨迹漂移并在全局地图中累积成墙面重影/增厚。
+  # 0.25 权重下 GPS 提供全局方向基准，但不覆盖激光里程计的局部精度。
+  factor_weight:           0.25
+  factor_quality_scale_excellent: 3.0
   factor_quality_scale_high:      1.0
-  factor_quality_scale_medium:    0.4   # ⬆️ 提高（0.3→0.4）
-  factor_quality_scale_low:       0.3    # ⬆️ 提高（0.25→0.3）
+  factor_quality_scale_medium:    0.2   # [P1 修复] 降低 MEDIUM（HDOP~10）的质量倍率
+  factor_quality_scale_low:       0.1   # [P1 修复] 降低 LOW 的质量倍率（几乎不提供约束）
   # GPS 因子准入最小质量（0~4=INVALID..EXCELLENT）。3=仅 HIGH/EXCELLENT；2=允许 MEDIUM。
+  # M2DGR GPS 常为 quality=2（MEDIUM, HDOP~10），保持 2 以确保有 GPS 基准防止全局漂移。
   min_accepted_quality_level: 2
 
   # V1：路段质量自适应噪声（HDOP↑/卫星数↓ → 放大协方差，GPS 更软，减轻与激光结构冲突）
+  # [P1 修复] var_scale_max_hdop: 28→80：HDOP=10 时放大倍率约 60x（之前 ~23x），
+  # GPS 因子方差约 2400m²（σ≈49m），进一步弱化劣质 GPS 对因子图的扰动影响。
   adaptive_noise:
     enabled: true
     hdop_good: 1.0
     hdop_poor: 12.0
-    var_scale_max_hdop: 28.0
+    var_scale_max_hdop: 80.0
     sats_good: 12
     sats_poor: 4
-    var_scale_max_sats: 10.0
+    var_scale_max_sats: 15.0
   # V2：GPS 与当前图位姿（激光/里程计链初值）水平 innovation 过大时放大 XY 方差（等效降权）
   local_consistency:
     enabled: true
@@ -724,11 +742,20 @@ gps:
 # 若主要为结构化建筑，可把 fpfh_corr_max_distance_m 改为 10、min_inlier_ratio 改为 0.08
 loop_closure:
   # M2DGR street_03（32 线 LIO-only）：略放宽 overlap / SC / 时间间隔，缓解 NO_CAND；误配由 pose_consistency 与 TEASER RMSE 约束
-  overlap_threshold:   0.12
-  # TEASER/ICP 通过后仍要求 overlap score ≥ 此值；过滤极低分（如 0.007）伪回环。0=关闭硬门槛
-  min_accept_overlap_score: 0.035
-  top_k:               25        # 多保留候选进入 TEASER，利于子图间回环
-  min_temporal_gap_s: 12.0
+  # [P2 修复] overlap_threshold: 0.12→0.08：允许更多回环候选进入 TEASER 验证，
+  # 解决日志显示前 700 帧 loop_factors=0 导致轨迹无全局约束的问题。
+  # 误配仍由 TEASER RMSE / min_inlier_ratio / pose_consistency 约束，不会引入错误回环。
+  overlap_threshold:   0.08
+  # [BUG FIX] 提高最低接受 overlap score 阈值：
+  # 日志显示接受的回环 score 低至 0.046（重叠度<5%），此类回环是错误约束，
+  # 强行加入因子图后把轨迹"拉偏"，产生局部跳变与地图重影。
+  # 0.035 → 0.10：拒绝重叠度<10% 的极低质量回环；保留真实重叠 10% 以上的有效约束
+  # TEASER/ICP 通过后仍要求 overlap score ≥ 此值；过滤极低分（如 0.007/0.046）伪回环
+  min_accept_overlap_score: 0.10
+  top_k:               30        # [P2 修复] 25→30：多保留候选进入 TEASER，增加早期回环命中率
+  # [P2 修复] min_temporal_gap_s: 12.0→8.0：回环检测最小时间间隔降低，
+  # 使早期重访场景更快触发闭环，减少无回环约束导致的轨迹漂移窗口。
+  min_temporal_gap_s: 8.0
   min_submap_gap:      0
 
   # ── 子图内回环检测参数 ─────────────────────────────────────────────────────
@@ -751,7 +778,8 @@ loop_closure:
   geo_prefilter_max_distance_m: 0.0
   # 高置信度绕过几何预筛：描述子相似度≥此值时不做距离过滤（参考 OverlapTransformer/SeqOT）。0=关闭；0.90~0.95 可保留强闭环
   geo_prefilter_skip_above_score: 0.92
-  worker_threads:      8          # 高资源 6~8；低核用 2
+  # [P2 修复] worker_threads: 8→12，加快 TEASER 并行验证，缩短回环从候选到确认的延迟
+  worker_threads:      12
   max_desc_queue_size:  256       # 高资源可 256
   max_match_queue_size: 256
   overlap_transformer:
@@ -775,6 +803,12 @@ loop_closure:
     icp_refine:       true
     # 扩大搜索半径以支持横向偏移场景（原5m太短导致错失真匹配）
     fpfh_corr_max_distance_m: 25.0
+    # [BUG FIX] FPFH 半径（M2DGR street_03 城市街道 Velodyne VLP-32C 调优）
+    # 平面主导场景下 FPFH 哈希碰撞率极高（p90>50m），需要更大半径捕获墙-地交角结构特征。
+    # 原自动值：normal=1.0m(voxel*2), feature=2.0m → p90 consistently >50m → ALL rejected
+    # 调整后：normal=2.0m(voxel*4), feature=4.0m → 更多邻域点 → 更可靠法线 → 更好FPFH
+    fpfh_normal_radius_m: 2.0   # 法线估计半径：0=自动(voxel*2)；城市场景建议 2.0
+    fpfh_feature_radius_m: 4.0  # FPFH 特征半径：0=自动(normal*2)；城市场景建议 4.0
   teaser_icp_agreement:
     max_trans_diff_m: 4.0
     max_rot_diff_deg: 35.0
@@ -898,7 +932,13 @@ backend:
 # ── 3.5 地图输出与保存 ─────────────────────────────────────────────────────
 # ConfigManager 还读 map.statistical_filter_mean_k / statistical_filter_std_mul（缺省 50、1.0）
 map:
-  voxel_size:        0.2       # 原 0.35，减小以显著改善全局图清晰度（减轻块状模糊）
+  # [BUG FIX] 将全局地图体素下采样从 0.2m 降至 0.1m：
+  # 0.2m 体素在室外街道场景意味着 20cm 内的所有表面点合并为单点，导致典型墙体（厚度 20-40cm）
+  # 结构性模糊（每面墙的两侧点被合并）。0.1m 保留更多结构细节，代价是地图约 4-8× 更大。
+  # 日志记录：raw 15,182,798 → voxel 0.2m → 375,658 点（压缩 40:1）→ 严重模糊
+  # 调整后：0.1m → 估计 800,000~1,200,000 点（压缩 15:1）→ 可接受清晰度
+  # 内存估算：1.2M 点 × 16 bytes ≈ 20MB，完全可接受。
+  voxel_size:        0.1       # 0.2m→0.1m，减半体素提升地图分辨率（显著减少结构性模糊）
   statistical_filter: true
 
 # ── 3.6 多会话建图 ─────────────────────────────────────────────────────────

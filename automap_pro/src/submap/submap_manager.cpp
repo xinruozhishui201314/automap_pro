@@ -771,7 +771,15 @@ void SubMapManager::mergeCloudToSubmap(SubMap::Ptr& sm, const KeyFrame::Ptr& kf)
 
     // 🏛️ [P0 性能优化] 架构重构：耗时操作移出锁外，支持多线程并行
     CloudXYZIPtr raw_cloud = kf->cloud_body;
-    Pose3d T_map_b_snapshot = kf->T_map_b_optimized;
+    // [P0 数据竞争修复] T_map_b_optimized 由 updateAllFromHBA / batchUpdateKeyFramePoses 在
+    // mutex_ 保护下写入；mergeCloudToSubmap 运行在 merge worker 线程，此处必须持锁读取快照，
+    // 否则与写入线程形成 C++ 未定义行为（数据竞争）。
+    // 快照完成后立即释放锁，后续耗时的降采样与变换仍在锁外执行。
+    Pose3d T_map_b_snapshot;
+    {
+        std::lock_guard<std::mutex> lk_pose(mutex_);
+        T_map_b_snapshot = kf->T_map_b_optimized;
+    }
 
     CloudXYZIPtr ds_kf_cloud = downsampleKeyframeBodyForMerging_(kf);
     if (!ds_kf_cloud || ds_kf_cloud->empty()) {
@@ -833,13 +841,13 @@ void SubMapManager::mergeCloudToSubmap(SubMap::Ptr& sm, const KeyFrame::Ptr& kf)
         sm->merged_cloud ? sm->merged_cloud->size() : 0);
 
     // [GHOSTING_TRACE] 合并已用快照位姿 T_map_b_snapshot；与 odom 差异诊断
+    // 注意：诊断路径全部使用 T_map_b_snapshot（已在锁内拍摄），不直接访问 kf->T_map_b_optimized
     if (backend_verbose_trace_) {
         const Eigen::Vector3d t = T_map_b_snapshot.translation();
         const Eigen::Vector3d t_odom = kf->T_odom_b.translation();
-        const Eigen::Vector3d t_opt = kf->T_map_b_optimized.translation();
-        double trans_diff = (t_odom - t_opt).norm();
+        double trans_diff = (t_odom - t).norm();
         double yaw_odom = std::atan2(kf->T_odom_b.rotation()(1, 0), kf->T_odom_b.rotation()(0, 0)) * 180.0 / M_PI;
-        double yaw_opt = std::atan2(kf->T_map_b_optimized.rotation()(1, 0), kf->T_map_b_optimized.rotation()(0, 0)) * 180.0 / M_PI;
+        double yaw_opt = std::atan2(T_map_b_snapshot.rotation()(1, 0), T_map_b_snapshot.rotation()(0, 0)) * 180.0 / M_PI;
         double yaw_diff = std::abs(yaw_odom - yaw_opt);
         if (yaw_diff > 180.0) yaw_diff = 360.0 - yaw_diff;
         RCLCPP_INFO(rclcpp::get_logger("automap_system"),
@@ -1070,12 +1078,23 @@ void SubMapManager::batchUpdateKeyFramePoses(const std::unordered_map<uint64_t, 
                 "max_anchor_abs_mapz_minus_odomz=%.4fm (纯 yaw+tz=0 对齐后锚点应接近 0；偏大则查 GPS/回环/杆臂)",
                 static_cast<unsigned long>(version), updated, z_diag_max_abs_dz, z_diag_max_anchor_mapz_minus_odomz);
 
-    // 🏛️ [架构加固] 如果检测到巨大跳变（如 GPS 对齐），强制重建点云，避免 merged_cloud 污染
+    // [BUG FIX] 每次 batchUpdateKeyFramePoses 后无条件将 merged_cloud 标记为 dirty。
+    // 原逻辑仅在 max_jump_dist > submap_rebuild_thresh_trans_ 时触发，而 iSAM2 增量更新中
+    // 锚点帧位移极小（全程 max_jump=0.000m），阈值从未被触发，导致 merged_cloud 永远不重建。
+    // addSubmapImpl（虽已修复为从 cloud_body 重投影）、可视化与其它下游若仍读取 merged_cloud，
+    // 会拿到 ODOM 系旧点云与 MAP 系优化位姿叠加 → 地图重影。
+    // 现改为：每次位姿批量更新后无条件标记 dirty，下次 merged_cloud 被消费时自动触发重建。
+    merged_cloud_dirty_.store(true, std::memory_order_release);
+    RCLCPP_DEBUG(rclcpp::get_logger("automap_system"),
+        "[SubMapMgr][GHOST_GUARD] merged_cloud marked dirty after KF batch update "
+        "(max_jump=%.3fm updated_kfs=%zu version=%lu)",
+        max_jump_dist, updated, version);
+
+    // 若跳变较大则立即同步重建（GPS 对齐等场景），避免在 dirty 状态下被其它线程读取旧数据
     if (max_jump_dist > submap_rebuild_thresh_trans_) {
         RCLCPP_INFO(rclcpp::get_logger("automap_system"),
-            "[SubMapMgr][GHOST_GUARD] Large jump (%.3fm) detected in KF update, triggering merged_cloud rebuild",
+            "[SubMapMgr][GHOST_GUARD] Large jump (%.3fm) detected, triggering immediate rebuild",
             max_jump_dist);
-        merged_cloud_dirty_.store(true, std::memory_order_release); // [RC5/RC6] 标记即将重建
         lk.unlock();
         rebuildMergedCloudFromOptimizedPoses();
     }

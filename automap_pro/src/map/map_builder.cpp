@@ -472,15 +472,35 @@ void MapBuilder::addKeyFrameImpl(const KeyFrame::Ptr& kf) {
 }
 
 void MapBuilder::addSubmapImpl(const SubMap::Ptr& sm) {
-    if (!sm || !sm->merged_cloud || sm->merged_cloud->empty()) return;
-    
+    if (!sm || sm->keyframes.empty()) return;
+
     std::lock_guard<std::mutex> lk(mutex_);
-    
-    // 直接使用子图的合并点云
-    mergeCloud(sm->merged_cloud, base_map_);
-    
-    // 将子图点云添加到全局地图
-    global_map_->addCloud(sm->downsampled_cloud, sm->pose_map_anchor_optimized);
+
+    // [BUG FIX] 不再直接使用 sm->merged_cloud。
+    // merged_cloud 是子图冻结时用 T_odom_b 合并的旧点云；GPS 对齐或 HBA 后，子图锚点位姿已
+    // 更新为 T_map_b_optimized，但 merged_cloud 未随之重建。若直接使用，地图中会叠加 ODOM
+    // 系与 MAP 系两套点云 → 同一墙面出现两个位置 → 严重重影（厚墙）。
+    // 修复：与 buildFromSubmapsImpl 保持一致，统一从每帧 cloud_body × T_map_b_optimized 重投影。
+    size_t added = 0;
+    for (const auto& kf : sm->keyframes) {
+        if (!kf || !kf->cloud_body || kf->cloud_body->empty()) continue;
+        if (!kf->T_map_b_optimized.matrix().allFinite()) continue;
+        CloudXYZI map_cloud;
+        transformCloudToMap(kf->cloud_body, kf->T_map_b_optimized, map_cloud);
+        if (!map_cloud.empty()) {
+            mergeCloud(std::make_shared<CloudXYZI>(map_cloud), base_map_);
+            ++added;
+        }
+    }
+
+    // 全局地图仍用锚点位姿索引子图（用于稀疏查询），此处仅记录；真实点云以 base_map_ 为准
+    if (sm->downsampled_cloud && !sm->downsampled_cloud->empty() &&
+        sm->pose_map_anchor_optimized.matrix().allFinite()) {
+        global_map_->addCloud(sm->downsampled_cloud, sm->pose_map_anchor_optimized);
+    }
+
+    ALOG_INFO("MapBuilder", "[addSubmapImpl] sm_id={} kfs={} added_kf_clouds={} base_map_pts={}",
+              sm->id, sm->keyframes.size(), added, base_map_->size());
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

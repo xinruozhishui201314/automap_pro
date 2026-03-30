@@ -59,6 +59,19 @@ public:
                 ev.success ? 1 : 0,
                 static_cast<unsigned long>(ev.alignment_epoch),
                 static_cast<unsigned long>(map_registry_->getVersion()));
+            // [BUG FIX] GPS 对齐后抑制下游 N 次 path 发布：
+            // GPS 对齐将全轨迹一次性旋转 ~18°，若立即发布 publishOptimizedPath 会导致 RVIZ
+            // 显示全路径瞬间跳变。等待全局地图重建完成后（suppress_cycles 减到 0）再发布，
+            // 使 RVIZ 中地图与轨迹的显示节奏一致，减轻视觉冲击。
+            if (ev.success) {
+                const int suppress = ConfigManager::instance().vizSuppressPathOnAlignmentCycles();
+                if (suppress > 0) {
+                    alignment_suppress_cycles_.store(suppress, std::memory_order_release);
+                    RCLCPP_INFO(node_->get_logger(),
+                        "[V3][VIZ_GPS_SUPPRESS] GPS aligned (epoch=%lu), suppressing path publish for %d cycles",
+                        static_cast<unsigned long>(ev.alignment_epoch), suppress);
+                }
+            }
             requestRefresh();
         });
 
@@ -607,7 +620,6 @@ private:
         T_odom_to_map.linear() = snapshot->R_enu_to_map;
         T_odom_to_map.translation() = snapshot->t_enu_to_map;
 
-        bool has_correction = snapshot->gps_aligned;
         RCLCPP_INFO_THROTTLE(
             node_->get_logger(), *node_->get_clock(), 5000,
             "[V3][VIZ_PUBLISH_ALL] snap_ver=%lu snap_ep=%lu reg_ver=%lu sm=%zu kf=%zu snap_kf_pose_entries=%zu "
@@ -620,10 +632,18 @@ private:
             snapshot->keyframe_poses.size(),
             snapshot->gps_aligned ? 1 : 0);
         
-        // 发布优化后的轨迹（使用快照中的位姿）
-        rviz_publisher_.publishOptimizedPath(all_sm, snapshot, snapshot->alignment_epoch);
-        // 发布所有关键帧位姿
-        rviz_publisher_.publishKeyframePoses(all_kf, snapshot, snapshot->alignment_epoch);
+        // [BUG FIX] GPS 对齐后暂时抑制轨迹发布，待地图重建完成后再统一刷新
+        const int suppress_remaining = alignment_suppress_cycles_.load(std::memory_order_acquire);
+        if (suppress_remaining > 0) {
+            alignment_suppress_cycles_.fetch_sub(1, std::memory_order_acq_rel);
+            RCLCPP_INFO_THROTTLE(node_->get_logger(), *node_->get_clock(), 1000,
+                "[V3][VIZ_GPS_SUPPRESS] Suppressing path publish after GPS alignment: remaining=%d", suppress_remaining);
+        } else {
+            // 发布优化后的轨迹（使用快照中的位姿）
+            rviz_publisher_.publishOptimizedPath(all_sm, snapshot, snapshot->alignment_epoch);
+            // 发布所有关键帧位姿
+            rviz_publisher_.publishKeyframePoses(all_kf, snapshot, snapshot->alignment_epoch);
+        }
 
         // 发布语义地标（如树木圆柱体）
         rviz_publisher_.publishSemanticLandmarks(all_sm);
@@ -635,10 +655,12 @@ private:
 
     rclcpp::Node::SharedPtr node_;
     RvizPublisher rviz_publisher_;
-    
+
     std::atomic<bool> refresh_pending_{false};
     std::atomic<uint64_t> semantic_cloud_events_received_{0};
     std::atomic<uint64_t> semantic_cloud_events_published_{0};
+    /** GPS 对齐后轨迹发布抑制计数器；>0 时跳过 publishOptimizedPath，每轮 publishEverything 递减 */
+    std::atomic<int> alignment_suppress_cycles_{0};
 
     std::deque<VizWorkItem> viz_work_queue_;
 };

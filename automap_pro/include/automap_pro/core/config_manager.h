@@ -562,6 +562,10 @@ public:
     double teaserMaxRMSE()      const { return get<double>("loop_closure.teaser.max_rmse_m", 0.3); }
     int    teaserMaxPoints()    const { return std::max(500, get<int>("loop_closure.teaser.max_points", 8000)); }
     bool   teaserICPRefine()    const { return get<bool>("loop_closure.teaser.icp_refine", true); }
+    // FPFH 半径：0=自动（voxel_size*2 / voxel_size*4）；>0=显式覆盖
+    // 城市街道 Velodyne VLP-32 建议：normal_radius=2.0，feature_radius=4.0
+    double fpfhNormalRadius()   const { return get<double>("loop_closure.teaser.fpfh_normal_radius_m", 0.0); }
+    double fpfhFeatureRadius()  const { return get<double>("loop_closure.teaser.fpfh_feature_radius_m", 0.0); }
     /** SuMa++ 类：回环 ICP 用语义一致性加权/降权对应点（intensity=label） */
     bool   loopSemanticIcpEnabled() const { return get<bool>("loop_closure.semantic_icp.enabled", true); }
     double loopSemanticIcpMinLabelRatio() const {
@@ -827,6 +831,11 @@ public:
     bool vizLogPoseJumpDetail() const { return viz_log_pose_jump_detail_; }
     /** visualization.suppress_optimize_driven_global_map：禁止 applyOptimizedPoses 内「优化计数」触发的全局图请求（仅保留按帧周期等其它入口） */
     bool vizSuppressOptimizeDrivenGlobalMap() const { return viz_suppress_optimize_driven_global_map_; }
+    /** GPS 对齐成功后，若干轮 publishEverything 内跳过轨迹发布，减轻 RViz 全路径瞬跳；0 表示不抑制 */
+    int vizSuppressPathOnAlignmentCycles() const {
+        int v = get<int>("visualization.suppress_path_on_alignment_cycles", 3);
+        return std::max(0, v);
+    }
     bool asyncIsam2Update() const { return perf_async_isam2_update_; }
     bool parallelVoxelDownsample() const { return perf_parallel_voxel_downsample_; }
     bool parallelTeaserMatch() const { return perf_parallel_teaser_match_; }

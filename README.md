@@ -152,6 +152,46 @@ MappingModule -> CYLINDER_LANDMARK_FACTOR -> Optimizer
 
 ## 🏛️ 系统架构（详细）
 
+### 0) 架构分层（数据面 / 控制面 / 状态面）
+
+```mermaid
+flowchart LR
+    subgraph DP[数据面 Data Plane]
+        D1[FrontEndModule]
+        D2[DynamicFilterModule]
+        D3[SemanticModule]
+        D4[MappingModule]
+        D5[OptimizerModule]
+    end
+
+    subgraph CP[控制面 Control Plane]
+        C1[MapOrchestrator]
+        C2[ConfigManager]
+        C3[GPSModule / LoopModule]
+    end
+
+    subgraph SP[状态面 State Plane]
+        S1[MapRegistry]
+        S2[Trajectory / Submap State]
+        S3[VisualizationModule]
+    end
+
+    D1 --> D2 --> D4 --> D5
+    D3 --> D4
+    D5 --> S1 --> S2 --> S3
+    C2 --> D1
+    C2 --> D3
+    C2 --> D5
+    C1 -.observe/advice.-> D4
+    C3 --> D5
+```
+
+分层约束（建议长期保持）：
+
+- 数据面仅负责“生产/消费事件”，避免承载复杂策略判断。
+- 控制面只做“调度、阈值、降级决策”，不直接篡改底层数据。
+- 状态面通过 `MapRegistry` 统一收敛，避免多模块绕开状态中心并发写入。
+
 ### 1) 模块启动与依赖顺序
 
 系统按以下顺序完成模块注册与启动（先生产数据、后消费数据）：
@@ -226,6 +266,35 @@ Host (Ubuntu)
 - 模块内部采用 worker + queue 的异步处理模式，避免在 ROS 回调中做重计算
 - 队列必须有边界与超时策略，防止离线高倍速回放导致内存/延迟失控
 - 日志定位优先看 `logs/full.log` 的模块 INIT/RUN 标记，确认链路是否卡在某一阶段
+
+### 5) 关键链路时序（离线建图）
+
+```mermaid
+sequenceDiagram
+    participant Bag as ros2 bag play
+    participant FE as FrontEndModule
+    participant DF as DynamicFilterModule
+    participant SEM as SemanticModule
+    participant MAP as MappingModule
+    participant OPT as OptimizerModule
+    participant REG as MapRegistry
+    participant VIS as VisualizationModule
+
+    Bag->>FE: LiDAR/IMU/GPS 消息
+    FE->>DF: SyncedFrameEvent
+    FE->>SEM: SyncedFrameEvent
+    DF->>MAP: FilteredFrameEventRequiredDs
+    SEM->>MAP: SemanticLandmarkEvent
+    MAP->>OPT: Submap / FactorGraph 任务
+    OPT->>REG: OptimizationResultEvent
+    REG->>VIS: 地图/轨迹快照
+```
+
+关键参数建议（离线模式起步值）：
+
+- `--bag-rate`：先从 `0.5` 启动，确认稳定后升到 `1.0`。
+- 优先检查 GPS 质量与高度方差策略，不建议先用“极低 HDOP 阈值”硬过滤。
+- 如观察到队列堆积，优先降低回放速率，再检查语义与优化耗时热点。
 
 ---
 
@@ -329,6 +398,68 @@ rg "stub mode|runtime semantic capability is unavailable|AUTOMAP_USE_SLOAM_SEMAN
 
 ---
 
+## 📘 操作说明（SOP）
+
+### 1) 日常标准流程（推荐）
+
+```bash
+# Step 1: 清理并编译（确保二进制与当前代码一致）
+bash run_automap.sh --clean --build-only
+
+# Step 2: 离线回放建图（M2DGR 示例）
+bash run_automap.sh --offline \
+  --bag-file data/automap_input/M2DGR/street_03_ros2 \
+  --config system_config_M2DGR.yaml \
+  --bag-rate 0.5
+
+# Step 3: 结果检查（关键日志）
+rg "\[SEMANTIC\]\[Module\]\[RUN\] step=done|OptimizationResultEvent|MapRegistry" logs/full.log
+```
+
+### 2) 在线模式操作
+
+```bash
+# 编译 + 在线运行
+bash run_automap.sh
+
+# 已完成编译后仅运行
+bash run_automap.sh --run-only
+```
+
+上线前最小检查：
+
+- `logs/build.log` 无 CMake/FATAL_ERROR、无 undefined symbol。
+- `logs/full.log` 中各模块 INIT 均成功，且 `OptimizationResultEvent` 持续出现。
+- RViz 中轨迹连续、无明显跳变与双层重影。
+
+### 3) 离线问题快速定位
+
+```bash
+# 语义初始化与运行
+rg "\[SEMANTIC\]\[Processor\]\[INIT\]|\[SEMANTIC\]\[Module\]\[RUN\]" logs/full.log
+
+# 优化主链路
+rg "OptimizerModule|OptimizationResultEvent|MapRegistry" logs/full.log
+
+# 失败特征
+rg "stub mode|bad conversion|pose_vec.size\(\)=0|undefined symbol" logs/full.log logs/build.log
+```
+
+### 4) 产物与目录约定
+
+- 地图/轨迹输出：`data/`（按任务目录归档）
+- 运行日志：`logs/full.log`
+- 编译日志：`logs/build.log`
+- 容器相关脚本与说明：`docker/`、`docker/DOCKER_USAGE.md`
+
+### 5) 一次任务完成定义（DoD）
+
+- 编译通过，且语义链路真实生效（无 stub）。
+- 优化事件连续输出，地图可视化无明显结构断裂。
+- 关键配置（bag、yaml、速率）已记录到任务文档或提交说明中，可复现。
+
+---
+
 ## 📁 项目结构（简化）
 
 ```text
@@ -412,5 +543,5 @@ automap_pro/                    # 仓库根目录
 
 **Made with ❤️ by AutoMap-Pro Team**
 
-文档版本：v2.4（M2DGR HDOP 与代码对齐、补充 MapOrchestrator、回环 ICP 精化）  
+文档版本：v2.5（细化系统分层架构、补充离线时序与SOP操作说明）  
 更新日期：2026-03-30

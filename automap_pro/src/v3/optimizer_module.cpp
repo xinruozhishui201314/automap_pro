@@ -417,6 +417,12 @@ void OptimizerModule::processGPSBatchKF(const OptTaskItem& task) {
             "(suppress_pose_notify=true, GPS factors will notify after convergence)");
     }
 
+    // [P1 GPS批量去重] 对齐时对历史帧批量注入 GPS 因子：按时间顺序遍历，跳过距上条 GPS 因子
+    // 位移不足 factor_interval_m 的重复坐标（GPS 1Hz、KF ~10Hz 时同一 GPS 坐标覆盖多帧）。
+    // 这与 gps_manager.cpp 的实时路径去重逻辑互补，专门覆盖批量对齐路径。
+    const double batch_gps_interval = cfg.gpsFactorIntervalM();
+    Eigen::Vector3d batch_last_pos = Eigen::Vector3d::Constant(std::numeric_limits<double>::quiet_NaN());
+    size_t reject_duplicate = 0;
     for (const auto& kf : all_kfs) {
         if (!kf) continue;
         const double gps_dt = std::abs(kf->timestamp - kf->gps.timestamp);
@@ -429,8 +435,20 @@ void OptimizerModule::processGPSBatchKF(const OptTaskItem& task) {
             continue;
         }
         Eigen::Vector3d pos_map = gpsImuPositionInMapFromImuEnu(R, t, kf->gps.position_enu);
+        const bool first_batch = !batch_last_pos.allFinite();
+        const double dist = first_batch ? std::numeric_limits<double>::max()
+                                        : (pos_map - batch_last_pos).norm();
+        if (dist < batch_gps_interval) {
+            reject_duplicate++;
+            continue;
+        }
+        batch_last_pos = pos_map;
         factors.push_back(IncrementalOptimizer::GPSFactorItemKF{
             static_cast<int>(kf->id), pos_map, kf->gps.covariance, kf->gps.hdop, kf->gps.num_satellites});
+    }
+    // 同步更新 processTaskInternal 的去重状态，使批量对齐后单帧路径延续去重边界
+    if (!factors.empty()) {
+        last_gps_kf_factor_pos_ = factors.back().pos;
     }
     if (factors.empty()) {
         RCLCPP_DEBUG(node_->get_logger(),
@@ -441,8 +459,10 @@ void OptimizerModule::processGPSBatchKF(const OptTaskItem& task) {
     g_gps_kf_added_total.fetch_add(factors.size(), std::memory_order_relaxed);
     g_gps_kf_reject_quality_total.fetch_add(reject_quality, std::memory_order_relaxed);
     RCLCPP_INFO(node_->get_logger(),
-        "[CONSTRAINT_KPI][GPS_KF] mode=batch candidates=%zu added=%zu reject_quality=%zu min_accepted_quality_level=%d total_added=%lu",
-        all_kfs.size(), factors.size(), reject_quality, cfg.gpsMinAcceptedQualityLevel(),
+        "[CONSTRAINT_KPI][GPS_KF] mode=batch candidates=%zu added=%zu reject_quality=%zu reject_duplicate=%zu "
+        "interval_m=%.1f min_accepted_quality_level=%d total_added=%lu",
+        all_kfs.size(), factors.size(), reject_quality, reject_duplicate,
+        batch_gps_interval, cfg.gpsMinAcceptedQualityLevel(),
         static_cast<unsigned long>(g_gps_kf_added_total.load(std::memory_order_relaxed)));
     optimizer_.addGPSFactorsForKeyFramesBatch(factors);
     RCLCPP_DEBUG(node_->get_logger(),
@@ -492,18 +512,35 @@ void OptimizerModule::processKeyframeCreate(const OptTaskItem& task) {
     if (task.gps_aligned && gps_decision.accepted) {
         Eigen::Vector3d pos_map = gpsImuPositionInMapFromImuEnu(
             task.gps_transform_R, task.gps_transform_t, kf->gps.position_enu);
+
+        // [P1 GPS去重] 跳过与上次添加位置过近的重复 GPS 因子：
+        // GPS 1Hz 而关键帧 ~10Hz，多帧共享同一 GPS 坐标。若对同位点重复添加多个 PriorFactor，
+        // 优化器会将这几帧同时拉向同一位置，与里程计 Between 因子产生局部压缩冲突，
+        // 造成因子图在该区域产生逐帧小幅跳变，累积后导致地图重影。
+        const double gps_kf_interval = gcfg.gpsFactorIntervalM();
+        const bool first_gps_factor = !last_gps_kf_factor_pos_.allFinite();
+        const double dist_from_last = first_gps_factor ? std::numeric_limits<double>::max()
+                                                       : (pos_map - last_gps_kf_factor_pos_).norm();
+        if (dist_from_last < gps_kf_interval) {
+            g_gps_kf_candidates_total.fetch_add(1, std::memory_order_relaxed);
+            RCLCPP_DEBUG(node_->get_logger(),
+                "[CONSTRAINT][GPS_KF] result=skip reason=duplicate_position kf_id=%lu dist_from_last=%.3fm interval=%.1fm",
+                static_cast<unsigned long>(kf->id), dist_from_last, gps_kf_interval);
+        } else {
         optimizer_.addGPSFactorForKeyFrame(
             kf->id, pos_map, kf->gps.covariance, kf->gps.hdop, kf->gps.num_satellites);
+        last_gps_kf_factor_pos_ = pos_map;
         g_gps_kf_candidates_total.fetch_add(1, std::memory_order_relaxed);
         g_gps_kf_added_total.fetch_add(1, std::memory_order_relaxed);
         RCLCPP_INFO_THROTTLE(node_->get_logger(), *node_->get_clock(), 30000,
             "[Z_DRIFT_DIAG] stage=gps_factor_kf pos_map=R_enu_to_map*position_enu_imu+t (杆臂仅在前端/GPSManager 入口)");
         RCLCPP_INFO(node_->get_logger(),
-            "[CONSTRAINT][GPS_KF] result=ok kf_id=%lu quality=%d rank=%d min_rank=%d hdop=%.2f sats=%d "
+            "[CONSTRAINT][GPS_KF] result=ok kf_id=%lu quality=%d rank=%d min_rank=%d hdop=%.2f sats=%d dist_from_last=%.2fm "
             "(grep CONSTRAINT GPS_KF)",
             static_cast<unsigned long>(kf->id), static_cast<int>(kf->gps.quality),
             gpsQualityRank(kf->gps.quality), gcfg.gpsMinAcceptedQualityLevel(),
-            kf->gps.hdop, kf->gps.num_satellites);
+            kf->gps.hdop, kf->gps.num_satellites, dist_from_last);
+        }
     } else if (task.gps_aligned && gps_decision.reason == GPSConstraintRejectReason::QUALITY_BELOW_POLICY) {
         g_gps_kf_candidates_total.fetch_add(1, std::memory_order_relaxed);
         g_gps_kf_reject_quality_total.fetch_add(1, std::memory_order_relaxed);

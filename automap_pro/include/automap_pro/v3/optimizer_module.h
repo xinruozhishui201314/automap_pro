@@ -61,6 +61,11 @@ private:
     
     std::deque<OptTaskItem> task_queue_;
     mutable std::mutex task_mutex_;
+
+    // [P1 GPS去重] 记录上一条 per-keyframe GPS 因子的地图坐标（位移去重）
+    // 与 gps_manager.cpp 的 last_gps_factor_dist_ 独立：此处针对 processTaskInternal 单帧路径。
+    // 连续关键帧 GPS 坐标相同（1Hz GPS / 10Hz KF）时跳过重复因子，避免多帧同位压缩轨迹。
+    Eigen::Vector3d last_gps_kf_factor_pos_{Eigen::Vector3d::Constant(std::numeric_limits<double>::quiet_NaN())};
 };
 
 } // namespace automap_pro::v3

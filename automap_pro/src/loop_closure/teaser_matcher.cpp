@@ -88,6 +88,8 @@ void TeaserMatcher::applyConfig() {
     max_points_        = cfg.teaserMaxPoints();
     min_safe_inliers_  = cfg.teaserMinSafeInliers();
     fpfh_corr_max_dist_ = cfg.teaserFpfhCorrMaxDistanceM();
+    fpfh_normal_radius_ = cfg.fpfhNormalRadius();
+    fpfh_feature_radius_ = cfg.fpfhFeatureRadius();
 }
 
 CloudXYZIPtr TeaserMatcher::preprocess(const CloudXYZIPtr& cloud) const {
@@ -221,14 +223,21 @@ TeaserMatcher::Result TeaserMatcher::match(
         ALOG_DEBUG(MOD, "[tid={}] step=fpfh_compute_start src_pts={} tgt_pts={}", tid, src->size(), tgt->size());
         FpfhExtractor extractor;
 
+        // [BUG FIX] FPFH 半径计算：优先使用显式配置值（loop_closure.teaser.fpfh_normal_radius_m /
+        // fpfh_feature_radius_m）；未配置时退回自动计算（voxel_size * 2 / 4）。
+        // 城市街道 Velodyne VLP-32C 场景中，平面主导导致 FPFH 哈希碰撞严重（p90>50m），
+        // 需要更大半径（建议 normal_r=2.0m、fpfh_r=4.0m）捕获墙-地交角等结构特征。
+        const float auto_normal_r = std::max(0.5f, static_cast<float>(voxel_size_ * 2.0));
+        const float auto_fpfh_r   = std::max(1.0f, auto_normal_r * 2.0f);
+        const float normal_r_cfg = (fpfh_normal_radius_ > 0.0) ? static_cast<float>(fpfh_normal_radius_) : auto_normal_r;
+        const float fpfh_r_cfg   = (fpfh_feature_radius_ > 0.0) ? static_cast<float>(fpfh_feature_radius_) : auto_fpfh_r;
+        ALOG_INFO(MOD, "[tid={}] FPFH radii: normal_r={:.2f}m fpfh_r={:.2f}m (cfg_normal={:.2f} cfg_feat={:.2f} voxel={:.2f})",
+                  tid, normal_r_cfg, fpfh_r_cfg, fpfh_normal_radius_, fpfh_feature_radius_, voxel_size_);
+
         FPFHCloudPtr src_feat;
         try {
             ALOG_DEBUG(MOD, "[tid={}] step=fpfh_src_compute_start src_ptr={} src_pts={}", tid, static_cast<const void*>(src.get()), src->size());
-            // 🏛️ [V3 修复] 自适应半径：确保法线搜索半径至少为体素大小的 2 倍，FPFH 半径为 4 倍。
-            // 否则在 sparse 下采样（如 0.5m）后，0.5m 半径无法找到邻域导致 FPFH 特征全是 NaN/垃圾。
-            const float normal_r = std::max(0.5f, static_cast<float>(voxel_size_ * 2.0));
-            const float fpfh_r   = std::max(1.0f, normal_r * 2.0f);
-            src_feat = extractor.compute(src, normal_r, fpfh_r);
+            src_feat = extractor.compute(src, normal_r_cfg, fpfh_r_cfg);
         } catch (const std::bad_alloc& e) {
             ALOG_ERROR(MOD, "[tid={}] step=fpfh_src_exception reason=bad_alloc msg={}", tid, e.what());
             ALOG_INFO(MOD, "[TRACE] step=loop_match result=fail reason=fpfh_src_bad_alloc tid={} (精准定位: 源点云 FPFH 内存不足)", tid);
@@ -254,9 +263,7 @@ TeaserMatcher::Result TeaserMatcher::match(
         FPFHCloudPtr tgt_feat;
         try {
             ALOG_DEBUG(MOD, "[tid={}] step=fpfh_tgt_compute_start tgt_ptr={} tgt_pts={}", tid, static_cast<const void*>(tgt.get()), tgt->size());
-            const float normal_r = std::max(0.5f, static_cast<float>(voxel_size_ * 2.0));
-            const float fpfh_r   = std::max(1.0f, normal_r * 2.0f);
-            tgt_feat = extractor.compute(tgt, normal_r, fpfh_r);
+            tgt_feat = extractor.compute(tgt, normal_r_cfg, fpfh_r_cfg);
         } catch (const std::bad_alloc& e) {
             ALOG_ERROR(MOD, "[tid={}] step=fpfh_tgt_exception reason=bad_alloc msg={}", tid, e.what());
             ALOG_INFO(MOD, "[TRACE] step=loop_match result=fail reason=fpfh_tgt_bad_alloc tid={} (精准定位: 目标点云 FPFH 内存不足)", tid);

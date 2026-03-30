@@ -1420,6 +1420,23 @@ bool MappingModule::applyOptimizedPoses(const std::unordered_map<int, Pose3d>& s
         }
     }
 
+    // [BUG FIX] 必须在 batchUpdateKeyFramePoses 之前读取 T_old。
+    // batchUpdateKeyFramePoses 就地覆盖 kf->T_map_b_optimized = T_new；若在其之后读取
+    // T_old，则 T_old == T_new，delta = Identity，FrontendPoseAdjustEvent 完全失效，
+    // 前端 last_odom_pose_ 永远得不到矫正。（根因：POSE_JUMP_DETAIL 全程 0.0000m）
+    uint64_t latest_kf_id_for_delta = 0;
+    Pose3d T_old_for_delta = Pose3d::Identity();
+    bool has_kf_for_delta = false;
+    if (!kf_to_apply.empty()) {
+        for (const auto& [id, _] : kf_to_apply)
+            latest_kf_id_for_delta = std::max(latest_kf_id_for_delta, id);
+        auto kf_pre = map_registry_->getKeyFrame(static_cast<int>(latest_kf_id_for_delta));
+        if (kf_pre) {
+            T_old_for_delta = kf_pre->T_map_b_optimized;  // 优化前的旧位姿
+            has_kf_for_delta = true;
+        }
+    }
+
     // 2. 批量分发到位姿后端 (SubMapManager / MapRegistry)
     if (!sm_to_apply.empty()) {
         sm_manager_.batchUpdateSubmapPoses(sm_to_apply, version, effective_frame, alignment_epoch);
@@ -1441,39 +1458,32 @@ bool MappingModule::applyOptimizedPoses(const std::unordered_map<int, Pose3d>& s
     }
 
     // 4. 计算位姿跳变增量并反馈前端 (Propagation)
-    // 选取最后一个关键帧作为参考点计算坐标系偏移
-    if (!kf_to_apply.empty()) {
-        uint64_t latest_kf_id = 0;
-        for (const auto& [id, _] : kf_to_apply) latest_kf_id = std::max(latest_kf_id, id);
-        
-        auto kf = map_registry_->getKeyFrame(static_cast<int>(latest_kf_id));
-        if (kf) {
-            Pose3d T_old = kf->T_map_b_optimized;
-            Pose3d T_new = kf_to_apply.at(latest_kf_id);
-            Pose3d delta = T_new * T_old.inverse();
+    // T_old 已在步骤 2 之前安全读取（见 BUG FIX 注释）
+    if (has_kf_for_delta) {
+        Pose3d T_new = kf_to_apply.at(latest_kf_id_for_delta);
+        Pose3d delta = T_new * T_old_for_delta.inverse();
 
-            FrontendPoseAdjustEvent adjust_ev;
-            adjust_ev.from_version = processed_map_version_.load();
-            adjust_ev.to_version = version;
-            adjust_ev.T_map_new_map_old = delta;
-            adjust_ev.target_frame = effective_frame;
-            event_bus_->publish(adjust_ev);
-            
+        FrontendPoseAdjustEvent adjust_ev;
+        adjust_ev.from_version = processed_map_version_.load();
+        adjust_ev.to_version = version;
+        adjust_ev.T_map_new_map_old = delta;
+        adjust_ev.target_frame = effective_frame;
+        event_bus_->publish(adjust_ev);
+
+        RCLCPP_INFO(node_->get_logger(),
+            "[V3][GHOST_GUARD] Propagating pose jump to Frontend: delta_t=[%.2f,%.2f,%.2f]",
+            delta.translation().x(), delta.translation().y(), delta.translation().z());
+        if (ConfigManager::instance().vizLogPoseJumpDetail()) {
+            const double t_norm = delta.translation().norm();
+            const double rot_deg =
+                Eigen::AngleAxisd(delta.linear()).angle() * (180.0 / M_PI);
             RCLCPP_INFO(node_->get_logger(),
-                "[V3][GHOST_GUARD] Propagating pose jump to Frontend: delta_t=[%.2f,%.2f,%.2f]",
-                delta.translation().x(), delta.translation().y(), delta.translation().z());
-            if (ConfigManager::instance().vizLogPoseJumpDetail()) {
-                const double t_norm = delta.translation().norm();
-                const double rot_deg =
-                    Eigen::AngleAxisd(delta.linear()).angle() * (180.0 / M_PI);
-                RCLCPP_INFO(node_->get_logger(),
-                    "[V3][GHOST_GUARD][POSE_JUMP_DETAIL] delta_t_norm=%.4fm delta_rot_deg=%.2f "
-                    "from_ver=%lu to_ver=%lu kf_id=%lu",
-                    t_norm, rot_deg,
-                    static_cast<unsigned long>(adjust_ev.from_version),
-                    static_cast<unsigned long>(adjust_ev.to_version),
-                    static_cast<unsigned long>(latest_kf_id));
-            }
+                "[V3][GHOST_GUARD][POSE_JUMP_DETAIL] delta_t_norm=%.4fm delta_rot_deg=%.2f "
+                "from_ver=%lu to_ver=%lu kf_id=%lu",
+                t_norm, rot_deg,
+                static_cast<unsigned long>(adjust_ev.from_version),
+                static_cast<unsigned long>(adjust_ev.to_version),
+                static_cast<unsigned long>(latest_kf_id_for_delta));
         }
     }
 
