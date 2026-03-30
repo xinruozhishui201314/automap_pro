@@ -1,3 +1,7 @@
+/**
+ * @file backend/global_coord_manager.cpp
+ * @brief 后端优化与因子实现。
+ */
 #include "automap_pro/backend/global_coord_manager.h"
 
 #include <GeographicLib/LocalCartesian.hpp>

@@ -1,3 +1,7 @@
+/**
+ * @file sensor/lidar_processor.cpp
+ * @brief 传感器驱动与同步实现。
+ */
 #include "automap_pro/sensor/lidar_processor.h"
 #include "automap_pro/core/config_manager.h"
 #include "automap_pro/core/utils.h"

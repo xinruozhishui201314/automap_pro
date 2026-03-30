@@ -1,4 +1,9 @@
 #pragma once
+/**
+ * @file core/validator.h
+ * @brief 核心：指标、协议、错误、资源、ONNX 等横切能力。
+ */
+
 
 #include <string>
 #include <optional>

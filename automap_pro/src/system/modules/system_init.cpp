@@ -1,3 +1,7 @@
+/**
+ * @file system/modules/system_init.cpp
+ * @brief 系统节点与 ROS 服务实现。
+ */
 #include "automap_pro/system/automap_system.h"
 #include "automap_pro/core/config_manager.h"
 #include "automap_pro/core/crash_report.h"

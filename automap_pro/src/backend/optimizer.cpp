@@ -1,3 +1,7 @@
+/**
+ * @file backend/optimizer.cpp
+ * @brief 后端优化与因子实现。
+ */
 #include "automap_pro/backend/optimizer.h"
 #include "automap_pro/backend/gtsam_guard.h"
 #include "automap_pro/core/utils.h"

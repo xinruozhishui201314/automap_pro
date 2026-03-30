@@ -616,8 +616,8 @@ fast_livo:
     pose_output_en: false
 
   pcd_save:
-    pcd_save_en:      true   # 设为 true：运行结束时保存 all_raw_points.pcd 到 output_dir
-    output_dir:       "/data/automap_output"  # 与 system.output_dir 一致，前端 PCD 与后端地图同目录
+    pcd_save_en:      true   # true：结束时保存 all_raw_points.pcd；launch 会将目录设为 <session>/optimized，与 global_map_final.pcd 同目录
+    output_dir:       "/data/automap_output"  # 由 get_fast_livo2_params 覆盖为 <system.output_dir 或 AUTOMAP>/optimized
     colmap_output_en: false
     filter_size_pcd:  0.25
     interval:         -1     # -1 表示仅在结束时保存一次；>0 表示每 N 帧额外保存一次
@@ -879,6 +879,7 @@ backend:
     trigger_every_n_submaps: 3   # ⬇️ 降低（5→3），更频繁触发HBA
     trigger_on_loop:         true
     trigger_on_finish:       true
+    trigger_wait_timeout_sec: 0   # 收尾 wait=true 不限制时长；若需保险上限可设 7200 等
     frontend_idle_trigger_sec: 100.0
     frontend_idle_min_submaps: 1   # 至少 5 个子图时才因「前端空闲」触发 HBA，避免第一个子图刚建完就优化（共 5 个子图场景）
     data_path:               "/tmp/hba_data"

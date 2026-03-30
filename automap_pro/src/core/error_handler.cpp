@@ -1,3 +1,7 @@
+/**
+ * @file core/error_handler.cpp
+ * @brief 核心实现。
+ */
 #include "automap_pro/core/error_handler.h"
 #include <random>
 #include <iomanip>

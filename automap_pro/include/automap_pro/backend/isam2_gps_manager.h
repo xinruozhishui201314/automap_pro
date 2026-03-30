@@ -1,4 +1,9 @@
 #pragma once
+/**
+ * @file backend/isam2_gps_manager.h
+ * @brief 后端优化：iSAM2、HBA、GPS/回环因子、任务队列与坐标管理。
+ */
+
 
 /**
  * iSAM2 GPS 因子管理模块

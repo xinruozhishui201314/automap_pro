@@ -1,3 +1,7 @@
+/**
+ * @file core/ort_wrapper.cpp
+ * @brief 核心实现。
+ */
 #include "automap_pro/core/ort_wrapper.h"
 #include "automap_pro/core/logger.h"
 #include <iostream>

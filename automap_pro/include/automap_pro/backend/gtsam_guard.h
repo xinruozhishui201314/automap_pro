@@ -1,5 +1,10 @@
 #pragma once
 /**
+ * @file backend/gtsam_guard.h
+ * @brief 后端优化：iSAM2、HBA、GPS/回环因子、任务队列与坐标管理。
+ */
+
+/**
  * GTSAM 多路使用防护与统一日志
  *
  * 同一进程内多处使用 GTSAM（iSAM2、Optimizer、HBA PGO）时：

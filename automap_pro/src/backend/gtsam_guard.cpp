@@ -1,3 +1,7 @@
+/**
+ * @file backend/gtsam_guard.cpp
+ * @brief 后端优化与因子实现。
+ */
 #include "automap_pro/backend/gtsam_guard.h"
 #include "automap_pro/core/config_manager.h"
 #include "automap_pro/core/logger.h"

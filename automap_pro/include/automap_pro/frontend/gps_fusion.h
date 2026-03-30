@@ -1,4 +1,9 @@
 #pragma once
+/**
+ * @file frontend/gps_fusion.h
+ * @brief 前端：关键帧、LIVO 适配、GPS 融合与桥接。
+ */
+
 
 #include <deque>
 #include <mutex>

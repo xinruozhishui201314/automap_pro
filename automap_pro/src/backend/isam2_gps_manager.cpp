@@ -1,3 +1,7 @@
+/**
+ * @file backend/isam2_gps_manager.cpp
+ * @brief 后端优化与因子实现。
+ */
 #include "automap_pro/backend/isam2_gps_manager.h"
 #include "automap_pro/backend/gtsam_guard.h"
 #include "automap_pro/backend/isam2_factor_types.h"

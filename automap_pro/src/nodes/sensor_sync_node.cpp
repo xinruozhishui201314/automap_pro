@@ -1,3 +1,7 @@
+/**
+ * @file nodes/sensor_sync_node.cpp
+ * @brief 独立 ROS 节点入口。
+ */
 #include <rclcpp/rclcpp.hpp>
 #include "automap_pro/core/config_manager.h"
 #include "automap_pro/sensor/sensor_manager.h"

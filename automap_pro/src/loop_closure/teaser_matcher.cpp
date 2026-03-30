@@ -1,3 +1,7 @@
+/**
+ * @file teaser_matcher.cpp
+ * @brief TEASER 匹配、FPFH 预处理、SVD/Umeyama 兜底与配置热更新（applyConfig）。
+ */
 #include "automap_pro/loop_closure/teaser_matcher.h"
 #include "automap_pro/core/config_manager.h"
 #include "automap_pro/core/logger.h"

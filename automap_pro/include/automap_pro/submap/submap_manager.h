@@ -1,4 +1,9 @@
 #pragma once
+/**
+ * @file submap/submap_manager.h
+ * @brief 子图/会话：生命周期、合并、持久化与 MS-Mapping 桥接。
+ */
+
 
 #include "automap_pro/core/data_types.h"
 #include "automap_pro/core/error_code.h"
@@ -18,7 +23,8 @@
 namespace automap_pro {
 
 /**
- * SubMap 生命周期管理器（MS-Mapping 增量式建图核心）
+ * @class SubMapManager
+ * @brief SubMap 生命周期管理器（MS-Mapping 增量式建图核心）。
  *
  * 子图状态机：
  *   ACTIVE → (isFull) → FROZEN → (iSAM2优化) → OPTIMIZED → (持久化) → ARCHIVED
@@ -64,6 +70,13 @@ public:
     void rebuildMergedCloudFromOptimizedPoses();
 
     /**
+     * 最终落盘前：将 T_map_b_optimized 与最近一次 HBA 写回 T_map_b_hba 对齐（iSAM2 可能已覆写前者），
+     * 并重算各子图 pose_map_anchor_optimized / T_submap_kf；若有同步则 bump 地图版本并清空全局图缓存。
+     * 供 global_map_final.pcd 与 keyframes_post_hba 几何一致。
+     */
+    void syncOptimizedPosesFromLastHbaWriteback();
+
+    /**
      * GPS 对齐成功后：将仍为 ODOM 语义的关键帧升为 MAP（T_map_b = T_map_odom * T_odom_b），
      * 重同步各子图 pose_map_anchor_optimized 与 T_submap_kf，清空全局图缓存并按 T_map_b_optimized 重建 merged_cloud。
      * 与 IncrementalOptimizer::transformHistoryAndRebuild 及 MappingModule 新建 KF 升级路径一致；
@@ -94,7 +107,9 @@ public:
 
     // ── 持久化 ────────────────────────────────────────────────────────────
 
-    /** 将已优化子图序列化到磁盘（增量式建图的核心：允许跨 session 加载） */
+    /** 将已优化子图序列化到磁盘（增量式建图的核心：允许跨 session 加载）。
+     *  收尾保存时应在 **syncOptimizedPosesFromLastHbaWriteback + rebuildMergedCloudFromOptimizedPoses** 之后调用，
+     *  以保证 meta/关键帧位姿/downsampled_cloud 与最后一次全图 HBA 一致。 */
     bool archiveSubmap(const SubMap::Ptr& submap, const std::string& dir);
 
     /** 从磁盘恢复子图（跨 session 加载历史地图） */

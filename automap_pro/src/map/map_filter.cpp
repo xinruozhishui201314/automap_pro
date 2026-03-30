@@ -1,3 +1,7 @@
+/**
+ * @file map/map_filter.cpp
+ * @brief 地图构建与维护实现。
+ */
 #include "automap_pro/map/map_filter.h"
 #include "automap_pro/core/config_manager.h"
 #include "automap_pro/core/utils.h"

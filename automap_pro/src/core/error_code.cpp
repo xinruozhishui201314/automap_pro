@@ -1,3 +1,7 @@
+/**
+ * @file core/error_code.cpp
+ * @brief 核心实现。
+ */
 #include "automap_pro/core/error_code.h"
 #include <nlohmann/json.hpp>
 #include <sstream>

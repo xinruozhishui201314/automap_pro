@@ -1,3 +1,7 @@
+/**
+ * @file v3/mapping_module.cpp
+ * @brief V3 流水线模块实现。
+ */
 #include "automap_pro/v3/mapping_module.h"
 #include "automap_pro/core/config_manager.h"
 #include "automap_pro/core/logger.h"
@@ -15,7 +19,9 @@
 #include <unordered_set>
 #include <filesystem>
 #include <chrono>
+#include <fstream>
 #include <future>
+#include <iomanip>
 #include <pcl/common/transforms.h>
 #include <pcl/io/pcd_io.h>
 #include <Eigen/Geometry>
@@ -485,6 +491,51 @@ std::string MappingModule::idleDetail() const {
         return "SubMapManager busy(merge/freeze-post)";
     }
     return "";
+}
+
+void MappingModule::forceFreezeActiveSubmapForFinish() {
+    sm_manager_.forceFreezeActiveSubmapForFinish();
+}
+
+bool MappingModule::runFinalFullHbaBlockingIfConfigured() {
+    const auto& cfg = ConfigManager::instance();
+    if (!cfg.hbaEnabled()) {
+        RCLCPP_INFO(node_->get_logger(),
+            "[V3][FINISH] skip final full HBA: backend.hba.enabled=false");
+        return false;
+    }
+    if (!cfg.hbaOnFinish()) {
+        RCLCPP_INFO(node_->get_logger(),
+            "[V3][FINISH] skip final full HBA: backend.hba.trigger_on_finish=false");
+        return false;
+    }
+
+    std::vector<LoopConstraint::Ptr> loops;
+    {
+        std::lock_guard<std::mutex> lk(loop_constraints_mutex_);
+        loops = loop_constraints_;
+    }
+    std::vector<SubMap::Ptr> frozen_for_hba;
+    for (const auto& sm : map_registry_->getAllSubMaps()) {
+        if (sm && (sm->state == SubMapState::FROZEN || sm->state == SubMapState::OPTIMIZED)) {
+            frozen_for_hba.push_back(sm);
+        }
+    }
+    std::sort(frozen_for_hba.begin(), frozen_for_hba.end(),
+              [](const SubMap::Ptr& a, const SubMap::Ptr& b) { return a->id < b->id; });
+
+    if (frozen_for_hba.empty()) {
+        RCLCPP_WARN(node_->get_logger(),
+            "[V3][FINISH] skip final full HBA: no FROZEN/OPTIMIZED submaps in registry");
+        return false;
+    }
+
+    RCLCPP_INFO(node_->get_logger(),
+        "[V3][FINISH] final full HBA: submaps=%zu loops=%zu wait=true (backend.hba.trigger_on_finish)",
+        frozen_for_hba.size(), loops.size());
+    hba_optimizer_.triggerAsync(frozen_for_hba, loops, true, "FinishMapping",
+                                processed_alignment_epoch_.load());
+    return true;
 }
 
 void MappingModule::run() {
@@ -1553,41 +1604,116 @@ bool MappingModule::shouldAcceptOptimizationDelta(const OptimizationDeltaEvent& 
     return ev.meta.ref_version >= processed_map_version_.load(std::memory_order_relaxed);
 }
 
+void MappingModule::savePoseExportsAfterGlobalMap(const std::string& optimized_dir) {
+    if (!map_registry_ || optimized_dir.empty()) return;
+
+    std::error_code ec_mk;
+    fs::create_directories(optimized_dir, ec_mk);
+    (void)ec_mk;
+
+    auto all_kfs = map_registry_->getAllKeyFrames();
+    if (all_kfs.empty()) return;
+
+    std::sort(all_kfs.begin(), all_kfs.end(), [](const KeyFrame::Ptr& a, const KeyFrame::Ptr& b) {
+        if (!a || !b) return a.get() < b.get();
+        return a->timestamp < b->timestamp;
+    });
+
+    const std::string kf_path = optimized_dir + "/keyframes_post_hba.csv";
+    std::ofstream fk(kf_path);
+    if (fk.is_open()) {
+        fk << "kf_id,timestamp,x,y,z,qx,qy,qz,qw,roll_rad,pitch_rad,yaw_rad\n";
+        fk << std::fixed << std::setprecision(9);
+        for (const auto& kf : all_kfs) {
+            if (!kf) continue;
+            const Pose3d T = kf->mapPoseForExportPreferLastHba();
+            const Eigen::Vector3d t = T.translation();
+            const Eigen::Matrix3d R = T.rotation();
+            const Eigen::Quaterniond q(R);
+            // Z-Y-X 外旋等价顺序：yaw(Z) → pitch(Y) → roll(X)，与 Eigen::eulerAngles(2,1,0) 一致
+            const Eigen::Vector3d zyx = R.eulerAngles(2, 1, 0);
+            const double yaw = zyx[0];
+            const double pitch = zyx[1];
+            const double roll = zyx[2];
+            fk << kf->id << "," << kf->timestamp << ","
+               << t.x() << "," << t.y() << "," << t.z() << ","
+               << q.x() << "," << q.y() << "," << q.z() << "," << q.w() << ","
+               << roll << "," << pitch << "," << yaw << "\n";
+        }
+        fk.close();
+        RCLCPP_INFO(node_->get_logger(), "[V3][MappingModule] Post-HBA keyframe poses -> %s", kf_path.c_str());
+    } else {
+        RCLCPP_WARN(node_->get_logger(), "[V3][MappingModule] Cannot open %s", kf_path.c_str());
+    }
+
+    Eigen::Matrix3d R_map_enu = Eigen::Matrix3d::Identity();
+    Eigen::Vector3d t_map_enu = Eigen::Vector3d::Zero();
+    const bool aligned = map_registry_->isGPSAligned();
+    if (aligned) {
+        map_registry_->getGPSTransform(R_map_enu, t_map_enu);
+    }
+
+    const std::string gps_path = optimized_dir + "/gps_constraints_map_post_hba.csv";
+    std::ofstream fg(gps_path);
+    if (!fg.is_open()) {
+        RCLCPP_WARN(node_->get_logger(), "[V3][MappingModule] Cannot open %s", gps_path.c_str());
+        return;
+    }
+    fg << "kf_id,timestamp,gps_x_map,gps_y_map,gps_z_map,qx,qy,qz,qw,roll_rad,pitch_rad,yaw_rad\n";
+    fg << std::fixed << std::setprecision(9);
+    int n_gps = 0;
+    for (const auto& kf : all_kfs) {
+        if (!kf || !kf->has_valid_gps || !aligned) continue;
+        const Eigen::Vector3d pos_gps_map = R_map_enu * kf->gps.position_enu + t_map_enu;
+        // 仅位置约束：单位四元数 + rpy=0
+        fg << kf->id << "," << kf->timestamp << ","
+           << pos_gps_map.x() << "," << pos_gps_map.y() << "," << pos_gps_map.z()
+           << ",0.0,0.0,0.0,1.0,0.0,0.0,0.0\n";
+        ++n_gps;
+    }
+    fg.close();
+    RCLCPP_INFO(node_->get_logger(),
+        "[V3][MappingModule] Post-HBA GPS constraint positions (map frame, rpy=0) -> %s (%d rows, gps_aligned=%d)",
+        gps_path.c_str(), n_gps, aligned ? 1 : 0);
+}
+
 void MappingModule::handleSaveMap(const SaveMapRequestEvent& ev) {
     auto all_submaps = sm_manager_.getAllSubmaps();
     RCLCPP_INFO(node_->get_logger(), "[V3][MappingModule] Saving %zu submaps to %s", 
                 all_submaps.size(), ev.output_dir.c_str());
 
     fs::create_directories(ev.output_dir);
-    for (const auto& sm : all_submaps) {
-        if (sm) sm_manager_.archiveSubmap(sm, ev.output_dir);
-    }
 
-    // ========== [架构增强] 强制生成并保存一份全量全局地图 ==========
+    const fs::path opt_dir = fs::path(ev.output_dir) / "optimized";
+    std::error_code ec_opt;
+    fs::create_directories(opt_dir, ec_opt);
+    const std::string opt_dir_str = (!ec_opt && fs::is_directory(opt_dir))
+        ? opt_dir.string()
+        : ev.output_dir;
+
+    // ========== [架构增强] 全图 HBA 对齐 → 子图存档 → 全局地图 ==========
     try {
-        RCLCPP_INFO(node_->get_logger(), "[V3][MappingModule] Building final global map for saving...");
+        RCLCPP_INFO(node_->get_logger(),
+            "[V3][MappingModule] Final save pipeline: HBA sync, merged rebuild, submap archive, global_map_final...");
         float save_voxel_size = ConfigManager::instance().mapVoxelSize();
         uint64_t current_epoch = map_registry_->getAlignmentEpoch();
-        
-        // 🏛️ [架构加固] 保存前强制触发一次增量重建，确保 fallback 路径的 merged_cloud 也是基于最新位姿的
-        sm_manager_.rebuildMergedCloudFromOptimizedPoses(); 
-        
+
+        // 与最后一次 HBA 写回对齐后再持久化：submap_meta/关键帧位姿/downsampled_cloud 与 global_map_final 同源
+        sm_manager_.syncOptimizedPosesFromLastHbaWriteback();
+        sm_manager_.rebuildMergedCloudFromOptimizedPoses();
         sm_manager_.invalidateGlobalMapCache();
+
+        for (const auto& sm : all_submaps) {
+            if (sm) sm_manager_.archiveSubmap(sm, ev.output_dir);
+        }
+
         CloudXYZIPtr global_map = sm_manager_.buildGlobalMap(save_voxel_size, current_epoch);
         if (global_map && !global_map->empty()) {
-            // [RC-4 修复] 将最终 GPS 对齐地图保存在 optimized/ 子目录，与 fast-livo 保存的
-            // all_raw_points.pcd（odom 系）物理隔离，防止用户误将两个不同坐标系的点云同时加载导致重影。
-            const fs::path opt_dir = fs::path(ev.output_dir) / "optimized";
-            std::error_code ec;
-            fs::create_directories(opt_dir, ec);
-            if (ec) {
-                RCLCPP_WARN(node_->get_logger(),
-                    "[V3][MappingModule] Failed to create optimized/ subdir (%s), saving to output_dir",
-                    ec.message().c_str());
-            }
-            const std::string global_path = (!ec && fs::is_directory(opt_dir))
-                ? (opt_dir / "global_map_final.pcd").string()
-                : ev.output_dir + "/global_map_final.pcd";
+            // [RC-4] 最终地图在 optimized/；fast_livo 的 all_raw_points.pcd 由 launch 注入 pcd_save.output_dir=.../optimized
+            // 与之同目录。fast_livo 点云仍为里程计/world 系，global_map_final 为 map/GPS 对齐系，加载时勿混叠显示。
+            const std::string global_path = opt_dir_str + "/global_map_final.pcd";
+            std::error_code ec_g;
+            fs::create_directories(fs::path(global_path).parent_path(), ec_g);
             pcl::io::savePCDFileBinary(global_path, *global_map);
             RCLCPP_INFO(node_->get_logger(), "[V3][MappingModule] Global map saved to %s (%zu pts)", 
                         global_path.c_str(), global_map->size());
@@ -1597,8 +1723,11 @@ void MappingModule::handleSaveMap(const SaveMapRequestEvent& ev) {
                 ev.output_dir.c_str());
         }
     } catch (const std::exception& e) {
-        RCLCPP_ERROR(node_->get_logger(), "[V3][MappingModule] Failed to save final global map: %s", e.what());
+        RCLCPP_ERROR(node_->get_logger(),
+            "[V3][MappingModule] Final save pipeline failed (sync/rebuild/archive/global_map): %s", e.what());
     }
+
+    savePoseExportsAfterGlobalMap(opt_dir_str);
     // ========================================================
 }
 

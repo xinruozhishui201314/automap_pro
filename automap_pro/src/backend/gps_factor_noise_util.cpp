@@ -1,3 +1,7 @@
+/**
+ * @file backend/gps_factor_noise_util.cpp
+ * @brief 后端优化与因子实现。
+ */
 #include "automap_pro/backend/gps_factor_noise_util.h"
 #include "automap_pro/core/config_manager.h"
 

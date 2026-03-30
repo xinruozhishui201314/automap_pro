@@ -1,3 +1,7 @@
+/**
+ * @file system/modules/data_callbacks.cpp
+ * @brief 系统节点与 ROS 服务实现。
+ */
 #include "automap_pro/system/automap_system.h"
 #include "automap_pro/v3/map_registry.h"
 

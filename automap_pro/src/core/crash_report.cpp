@@ -1,3 +1,7 @@
+/**
+ * @file core/crash_report.cpp
+ * @brief 核心实现。
+ */
 #include "automap_pro/core/crash_report.h"
 
 #include <csignal>

@@ -415,6 +415,8 @@ backend:
     trigger_every_n_submaps: 10
     trigger_on_loop:         false
     trigger_on_finish:       true
+    # triggerAsync(wait=true) 等待 HBA 完成的墙钟上限（秒）。≤0 = 不限制，直到本轮 HBA+callback 结束（收尾/大地图推荐 0）
+    trigger_wait_timeout_sec: 0
     # 前端空闲 N 秒且队列空时触发一次 HBA（不结束建图）。≤0 不触发。需同时满足 frontend_idle_min_submaps
     frontend_idle_trigger_sec: 10.0
     frontend_idle_min_submaps: 2    # 至少几个子图时才因空闲触发，避免「第一个子图刚建完就 HBA」；共 N 个子图可设为 N

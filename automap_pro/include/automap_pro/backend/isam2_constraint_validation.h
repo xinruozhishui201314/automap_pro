@@ -1,4 +1,9 @@
 #pragma once
+/**
+ * @file backend/isam2_constraint_validation.h
+ * @brief 后端优化：iSAM2、HBA、GPS/回环因子、任务队列与坐标管理。
+ */
+
 
 /**
  * iSAM2 约束验证日志模块

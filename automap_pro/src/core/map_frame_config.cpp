@@ -1,3 +1,7 @@
+/**
+ * @file core/map_frame_config.cpp
+ * @brief 核心实现。
+ */
 #include "automap_pro/core/map_frame_config.h"
 #include "automap_pro/core/logger.h"
 

@@ -1,3 +1,7 @@
+/**
+ * @file core/health_monitor_impl.cpp
+ * @brief 核心实现。
+ */
 #include "automap_pro/core/health_monitor.h"
 #include "automap_pro/core/logger.h"
 #include "automap_pro/core/structured_logger.h"

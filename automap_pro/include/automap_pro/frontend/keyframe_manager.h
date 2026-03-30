@@ -1,4 +1,9 @@
 #pragma once
+/**
+ * @file frontend/keyframe_manager.h
+ * @brief 前端：关键帧、LIVO 适配、GPS 融合与桥接。
+ */
+
 #include "automap_pro/core/data_types.h"
 #include <atomic>
 #include <functional>

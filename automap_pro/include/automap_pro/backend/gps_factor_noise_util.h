@@ -1,4 +1,9 @@
 #pragma once
+/**
+ * @file backend/gps_factor_noise_util.h
+ * @brief 后端优化：iSAM2、HBA、GPS/回环因子、任务队列与坐标管理。
+ */
+
 
 #include <Eigen/Core>
 

@@ -1,3 +1,7 @@
+/**
+ * @file backend/isam2_task_queue.cpp
+ * @brief 后端优化与因子实现。
+ */
 #include "automap_pro/backend/isam2_task_queue.h"
 #include "automap_pro/backend/isam2_factor_types.h"
 

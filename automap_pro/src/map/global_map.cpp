@@ -1,3 +1,7 @@
+/**
+ * @file map/global_map.cpp
+ * @brief 地图构建与维护实现。
+ */
 #include "automap_pro/map/global_map.h"
 #include "automap_pro/core/logger.h"
 #include <pcl/common/transforms.h>

@@ -1,3 +1,7 @@
+/**
+ * @file v3/geometric_processor.cpp
+ * @brief V3 流水线模块实现。
+ */
 #include "automap_pro/v3/geometric_processor.h"
 #include <patchworkpp/patchworkpp.hpp>
 #include <Eigen/Geometry>

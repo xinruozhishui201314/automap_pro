@@ -1,4 +1,9 @@
 #pragma once
+/**
+ * @file backend/isam2_task_queue.h
+ * @brief 后端优化：iSAM2、HBA、GPS/回环因子、任务队列与坐标管理。
+ */
+
 
 /**
  * iSAM2 异步优化任务队列模块

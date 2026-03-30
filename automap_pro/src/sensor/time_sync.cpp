@@ -1,3 +1,7 @@
+/**
+ * @file sensor/time_sync.cpp
+ * @brief 传感器驱动与同步实现。
+ */
 #include "automap_pro/sensor/time_sync.h"
 #include "automap_pro/core/logger.h"
 

@@ -1,3 +1,7 @@
+/**
+ * @file core/diagnostics_service.cpp
+ * @brief 核心实现。
+ */
 #include "automap_pro/core/diagnostics_service.h"
 #include "automap_pro/core/logger.h"
 #include "automap_pro/core/structured_logger.h"

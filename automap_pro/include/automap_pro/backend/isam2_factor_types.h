@@ -1,4 +1,9 @@
 #pragma once
+/**
+ * @file backend/isam2_factor_types.h
+ * @brief 后端优化：iSAM2、HBA、GPS/回环因子、任务队列与坐标管理。
+ */
+
 
 /**
  * iSAM2 因子类型定义模块

@@ -1,4 +1,9 @@
 #pragma once
+/**
+ * @file v3/semantic_backend_gates.h
+ * @brief V3 微内核：模块编排、事件总线、Registry、前端/语义/优化流水线。
+ */
+
 
 #include "automap_pro/core/config_manager.h"
 #include "automap_pro/core/data_types.h"

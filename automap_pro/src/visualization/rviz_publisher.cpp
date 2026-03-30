@@ -1,3 +1,7 @@
+/**
+ * @file visualization/rviz_publisher.cpp
+ * @brief 可视化实现。
+ */
 #include "automap_pro/visualization/rviz_publisher.h"
 #include "automap_pro/core/config_manager.h"
 #include "automap_pro/core/utils.h"

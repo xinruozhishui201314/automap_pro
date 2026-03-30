@@ -1,4 +1,8 @@
 /**
+ * @file core/load_trace.cpp
+ * @brief 核心实现。
+ */
+/**
  * 库加载顺序追踪：在 .so 静态初始化时写 stderr，便于定位「double free in _GLOBAL__sub_I_lago」等启动崩溃。
  * 不依赖 Logger/rclcpp，仅用 fprintf，保证在任意 .so 初始化阶段可安全执行。
  * 若崩溃在 libgtsam 静态初始化，会看到 automap_core 的 LOAD_TRACE，不会看到 automap_backend 的。

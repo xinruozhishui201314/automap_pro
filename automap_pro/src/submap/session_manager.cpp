@@ -1,3 +1,7 @@
+/**
+ * @file submap/session_manager.cpp
+ * @brief 子图与会话实现。
+ */
 #include "automap_pro/submap/session_manager.h"
 #include "automap_pro/core/utils.h"
 

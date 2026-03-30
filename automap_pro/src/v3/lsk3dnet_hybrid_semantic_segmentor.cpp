@@ -1,3 +1,7 @@
+/**
+ * @file v3/lsk3dnet_hybrid_semantic_segmentor.cpp
+ * @brief V3 流水线模块实现。
+ */
 #include "automap_pro/v3/semantic_segmentor.h"
 
 #include <algorithm>

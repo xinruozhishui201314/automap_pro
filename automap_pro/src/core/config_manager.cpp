@@ -1,3 +1,7 @@
+/**
+ * @file core/config_manager.cpp
+ * @brief 核心实现。
+ */
 #include "automap_pro/core/config_manager.h"
 #include "automap_pro/core/logger.h"
 #include "automap_pro/core/error_code.h"
@@ -774,8 +778,8 @@ void ConfigManager::load(const std::string& yaml_path) {
                 teaserNoiseBound(), teaserVoxelSize(), teaserMaxPoints(), teaserMinInlierRatio(), teaserMinSafeInliers(), teaserMaxRMSE(), teaserICPRefine() ? "true" : "false");
             RCLCPP_INFO(L, "[ConfigManager][CONFIG_READ_BACK] loop_closure.pose_consistency: max_trans_diff_m=%.1f max_rot_diff_deg=%.1f (0=off)",
                 loopPoseConsistencyMaxTransDiffM(), loopPoseConsistencyMaxRotDiffDeg());
-            RCLCPP_INFO(L, "[ConfigManager][CONFIG_READ_BACK] backend.verbose_trace=%s backend.process_every_n=%d backend.publish_global_map_every_n=%d backend.hba.enabled=%s backend.hba.on_finish=%s backend.hba.frontend_idle_trigger_sec=%.1f backend.hba.frontend_idle_min_submaps=%d backend.hba.enable_gtsam_fallback=%s",
-                backendVerboseTrace() ? "true" : "false", backendProcessEveryNFrames(), backendPublishGlobalMapEveryNProcessed(), hbaEnabled() ? "true" : "false", hbaOnFinish() ? "true" : "false", hbaFrontendIdleTriggerSec(), hbaFrontendIdleMinSubmaps(), hbaGtsamFallbackEnabled() ? "true" : "false");
+            RCLCPP_INFO(L, "[ConfigManager][CONFIG_READ_BACK] backend.verbose_trace=%s backend.process_every_n=%d backend.publish_global_map_every_n=%d backend.hba.enabled=%s backend.hba.on_finish=%s backend.hba.trigger_wait_timeout_sec=%.1f (<=0=unbounded wait for triggerAsync wait=true) backend.hba.frontend_idle_trigger_sec=%.1f backend.hba.frontend_idle_min_submaps=%d backend.hba.enable_gtsam_fallback=%s",
+                backendVerboseTrace() ? "true" : "false", backendProcessEveryNFrames(), backendPublishGlobalMapEveryNProcessed(), hbaEnabled() ? "true" : "false", hbaOnFinish() ? "true" : "false", hbaTriggerWaitTimeoutSec(), hbaFrontendIdleTriggerSec(), hbaFrontendIdleMinSubmaps(), hbaGtsamFallbackEnabled() ? "true" : "false");
             RCLCPP_INFO(L, "[ConfigManager][CONFIG_READ_BACK] backend.isam2.relin_thresh=%.4f backend.isam2.relinearize_skip=%d backend.isam2.prior_variance=%.0e",
                 isam2RelinThresh(), isam2RelinSkip(), isam2PriorVariance());
             RCLCPP_INFO(L, "[ConfigManager][CONFIG_READ_BACK] map.voxel_size=%.2f map.frame_config_path=%s",

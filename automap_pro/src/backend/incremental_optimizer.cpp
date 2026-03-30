@@ -1,3 +1,7 @@
+/**
+ * @file backend/incremental_optimizer.cpp
+ * @brief 后端优化与因子实现。
+ */
 #include "automap_pro/backend/incremental_optimizer.h"
 #include "automap_pro/backend/gps_factor_noise_util.h"
 #include "automap_pro/backend/gtsam_guard.h"

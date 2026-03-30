@@ -1,4 +1,8 @@
 /**
+ * @file tools/vtk_trajectory_viewer_node.cpp
+ * @brief 工具节点。
+ */
+/**
  * VTK 轨迹曲线显示工具（工程内 C++ 节点）
  *
  * 订阅 /automap/optimized_path（HBA 轨迹）与 /automap/gps_keyframe_path（GPS 轨迹），

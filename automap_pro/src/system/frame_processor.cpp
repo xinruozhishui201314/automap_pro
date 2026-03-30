@@ -1,3 +1,7 @@
+/**
+ * @file system/frame_processor.cpp
+ * @brief 系统节点与 ROS 服务实现。
+ */
 #include "automap_pro/system/frame_processor.h"
 
 #include "automap_pro/core/config_manager.h"

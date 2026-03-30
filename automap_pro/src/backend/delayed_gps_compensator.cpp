@@ -1,3 +1,7 @@
+/**
+ * @file backend/delayed_gps_compensator.cpp
+ * @brief 后端优化与因子实现。
+ */
 #include "automap_pro/backend/delayed_gps_compensator.h"
 #include "automap_pro/core/config_manager.h"
 #include "automap_pro/core/logger.h"

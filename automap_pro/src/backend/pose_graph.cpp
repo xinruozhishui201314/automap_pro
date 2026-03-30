@@ -1,3 +1,7 @@
+/**
+ * @file backend/pose_graph.cpp
+ * @brief 后端优化与因子实现。
+ */
 #include "automap_pro/backend/pose_graph.h"
 #include "automap_pro/core/logger.h"
 #include <queue>

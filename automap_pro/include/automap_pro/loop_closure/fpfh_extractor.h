@@ -1,4 +1,12 @@
 #pragma once
+/**
+ * @file fpfh_extractor.h
+ * @brief FPFH（Fast Point Feature Histograms）提取与互最近邻匹配；PCL 单线程路径 + 全局互斥规避 OMP 析构问题。
+ *
+ * @details
+ * 对点 @f$\mathbf{p}@f$，SPFH 统计 @f$r@f$ 邻域内相对几何直方图，FPFH 为邻域 SPFH 加权平均（Rusu et al.）；
+ * 输出 33 维直方图用于粗对应检索。
+ */
 #include "automap_pro/core/data_types.h"
 #include <pcl/features/fpfh.h>
 #include <pcl/features/normal_3d.h>
@@ -11,14 +19,12 @@ using FPFHCloud    = pcl::PointCloud<pcl::FPFHSignature33>;
 using FPFHCloudPtr = FPFHCloud::Ptr;
 
 /**
- * FPFH特征提取器（线程安全版本）
- * 
- * 修复PCL 1.11-1.12版本中FPFHEstimationOMP的多线程内存泄漏问题：
- * - 使用单线程版本（pcl::FPFHEstimation）替代OMP
- * - 全局互斥锁保护单个Extractor实例
- * - 预生成对象以避免频繁创建销毁触发double-free
- * 
- * 性能：单帧~80-120ms (4000pts) → acceptable for offline/loop closure
+ * @class FpfhExtractor
+ * @brief FPFH 特征提取器（进程内串行化保证线程安全）。
+ *
+ * @details
+ * PCL 1.11–1.12 FPFHEstimationOMP 存在多线程泄漏；此处用单线程 FPFHEstimation + 静态互斥。
+ * 性能量级约单帧 80–120 ms（~4k 点），适用于离线/回环。
  */
 class FpfhExtractor {
 public:

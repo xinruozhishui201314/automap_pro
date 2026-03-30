@@ -1,13 +1,11 @@
 #pragma once
 /**
- * AutoMap-Pro 统一日志模块
+ * @file logger.h
+ * @brief AutoMap-Pro 统一日志：模块名、文件/行/函数定位，spdlog 多 sink，异步与级别控制。
  *
- * 设计目标：
- *   - 每条日志包含 [模块][文件:行][函数] 三元定位信息
- *   - 支持 spdlog 多 sink：stdout（彩色）+ 滚动文件
- *   - 性能计时宏（AUTOMAP_TIMED_SCOPE）
- *   - 线程安全（spdlog async）
- *   - 可通过环境变量 AUTOMAP_LOG_LEVEL 动态调整级别
+ * @details
+ * - 环境变量 AUTOMAP_LOG_LEVEL 覆盖运行时级别。
+ * - ALOG_* 宏封装格式串与上下文；崩溃排查见仓库内 LOGGING_AND_DIAGNOSIS 文档。
  */
 
 #include <spdlog/spdlog.h>

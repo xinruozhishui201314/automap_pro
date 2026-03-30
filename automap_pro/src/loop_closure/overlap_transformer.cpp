@@ -1,3 +1,7 @@
+/**
+ * @file overlap_transformer.cpp
+ * @brief OverlapTransformer 类实现：范围图、描述子、检索与 fallback 直方图。
+ */
 #include "automap_pro/loop_closure/overlap_transformer.h"
 #include "automap_pro/core/config_manager.h"
 #include "automap_pro/core/utils.h"

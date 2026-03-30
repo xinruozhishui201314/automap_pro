@@ -1,3 +1,7 @@
+/**
+ * @file backend/isam2_constraint_validation.cpp
+ * @brief 后端优化与因子实现。
+ */
 #include "automap_pro/backend/isam2_constraint_validation.h"
 
 #include <rclcpp/rclcpp.hpp>

@@ -1,4 +1,9 @@
 #pragma once
+/**
+ * @file sensor/imu_online_calibrator.h
+ * @brief 传感器：LiDAR/IMU/GPS/相机/时间同步与在线标定。
+ */
+
 
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/imu.hpp>

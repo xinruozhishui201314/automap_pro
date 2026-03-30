@@ -1,4 +1,9 @@
 #pragma once
+/**
+ * @file v3/mapping_module.h
+ * @brief V3 微内核：模块编排、事件总线、Registry、前端/语义/优化流水线。
+ */
+
 
 #include "automap_pro/v3/module_base.h"
 #include "automap_pro/frontend/keyframe_manager.h"
@@ -34,6 +39,19 @@ public:
     std::vector<std::pair<std::string, size_t>> queueDepths() const override;
     std::string idleDetail() const override;
 
+    /**
+     * @brief 建图收尾：将当前 ACTIVE 子图强制冻结并入图（触发与正常 freeze 相同的回调链）。
+     *        供 finish_mapping 在最终 HBA/存档前调用，避免最后一段轨迹未进入 registry/因子图。
+     */
+    void forceFreezeActiveSubmapForFinish();
+
+    /**
+     * @brief 当 backend.hba.enabled 且 backend.hba.trigger_on_finish 为真时，对当前 registry 中
+     *        全部 FROZEN/OPTIMIZED 子图 + 已缓存回环执行一次全图 HBA，并阻塞至 HBA 完成（同 triggerAsync wait=true）。
+     * @return 是否实际触发了 HBA（配置关闭或无子图时返回 false）。
+     */
+    bool runFinalFullHbaBlockingIfConfigured();
+
 protected:
     void run() override;
 
@@ -43,6 +61,8 @@ private:
 
     // 🏛️ 生产级命令处理 (Command Handlers)
     void handleSaveMap(const SaveMapRequestEvent& ev);
+    /** 收尾保存：在 optimized/ 下写出全图 HBA 后的关键帧位姿与 GPS 约束点（map 系，GPS 仅位置时 rpy=0） */
+    void savePoseExportsAfterGlobalMap(const std::string& optimized_dir);
     void handleGlobalMapBuild(const GlobalMapBuildRequestEvent& ev);
     /** 发布 GlobalMapBuildResultEvent 并紧跟 MapUpdateEvent(GLOBAL_MAP_REBUILT)，保证 RViz 点云与轨迹刷新顺序一致 */
     void publishGlobalMapResultAndTriggerVizSync(const CloudXYZIPtr& global);

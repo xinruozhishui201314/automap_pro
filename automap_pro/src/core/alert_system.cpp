@@ -1,3 +1,7 @@
+/**
+ * @file core/alert_system.cpp
+ * @brief 核心实现。
+ */
 #include "automap_pro/core/alert_system.h"
 #include "automap_pro/core/logger.h"
 #include "automap_pro/core/structured_logger.h"

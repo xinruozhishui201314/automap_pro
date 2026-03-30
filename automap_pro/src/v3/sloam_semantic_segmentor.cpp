@@ -1,3 +1,7 @@
+/**
+ * @file v3/sloam_semantic_segmentor.cpp
+ * @brief V3 流水线模块实现。
+ */
 #include "automap_pro/v3/semantic_segmentor.h"
 
 #ifdef AUTOMAP_USE_SLOAM_SEMANTIC

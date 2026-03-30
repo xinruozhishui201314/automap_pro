@@ -1,4 +1,9 @@
 #pragma once
+/**
+ * @file system/frame_processor.h
+ * @brief 系统节点：Composable 主控、帧处理、位姿事务。
+ */
+
 
 /**
  * 帧处理器模块

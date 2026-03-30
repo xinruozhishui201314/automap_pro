@@ -139,7 +139,7 @@
 HBA 完成且 GPS 已对齐时，系统会：
 
 1. **创建带时间戳的目录**：`<output_dir>/YYYYMMDD_HHMM`（如 `automap_output/20260317_2030`）。`output_dir` 来自配置 `system.output_dir` 或 launch 参数 `output_dir`。
-2. **将点云与轨迹写入该目录**：调用 `saveMapToFiles(timestamped_dir)`，保存 `global_map.pcd`、`trajectory_tum.txt`、`keyframe_poses.pcd`、`gps_positions_map.pcd`、`trajectory_odom.csv`、session 归档等（与手动“保存地图”内容一致）。
+2. **将点云与轨迹写入该目录**：调用 `saveMapToFiles(timestamped_dir)`，保存 `global_map.pcd`、`trajectory_tum.txt`、`keyframe_poses.pcd`、`gps_positions_map.pcd`、`optimized/trajectory_odom.csv`、session 归档等（与手动“保存地图”内容一致）。
 3. **启动 VTK 查看器并传入该目录**：通过环境变量 `AUTOMAP_ACCURACY_SAVE_DIR` 传入时间戳目录路径。
 4. **VTK 首次渲染成功后保存高清图**：将“两条轨迹 + 偏差曲线”窗口保存为 **accuracy_curves.png**（2x 分辨率）到同一时间戳目录。
 

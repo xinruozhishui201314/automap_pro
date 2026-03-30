@@ -1,3 +1,7 @@
+/**
+ * @file landmark_id.cpp
+ * @brief 全局原子序列 @f$\texttt{g\_landmark\_id\_seq}@f$ 的实现与 compare-exchange 播种。
+ */
 #include "automap_pro/core/landmark_id.h"
 
 #include <algorithm>

@@ -386,9 +386,12 @@ void LIVMapper::readParameters(rclcpp::Node::SharedPtr &node)
   if (!pcd_output_dir_.empty() && pcd_output_dir_.back() == '/') pcd_output_dir_.pop_back();
 
   // 🔧 会话子目录：若 launch/params 已给出 .../run_*（与 AUTOMAP_SESSION_OUTPUT_DIR 一致），不再嵌套第二层 run_
+  // 若以 /optimized 结尾（与后端 global_map_final.pcd 目录一致），也不再嵌套 run_*，避免与 optimized/ 错位
   static std::string s_timestamped_dir = "";
   if (s_timestamped_dir.empty() && !pcd_output_dir_.empty()) {
-      if (pcd_output_dir_.find("/run_") != std::string::npos) {
+      const bool ends_with_optimized = (pcd_output_dir_.size() >= 10 &&
+          pcd_output_dir_.compare(pcd_output_dir_.size() - 10, 10, "/optimized") == 0);
+      if (pcd_output_dir_.find("/run_") != std::string::npos || ends_with_optimized) {
           s_timestamped_dir = pcd_output_dir_;
       } else {
           auto now = std::chrono::system_clock::now();

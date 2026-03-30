@@ -1,5 +1,8 @@
 #pragma once
-
+/**
+ * @file overlap_transformer.h
+ * @brief 深度学习地点识别描述子封装（与 infer 分工：此处可为高层 API）；无模型时用类 M2DP 投影直方图 fallback。
+ */
 #include <vector>
 #include <memory>
 #include <string>
@@ -10,12 +13,7 @@
 
 namespace automap_pro {
 
-// ──────────────────────────────────────────────────────────
-// OverlapTransformer: deep-learning loop place recognition
-// Produces 256-d global descriptors from LiDAR range images.
-// When LibTorch is not available, uses a hand-crafted fallback
-// descriptor (M2DP-like: projection histogram).
-// ──────────────────────────────────────────────────────────
+/** @brief LiDAR 全局描述子 + Top-K 检索（LibTorch 可选）。 */
 class OverlapTransformer {
 public:
     OverlapTransformer();

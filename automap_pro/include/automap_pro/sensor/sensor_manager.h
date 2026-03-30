@@ -1,4 +1,9 @@
 #pragma once
+/**
+ * @file sensor/sensor_manager.h
+ * @brief 传感器：LiDAR/IMU/GPS/相机/时间同步与在线标定。
+ */
+
 
 #include <memory>
 

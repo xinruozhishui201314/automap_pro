@@ -1,4 +1,11 @@
 #pragma once
+/**
+ * @file config_manager.h
+ * @brief 单例配置加载器：解析 YAML，提供类型化 getter 与 ConfigSnapshot（供 worker 线程只读快照）。
+ *
+ * @details
+ * 进程生命周期内应通过 load() 单一入口加载；重复路径冲突时抛异常，避免多源配置漂移。
+ */
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -845,6 +852,15 @@ public:
     int    hbaTriggerSubmaps()  const { return std::max(1, get<int>("backend.hba.trigger_every_n_submaps", 10)); }
     bool   hbaOnLoop()          const { return get<bool>("backend.hba.trigger_on_loop", false); }
     bool   hbaOnFinish()        const { return get<bool>("backend.hba.trigger_on_finish", true); }
+    /**
+     * triggerAsync(..., wait=true) 时等待 HBA 空闲的最长时间（秒）。
+     * <= 0 或 non-finite：不限制墙钟时间，直到本轮 HBA + 回调完成（适合收尾全图 HBA）。
+     * > 0：最多等待该秒数，超时后调用方继续执行（可能 save 与仍在跑的 HBA 竞态）。
+     */
+    double hbaTriggerWaitTimeoutSec() const {
+        double v = get<double>("backend.hba.trigger_wait_timeout_sec", 0.0);
+        return std::isfinite(v) ? v : 0.0;
+    }
     std::string hbaDataPath()   const { return get<std::string>("backend.hba.data_path", "/tmp/hba_data"); }
     /** 是否允许使用 GTSAM fallback 做 HBA（无 hba_api 时）。生产建议 false，避免 double free；见 docs/HBA_GTSAM_FALLBACK_DOUBLE_FREE_FIX.md */
     bool   hbaGtsamFallbackEnabled() const { return get<bool>("backend.hba.enable_gtsam_fallback", false); }

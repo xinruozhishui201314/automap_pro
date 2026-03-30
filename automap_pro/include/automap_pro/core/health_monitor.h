@@ -1,5 +1,10 @@
 #pragma once
 /**
+ * @file core/health_monitor.h
+ * @brief 核心：指标、协议、错误、资源、ONNX 等横切能力。
+ */
+
+/**
  * AutoMap-Pro 健康检查系统
  *
  * 设计目标：

@@ -1,5 +1,11 @@
 #pragma once
-
+/**
+ * @file loop_detector.h
+ * @brief 异步回环检测编排：描述子队列 → 候选检索 → TEASER/ICP 几何验证 → 回环因子回调。
+ *
+ * @details
+ * 与 IncrementalOptimizer 通过 registerLoopCallback 解耦；线程模型见 @class LoopDetector 说明。
+ */
 #include "automap_pro/core/data_types.h"
 #include "automap_pro/loop_closure/icp_refiner.h"
 #include "automap_pro/loop_closure/overlap_transformer_infer.h"
@@ -29,7 +35,8 @@
 namespace automap_pro {
 
 /**
- * 异步回环检测器（优先队列调度 + 并行描述子计算）
+ * @class LoopDetector
+ * @brief 异步回环检测器（优先队列调度 + 并行描述子计算）。
  *
  * 流水线（4阶段）：
  *

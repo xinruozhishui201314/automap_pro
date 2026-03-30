@@ -1,3 +1,7 @@
+/**
+ * @file system/modules/tasks_and_utils.cpp
+ * @brief 系统节点与 ROS 服务实现。
+ */
 #include "automap_pro/system/automap_system.h"
 #include "automap_pro/core/config_manager.h"
 #include "automap_pro/core/logger.h"
@@ -107,14 +111,19 @@ void AutoMapSystem::writeTrajectoryOdomAfterMapping(const std::string& output_di
     auto all_kfs = v3_context_->mapRegistry()->getAllKeyFrames();
     if (all_kfs.empty()) return;
 
-    std::string path = output_dir + "/trajectory_odom.csv";
+    const fs::path opt_dir = fs::path(output_dir) / "optimized";
+    std::error_code ec;
+    fs::create_directories(opt_dir, ec);
+    const std::string opt_base = (!ec && fs::is_directory(opt_dir)) ? opt_dir.string() : output_dir;
+    std::string path = opt_base + "/trajectory_odom.csv";
     std::ofstream f(path);
     if (!f.is_open()) return;
 
     f << "timestamp,x,y,z,qx,qy,qz,qw,gps_lat,gps_lon,gps_alt,has_gps\n";
     for (const auto& kf : all_kfs) {
-        const auto& t = kf->T_map_b_optimized.translation();
-        const auto q = Eigen::Quaterniond(kf->T_map_b_optimized.rotation());
+        const Pose3d T_exp = kf->mapPoseForExportPreferLastHba();
+        const auto& t = T_exp.translation();
+        const auto q = Eigen::Quaterniond(T_exp.rotation());
         f << std::fixed << std::setprecision(6) << kf->timestamp << ","
           << t.x() << "," << t.y() << "," << t.z() << ","
           << q.x() << "," << q.y() << "," << q.z() << "," << q.w() << ",";
@@ -153,7 +162,7 @@ void AutoMapSystem::writeMappingAccuracyGpsVsHba(const std::string& output_dir) 
     for (const auto& kf : all_kfs) {
         if (!kf || !kf->has_valid_gps) continue;
         
-        Eigen::Vector3d pos_opt = kf->T_map_b_optimized.translation();
+        Eigen::Vector3d pos_opt = kf->mapPoseForExportPreferLastHba().translation();
         
         // 🏛️ [V3] 坐标系：kf->T_map_b_optimized 已经在 map 系，kf->gps.position_enu 在 ENU 系
         // 注意：T_odom_b 始终在 odom 系，不受 GPS 对齐影响。

@@ -1,4 +1,9 @@
 #pragma once
+/**
+ * @file core/config_snapshot.h
+ * @brief 核心：指标、协议、错误、资源、ONNX 等横切能力。
+ */
+
 
 /**
  * ConfigSnapshot — 不可变配置快照

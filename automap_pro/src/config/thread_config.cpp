@@ -1,3 +1,7 @@
+/**
+ * @file config/thread_config.cpp
+ * @brief 配置实现。
+ */
 #include "automap_pro/config/thread_config.h"
 
 #include "automap_pro/core/config_manager.h"

@@ -1,3 +1,7 @@
+/**
+ * @file core/validator.cpp
+ * @brief 核心实现。
+ */
 #include "automap_pro/core/validator.h"
 
 namespace automap_pro {

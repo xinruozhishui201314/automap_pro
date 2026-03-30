@@ -1,3 +1,7 @@
+/**
+ * @file v3/dynamic_filter_module.cpp
+ * @brief V3 流水线模块实现。
+ */
 #include "automap_pro/v3/dynamic_filter_module.h"
 #include "automap_pro/core/config_manager.h"
 #include "automap_pro/core/metrics.h"

@@ -1,4 +1,9 @@
 #pragma once
+/**
+ * @file backend/delayed_gps_compensator.h
+ * @brief 后端优化：iSAM2、HBA、GPS/回环因子、任务队列与坐标管理。
+ */
+
 
 #include "automap_pro/core/data_types.h"
 #include <memory>

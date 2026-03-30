@@ -1,3 +1,7 @@
+/**
+ * @file frontend/fast_livo2_adapter.cpp
+ * @brief 前端与里程计适配实现。
+ */
 #include "automap_pro/frontend/fast_livo2_adapter.h"
 #include "automap_pro/core/config_manager.h"
 #include "automap_pro/core/utils.h"

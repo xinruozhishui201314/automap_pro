@@ -1,5 +1,11 @@
 #pragma once
-
+/**
+ * @file data_types.h
+ * @brief 全工程共享类型：点云别名、位姿 @f$\texttt{Pose3d}=\texttt{Eigen::Isometry3d}@f$、GPS/IMU/语义地标与消息侧数据结构。
+ *
+ * @details
+ * 坐标与协议字段（如 GPSAlignState、PoseFrame）为跨模块契约；修改时需同步前端/后端/回环消费者。
+ */
 #include <memory>
 #include <vector>
 #include <string>
@@ -259,6 +265,15 @@ struct KeyFrame {
 
     // 标记
     bool is_anchor = false;  // 是否为子图锚定帧
+
+    /**
+     * @brief 存档/轨迹导出用 map 系位姿：优先 **最近一次 HBA 写回**（`T_map_b_hba`，iSAM2 路径不修改）；
+     *        若尚未经历 HBA 写回则退回 `T_map_b_optimized`（iSAM2/里程计当前值）。
+     */
+    Pose3d mapPoseForExportPreferLastHba() const {
+        if (hba_pose_valid) return T_map_b_hba;
+        return T_map_b_optimized;
+    }
 
     using Ptr = std::shared_ptr<KeyFrame>;
 };

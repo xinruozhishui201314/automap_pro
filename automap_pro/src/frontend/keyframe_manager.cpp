@@ -1,3 +1,7 @@
+/**
+ * @file frontend/keyframe_manager.cpp
+ * @brief 前端与里程计适配实现。
+ */
 #include "automap_pro/frontend/keyframe_manager.h"
 #include "automap_pro/core/config_manager.h"
 #include "automap_pro/core/logger.h"

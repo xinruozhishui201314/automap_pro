@@ -1,4 +1,9 @@
 #pragma once
+/**
+ * @file system/pose_update_transaction.h
+ * @brief 系统节点：Composable 主控、帧处理、位姿事务。
+ */
+
 
 #include "automap_pro/core/data_types.h"
 #include <cstdint>

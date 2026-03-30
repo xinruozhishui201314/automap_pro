@@ -1,3 +1,10 @@
+/**
+ * @file utils.cpp
+ * @brief utils 命名空间实现：体素分块/超时、OpenMP 并行、WGS84→ENU、位姿 6D 与 Isometry 互转。
+ *
+ * @details
+ * PCL VoxelGrid 索引安全：单轴格数过大时 @f$d_x d_y d_z@f$ 可能溢出 32 位；本文件用分块与 leaf clamp 规避。
+ */
 #include "automap_pro/core/utils.h"
 #include "automap_pro/core/config_manager.h"
 #include "automap_pro/core/logger.h"

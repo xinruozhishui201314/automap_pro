@@ -1,4 +1,9 @@
 #pragma once
+/**
+ * @file config/thread_config.h
+ * @brief 线程与运行时配置片段。
+ */
+
 
 /**
  * 线程与队列配置模块

@@ -1,4 +1,9 @@
 #pragma once
+/**
+ * @file backend/gps_constraint_policy.h
+ * @brief 后端优化：iSAM2、HBA、GPS/回环因子、任务队列与坐标管理。
+ */
+
 
 #include "automap_pro/core/config_manager.h"
 #include "automap_pro/core/data_types.h"

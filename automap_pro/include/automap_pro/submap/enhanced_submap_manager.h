@@ -1,4 +1,9 @@
 #pragma once
+/**
+ * @file submap/enhanced_submap_manager.h
+ * @brief 子图/会话：生命周期、合并、持久化与 MS-Mapping 桥接。
+ */
+
 
 #include "automap_pro/submap/submap_manager.h"
 #include "automap_pro/core/data_types.h"

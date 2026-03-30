@@ -1,4 +1,12 @@
 #pragma once
+/**
+ * @file teaser_matcher.h
+ * @brief TEASER++（可选编译）与 FPFH 粗对应下的全局配准；失败时 SVD/Umeyama 兜底。
+ *
+ * @details
+ * TEASER++ 在存在外点对应时估计刚体 @f$\mathbf{T}_{tgt\leftarrow src}@f$（截断最小二乘/PMC 框架）。
+ * 接口约定：initial_guess 为 @f$\mathbf{T}_{tgt\leftarrow src}@f$，内部将 src 预变换后再估计增量并左乘合并。
+ */
 #include "automap_pro/core/data_types.h"
 
 #ifdef USE_TEASER
@@ -8,6 +16,7 @@
 
 namespace automap_pro {
 
+/** @brief TEASER++/FPFH/SVD 回环几何初值估计器。 */
 class TeaserMatcher {
 public:
     enum class GeomPath : int {

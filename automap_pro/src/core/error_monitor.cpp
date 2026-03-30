@@ -1,3 +1,7 @@
+/**
+ * @file core/error_monitor.cpp
+ * @brief 核心实现。
+ */
 #include "automap_pro/core/error_monitor.h"
 #include "automap_pro/core/error_code.h"
 #include "automap_pro/core/logger.h"

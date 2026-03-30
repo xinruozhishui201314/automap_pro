@@ -1,3 +1,7 @@
+/**
+ * @file fpfh_extractor.cpp
+ * @brief FPFH 计算与互最近邻；含崩溃追踪宏与可选 backtrace（诊断 PCL/ABI 问题）。
+ */
 #include "automap_pro/loop_closure/fpfh_extractor.h"
 #include "automap_pro/core/logger.h"
 #include <pcl/search/kdtree.h>

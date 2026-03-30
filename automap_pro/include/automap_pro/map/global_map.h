@@ -1,4 +1,9 @@
 #pragma once
+/**
+ * @file map/global_map.h
+ * @brief 全局地图：增量构建、体素/KD、导出与滤波。
+ */
+
 
 #include <memory>
 #include <vector>

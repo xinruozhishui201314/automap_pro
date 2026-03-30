@@ -1,3 +1,7 @@
+/**
+ * @file sensor/attitude_estimator.cpp
+ * @brief 传感器驱动与同步实现。
+ */
 #include "automap_pro/sensor/attitude_estimator.h"
 #include <algorithm>
 #include <cmath>

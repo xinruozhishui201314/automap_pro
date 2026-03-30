@@ -1,3 +1,7 @@
+/**
+ * @file submap/submap_manager.cpp
+ * @brief 子图与会话实现。
+ */
 #include "automap_pro/submap/submap_manager.h"
 #include "automap_pro/v3/pose_chain.hpp"
 #include "automap_pro/core/config_manager.h"
@@ -1443,6 +1447,56 @@ void SubMapManager::rebuildMergedCloudFromOptimizedPoses() {
     }
     // [RC5/RC6] 重建完成，cleared merged_cloud_dirty_ 标志，允许 buildGlobalMap fallback 路径使用
     merged_cloud_dirty_.store(false, std::memory_order_release);
+}
+
+void SubMapManager::syncOptimizedPosesFromLastHbaWriteback() {
+    std::lock_guard<std::mutex> lk(mutex_);
+    const rclcpp::Logger log = rclcpp::get_logger("automap_system");
+
+    size_t n_synced = 0;
+    auto syncKeyframes = [&n_synced](const SubMap::Ptr& sm) {
+        if (!sm) return;
+        for (auto& kf : sm->keyframes) {
+            if (!kf || !kf->hba_pose_valid) continue;
+            kf->T_map_b_optimized = kf->T_map_b_hba;
+            ++n_synced;
+        }
+    };
+    for (auto& sm : submaps_) syncKeyframes(sm);
+    syncKeyframes(active_submap_);
+
+    if (n_synced == 0) {
+        RCLCPP_INFO(log,
+            "[SubMapMgr][SAVE_SYNC] syncOptimizedPosesFromLastHbaWriteback: no kf with hba_pose_valid, skip "
+            "(global_map_final uses current T_map_b_optimized)");
+        return;
+    }
+
+    auto resyncSubmapRelative = [](const SubMap::Ptr& sm) {
+        if (!sm || sm->keyframes.empty()) return;
+        KeyFrame::Ptr anchor = sm->keyframes.front();
+        if (!anchor || !anchor->T_map_b_optimized.matrix().allFinite()) return;
+        sm->pose_map_anchor_optimized = anchor->T_map_b_optimized;
+        sm->pose_frame = anchor->pose_frame;
+        const Pose3d inv_a = sm->pose_map_anchor_optimized.inverse();
+        if (!inv_a.matrix().allFinite()) return;
+        for (auto& kf : sm->keyframes) {
+            if (!kf || !kf->T_map_b_optimized.matrix().allFinite()) continue;
+            kf->T_submap_kf = inv_a * kf->T_map_b_optimized;
+        }
+    };
+    for (auto& sm : submaps_) resyncSubmapRelative(sm);
+    resyncSubmapRelative(active_submap_);
+
+    ++current_map_version_;
+    cached_global_map_.reset();
+    last_build_map_version_ = std::numeric_limits<uint64_t>::max();
+    merged_cloud_dirty_.store(true, std::memory_order_release);
+
+    RCLCPP_INFO(log,
+        "[SubMapMgr][SAVE_SYNC] syncOptimizedPosesFromLastHbaWriteback: kf_synced=%zu map_version=%lu "
+        "(T_map_b_optimized<-T_map_b_hba; anchors/T_submap_kf resynced; cache invalidated for global_map_final)",
+        n_synced, current_map_version_);
 }
 
 // ── 查询接口实现（头文件声明，此前未实现会导致 undefined symbol）────────────────────

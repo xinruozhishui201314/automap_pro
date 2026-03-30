@@ -1,4 +1,9 @@
 #pragma once
+/**
+ * @file submap/session_manager.h
+ * @brief 子图/会话：生命周期、合并、持久化与 MS-Mapping 桥接。
+ */
+
 
 #include <string>
 #include <vector>

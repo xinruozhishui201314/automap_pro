@@ -1,3 +1,12 @@
+/**
+ * @file icp_refiner.cpp
+ * @brief IcpRefiner 实现：PCL ICP/GICP/NDT 封装、多尺度与语义加权 SVD 刚性迭代。
+ *
+ * @details
+ * - 体素下采样：边长 @f$h@f$ 时，点落入网格单元后保留代表点（PCL VoxelGrid）。
+ * - 统计离群：邻域均值 @f$\mu@f$、标准差 @f$\sigma@f$，剔除距离 @f$>\mu + k\sigma@f$ 的点（SOR，@f$k@f$=stddev_mul）。
+ * - 验证内点启发式：@f$r_{inlier} \approx 1 - \mathrm{rmse}/d_{max}@f$（实现约定，非严格内点比例）。
+ */
 #include "automap_pro/loop_closure/icp_refiner.h"
 #include "automap_pro/core/logger.h"
 #include <pcl/common/transforms.h>
@@ -33,10 +42,9 @@ IcpRefiner::Config IcpRefiner::getConfig() const {
     return config_;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 主要配准接口
-// ─────────────────────────────────────────────────────────────────────────────
-
+/**
+ * @brief 主入口：选算法、计时、可选 validateResult、位姿变化统计。
+ */
 IcpRefiner::Result IcpRefiner::refine(const CloudXYZIPtr& src, 
                                         const CloudXYZIPtr& tgt,
                                         const Pose3d& initial) const {
@@ -86,10 +94,9 @@ IcpRefiner::Result IcpRefiner::refine(const CloudXYZIPtr& src,
     return res;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 多尺度配准
-// ─────────────────────────────────────────────────────────────────────────────
-
+/**
+ * @brief 多尺度：第 @f$\ell@f$ 层体素边长 @f$s_\ell@f$（scale_levels），逐层更新 @f$T@f$，最后在全分辨率上 refine。
+ */
 IcpRefiner::Result IcpRefiner::refineMultiscale(const CloudXYZIPtr& src, 
                                                   const CloudXYZIPtr& tgt,
                                                   const Pose3d& initial) const {
@@ -138,10 +145,12 @@ IcpRefiner::Result IcpRefiner::refineMultiscale(const CloudXYZIPtr& src,
     return final_res;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// ICP配准
-// ─────────────────────────────────────────────────────────────────────────────
-
+/**
+ * @brief PCL IterativeClosestPoint。
+ * @details 点对点目标 @f$\min_{\mathbf{R},\mathbf{t}} \sum_i \|\mathbf{R}\mathbf{p}_i+\mathbf{t}-\mathbf{q}_{\pi(i)}\|^2@f$；
+ *          点到面常用形式 @f$\sum_i (\mathbf{n}_i^\top(\mathbf{R}\mathbf{p}_i+\mathbf{t}-\mathbf{q}_{\pi(i)}))^2@f$。
+ *          收敛判据与最大对应距离由 Config 映射到 PCL。
+ */
 IcpRefiner::Result IcpRefiner::refineICP(const CloudXYZIPtr& src, 
                                             const CloudXYZIPtr& tgt,
                                             const Pose3d& initial,
@@ -201,10 +210,9 @@ IcpRefiner::Result IcpRefiner::refineICP(const CloudXYZIPtr& src,
     return res;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// GICP配准
-// ─────────────────────────────────────────────────────────────────────────────
-
+/**
+ * @brief PCL Generalized ICP：在对应约束上使用局部协方差建模的 Mahalanobis 型残差（见 Segal et al.）。
+ */
 IcpRefiner::Result IcpRefiner::refineGICP(const CloudXYZIPtr& src,
                                              const CloudXYZIPtr& tgt,
                                              const Pose3d& initial) const {
@@ -240,10 +248,10 @@ IcpRefiner::Result IcpRefiner::refineGICP(const CloudXYZIPtr& src,
     return res;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// NDT配准
-// ─────────────────────────────────────────────────────────────────────────────
-
+/**
+ * @brief NDT：目标体素内拟合 @f$\mathcal{N}(\boldsymbol{\mu}_c, \boldsymbol{\Sigma}_c)@f$，
+ *        优化 @f$T@f$ 使源点变换后落在目标分布下的得分最大（PCL 实现）。
+ */
 IcpRefiner::Result IcpRefiner::refineNDT(const CloudXYZIPtr& src,
                                             const CloudXYZIPtr& tgt,
                                             const Pose3d& initial) const {
@@ -277,10 +285,7 @@ IcpRefiner::Result IcpRefiner::refineNDT(const CloudXYZIPtr& src,
     return res;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 验证配准结果
-// ─────────────────────────────────────────────────────────────────────────────
-
+/** @brief 见 IcpRefiner::validateResult 声明（角、平移、启发式内点）。 */
 bool IcpRefiner::validateResult(const Result& res, const CloudXYZIPtr& src,
                                 const CloudXYZIPtr& tgt) const {
     if (!res.converged) return false;
@@ -312,10 +317,7 @@ bool IcpRefiner::validateResult(const Result& res, const CloudXYZIPtr& src,
     return true;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 计算对应关系协方差
-// ─────────────────────────────────────────────────────────────────────────────
-
+/** @brief 对平移误差分量累加 @f$\mathrm{cov}(k,k)+=e_k^2@f$，样本均值后得到对角粗估计。 */
 Mat66d IcpRefiner::computeCorrespondenceCovariance(
     const CloudXYZIPtr& src, const CloudXYZIPtr& tgt,
     const Pose3d& T_src_tgt) const {
@@ -351,10 +353,7 @@ Mat66d IcpRefiner::computeCorrespondenceCovariance(
     return cov;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 预处理
-// ─────────────────────────────────────────────────────────────────────────────
-
+/** @brief 可选 VoxelGrid + SOR；语义路径可通过开关保留 intensity 对齐。 */
 CloudXYZIPtr IcpRefiner::preprocessCloud(const CloudXYZIPtr& cloud) const {
     if (!cloud) return nullptr;
     
@@ -385,6 +384,7 @@ CloudXYZIPtr IcpRefiner::preprocessCloud(const CloudXYZIPtr& cloud) const {
     return processed;
 }
 
+/** @brief 半径邻域法向估计（GICP 内部仍会处理协方差；此处供显式调试/扩展）。 */
 void IcpRefiner::computeNormals(const CloudXYZIPtr& cloud) const {
     if (!cloud || cloud->empty()) return;
     
@@ -415,10 +415,7 @@ void IcpRefiner::computeNormals(const CloudXYZIPtr& cloud) const {
                cloud->size(), config_.gicp_correspondence_knn);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 对应关系分析
-// ─────────────────────────────────────────────────────────────────────────────
-
+/** @brief 最近邻对应 @f$\pi(i)=\arg\min_j \|\mathbf{R}\mathbf{p}_i+\mathbf{t}-\mathbf{q}_j\|@f$，阈值 @f$d_{max}@f$。 */
 std::vector<std::pair<int, int>> IcpRefiner::findCorrespondences(
     const CloudXYZIPtr& src, const CloudXYZIPtr& tgt,
     const Pose3d& T_src_tgt, float max_dist) const {
@@ -449,6 +446,7 @@ std::vector<std::pair<int, int>> IcpRefiner::findCorrespondences(
     return correspondences;
 }
 
+/** @brief 距离比门控；角度门控留作扩展（需法向）。 */
 void IcpRefiner::filterCorrespondences(
     std::vector<std::pair<int, int>>& correspondences,
     const CloudXYZIPtr& src, const CloudXYZIPtr& tgt,
@@ -483,10 +481,7 @@ void IcpRefiner::filterCorrespondences(
     correspondences = std::move(filtered);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 结果分析
-// ─────────────────────────────────────────────────────────────────────────────
-
+/** @brief @f$\mathrm{fitness} = \frac{1}{N}\sum_i \min_j \|\tilde{\mathbf{p}}_i - \mathbf{q}_j\|@f$（@f$\tilde{\mathbf{p}}_i@f$ 为对齐后源点）。 */
 double IcpRefiner::computeFitnessScore(const CloudXYZIPtr& aligned,
                                          const CloudXYZIPtr& tgt) const {
     
@@ -509,6 +504,7 @@ double IcpRefiner::computeFitnessScore(const CloudXYZIPtr& aligned,
     return count > 0 ? total_error / count : 1e6;
 }
 
+/** @brief @f$\mathbf{T}_\delta = T_i^{-1} T_f@f$，角轴角转度、平移范数。 */
 void IcpRefiner::computePoseChange(const Pose3d& T_initial, const Pose3d& T_final,
                                  double& angle_deg, double& translation) const {
     
@@ -522,10 +518,7 @@ void IcpRefiner::computePoseChange(const Pose3d& T_initial, const Pose3d& T_fina
     translation = T_change.translation().norm();
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 语义加权 ICP（SuMa++ 类：同类高权、异类/动态/未知降权）
-// ─────────────────────────────────────────────────────────────────────────────
-
+/** @brief 将 intensity 量化为非负语义 id；非法或越界为 0（未知）。 */
 int IcpRefiner::intensityToSemanticLabel(float intensity) {
     if (!std::isfinite(intensity)) return 0;
     const int v = static_cast<int>(std::lround(intensity));
@@ -533,6 +526,7 @@ int IcpRefiner::intensityToSemanticLabel(float intensity) {
     return v;
 }
 
+/** @brief 非零标签点数占比 @f$|\{i: l_i\neq 0\}| / N@f$。 */
 double IcpRefiner::semanticLabelRatio(const CloudXYZIPtr& cloud) {
     if (!cloud || cloud->empty()) return 0.0;
     size_t n = 0;
@@ -542,6 +536,7 @@ double IcpRefiner::semanticLabelRatio(const CloudXYZIPtr& cloud) {
     return static_cast<double>(n) / static_cast<double>(cloud->size());
 }
 
+/** @brief 由动态集、未知类、同/异类查表得到标量权 @f$w_{ij}@f$。 */
 double IcpRefiner::semanticCorrespondenceWeight(int ls, int lt,
                                                 const std::unordered_set<int>& dyn) const {
     const bool dyn_s = dyn.count(ls) != 0;
@@ -554,6 +549,10 @@ double IcpRefiner::semanticCorrespondenceWeight(int ls, int lt,
     return static_cast<double>(config_.semantic_weight_mismatch);
 }
 
+/**
+ * @brief 语义加权刚性迭代：每步建立 NN 对应后解加权 Procrustes（@f$\mathbf{H}@f$ SVD，见头文件）。
+ *        RMSE 报告为 @f$\sqrt{\sum w_i d_i^2 / \sum w_i}@f$（@f$d_i@f$ 为最近邻欧氏距离）。
+ */
 IcpRefiner::Result IcpRefiner::refineSemanticWeighted(const CloudXYZIPtr& src,
                                                        const CloudXYZIPtr& tgt,
                                                        const Pose3d& initial) const {

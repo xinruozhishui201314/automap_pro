@@ -1,4 +1,9 @@
 #pragma once
+/**
+ * @file backend/hba_optimizer.h
+ * @brief 后端优化：iSAM2、HBA、GPS/回环因子、任务队列与坐标管理。
+ */
+
 
 #include "automap_pro/core/data_types.h"
 #include "automap_pro/backend/isam2_factor_types.h"
@@ -6,6 +11,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <queue>
+#include <string>
 #include <atomic>
 #include <chrono>
 
@@ -44,8 +50,8 @@ public:
     void stop();   // 等待优化完成并停止（析构/常规关闭：无限期 join）
 
     /**
-     * 关闭路径专用：与 triggerAsync(..., wait=true) 的 5 分钟等待对齐，避免 runHBA 内部卡住时 stop() 无限 join。
-     * 超时后打 ERROR 并 detach 工作线程（进程即将退出时仍可接受；见 service_handlers finish_mapping）。
+     * 关闭路径专用：短超时 join HBA worker（与 triggerAsync wait 的墙钟上限无关；默认 stop() 用数秒级）。
+     * 超时后打 ERROR 并 detach 工作线程（进程即将退出时仍可接受）。
      */
     void stopJoinWithTimeout(std::chrono::milliseconds max_join);
 
@@ -61,7 +67,11 @@ public:
                       const char* trigger_source = nullptr,
                       uint64_t alignment_epoch_snapshot = 0);
 
-    /** 等待队列清空且当前无 HBA 运行，最多等待 timeout_ms 毫秒（用于关闭时限时等待） */
+    /**
+     * 等待队列清空且当前无 HBA 运行。
+     * timeout_ms.count()==0：不限制墙钟时间，直到 idle（用于大地图收尾 wait=true；见 backend.hba.trigger_wait_timeout_sec）。
+     * timeout_ms>0：最多等待该毫秒数。
+     */
     void waitUntilIdleFor(std::chrono::milliseconds timeout_ms);
 
     /** GPS 对齐完成后，批量为已有关键帧添加 GPS 因子并立即触发 HBA（若仅建图结束时做一次 HBA，则改用 setGPSAlignedState） */
@@ -96,6 +106,8 @@ private:
         std::unordered_map<int, Pose3d> submap_anchor_poses;
         uint64_t alignment_epoch_snapshot = 0;
         bool enable_gps = false;
+        /** triggerAsync 传入，worker 内用于 FINAL_FULL_MAP 等可检索日志 */
+        std::string trigger_source;
     };
 
     std::queue<PendingTask>     pending_queue_;

@@ -1,3 +1,7 @@
+/**
+ * @file backend/hba_wrapper.cpp
+ * @brief 后端优化与因子实现。
+ */
 #include "automap_pro/backend/hba_wrapper.h"
 #include "automap_pro/core/config_manager.h"
 #include "automap_pro/core/utils.h"

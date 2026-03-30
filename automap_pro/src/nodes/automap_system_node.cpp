@@ -1,3 +1,7 @@
+/**
+ * @file nodes/automap_system_node.cpp
+ * @brief 独立 ROS 节点入口。
+ */
 #include "automap_pro/system/automap_system.h"
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp/executors.hpp>

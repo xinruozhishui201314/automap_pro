@@ -1,3 +1,7 @@
+/**
+ * @file system/modules/service_handlers.cpp
+ * @brief 系统节点与 ROS 服务实现。
+ */
 #include "automap_pro/system/automap_system.h"
 #include "automap_pro/core/config_manager.h"
 #include "automap_pro/core/health_monitor.h"
@@ -238,7 +242,51 @@ void AutoMapSystem::handleFinishMapping(
         if (wait_count >= 600) {
             RCLCPP_WARN(get_logger(), "[AutoMapSystem] Wait for idle TIMEOUT! Forcing save and exit.");
         } else {
-            RCLCPP_INFO(get_logger(), "[AutoMapSystem] All modules QUIESCED and IDLE. Proceeding to final save.");
+            RCLCPP_INFO(get_logger(), "[AutoMapSystem] All modules QUIESCED and IDLE. Proceeding to finalize (freeze/HBA) then save.");
+        }
+
+        // 🏛️ [收尾] 强制冻结活跃子图，使最后一段轨迹与 onSubmapFrozen 链路一致；随后排空因新图任务产生的后端工作。
+        if (mapping_module_) {
+            RCLCPP_INFO(get_logger(), "[AutoMapSystem] Finish: force-freeze active submap (if any) for complete graph...");
+            mapping_module_->forceFreezeActiveSubmapForFinish();
+        } else {
+            RCLCPP_WARN(get_logger(), "[AutoMapSystem] Finish: mapping_module_ null, skip force-freeze");
+        }
+
+        int drain_count = 0;
+        while (!v3_context_->isAllIdle() && drain_count < 300) {
+            if (drain_count % 10 == 0) {
+                RCLCPP_INFO(get_logger(),
+                    "[AutoMapSystem] Finish: draining post-freeze graph tasks... (%ds)", drain_count);
+            }
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            drain_count++;
+        }
+        if (drain_count >= 300) {
+            RCLCPP_WARN(get_logger(),
+                "[AutoMapSystem] Finish: post-freeze drain TIMEOUT (300s); continuing to HBA/save anyway.");
+        }
+
+        // 🏛️ [收尾] backend.hba.trigger_on_finish：全图 HBA（wait=true）后再存档；配置关闭则跳过。
+        if (mapping_module_) {
+            const bool did_hba = mapping_module_->runFinalFullHbaBlockingIfConfigured();
+            if (did_hba) {
+                RCLCPP_INFO(get_logger(), "[AutoMapSystem] Finish: final full HBA worker returned; draining apply/rebuild...");
+                int post_hba = 0;
+                while (!v3_context_->isAllIdle() && post_hba < 120) {
+                    if (post_hba % 10 == 0) {
+                        RCLCPP_INFO(get_logger(),
+                            "[AutoMapSystem] Finish: post-HBA idle wait... (%ds)", post_hba);
+                    }
+                    std::this_thread::sleep_for(std::chrono::seconds(1));
+                    post_hba++;
+                }
+                if (post_hba >= 120) {
+                    RCLCPP_WARN(get_logger(),
+                        "[AutoMapSystem] Finish: post-HBA idle TIMEOUT (120s); save may see slightly stale viz state.");
+                }
+                RCLCPP_INFO(get_logger(), "[AutoMapSystem] Finish: final full HBA path done.");
+            }
         }
 
         // 🏛️ [架构契约] 协议版本检查（即使 srv 还没更新，也要在日志中显式声明契约一致性）

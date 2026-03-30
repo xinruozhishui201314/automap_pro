@@ -1,4 +1,9 @@
 #pragma once
+/**
+ * @file core/crash_report.h
+ * @brief 核心：指标、协议、错误、资源、ONNX 等横切能力。
+ */
+
 
 /**
  * 崩溃时在 stderr 输出最后一步上下文，便于即使日志缓冲未刷新也能定位。

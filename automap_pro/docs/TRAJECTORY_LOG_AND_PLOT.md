@@ -14,11 +14,14 @@
 当 **`trajectory_log_after_mapping_only=true`**（默认）时：
 
 - **用于轨迹-GPS 对比的 trajectory_odom** 仅在建图完成（调用 save_map / saveMapToFiles）时写入。
-- **首选使用保存目录**（与 `keyframe_poses.pcd`、`gps_positions_map.pcd`、`global_map.pcd` 同目录）下的 `trajectory_odom_<session_id>.csv`。
+- **首选使用保存目录**下 **`optimized/trajectory_odom.csv`**（与 `global_map_final.pcd`、`keyframes_post_hba.csv` 等同级目录），与 `keyframe_poses.pcd` 等仍可能在会话根目录；做对比时以 `optimized/` 下该文件为准。
+- **`keyframes_post_hba.csv` / `trajectory_odom.csv` / `mapping_accuracy.csv` 中的关键帧 map 位姿**：在 `hba_pose_valid` 时使用 **`T_map_b_hba`（最近一次 HBA 写回，含收尾全图 HBA）**，避免 iSAM2 后续覆写 `T_map_b_optimized` 导致记录与 HBA 不一致；从未跑过 HBA 写回时仍用 `T_map_b_optimized`。
+- **`global_map_final.pcd`**：在 `handleSaveMap` 内先调用 **`SubMapManager::syncOptimizedPosesFromLastHbaWriteback()`**，将 `T_map_b_optimized` 与 `T_map_b_hba` 对齐并重算子图锚点/`T_submap_kf`，再 `rebuildMergedCloudFromOptimizedPoses` 与 `buildGlobalMap`，使最终点云与最后一次 HBA 一致（无 `hba_pose_valid` 的关键帧时行为与原先相同）。
+- **`submap_*/` 存档**（`submap_meta.json`、各 `keyframes/kf_*.json` 位姿、`downsampled_cloud.pcd`）：与 `global_map_final` 同一流水线，在 HBA 同步与 merged 重建 **之后** 再 `archiveSubmap`，与全图 HBA 结果一致。
 - 该文件与 keyframe_poses.pcd、gps_positions_map.pcd **同坐标系（map）**，轨迹与 GPS 在同一地图系下可重合对比。
 - 若配置了 `trajectory_log_dir` 且与保存目录不同，系统会**同时**写一份副本到 `trajectory_log_dir`；做对比与绘图时仍请以**保存目录**下的文件为准。
 
-**推荐步骤**：1）保持 `trajectory_log_after_mapping_only: true`；2）建图结束后执行保存（save_map 或自动保存）；3）使用保存目录下的 `trajectory_odom_*.csv` 做对比与 `plot_trajectory_compare.py` 绘图。
+**推荐步骤**：1）保持 `trajectory_log_after_mapping_only: true`；2）建图结束后执行保存（save_map 或自动保存）；3）使用 **`optimized/trajectory_odom.csv`**（或日志目录下带时间戳的 `trajectory_odom_*.csv`，若启用边建图边写）做对比与 `plot_trajectory_compare.py` 绘图。
 
 | 文件 | 含义 | 表头 |
 |------|------|------|

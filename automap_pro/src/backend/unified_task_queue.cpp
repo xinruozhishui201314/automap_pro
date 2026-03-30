@@ -1,3 +1,7 @@
+/**
+ * @file backend/unified_task_queue.cpp
+ * @brief 后端优化与因子实现。
+ */
 #include "automap_pro/backend/unified_task_queue.h"
 
 #include "automap_pro/core/logger.h"

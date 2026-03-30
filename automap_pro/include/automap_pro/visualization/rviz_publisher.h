@@ -1,4 +1,9 @@
 #pragma once
+/**
+ * @file visualization/rviz_publisher.h
+ * @brief RViz2 可视化与话题发布。
+ */
+
 
 #include <memory>
 #include <vector>

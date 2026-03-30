@@ -1,3 +1,7 @@
+/**
+ * @file loop_detector.cpp
+ * @brief LoopDetector 实现：ScanContext/Overlap/TEASER/ICP 流水线、子图内外回环、Python 服务可选、线程池与优先队列。
+ */
 #include "automap_pro/loop_closure/loop_detector.h"
 #include "automap_pro/loop_closure/icp_refiner.h"
 #include "automap_pro/core/config_manager.h"

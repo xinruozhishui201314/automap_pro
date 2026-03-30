@@ -1,3 +1,7 @@
+/**
+ * @file v3/map_orchestrator.cpp
+ * @brief V3 流水线模块实现。
+ */
 #include "automap_pro/v3/map_orchestrator.h"
 #include "automap_pro/core/config_manager.h"
 

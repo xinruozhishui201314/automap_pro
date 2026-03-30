@@ -1,5 +1,10 @@
 #pragma once
 /**
+ * @file core/alert_system.h
+ * @brief 核心：指标、协议、错误、资源、ONNX 等横切能力。
+ */
+
+/**
  * AutoMap-Pro Alert System
  */
 

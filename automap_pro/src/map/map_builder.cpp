@@ -1,3 +1,7 @@
+/**
+ * @file map/map_builder.cpp
+ * @brief 地图构建与维护实现。
+ */
 #include "automap_pro/map/map_builder.h"
 #include "automap_pro/core/logger.h"
 #include <pcl/common/transforms.h>

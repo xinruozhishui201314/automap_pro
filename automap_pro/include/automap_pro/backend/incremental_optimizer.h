@@ -1,4 +1,9 @@
 #pragma once
+/**
+ * @file backend/incremental_optimizer.h
+ * @brief 后端优化：iSAM2、HBA、GPS/回环因子、任务队列与坐标管理。
+ */
+
 
 #include "automap_pro/core/data_types.h"
 #include "automap_pro/backend/isam2_factor_types.h"
@@ -30,7 +35,12 @@
 namespace automap_pro {
 
 /**
- * iSAM2 实时增量优化器
+ * @class IncrementalOptimizer
+ * @brief iSAM2 实时增量优化器（子图位姿图 + 回环/GPS 因子）。
+ *
+ * @details
+ * 图优化目标为 @f$\min_{\mathbf{X}} \sum_k \|\mathbf{e}_k(\mathbf{X})\|^2_{\boldsymbol{\Sigma}_k}@f$（鲁棒核 @f$\rho@f$ 可选），
+ * 因子类型见下文；残差在 GTSAM Pose3/李群上定义，细节见 GTSAM 文档。
  *
  * 两轨制设计：
  *   轨道1（实时）: iSAM2 ← 每帧里程计因子 + 每个回环因子 → 实时 <50ms 更新

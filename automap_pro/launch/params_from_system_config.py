@@ -353,7 +353,8 @@ def _get_fast_livo2_params_impl(config):
     if "pcd_save" not in params:
         params["pcd_save"] = {}
     if isinstance(params["pcd_save"], dict):
-        params["pcd_save"]["output_dir"] = out_dir
+        # 与 MappingModule 保存 global_map_final.pcd 的 optimized/ 子目录一致，便于同目录归档 fast_livo 点云
+        params["pcd_save"]["output_dir"] = os.path.normpath(os.path.join(out_dir, "optimized"))
 
     # 确保 evo.seq_name 等字符串参数非空（fast_livo 声明为 string，不能为 not set）
     if "evo" in params:

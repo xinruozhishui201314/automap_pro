@@ -1,3 +1,7 @@
+/**
+ * @file map/map_exporter.cpp
+ * @brief 地图构建与维护实现。
+ */
 #include "automap_pro/map/map_exporter.h"
 #include "automap_pro/core/logger.h"
 #include "automap_pro/core/config_manager.h"

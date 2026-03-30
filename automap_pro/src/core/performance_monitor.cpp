@@ -1,3 +1,7 @@
+/**
+ * @file core/performance_monitor.cpp
+ * @brief 核心实现。
+ */
 #include "automap_pro/core/performance_monitor.h"
 #include <limits>
 #include <sstream>

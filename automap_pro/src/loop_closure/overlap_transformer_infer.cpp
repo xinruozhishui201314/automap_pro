@@ -1,3 +1,7 @@
+/**
+ * @file overlap_transformer_infer.cpp
+ * @brief Range 图投影、TorchScript 前向、L2 归一化描述子、余弦 Top-K 检索与 FPFH fallback。
+ */
 #include "automap_pro/loop_closure/overlap_transformer_infer.h"
 #include "automap_pro/core/config_manager.h"
 #include "automap_pro/core/logger.h"

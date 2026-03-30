@@ -1,5 +1,13 @@
 #pragma once
-
+/**
+ * @file utils.h
+ * @brief 点云几何预处理、体素安全下采样、文件系统与位姿/GNSS 工具函数。
+ *
+ * @details
+ * - 体素单元内通常取**质心**：@f$\mathbf{c}=\frac{1}{|V|}\sum_{i\in V}\mathbf{p}_i@f$（实现依 PCL 或自定义哈希格）。
+ * - 溢出安全：单轴体素格数需满足 @f$d_x d_y d_z \le 2^{31}-1@f$ 量级约束，见 .cpp 中分块策略。
+ * - WGS84→ENU：以原点为参考的局部切平面（GeographicLib::LocalCartesian）。
+ */
 #include <string>
 #include <chrono>
 #include "automap_pro/core/data_types.h"
@@ -9,9 +17,10 @@
 
 namespace automap_pro {
 
+/** @brief 无状态工具函数命名空间（点云/IO/坐标/计时）。 */
 namespace utils {
 
-/** Remove NaN/Inf and optionally clip points to ±max_abs_coord. Returns new cloud; may be empty. */
+/** @brief 去除 NaN/Inf，可选将坐标裁剪到 @f$\pm\texttt{max\_abs\_coord}@f$；返回新云。 */
 CloudXYZIPtr sanitizePointCloudForVoxel(const CloudXYZIPtr& cloud, float max_abs_coord = 1e6f);
 
 /** 点云体素滤波参数下限，避免过小导致 PCL 索引溢出/崩溃。所有 leaf_size 会 clamp 至此值。 */

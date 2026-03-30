@@ -1,4 +1,9 @@
 #pragma once
+/**
+ * @file map/map_filter.h
+ * @brief 全局地图：增量构建、体素/KD、导出与滤波。
+ */
+
 
 #include "automap_pro/core/data_types.h"
 

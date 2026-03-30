@@ -1,4 +1,9 @@
 #pragma once
+/**
+ * @file frontend/fast_livo2_wrapper.h
+ * @brief 前端：关键帧、LIVO 适配、GPS 融合与桥接。
+ */
+
 
 #include <thread>
 #include <atomic>

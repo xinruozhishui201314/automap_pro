@@ -1,4 +1,9 @@
 #pragma once
+/**
+ * @file core/frame_types.h
+ * @brief 核心：指标、协议、错误、资源、ONNX 等横切能力。
+ */
+
 
 /**
  * 帧数据类型定义

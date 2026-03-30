@@ -1,5 +1,12 @@
 #pragma once
-
+/**
+ * @file overlap_transformer_infer.h
+ * @brief OverlapTransformer 描述子：Range Image → TorchScript @f$\Rightarrow@f$ 256-D L2 归一化向量；检索用余弦相似度。
+ *
+ * @details
+ * 相似度：对单位范数向量 @f$\mathbf{q},\mathbf{d}@f$，@f$s=\mathbf{q}^\top\mathbf{d}@f$（等价于余弦，因 @f$\|\mathbf{q}\|=\|\mathbf{d}\|=1@f$）。
+ * 无 LibTorch 时走 FPFH 直方图等 fallback（见实现）。
+ */
 #include "automap_pro/core/data_types.h"
 #include "automap_pro/core/ort_wrapper.h"
 #include <string>

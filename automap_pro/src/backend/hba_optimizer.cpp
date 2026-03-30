@@ -1,3 +1,7 @@
+/**
+ * @file backend/hba_optimizer.cpp
+ * @brief 后端优化与因子实现。
+ */
 #include "automap_pro/backend/hba_optimizer.h"
 #include "automap_pro/backend/gps_constraint_policy.h"
 #include "automap_pro/backend/gps_factor_noise_util.h"
@@ -484,6 +488,7 @@ void HBAOptimizer::triggerAsync(
         task.submap_anchor_poses = std::move(sm_anchor_poses);
         task.alignment_epoch_snapshot = alignment_epoch_snapshot;
         task.enable_gps = gps_aligned_;
+        task.trigger_source = trigger_source ? std::string(trigger_source) : std::string();
         pending_queue_.push(std::move(task));
         queue_cv_.notify_one();
         trigger_count_++;
@@ -498,14 +503,28 @@ void HBAOptimizer::triggerAsync(
               src, sm_count, kf_count, loop_count, gps_aligned_ ? 1 : 0, trigger_count_, queue_depth);
 
     if (wait) {
-        // 设置合理超时：最多等待5分钟，避免永久阻塞导致析构卡死
-        constexpr auto kMaxWaitTime = std::chrono::minutes(5);
-        waitUntilIdleFor(kMaxWaitTime);
+        const double sec = ConfigManager::instance().hbaTriggerWaitTimeoutSec();
+        if (!std::isfinite(sec) || sec <= 0.0) {
+            RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                "[HBA][WAIT] triggerAsync wait=true: unbounded wall-clock wait until idle "
+                "(backend.hba.trigger_wait_timeout_sec<=0) source=%s",
+                src);
+            waitUntilIdleFor(std::chrono::milliseconds(0));
+        } else {
+            constexpr double kMaxSec = 86400.0 * 30.0; // 防 chrono 溢出
+            const double clamped = std::min(sec, kMaxSec);
+            const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::duration<double>(clamped));
+            RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                "[HBA][WAIT] triggerAsync wait=true: max_wait=%.1fs (backend.hba.trigger_wait_timeout_sec) source=%s",
+                clamped, src);
+            waitUntilIdleFor(ms);
+        }
         if (!isIdle()) {
-            ALOG_ERROR(MOD, "HBA wait timeout after 5 minutes — save/stop may race with running HBA (use stopJoinWithTimeout on shutdown)");
+            ALOG_ERROR(MOD, "HBA wait timeout — save/stop may race with running HBA (tune backend.hba.trigger_wait_timeout_sec or fix stall)");
             RCLCPP_ERROR(rclcpp::get_logger("automap_system"),
-                "[HBAOptimizer][TIMEOUT] HBA did not become idle after 5 minutes (wait=true). "
-                "saveMapToFiles / shutdown will use stopJoinWithTimeout to avoid unbounded join; expect possible abandoned HBA worker if still blocked in runHBA.");
+                "[HBAOptimizer][TIMEOUT] HBA did not become idle before wait deadline (wait=true). "
+                "Increase backend.hba.trigger_wait_timeout_sec or use <=0 for unbounded; expect possible save/HBA race if continuing.");
         }
     }
 }
@@ -523,10 +542,21 @@ size_t HBAOptimizer::queueDepth() const {
 }
 
 void HBAOptimizer::waitUntilIdleFor(std::chrono::milliseconds timeout_ms) {
-    // timeout_ms <= 0 视为使用最大合理等待时间，避免无限阻塞析构
-    constexpr auto kMaxWaitTime = std::chrono::minutes(5);
     if (timeout_ms.count() <= 0) {
-        timeout_ms = std::chrono::duration_cast<std::chrono::milliseconds>(kMaxWaitTime);
+        // 0 = 不限制墙钟时间（收尾全图 HBA 等）；约每 60s 打一条 INFO 便于确认未卡死
+        const auto t0 = std::chrono::steady_clock::now();
+        int64_t iter = 0;
+        while (!isIdle()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            if (++iter % 1200 == 0) {
+                const double elapsed_s =
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                    "[HBA][WAIT] unbounded wait: still not idle after %.0fs (hba_running/queue; expected for large maps)",
+                    elapsed_s);
+            }
+        }
+        return;
     }
 
     auto deadline = std::chrono::steady_clock::now() + timeout_ms;
@@ -579,6 +609,11 @@ void HBAOptimizer::workerLoop() {
         }
 
         hba_running_ = true;
+        if (task.trigger_source == "FinishMapping") {
+            RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                "[HBA][FINAL_FULL_MAP] BEGIN keyframes=%zu loops=%zu gps=%d (收尾全图 HBA 已启动；grep FINAL_FULL_MAP)",
+                task.keyframes.size(), task.loops.size(), task.enable_gps ? 1 : 0);
+        }
         BACKEND_STEP("step=HBA_workerLoop_start keyframes=%zu gps=%d", task.keyframes.size(), task.enable_gps ? 1 : 0);
         RCLCPP_INFO(rclcpp::get_logger("automap_system"),
             "[HBA][STATE] optimization start keyframes=%zu gps=%d (running=1)",
@@ -588,6 +623,12 @@ void HBAOptimizer::workerLoop() {
         AUTOMAP_TIMED_SCOPE(MOD, "HBA full optimize", 60000.0);
         HBAResult result = runHBA(task);
 
+        if (task.trigger_source == "FinishMapping") {
+            RCLCPP_INFO(rclcpp::get_logger("automap_system"),
+                "[HBA][FINAL_FULL_MAP] END success=%d elapsed_ms=%.1f poses=%zu MME=%.4f (收尾全图 HBA 已结束；grep FINAL_FULL_MAP)",
+                result.success ? 1 : 0, result.elapsed_ms,
+                result.optimized_poses.size(), result.final_mme);
+        }
         if (result.success) {
             BACKEND_STEP("step=HBA_workerLoop_done success=1 MME=%.4f elapsed_ms=%.1f poses=%zu",
                 result.final_mme, result.elapsed_ms, result.optimized_poses.size());
