@@ -255,9 +255,10 @@ IcpRefiner::Result IcpRefiner::refineNDT(const CloudXYZIPtr& src,
     pcl::NormalDistributionsTransform<pcl::PointXYZI, pcl::PointXYZI> ndt;
     ndt.setInputSource(src_proc);
     ndt.setInputTarget(tgt_proc);
+    // 仅使用 ndt_resolution：此前二次 setResolution(ndt_resolution_gradient) 会覆盖 YAML/配置中的体素尺寸，
+    // 导致回环 NDT 兜底实际一直在用默认 0.1m 网格，与 loop_closure.teaser_fallback_register.ndt_resolution 不一致。
     ndt.setResolution(config_.ndt_resolution);
     ndt.setStepSize(config_.ndt_step_size);
-    ndt.setResolution(config_.ndt_resolution_gradient);
     ndt.setMaximumIterations(config_.max_iterations);
     
     CloudXYZI aligned;

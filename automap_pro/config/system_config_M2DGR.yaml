@@ -784,7 +784,7 @@ loop_closure:
     enabled: true
     method: "ndt"   # ndt | gicp
     # 合并窗口约 2N+1 个关键帧；N=10 → 约 21 帧（满足 >20；可调大至 50 以内）
-    multi_kf_half_window: 10
+    multi_kf_half_window: 2
     merge_voxel_m: 0.35
     max_rmse: 1.2
     max_iterations: 50
