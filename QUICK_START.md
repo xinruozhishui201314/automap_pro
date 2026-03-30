@@ -32,6 +32,12 @@ bash run_automap.sh --build-only
 
 # 【清理重编】
 bash run_automap.sh --clean --offline --bag-file <path>
+
+# 【固定日志目录】（默认每次运行在 logs/run_YYYYMMDD_HHMMSS/）
+bash run_automap.sh --offline --bag-file <path> --config system_config_M2DGR.yaml --log-dir "$(pwd)/logs"
+
+# 【保留上次建图输出】（默认离线会清空 data/automap_output）
+bash run_automap.sh --offline --bag-file <path> --no-clean-output
 ```
 
 ## 错误排查速查表

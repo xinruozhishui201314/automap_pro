@@ -111,19 +111,19 @@ ros2 launch automap_pro automap_composable.launch.py \
 
 ---
 
-## 5. Docker 挂载说明（automap_start.sh）
+## 5. Docker 挂载说明（run_automap.sh）
 
-镜像 **仅提供**：ROS2 Humble、CUDA、系统依赖、编译工具链。**不包含**工程源码与编译产物，均通过挂载写入宿主机。
+镜像提供 ROS2（Humble 或随 `AUTOMAP_DOCKER_IMAGE` 的发行版）、CUDA/工具链等；**源码与编译产物在宿主机**，由 `run_automap.sh` 挂载进容器。
 
 | 宿主机 | 容器内 |
 |--------|--------|
-| `automap_ws/` | `/workspace/automap_ws` |
-| `automap_pro/` | `/workspace/automap_ws/src/automap_pro` |
-| `data/.../nya_02_ros2/`（bag 目录） | `/workspace/data/bag` |
-| `logs/automap_*/` | `/workspace/logs` |
-| `output/` | `/workspace/output` |
+| `automap_ws/` | `/root/automap_ws` |
+| `automap_pro/` | `/root/automap_ws/src/automap_pro` |
+| `data/` | `/data` |
+| `logs/` 或 `--log-dir` 指定目录 | `/root/run_logs`（运行期 stdout/stderr tee 到 `full.log`） |
+| `thrid_party/automap_cache/` | `/root/automap_download_cache` |
 
-工作目录：容器内 `-w /workspace/automap_ws`。
+工作目录：容器内 `-w /root/automap_ws`。历史脚本 `automap_start.sh` 若仍使用 `/workspace/*` 路径，与当前 `run_automap.sh` 不一致，**以本节为准**。
 
 ---
 
@@ -139,8 +139,8 @@ Modular 节点由 system_config 与 launch 参数控制（如 use_external_front
 ## 7. 验证
 
 - **配置**：`automap_pro/scripts/verify_system_config_launch.sh [config.yaml]`（若存在）
-- **建图流水线**：`./verify_mapping_pipeline.sh`（若存在）
-- **日志**：宿主机 `logs/automap_YYYYMMDD_HHMMSS/`，容器内 `/workspace/logs`
+- **建图流水线**：仓库内验证脚本（若存在）
+- **日志**：默认宿主机 `logs/run_YYYYMMDD_HHMMSS/`（每次运行子目录）；`--log-dir` 可固定到例如 `logs/`。容器内对应挂载为 `/root/run_logs`。
 
 ---
 
@@ -148,21 +148,22 @@ Modular 节点由 system_config 与 launch 参数控制（如 use_external_front
 
 | 现象 | 处理 |
 |------|------|
-| 找不到 `system_config.yaml` | 确认使用 `automap_start.sh` 或传入 `config:=/path/to/automap_pro/config/system_config.yaml` |
+| 找不到 `system_config.yaml` | 使用 `run_automap.sh` 时通过 `--config` 传 basename（如 `system_config_M2DGR.yaml`）；或直接 launch 时 `config:=/path/to/automap_pro/config/system_config.yaml` |
 | Launch 报 [Errno 21] Is a directory | 已修复；确保使用当前 `automap_pro/launch/automap_composable.launch.py` 与 `rviz/automap.rviz` |
 | 容器内无源码 | 确认宿主机存在 `automap_pro/`、`automap_ws/`，脚本会挂载到容器 |
-| 日志不在宿主机 | 确认脚本挂载了 `logs`，且容器内 `AUTOMAP_LOG_DIR=/workspace/logs` |
+| 日志不在宿主机 | 确认 `run_automap.sh` 挂载了日志目录；查看 `--log-dir` 与 `logs/run_*` 子目录 |
 
 ---
 
-## 9. 变更记录（重构后）
+## 9. 变更记录（与当前脚本对齐）
 
-- 推荐入口统一为 **automap_start.sh**（Docker + automap_ws + automap_pro 挂载）。
-- 默认 launch 为 **automap_composable.launch.py**（Composable 零拷贝），配置与 RViz 路径使用非空默认值。
-- 日志目录：宿主机 `logs/automap_YYYYMMDD_HHMMSS/`，容器 `/workspace/logs`。
-- 唯一主配置：`automap_pro/config/system_config.yaml`。
+- 推荐入口：**run_automap.sh**（Docker、挂载、`--offline`/`--config`/`--bag-rate`/`--gdb` 等）；可选 **automap_start.sh**。
+- 离线/在线 launch：`automap_offline.launch.py` / `automap_online.launch.py`（由 `run_automap.sh` 选择）；composable 入口仍见 `automap_composable.launch.py`。
+- 容器工作区：**/root/automap_ws**，数据 **/data**，日志默认 **logs/run_*** 子目录 → 容器 **/root/run_logs**。
+- 下载缓存：**thrid_party/automap_cache** → **/root/automap_download_cache**（pip、LibTorch、ONNX 等）。
+- 主配置：`automap_pro/config/system_config.yaml`；`--config` 可换用如 `system_config_M2DGR.yaml`。
 
 ---
 
-文档版本：v2.0（重构后）  
-更新日期：2026-03-03
+文档版本：v2.1（容器路径与 run_automap 对齐）  
+更新日期：2026-03-30

@@ -62,6 +62,11 @@
 
 | 文档 | 说明 |
 |------|------|
+| [../automap_pro/docs/V3_BARRIER_AND_META_CONTRACTS.md](../automap_pro/docs/V3_BARRIER_AND_META_CONTRACTS.md) | V3 事件屏障与 EventMeta 契约 |
+| [../automap_pro/docs/v3_stability_baseline.md](../automap_pro/docs/v3_stability_baseline.md) | V3 稳定性基线与自检 |
+| [../automap_pro/docs/LOGGING_AND_DIAGNOSIS.md](../automap_pro/docs/LOGGING_AND_DIAGNOSIS.md) | 日志与诊断约定 |
+| [../automap_pro/docs/HBA_AND_LOOP_DESIGN.md](../automap_pro/docs/HBA_AND_LOOP_DESIGN.md) | HBA 与回环设计笔记 |
+| [../automap_pro/docs/GLOBAL_MAP_MESSY_ANALYSIS.md](../automap_pro/docs/GLOBAL_MAP_MESSY_ANALYSIS.md) | 全局地图杂乱/重影分析 |
 | [../automap_pro/docs/TROUBLESHOOTING.md](../automap_pro/docs/TROUBLESHOOTING.md) | 系统启动故障排查（Bag/HBA/级联故障） |
 | [../automap_pro/docs/MAP_FRAME_CONFIG.md](../automap_pro/docs/MAP_FRAME_CONFIG.md) | 地图坐标系与配置 |
 | [../automap_pro/docs/DEBUG_WITH_GDB.md](../automap_pro/docs/DEBUG_WITH_GDB.md) | GDB 调试与 core 分析 |
@@ -78,5 +83,5 @@
 
 ---
 
-**文档版本**：v2.3  
-**更新日期**：2026-03-29（根目录 `README.md` / `readme.txt` 已同步近期 GPS 与 V3 变更摘要）
+**文档版本**：v2.4  
+**更新日期**：2026-03-30（与 `README.md` 对齐：MapOrchestrator、M2DGR HDOP、`docs/BUILD_DEPLOY_RUN.md` 容器路径）

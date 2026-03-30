@@ -76,12 +76,12 @@ bash run_automap.sh --help
 
 `automap_start.sh` 仍可作为兼容入口，但默认推荐统一使用 `run_automap.sh`。
 
-### 近期更新（2026-03-29）
+### 近期更新（2026-03-30）
 
-- **GPS / 因子图（RC-1）**：新增 `gps.disable_altitude_constraint`（默认 `true`）与 `gps.altitude_variance_override`（默认 `1e6`），在单频 GPS 高度不可靠时等效弱化 Z 向约束，配合 `incremental_optimizer` 中 **直接 add** 与 **flush 待处理 GPS 因子** 两条路径的 Z 方差逻辑一致化，减轻轨迹 Z 漂移导致的地面“双层/夹角”重影。`isam2_gps_manager`、`hba_optimizer` 同步应用相同策略。
-- **M2DGR 配置**：`system_config_M2DGR.yaml` 中收紧 `quality_threshold_hdop`（12→8）、`keyframe_max_hdop`（15→10），并显式启用上述高度约束策略说明项。
-- **V3 建图链路**：`mapping_module`、`optimizer_module`、`submap_manager` 子图/优化任务组织与调度相关更新。
-- **回环与可视化**：`loop_detector`、`teaser_matcher` 回环几何验证链路调整；`rviz_publisher` 发布逻辑更新。
+- **GPS / 因子图（RC-1）**：`gps.disable_altitude_constraint`（默认 `true`）与 `gps.altitude_variance_override`（默认 `1e6`）在单频 GPS 高度不可靠时弱化 Z 向约束；`incremental_optimizer` 在 **直接 add** 与 **flush 待处理 GPS 因子** 路径上 Z 方差一致；`isam2_gps_manager`、`hba_optimizer` 同步。
+- **M2DGR 配置**：`system_config_M2DGR.yaml` 中 `quality_threshold_hdop` / `keyframe_max_hdop` 当前为 **12.0**（与 M2DGR HDOP≈10 兼容、保留 GPS 触发对齐）；抑制 Z 向“双层/重影”主要依赖上述 **高度方差策略**，而非一味收紧 HDOP 过滤。
+- **V3 建图链路**：`mapping_module`、`optimizer_module`、`submap_manager` 子图/优化任务组织与调度；**`MapOrchestrator`** 在 `OptimizerModule` 与 `MappingModule` 之间注册，观测事件总线并产出路由/接管类建议（见 `system_init.cpp` 中 `deferredSetupModules`）。
+- **回环与可视化**：`loop_detector`、`teaser_matcher`、`icp_refiner` 几何验证链路；`rviz_publisher` 发布逻辑持续迭代。
 
 纯文本速查与上述摘要的副本见仓库根目录 **`readme.txt`**。
 
@@ -105,6 +105,8 @@ flowchart TD
     J --> K[VisualizationModule]
     J --> L[Map / Trajectory Output]
 
+    G -.-> O[MapOrchestrator<br/>observe / advice]
+
     C --> M[SemanticModule]
     M --> N[SemanticProcessor<br/>SLOAM + ONNX]
     N --> O[SemanticLandmarkEvent]
@@ -113,6 +115,8 @@ flowchart TD
     F --> P[LoopModule]
     P --> G
 ```
+
+（上图侧重 **数据与优化结果流向**；微内核 **注册/启动顺序** 以下文「模块启动与依赖顺序」列表为准，其中 `MapOrchestrator` 在 `OptimizerModule` 与 `MappingModule` 之间注册。）
 
 对应文本版主链路：
 
@@ -159,13 +163,14 @@ MappingModule -> CYLINDER_LANDMARK_FACTOR -> Optimizer
 5. `LoopModule`
 6. `VisualizationModule`
 7. `OptimizerModule`
-8. `MappingModule`
+8. `MapOrchestrator`（事件观测与路由/接管建议，非主数据链生产者）
+9. `MappingModule`
 
 该顺序用于保证：
 
 - 前端同步帧优先进入事件流
 - 语义与动态滤波可在建图前准备好输入
-- 优化器与建图调度在完整输入链路就绪后再工作
+- 优化器就绪后由 `MapOrchestrator` 观测全链路，再启动建图调度（子图 / HBA）
 
 ### 2) 部署拓扑（默认 Docker 模式）
 
@@ -230,7 +235,8 @@ Host (Ubuntu)
 - `MappingModule`：关键帧与子图生成、优化任务组织、语义地标入图
 - `OptimizerModule`：消费图优化任务并更新位姿结果
 - `SemanticModule`：异步语义处理与语义事件发布（必须真实生效，禁止 Stub）
-- `LoopModule`：回环候选与几何验证链路（含 OverlapTransformer/TEASER++）
+- `LoopModule`：回环候选与几何验证链路（含 OverlapTransformer/TEASER++/ICP 精化）
+- `MapOrchestrator`：事件观测与调度建议（配置项如 `orchestrator` 域）
 - `VisualizationModule`：RViz 数据发布与观测输出
 
 **约束建议**：共享位姿写入尽量经 `MapRegistry` 统一入口，降低跨模块并发写冲突与状态漂移风险。
@@ -385,10 +391,10 @@ automap_pro/                    # 仓库根目录
 
 | 文档 | 状态 |
 |------|------|
-| `README.md` | 主入口 `run_automap.sh`；含 V3 架构与语义管线；与 `readme.txt` 同步摘要 |
+| `README.md` | 主入口 `run_automap.sh`；V3 模块顺序含 `MapOrchestrator`；语义管线；与 `readme.txt` 同步摘要 |
 | `readme.txt` | 根目录纯文本速查 + 近期变更 |
-| `docs/BUILD_DEPLOY_RUN.md` | 已统一以 `run_automap.sh` 为主入口说明 |
-| `docs/CONFIG_SUMMARY.md` / `docs/MAPPING_WORKFLOW.md` | 按需与脚本参数、V3 模块顺序对照维护 |
+| `docs/BUILD_DEPLOY_RUN.md` | `run_automap.sh`；容器路径 `/root/automap_ws`、`/data`、`/root/run_logs`（2026-03-30 对齐） |
+| `docs/CONFIG_SUMMARY.md` / `docs/MAPPING_WORKFLOW.md` | 与 `ConfigManager`、GPS 高度方差键、`--config` 对照维护 |
 
 ---
 
@@ -406,5 +412,5 @@ automap_pro/                    # 仓库根目录
 
 **Made with ❤️ by AutoMap-Pro Team**
 
-文档版本：v2.3（GPS 高度约束与 M2DGR RC-1、V3/回环/RViz 同步说明）  
-更新日期：2026-03-29
+文档版本：v2.4（M2DGR HDOP 与代码对齐、补充 MapOrchestrator、回环 ICP 精化）  
+更新日期：2026-03-30

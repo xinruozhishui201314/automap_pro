@@ -32,20 +32,22 @@ AutoMap-Pro — 高精度自动化点云建图系统
   QUICK_START.md
   automap_pro/docs/TROUBLESHOOTING.md
 
-近期代码更新摘要（2026-03-29）
+近期代码更新摘要（2026-03-30）
 ------------------------------
 1) GPS / iSAM2（RC-1）
-   - 配置项 gps.disable_altitude_constraint（默认 true）与
-     gps.altitude_variance_override：弱 GPS 高度下放宽 Z 约束，减轻地面双层/重影。
+   - gps.disable_altitude_constraint（默认 true）与 gps.altitude_variance_override：
+     弱 GPS 高度下放宽 Z 约束，减轻地面双层/重影。
    - incremental_optimizer / isam2_gps_manager / hba_optimizer：add 与 flush 路径
-     对 Z 轴方差处理一致。
-   - system_config_M2DGR.yaml：收紧 quality_threshold_hdop / keyframe_max_hdop。
+     对 Z 轴方差一致。
+   - system_config_M2DGR.yaml：quality_threshold_hdop / keyframe_max_hdop 当前为 12.0
+    （兼容 M2DGR HDOP~10）；Z 向重影主要靠高度方差策略而非一味收紧 HDOP。
 
 2) V3 建图与后端
-   - mapping_module、optimizer_module、submap_manager：子图与优化任务调度相关增强。
+   - deferredSetupModules 注册顺序含 MapOrchestrator（在 Optimizer 与 Mapping 之间）。
+   - mapping_module、optimizer_module、submap_manager：子图与优化任务调度。
 
 3) 回环与可视化
-   - loop_detector、teaser_matcher：回环检测与几何验证链路调整。
+   - loop_detector、teaser_matcher、icp_refiner：几何验证链路。
    - rviz_publisher：RViz 发布逻辑更新。
 
-版本: 文档 bundle v2.3 | 与 Git 提交同步时请以提交说明为准。
+版本: 文档 bundle v2.4 | 与 Git 提交同步时请以提交说明为准。
